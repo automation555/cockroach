@@ -20,6 +20,7 @@ import "roachpb/io-formats.proto";
 import "sql/catalog/descpb/structured.proto";
 import "sql/catalog/descpb/tenant.proto";
 import "util/hlc/timestamp.proto";
+import "sql/schemachanger/scpb/scpb.proto";
 import "clusterversion/cluster_version.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -469,14 +470,14 @@ message TypeSchemaChangeProgress {
 
 }
 
-// NewSchemaChangeDetails is the job detail information for the new schema change job.
+// TypeSchemaChangeDetails is the job detail information for the new schema change job.
 message NewSchemaChangeDetails {
+
+  cockroach.sql.schemachanger.scpb.TargetState target_state = 5 [(gogoproto.nullable) = false];
 
   // BackfillProgress stores the progress for index backfills which may
   // be ongoing.
   repeated BackfillProgress backfill_progress = 4 [(gogoproto.nullable) = false];
-
-  reserved 1, 2, 3, 5;
 }
 
 // BackfillProgress is used to track backfill progress in the declarative
@@ -518,7 +519,10 @@ message BackfillProgress {
 
 // NewSchemaChangeProgress is the persisted progress for the new schema change job.
 message NewSchemaChangeProgress {
-  reserved 1;
+
+  // Current tracks the current state of elements in the same order as in the job
+  // details.
+  repeated cockroach.sql.schemachanger.scpb.Status current = 1;
 }
 
 // AutoSpanConfigReconciliationDetails is the job detail information for the
@@ -756,6 +760,7 @@ message ResolvedSpan {
   BoundaryType boundary_type = 4 ;
 }
 
+
 message ResolvedSpans {
   repeated ResolvedSpan resolved_spans = 1 [(gogoproto.nullable) = false];
 }
@@ -842,17 +847,6 @@ message AutoSQLStatsCompactionDetails {
 message AutoSQLStatsCompactionProgress {
 }
 
-message RowLevelTTLDetails {
-  uint32 table_id = 1 [
-    (gogoproto.customname) = "TableID",
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
-  ];
-  google.protobuf.Timestamp cutoff = 2 [(gogoproto.nullable)=false, (gogoproto.stdtime) = true];
-}
-
-message RowLevelTTLProgress {
-}
-
 message Payload {
   string description = 1;
   // If empty, the description is assumed to be the statement.
@@ -899,7 +893,6 @@ message Payload {
     AutoSpanConfigReconciliationDetails autoSpanConfigReconciliation = 27;
     AutoSQLStatsCompactionDetails autoSQLStatsCompaction = 30;
     StreamReplicationDetails streamReplication = 33;
-    RowLevelTTLDetails row_level_ttl = 34 [(gogoproto.customname)="RowLevelTTL"];
   }
   reserved 26;
   // PauseReason is used to describe the reason that the job is currently paused
@@ -937,7 +930,6 @@ message Progress {
     AutoSpanConfigReconciliationProgress AutoSpanConfigReconciliation = 22;
     AutoSQLStatsCompactionProgress autoSQLStatsCompaction = 23;
     StreamReplicationProgress streamReplication = 24;
-    RowLevelTTLProgress row_level_ttl = 25 [(gogoproto.customname)="RowLevelTTL"];
   }
 
   uint64 trace_id = 21 [(gogoproto.nullable) = false, (gogoproto.customname) = "TraceID", (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb.TraceID"];
@@ -965,7 +957,6 @@ enum Type {
   AUTO_SPAN_CONFIG_RECONCILIATION = 13 [(gogoproto.enumvalue_customname) = "TypeAutoSpanConfigReconciliation"];
   AUTO_SQL_STATS_COMPACTION = 14 [(gogoproto.enumvalue_customname) = "TypeAutoSQLStatsCompaction"];
   STREAM_REPLICATION = 15 [(gogoproto.enumvalue_customname) = "TypeStreamReplication"];
-  ROW_LEVEL_TTL = 16 [(gogoproto.enumvalue_customname) = "TypeRowLevelTTL"];
 }
 
 message Job {

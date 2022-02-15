@@ -254,21 +254,9 @@ const (
 	// DeleteCommentsWithDroppedIndexes cleans up left over comments that belong
 	// to dropped indexes.
 	DeleteCommentsWithDroppedIndexes
-	// RemoveIncompatibleDatabasePrivileges adds the migration which guarantees that
-	// databases do not have incompatible privileges
-	RemoveIncompatibleDatabasePrivileges
-	// AddRaftAppliedIndexTermMigration is a migration that causes each range
-	// replica to start populating RangeAppliedState.RaftAppliedIndexTerm field.
-	AddRaftAppliedIndexTermMigration
-	// PostAddRaftAppliedIndexTermMigration is used for asserting that
-	// RaftAppliedIndexTerm is populated.
-	PostAddRaftAppliedIndexTermMigration
-	// DontProposeWriteTimestampForLeaseTransfers stops setting the WriteTimestamp
-	// on lease transfer Raft proposals. New leaseholders now forward their clock
-	// directly to the new lease start time.
-	DontProposeWriteTimestampForLeaseTransfers
-	// TenantSettingsTable adds the system table for tracking tenant usage.
-	TenantSettingsTable
+	// ChangefeedIdleness is the version where changefeed aggregators forward
+	// idleness-related information alnog with resolved spans to the frontier
+	ChangefeedIdleness
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -410,24 +398,8 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 52},
 	},
 	{
-		Key:     RemoveIncompatibleDatabasePrivileges,
+		Key:     ChangefeedIdleness,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 54},
-	},
-	{
-		Key:     AddRaftAppliedIndexTermMigration,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 56},
-	},
-	{
-		Key:     PostAddRaftAppliedIndexTermMigration,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 58},
-	},
-	{
-		Key:     DontProposeWriteTimestampForLeaseTransfers,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 60},
-	},
-	{
-		Key:     TenantSettingsTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 62},
 	},
 
 	// *************************************************
