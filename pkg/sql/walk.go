@@ -218,7 +218,6 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *createViewNode:
 	case *setVarNode:
 	case *setClusterSettingNode:
-	case *resetAllNode:
 
 	case *delayedNode:
 		if n.plan != nil {
@@ -390,6 +389,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&explainVecNode{}):                 "explain vectorized",
 	reflect.TypeOf(&explainDDLNode{}):                 "explain ddl",
 	reflect.TypeOf(&exportNode{}):                     "export",
+	reflect.TypeOf(&fetchNode{}):                      "fetch",
 	reflect.TypeOf(&filterNode{}):                     "filter",
 	reflect.TypeOf(&GrantRoleNode{}):                  "grant role",
 	reflect.TypeOf(&groupNode{}):                      "group",
@@ -417,7 +417,6 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&renameTableNode{}):                "rename table",
 	reflect.TypeOf(&reparentDatabaseNode{}):           "reparent database",
 	reflect.TypeOf(&renderNode{}):                     "render",
-	reflect.TypeOf(&resetAllNode{}):                   "reset all",
 	reflect.TypeOf(&RevokeRoleNode{}):                 "revoke role",
 	reflect.TypeOf(&rowCountNode{}):                   "count",
 	reflect.TypeOf(&rowSourceToPlanNode{}):            "row source to plan node",

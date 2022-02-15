@@ -36,10 +36,6 @@ func TestContextualHelp(t *testing.T) {
 	}{
 		{`ALTER ??`, `ALTER`},
 
-		{`ALTER CHANGEFEED ??`, `ALTER CHANGEFEED`},
-		{`ALTER CHANGEFEED 123 ADD ??`, `ALTER CHANGEFEED`},
-		{`ALTER CHANGEFEED 123 DROP ??`, `ALTER CHANGEFEED`},
-
 		{`ALTER TABLE IF ??`, `ALTER TABLE`},
 		{`ALTER TABLE blah ??`, `ALTER TABLE`},
 		{`ALTER TABLE blah ADD ??`, `ALTER TABLE`},
@@ -221,6 +217,16 @@ func TestContextualHelp(t *testing.T) {
 		{`DEALLOCATE foo ??`, `DEALLOCATE`},
 		{`DEALLOCATE ALL ??`, `DEALLOCATE`},
 		{`DEALLOCATE PREPARE ??`, `DEALLOCATE`},
+
+		{`DECLARE ??`, `DECLARE`},
+		{`DECLARE foo ??`, `DECLARE`},
+		{`DECLARE foo BINARY ??`, `DECLARE`},
+		{`DECLARE foo BINARY CURSOR ??`, `DECLARE`},
+
+		{`CLOSE ??`, `CLOSE`},
+
+		{`FETCH ??`, `FETCH`},
+		{`FETCH 1 ??`, `FETCH`},
 
 		{`INSERT INTO ??`, `INSERT`},
 		{`INSERT INTO blah (??`, `<SELECTCLAUSE>`},
