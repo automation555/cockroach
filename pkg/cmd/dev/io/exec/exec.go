@@ -11,6 +11,7 @@
 package exec
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -21,31 +22,17 @@ import (
 	"strings"
 
 	"github.com/alessio/shellescape"
-	"github.com/irfansharif/recorder"
+	"github.com/cockroachdb/cockroach/pkg/cmd/dev/recording"
 )
 
-// Exec is a convenience wrapper around the stdlib os/exec package. It lets us:
-//
-// (a) mock all instances where we shell out, for tests, and
-// (b) capture all instances of shelling out that take place during execution
-//
-// We achieve (a) by embedding a Recorder, and either replaying from it if
-// configured to do so, or "doing the real thing" and recording the fact into
-// the Recorder for future playback.
-//
-// For (b), each operation is logged (if configured to do so). These messages
-// can be captured by the caller and compared against what is expected.
+// Exec is a convenience wrapper around the stdlib os/exec package. It lets us
+// mock all instances where we shell out for tests.
 type Exec struct {
 	dir            string
 	logger         *log.Logger
 	stdout, stderr io.Writer
 	blocking       bool
-	*recorder.Recorder
-
-	knobs struct { // testing knobs
-		dryrun    bool
-		intercept map[string]string // maps commands to outputs
-	}
+	*recording.Recording
 }
 
 // New returns a new Exec with the given options.
@@ -90,10 +77,10 @@ func WithStdOutErr(stdout, stderr io.Writer) func(e *Exec) {
 	}
 }
 
-// WithRecorder configures Exec to use the provided recorder.
-func WithRecorder(r *recorder.Recorder) func(e *Exec) {
+// WithRecording configures Exec to use the provided recording.
+func WithRecording(r *recording.Recording) func(e *Exec) {
 	return func(e *Exec) {
-		e.Recorder = r
+		e.Recording = r
 	}
 }
 
@@ -105,43 +92,8 @@ func (e *Exec) AsNonBlocking() *Exec {
 	return &out
 }
 
-// WithWorkingDir configures Exec to use the provided working directory.
-func WithWorkingDir(dir string) func(e *Exec) {
-	return func(e *Exec) {
-		e.dir = dir
-	}
-}
-
-// WithDryrun configures Exec to run in dryrun mode.
-func WithDryrun() func(e *Exec) {
-	return func(e *Exec) {
-		e.knobs.dryrun = true
-	}
-}
-
-// WithIntercept configures Exec to intercept the given command and return the
-// given output instead.
-func WithIntercept(command, output string) func(e *Exec) {
-	return func(e *Exec) {
-		if e.knobs.intercept == nil {
-			e.knobs.intercept = make(map[string]string)
-		}
-		e.knobs.intercept[command] = output
-	}
-}
-
-// LookPath wraps around exec.LookPath, which searches for an executable named
-// file in the directories named by the PATH environment variable.
-func (e *Exec) LookPath(file string) (string, error) {
-	command := fmt.Sprintf("which %s", file)
-	e.logger.Print(command)
-	return e.Next(command, func() (string, error) {
-		return exec.LookPath(file)
-	})
-}
-
 // CommandContextSilent is like CommandContext, but does not take over
-// stdout/stderr. It's used for "internal" operations, and always blocks.
+// stdout/stderr. It's to be used for "internal" operations, and always blocks.
 func (e *Exec) CommandContextSilent(
 	ctx context.Context, name string, args ...string,
 ) ([]byte, error) {
@@ -184,26 +136,50 @@ func (e *Exec) commandContextInheritingStdStreamsImpl(
 	}
 	e.logger.Print(command)
 
-	_, err := e.Next(command, func() (string, error) {
+	if e.Recording == nil {
+		// Do the real thing.
+		var outTrace, errTrace bytes.Buffer
+		defer e.logDebugExec(&outTrace, &errTrace)
 		cmd := exec.CommandContext(ctx, name, args...)
 		cmd.Stdin = os.Stdin
-		cmd.Stdout = e.stdout
-		cmd.Stderr = e.stderr
+		cmd.Stdout = io.MultiWriter(e.stdout, &outTrace)
+		cmd.Stderr = io.MultiWriter(e.stderr, &errTrace)
 		cmd.Dir = e.dir
 		cmd.Env = env
 
 		if err := cmd.Start(); err != nil {
-			return "", err
+			return err
 		}
 		if e.blocking {
 			if err := cmd.Wait(); err != nil {
-				return "", err
+				return err
 			}
 		}
-		return "", nil
-	})
+		return nil
+	}
 
+	_, err := e.replay(command)
 	return err
+}
+
+// LookPath wraps around exec.LookPath, which searches for an executable named
+// file in the directories named by the PATH environment variable.
+func (e *Exec) LookPath(path string) (string, error) {
+	command := fmt.Sprintf("which %s", path)
+	e.logger.Print(command)
+
+	if e.Recording == nil {
+		// Do the real thing.
+		var err error
+		fullPath, err := exec.LookPath(path)
+		if err != nil {
+			return "", err
+		}
+		return fullPath, nil
+	}
+
+	ret, err := e.replay(command)
+	return ret, err
 }
 
 func (e *Exec) commandContextImpl(
@@ -217,15 +193,17 @@ func (e *Exec) commandContextImpl(
 	}
 	e.logger.Print(command)
 
-	output, err := e.Next(command, func() (string, error) {
+	if e.Recording == nil {
+		// Do the real thing.
+		var outBuf, outTrace, errTrace bytes.Buffer
+		defer e.logDebugExec(&outTrace, &errTrace)
 		cmd := exec.CommandContext(ctx, name, args...)
-		var buffer bytes.Buffer
 		if silent {
-			cmd.Stdout = &buffer
-			cmd.Stderr = nil
+			cmd.Stdout = io.MultiWriter(&outBuf, &outTrace)
+			cmd.Stderr = &errTrace
 		} else {
-			cmd.Stdout = io.MultiWriter(e.stdout, &buffer)
-			cmd.Stderr = e.stderr
+			cmd.Stdout = io.MultiWriter(e.stdout, &outBuf, &outTrace)
+			cmd.Stderr = io.MultiWriter(e.stderr, &errTrace)
 		}
 		if stdin != nil {
 			cmd.Stdin = stdin
@@ -233,29 +211,51 @@ func (e *Exec) commandContextImpl(
 		cmd.Dir = e.dir
 
 		if err := cmd.Start(); err != nil {
-			return "", err
+			return nil, err
 		}
 		if err := cmd.Wait(); err != nil {
-			return "", err
+			return nil, err
 		}
-		return buffer.String(), nil
-	})
+		return outBuf.Bytes(), nil
+	}
+
+	output, err := e.replay(command)
 	if err != nil {
 		return nil, err
 	}
 	return []byte(output), nil
 }
 
-// Next is a thin interceptor for all exec activity, running them through
-// testing knobs first.
-func (e *Exec) Next(command string, f func() (output string, err error)) (string, error) {
-	if e.knobs.intercept != nil {
-		if output, ok := e.knobs.intercept[command]; ok {
-			return output, nil
+func (e *Exec) logDebugExec(out, err *bytes.Buffer) {
+	p := e.logger.Prefix()
+	defer e.logger.SetPrefix(p)
+	sc := bufio.NewScanner(out)
+	e.logger.SetPrefix(p + "EXEC OUT: ")
+	for sc.Scan() {
+		e.logger.Println(sc.Text())
+	}
+	sc = bufio.NewScanner(err)
+	e.logger.SetPrefix(p + "EXEC ERR: ")
+	for sc.Scan() {
+		e.logger.Println(sc.Text())
+	}
+}
+
+// replay replays the specified command, erroring out if it's mismatched with
+// what the recording plays back next. It returns the recorded output.
+func (e *Exec) replay(command string) (output string, err error) {
+	found, err := e.Recording.Next(func(op recording.Operation) error {
+		if op.Command != command {
+			return fmt.Errorf("expected %q, got %q", op.Command, command)
 		}
+		output = op.Output
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
-	if e.knobs.dryrun {
-		return "", nil
+	if !found {
+		return "", fmt.Errorf("recording for %q not found", command)
 	}
-	return e.Recorder.Next(command, f)
+	return output, nil
 }
