@@ -8,7 +8,6 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-//go:build !windows
 // +build !windows
 
 package security_test
@@ -79,11 +78,11 @@ func TestRotateCerts(t *testing.T) {
 	clientTest := func(httpClient http.Client) error {
 		req, err := http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
 		if err != nil {
-			return errors.Wrap(err, "could not create request")
+			return errors.Errorf("could not create request: %v", err)
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			return errors.Wrap(err, "http request failed")
+			return errors.Errorf("http request failed: %v", err)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
@@ -108,9 +107,16 @@ func TestRotateCerts(t *testing.T) {
 	const kBadCertificate = "tls: bad certificate"
 
 	// Test client with the same certs.
-	clientContext := testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
-	firstSCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+	firstSCtx := rpc.MakeSecurityContext(
+		rpc.ClientSecurityConfig{
+			CommonConfig: rpc.CommonConfig{
+				CertsDir: certsDir,
+				Insecure: false,
+			},
+			User: security.NodeUserName(),
+		},
+		security.CommandTLSSettings{},
+		roachpb.SystemTenantID)
 	firstClient, err := firstSCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatalf("could not create http client: %v", err)
@@ -139,10 +145,16 @@ func TestRotateCerts(t *testing.T) {
 	// Setup a second http client. It will load the new certs.
 	// We need to use a new context as it keeps the certificate manager around.
 	// Fails on crypto errors.
-	clientContext = testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
-
-	secondSCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+	secondSCtx := rpc.MakeSecurityContext(
+		rpc.ClientSecurityConfig{
+			CommonConfig: rpc.CommonConfig{
+				CertsDir: certsDir,
+				Insecure: false,
+			},
+			User: security.NodeUserName(),
+		},
+		security.CommandTLSSettings{},
+		roachpb.SystemTenantID)
 	secondClient, err := secondSCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatalf("could not create http client: %v", err)
@@ -178,8 +190,6 @@ func TestRotateCerts(t *testing.T) {
 	testutils.SucceedsSoon(t,
 		func() error {
 			if err := clientTest(firstClient); !testutils.IsError(err, "unknown authority") {
-				// NB: errors.Wrapf(nil, ...) returns nil.
-				// nolint:errwrap
 				return errors.Errorf("expected unknown authority, got %v", err)
 			}
 
@@ -249,9 +259,16 @@ func TestRotateCerts(t *testing.T) {
 	// Setup a third http client. It will load the new certs.
 	// We need to use a new context as it keeps the certificate manager around.
 	// This is HTTP and succeeds because we do not ask for or verify client certificates.
-	clientContext = testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
-	thirdSCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+	thirdSCtx := rpc.MakeSecurityContext(
+		rpc.ClientSecurityConfig{
+			CommonConfig: rpc.CommonConfig{
+				CertsDir: certsDir,
+				Insecure: false,
+			},
+			User: security.NodeUserName(),
+		},
+		security.CommandTLSSettings{},
+		roachpb.SystemTenantID)
 	thirdClient, err := thirdSCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatalf("could not create http client: %v", err)
@@ -283,10 +300,10 @@ func TestRotateCerts(t *testing.T) {
 	testutils.SucceedsSoon(t,
 		func() error {
 			if err := clientTest(thirdClient); err != nil {
-				return errors.Wrap(err, "third HTTP client failed")
+				return errors.Errorf("third HTTP client failed: %v", err)
 			}
 			if _, err := thirdSQLClient.Exec("SELECT 1"); err != nil {
-				return errors.Wrap(err, "third SQL client failed")
+				return errors.Errorf("third SQL client failed: %v", err)
 			}
 			return nil
 		})

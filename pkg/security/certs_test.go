@@ -11,9 +11,7 @@
 package security_test
 
 import (
-	"bytes"
 	"context"
-	"crypto/x509"
 	gosql "database/sql"
 	"fmt"
 	"io/ioutil"
@@ -27,10 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -130,7 +128,7 @@ func TestGenerateTenantCerts(t *testing.T) {
 	defer cleanup()
 
 	caKeyFile := filepath.Join(certsDir, "name-must-not-matter.key")
-	require.NoError(t, security.CreateTenantCAPair(
+	require.NoError(t, security.CreateTenantClientCAPair(
 		certsDir,
 		caKeyFile,
 		testKeySize,
@@ -139,18 +137,15 @@ func TestGenerateTenantCerts(t *testing.T) {
 		false, // overwrite
 	))
 
-	cp, err := security.CreateTenantPair(
+	cp, err := security.CreateTenantClientPair(
 		certsDir,
 		caKeyFile,
 		testKeySize,
 		time.Hour,
 		999,
-		[]string{"127.0.0.1"},
 	)
 	require.NoError(t, err)
-	require.NoError(t, security.WriteTenantPair(certsDir, cp, false))
-
-	require.NoError(t, security.CreateTenantSigningPair(certsDir, time.Hour, false /* overwrite */, 999))
+	require.NoError(t, security.WriteTenantClientPair(certsDir, cp, false))
 
 	cl := security.NewCertificateLoader(certsDir)
 	require.NoError(t, cl.Load())
@@ -169,17 +164,12 @@ func TestGenerateTenantCerts(t *testing.T) {
 	}
 	require.Equal(t, []*security.CertInfo{
 		{
-			FileUsage: security.TenantCAPem,
+			FileUsage: security.TenantClientCAPem,
 			Filename:  "ca-client-tenant.crt",
 		},
 		{
-			FileUsage: security.TenantPem,
+			FileUsage: security.TenantClientPem,
 			Filename:  "client-tenant.999.crt",
-			Name:      "999",
-		},
-		{
-			FileUsage: security.TenantSigningPem,
-			Filename:  "tenant-signing.999.crt",
 			Name:      "999",
 		},
 	}, infos)
@@ -228,8 +218,6 @@ func TestGenerateNodeCerts(t *testing.T) {
 // ca.crt: CA certificate
 // node.crt: dual-purpose node certificate
 // client.root.crt: client certificate for the root user.
-// client-tenant.10.crt: tenant client certificate for tenant 10.
-// tenant-signing.10.crt: tenant signing certificate for tenant 10.
 func generateBaseCerts(certsDir string) error {
 	{
 		caKey := filepath.Join(certsDir, security.EmbeddedCAKey)
@@ -257,24 +245,20 @@ func generateBaseCerts(certsDir string) error {
 	}
 
 	{
-		tenantID := uint64(10)
-		caKey := filepath.Join(certsDir, security.EmbeddedTenantCAKey)
-		if err := security.CreateTenantCAPair(
+		caKey := filepath.Join(certsDir, security.EmbeddedTenantClientCAKey)
+		if err := security.CreateTenantClientCAPair(
 			certsDir, caKey,
 			testKeySize, time.Hour*96, true, true,
 		); err != nil {
 			return err
 		}
 
-		tcp, err := security.CreateTenantPair(certsDir, caKey,
-			testKeySize, time.Hour*48, tenantID, []string{"127.0.0.1"})
+		tcp, err := security.CreateTenantClientPair(certsDir, caKey,
+			testKeySize, time.Hour*48, 10)
 		if err != nil {
 			return err
 		}
-		if err := security.WriteTenantPair(certsDir, tcp, true); err != nil {
-			return err
-		}
-		if err := security.CreateTenantSigningPair(certsDir, 96*time.Hour, true /* overwrite */, tenantID); err != nil {
+		if err := security.WriteTenantClientPair(certsDir, tcp, true); err != nil {
 			return err
 		}
 	}
@@ -299,35 +283,35 @@ func generateSplitCACerts(certsDir string) error {
 		certsDir, filepath.Join(certsDir, security.EmbeddedClientCAKey),
 		testKeySize, time.Hour*96, true, true,
 	); err != nil {
-		return errors.Wrap(err, "could not generate client CA pair")
+		return errors.Errorf("could not generate client CA pair: %v", err)
 	}
 
 	if err := security.CreateClientPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedClientCAKey),
 		testKeySize, time.Hour*48, true, security.NodeUserName(), false,
 	); err != nil {
-		return errors.Wrap(err, "could not generate Client pair")
+		return errors.Errorf("could not generate Client pair: %v", err)
 	}
 
 	if err := security.CreateClientPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedClientCAKey),
 		testKeySize, time.Hour*48, true, security.RootUserName(), false,
 	); err != nil {
-		return errors.Wrap(err, "could not generate Client pair")
+		return errors.Errorf("could not generate Client pair: %v", err)
 	}
 
 	if err := security.CreateUICAPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedUICAKey),
 		testKeySize, time.Hour*96, true, true,
 	); err != nil {
-		return errors.Wrap(err, "could not generate UI CA pair")
+		return errors.Errorf("could not generate UI CA pair: %v", err)
 	}
 
 	if err := security.CreateUIPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedUICAKey),
 		testKeySize, time.Hour*48, true, []string{"127.0.0.1"},
 	); err != nil {
-		return errors.Wrap(err, "could not generate UI pair")
+		return errors.Errorf("could not generate UI pair: %v", err)
 	}
 
 	return nil
@@ -337,6 +321,8 @@ func generateSplitCACerts(certsDir string) error {
 // We construct SSL server and clients and use the generated certs.
 func TestUseCerts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	// Do not mock cert access for this test.
 	security.ResetAssetLoader()
 	defer ResetTest()
@@ -367,9 +353,15 @@ func TestUseCerts(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	// Insecure mode.
-	clientContext := testutils.NewNodeTestBaseContext()
-	clientContext.Insecure = true
-	sCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+	sCtx := rpc.MakeSecurityContext(
+		rpc.ClientSecurityConfig{
+			CommonConfig: rpc.CommonConfig{
+				Insecure: true,
+			},
+			User: security.RootUserName(),
+		},
+		security.CommandTLSSettings{},
+		roachpb.SystemTenantID)
 	httpClient, err := sCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
@@ -386,27 +378,43 @@ func TestUseCerts(t *testing.T) {
 	}
 
 	// New client. With certs this time.
-	clientContext = testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
-	{
-		secondSCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
-		httpClient, err = secondSCtx.GetHTTPClient()
-	}
-	if err != nil {
-		t.Fatalf("Expected success, got %v", err)
-	}
-	req, err = http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
-	if err != nil {
-		t.Fatalf("could not create request: %v", err)
-	}
-	resp, err = httpClient.Do(req)
-	if err != nil {
-		t.Fatalf("Expected success, got %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		t.Fatalf("Expected OK, got %q with body: %s", resp.Status, body)
+	// We test that both root and node can connect.
+	for _, userName := range []security.SQLUsername{
+		security.NodeUserName(),
+		security.RootUserName()} {
+		// Use a closure to ensure the defer below runs between
+		// iterations.
+		func() {
+			{
+				secondSCtx := rpc.MakeSecurityContext(
+					rpc.ClientSecurityConfig{
+						CommonConfig: rpc.CommonConfig{
+							CertsDir: certsDir,
+							Insecure: false,
+						},
+						User: userName,
+					},
+					security.CommandTLSSettings{},
+					roachpb.SystemTenantID)
+				httpClient, err = secondSCtx.GetHTTPClient()
+			}
+			if err != nil {
+				t.Fatalf("Expected success, got %v", err)
+			}
+			req, err = http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
+			if err != nil {
+				t.Fatalf("could not create request: %v", err)
+			}
+			resp, err = httpClient.Do(req)
+			if err != nil {
+				t.Fatalf("Expected success, got %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := ioutil.ReadAll(resp.Body)
+				t.Fatalf("Expected OK, got %q with body: %s", resp.Status, body)
+			}
+		}()
 	}
 
 	// Check KV connection.
@@ -427,6 +435,8 @@ func makeSecurePGUrl(addr, user, certsDir, caName, certName, keyName string) str
 // We construct SSL server and clients and use the generated certs.
 func TestUseSplitCACerts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	// Do not mock cert access for this test.
 	security.ResetAssetLoader()
 	defer ResetTest()
@@ -457,9 +467,15 @@ func TestUseSplitCACerts(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	// Insecure mode.
-	clientContext := testutils.NewNodeTestBaseContext()
-	clientContext.Insecure = true
-	sCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+	sCtx := rpc.MakeSecurityContext(
+		rpc.ClientSecurityConfig{
+			CommonConfig: rpc.CommonConfig{
+				Insecure: true,
+			},
+			User: security.NodeUserName(),
+		},
+		security.CommandTLSSettings{},
+		roachpb.SystemTenantID)
 	httpClient, err := sCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
@@ -476,27 +492,43 @@ func TestUseSplitCACerts(t *testing.T) {
 	}
 
 	// New client. With certs this time.
-	clientContext = testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
-	{
-		secondSCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
-		httpClient, err = secondSCtx.GetHTTPClient()
-	}
-	if err != nil {
-		t.Fatalf("Expected success, got %v", err)
-	}
-	req, err = http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
-	if err != nil {
-		t.Fatalf("could not create request: %v", err)
-	}
-	resp, err = httpClient.Do(req)
-	if err != nil {
-		t.Fatalf("Expected success, got %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		t.Fatalf("Expected OK, got %q with body: %s", resp.Status, body)
+	// We test that both root and node can connect.
+	for _, userName := range []security.SQLUsername{
+		security.NodeUserName(),
+		security.RootUserName()} {
+		// Use a closure to ensure the defer below runs between
+		// iterations.
+		func() {
+			{
+				secondSCtx := rpc.MakeSecurityContext(
+					rpc.ClientSecurityConfig{
+						CommonConfig: rpc.CommonConfig{
+							CertsDir: certsDir,
+							Insecure: false,
+						},
+						User: userName,
+					},
+					security.CommandTLSSettings{},
+					roachpb.SystemTenantID)
+				httpClient, err = secondSCtx.GetHTTPClient()
+			}
+			if err != nil {
+				t.Fatalf("Expected success, got %v", err)
+			}
+			req, err = http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
+			if err != nil {
+				t.Fatalf("could not create request: %v", err)
+			}
+			resp, err = httpClient.Do(req)
+			if err != nil {
+				t.Fatalf("Expected success, got %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := ioutil.ReadAll(resp.Body)
+				t.Fatalf("Expected OK, got %q with body: %s", resp.Status, body)
+			}
+		}()
 	}
 
 	// Check KV connection.
@@ -524,19 +556,17 @@ func TestUseSplitCACerts(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			pgUrl := makeSecurePGUrl(s.ServingSQLAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
-			goDB, err := gosql.Open("postgres", pgUrl)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer goDB.Close()
+		pgUrl := makeSecurePGUrl(s.ServingSQLAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
+		goDB, err := gosql.Open("postgres", pgUrl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer goDB.Close()
 
-			_, err = goDB.Exec("SELECT 1")
-			if !testutils.IsError(err, tc.expectedError) {
-				t.Errorf("#%d: expected error %v, got %v", i, tc.expectedError, err)
-			}
-		})
+		_, err = goDB.Exec("SELECT 1")
+		if !testutils.IsError(err, tc.expectedError) {
+			t.Errorf("#%d: expected error %v, got %v", i, tc.expectedError, err)
+		}
 	}
 }
 
@@ -544,6 +574,8 @@ func TestUseSplitCACerts(t *testing.T) {
 // We construct SSL server and clients and use the generated certs.
 func TestUseWrongSplitCACerts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	// Do not mock cert access for this test.
 	security.ResetAssetLoader()
 	defer ResetTest()
@@ -583,9 +615,15 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	// Insecure mode.
-	clientContext := testutils.NewNodeTestBaseContext()
-	clientContext.Insecure = true
-	sCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+	sCtx := rpc.MakeSecurityContext(
+		rpc.ClientSecurityConfig{
+			CommonConfig: rpc.CommonConfig{
+				Insecure: true,
+			},
+			User: security.NodeUserName(),
+		},
+		security.CommandTLSSettings{},
+		roachpb.SystemTenantID)
 	httpClient, err := sCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
@@ -602,10 +640,17 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 	}
 
 	// New client with certs, but the UI CA is gone, we have no way to verify the Admin UI cert.
-	clientContext = testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
 	{
-		secondCtx := rpc.MakeSecurityContext(clientContext, security.CommandTLSSettings{}, roachpb.SystemTenantID)
+		secondCtx := rpc.MakeSecurityContext(
+			rpc.ClientSecurityConfig{
+				CommonConfig: rpc.CommonConfig{
+					CertsDir: certsDir,
+					Insecure: false,
+				},
+				User: security.NodeUserName(),
+			},
+			security.CommandTLSSettings{},
+			roachpb.SystemTenantID)
 		httpClient, err = secondCtx.GetHTTPClient()
 	}
 	if err != nil {
@@ -616,10 +661,7 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 		t.Fatalf("could not create request: %v", err)
 	}
 
-	resp, err = httpClient.Do(req)
-	if err == nil {
-		resp.Body.Close()
-	}
+	_, err = httpClient.Do(req)
 	if expected := "certificate signed by unknown authority"; !testutils.IsError(err, expected) {
 		t.Fatalf("Expected error %q, got %v", expected, err)
 	}
@@ -651,46 +693,6 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 		_, err = goDB.Exec("SELECT 1")
 		if !testutils.IsError(err, tc.expectedError) {
 			t.Errorf("#%d: expected error %v, got %v", i, tc.expectedError, err)
-		}
-	}
-}
-
-func TestAppendCertificateToBlob(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	caBlob, err := securitytest.Asset(filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert))
-	if err != nil {
-		t.Fatal(err)
-	}
-	testCertPool := x509.NewCertPool()
-
-	certsToAdd := make([][]byte, 0, 3)
-
-	for _, certFilename := range []string{
-		//		security.EmbeddedClientCACert,
-		//		security.EmbeddedUICACert,
-		security.EmbeddedTenantCACert,
-	} {
-		newCertBlob, err := securitytest.Asset(filepath.Join(security.EmbeddedCertsDir, certFilename))
-		if err != nil {
-			t.Errorf("failed to read certificate \"%s\": %s", certFilename, err)
-			continue
-		}
-
-		certsToAdd = append(certsToAdd, bytes.TrimRight(newCertBlob, "\n"))
-
-	}
-
-	caBlob = security.AppendCertificatesToBlob(
-		bytes.TrimRight(caBlob, "\n"),
-		certsToAdd...,
-	)
-
-	if !testCertPool.AppendCertsFromPEM(caBlob) {
-		if testing.Verbose() {
-			t.Fatalf("appendCertificatesToBlob failed to properly concatenate the test certificates together:\n===\n%s===\n", caBlob)
-		} else {
-			t.Fatal("appendCertificatesToBlob failed to properly concatenate the test certificates together. Run with the verbose flag set to see the output.")
 		}
 	}
 }
