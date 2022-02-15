@@ -30,17 +30,10 @@ import (
 // crdbSpan is a span for internal crdb usage. This is used to power SQL session
 // tracing.
 type crdbSpan struct {
-	// tracer is the Tracer that created this span.
 	tracer *Tracer
-	// sp is Span that this crdbSpan is part of.
-	sp *Span
 
-	traceID tracingpb.TraceID // probabilistically unique
-	spanID  tracingpb.SpanID  // probabilistically unique
-	// parentSpanID indicates the parent at the time when this span was created. 0
-	// if this span didn't have a parent. If crdbSpan.mu.parent is set,
-	// parentSpanID corresponds to it. However, if the parent finishes, or if the
-	// parent is a span from a remote node, crdbSpan.mu.parent will be nil.
+	traceID      tracingpb.TraceID // probabilistically unique
+	spanID       tracingpb.SpanID  // probabilistically unique
 	parentSpanID tracingpb.SpanID
 	operation    string // name of operation associated with the span
 
@@ -117,13 +110,18 @@ type crdbSpanMu struct {
 
 	recording recordingState
 
-	// tags are only captured when recording. These are tags that have been
-	// added to this Span, and will be appended to the tags in logTags when
-	// someone needs to actually observe the total set of tags that is a part of
-	// this Span.
-	// TODO(radu): perhaps we want a recording to capture all the tags (even
-	// those that were set before recording started)?
+	// tags are a list of key/value pairs associated with the span through
+	// SetTag(). They will be appended to the tags in logTags when someone needs
+	// to actually observe the total set of tags that is a part of this Span.
 	tags []attribute.KeyValue
+	// lazyTags are tags whose values are only string-ified on demand. Each lazy
+	// tag is expected to implement either fmt.Stringer or ExpandingTag.
+	lazyTags []lazyTag
+}
+
+type lazyTag struct {
+	Key   string
+	Value interface{}
 }
 
 type recordingState struct {
@@ -269,11 +267,10 @@ func (s *crdbSpan) finish() bool {
 			s.mu.finishing = false
 		}
 
-		// If the span was not part of the registry the first time the lock was
-		// acquired, above, it never will be (because we marked it as finished). So,
-		// we'll need to remove it from the registry only if it currently does not
-		// have a parent. We'll also need to manipulate the registry if there are
-		// open children (they'll need to be added to the registry).
+		// If the span is not part of the registry now, it never will be. So, we'll
+		// need to remove it from the registry only if it currently does not have a
+		// parent. We'll also need to manipulate the registry if there are open
+		// children (they'll need to be added to the registry).
 		needRegistryChange = !hasParent || len(s.mu.openChildren) > 0
 
 		// Deal with the orphaned children - make them roots. We call into the
@@ -332,10 +329,6 @@ func (s *crdbSpan) disableRecording() {
 // TraceID is part of the RegistrySpan interface.
 func (s *crdbSpan) TraceID() tracingpb.TraceID {
 	return s.traceID
-}
-
-func (s *crdbSpan) SpanID() tracingpb.SpanID {
-	return s.spanID
 }
 
 // GetRecording returns the span's recording.
@@ -507,6 +500,54 @@ func (s *crdbSpan) setTagLocked(key string, value attribute.Value) {
 		}
 	}
 	s.mu.tags = append(s.mu.tags, attribute.KeyValue{Key: k, Value: value})
+}
+
+// setLazyTagLocked sets a tag that's only stringified if s' recording is
+// collected.
+//
+// value is expected to implement either Stringer or ExpandingTag.
+//
+// key is expected to not match the key of a non-lazy tag.
+func (s *crdbSpan) setLazyTagLocked(key string, value interface{}) {
+	for i := range s.mu.lazyTags {
+		if s.mu.lazyTags[i].Key == key {
+			s.mu.lazyTags[i].Value = value
+			return
+		}
+	}
+	s.mu.lazyTags = append(s.mu.lazyTags, lazyTag{Key: key, Value: value})
+}
+
+// getLazyTagLocked returns the value of the tag with the given key. If that tag
+// doesn't exist, the bool retval is false.
+func (s *crdbSpan) getLazyTagLocked(key string) (interface{}, bool) {
+	for i := range s.mu.lazyTags {
+		if s.mu.lazyTags[i].Key == key {
+			return s.mu.lazyTags[i].Value, true
+		}
+	}
+	return nil, false
+}
+
+// clearTag removes a tag, if it exists.
+func (s *crdbSpan) clearTag(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := attribute.Key(key)
+	for i := range s.mu.tags {
+		if s.mu.tags[i].Key == k {
+			s.mu.tags[i] = s.mu.tags[len(s.mu.tags)-1]
+			s.mu.tags = s.mu.tags[:len(s.mu.tags)-1]
+			return
+		}
+	}
+	for i := range s.mu.lazyTags {
+		if s.mu.lazyTags[i].Key == string(k) {
+			s.mu.lazyTags[i] = s.mu.lazyTags[len(s.mu.lazyTags)-1]
+			s.mu.lazyTags = s.mu.lazyTags[:len(s.mu.lazyTags)-1]
+			return
+		}
+	}
 }
 
 // record includes a log message in s' recording.
@@ -706,6 +747,18 @@ func (s *crdbSpan) getRecordingNoChildrenLocked(
 		for _, kv := range s.mu.tags {
 			// We encode the tag values as strings.
 			addTag(string(kv.Key), kv.Value.Emit())
+		}
+		for _, kv := range s.mu.lazyTags {
+			switch v := kv.Value.(type) {
+			case ExpandingTag:
+				for _, tag := range v.ExpandToRecordingTags() {
+					addTag(string(tag.Key), tag.Value.Emit())
+				}
+			case fmt.Stringer:
+				addTag(kv.Key, v.String())
+			default:
+				addTag(kv.Key, fmt.Sprintf("<can't render %T>", kv.Value))
+			}
 		}
 	}
 

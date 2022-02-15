@@ -22,7 +22,7 @@ go_library(
         "//pkg/kv/kvserver/spanlatch",
         "//pkg/kv/kvserver/spanset",
         "//pkg/kv/kvserver/txnwait",
-        "//pkg/roachpb",
+        "//pkg/roachpb:with-mocks",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/storage/enginepb",
@@ -36,6 +36,7 @@ go_library(
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
+        "@io_opentelemetry_go_otel//attribute",
     ],
 )
 
@@ -58,7 +59,7 @@ go_test(
         "//pkg/kv/kvserver/spanlatch",
         "//pkg/kv/kvserver/spanset",
         "//pkg/kv/kvserver/txnwait",
-        "//pkg/roachpb",
+        "//pkg/roachpb:with-mocks",
         "//pkg/settings/cluster",
         "//pkg/storage/enginepb",
         "//pkg/testutils",

@@ -19,7 +19,6 @@ import "roachpb/data.proto";
 import "roachpb/errors.proto";
 import "roachpb/metadata.proto";
 import "roachpb/span_config.proto";
-import "settings/encoding.proto";
 import "storage/enginepb/mvcc.proto";
 import "storage/enginepb/mvcc3.proto";
 import "util/hlc/timestamp.proto";
@@ -764,11 +763,6 @@ message AdminSplitRequest {
   bytes split_key = 2 [(gogoproto.casttype) = "Key"];
   reserved 3;
   util.hlc.Timestamp expiration_time = 4 [(gogoproto.nullable) = false];
-
-  // PredicateKeys specifies keys which if not contained within the range should
-  // cause the split to be rejected. This can be used by a caller to effectively
-  // send a "conditional split" request, i.e. a split if not already split.
-  repeated bytes predicate_keys = 5 [(gogoproto.casttype) = "Key"];
 }
 
 // An AdminSplitResponse is the return value from the AdminSplit()
@@ -876,21 +870,6 @@ message AdminRelocateRangeRequest {
   repeated ReplicationTarget voter_targets = 2 [(gogoproto.nullable) = false];
   repeated ReplicationTarget non_voter_targets = 3 [(gogoproto.nullable) = false];
   // TODO(a-robinson): Add "reason"/"details" string fields?
-
-  // As of 22.1 (specifically #74077), leaseholder replicas can remove
-  // themselves from the range. This means that now, in a joint state, the
-  // leaseholder that is removing itself chooses the best target replica to
-  // transfer the lease to, all inside of AdminChangeReplicas.
-  //
-  // This means that the pre-22.1 contract of `AdminRelocateRange` to transfer
-  // the lease to the first voter replica isn't required anymore. Only callers
-  // that rely on this contract should set this attribute.
-  bool transfer_lease_to_first_voter = 4;
-  // TODO(aayush): Migration path:
-  // 22.1: Send and consult the attribute.
-  // 22.2: Send but don't consult the attribute.
-  // 23.1: Stop sending or consulting the attribute. Remove this field.
-  bool transfer_lease_to_first_voter_accurate = 5;
 }
 
 message AdminRelocateRangeResponse {
@@ -1751,9 +1730,8 @@ message RefreshRequest {
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   reserved 2;
 
-  // refresh_from specifies the exclusive lower-bound of the verification. The
-  // request verifies that there are no writes (committed or provisional) in the
-  // range (refresh_from, txn.read_timestamp].
+  // refresh_from specifies the lower-bound of the verification. The request verifies that
+  // there's no write in the range [refresh_from, txn.read_timestamp].
   util.hlc.Timestamp refresh_from = 3 [(gogoproto.nullable) = false];
 }
 
@@ -1769,9 +1747,8 @@ message RefreshRangeRequest {
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   reserved 2;
 
-  // refresh_from specifies the exclusive lower-bound of the verification. The
-  // request verifies that there are no writes (committed or provisional) in the
-  // range (refresh_from, txn.read_timestamp].
+  // refresh_from specifies the lower-bound of the verification. The request verifies that
+  // there's no write in the range [refresh_from, txn.read_timestamp].
   util.hlc.Timestamp refresh_from = 3 [(gogoproto.nullable) = false];
 }
 
@@ -2136,24 +2113,14 @@ message Header {
   // (txn.WriteTimestamp).
   util.hlc.Timestamp timestamp = 1 [(gogoproto.nullable) = false];
   // timestamp_from_server_clock is set when a non-transactional BatchRequest
-  // has its timestamp initialized to the wall time of the server node. When
-  // non-nil, this denotes the clock timestamp that the timestamp field was
-  // initially assigned upon arriving at the server node.
-  //
-  // It is needed to ensure that such requests are never served as follower
+  // has its timestamp initialized to the wall time of the server node. This
+  // flag is needed to ensure that such requests are never served as follower
   // reads. Initializing the timestamp of a request on a node that holds a
   // follower instead of the leaseholder for a range and then using this
   // timestamp to deem a follower read safe could allow for consistency
   // violations where a non-transactional read following a write could fail to
   // observe the write.
-  //
-  // It is also needed to record the time at which the request was received by
-  // the server node. The operation timestamp cannot serve this role because it
-  // can change due to server-side uncertainty retries. By remembering a stable
-  // reference to the initial timestamp, we ensure that a non-transactional
-  // request's uncertainty interval remains fixed across retries.
-  util.hlc.Timestamp timestamp_from_server_clock = 27 [
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
+  bool timestamp_from_server_clock = 20;
   // replica specifies the destination of the request.
   ReplicaDescriptor replica = 2 [(gogoproto.nullable) = false];
   // range_id specifies the ID of the Raft consensus group which the key
@@ -2387,7 +2354,7 @@ message Header {
 
   util.tracing.tracingpb.TraceInfo trace_info = 25 [(gogoproto.nullable) = false];
 
-  reserved 7, 10, 12, 14, 20;
+  reserved 7, 10, 12, 14;
 }
 
 // BoundedStalenessHeader contains configuration values pertaining to bounded
@@ -2730,7 +2697,7 @@ message TenantSettingsEvent {
   //  - the changed overrides since the last event for the precedence if
   //    Incremental is true (removed overrides have empty RawValue and ValueType
   //    fields).
-  repeated TenantSetting overrides = 3 [(gogoproto.nullable) = false];
+  repeated TenantSetting overrides = 3;
 
   // If non-nil, the other fields will be empty and this will be the final event
   // sent on the stream before it is terminated.
@@ -2738,9 +2705,13 @@ message TenantSettingsEvent {
 }
 
 // TenantSetting contains the name and value of a tenant setting.
+//
+// The value representation is the same as that used by the system.settings
+// table (value and valueType columns).
 message TenantSetting {
   string name = 1;
-  settings.EncodedValue value = 2 [(gogoproto.nullable) = false];
+  string raw_value = 2;
+  string value_type = 3;
 }
 
 // TenantConsumption contains information about resource utilization by a
@@ -2889,8 +2860,8 @@ message ContentionEvent {
 
   // Key is the key that this and the other transaction conflicted on.
   bytes key = 1 [(gogoproto.casttype) = "Key"];
-  // TxnMeta is the transaction conflicted
-  // with, i.e. the transaction holding a lock.
+  // TxnMeta is the transaction conflicted with, i.e. the transaction holding a
+  // lock or lock reservation.
   cockroach.storage.enginepb.TxnMeta txn_meta = 2 [(gogoproto.nullable) = false];
   // Duration spent contending against the other transaction.
   google.protobuf.Duration duration = 3 [(gogoproto.nullable) = false,
