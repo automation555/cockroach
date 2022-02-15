@@ -17,7 +17,7 @@ import "jobs/jobspb/jobs.proto";
 import "server/serverpb/status.proto";
 import "storage/enginepb/mvcc.proto";
 import "kv/kvserver/liveness/livenesspb/liveness.proto";
-import "kv/kvserver/kvserverpb/range_log.proto";
+import "kv/kvserver/kvserverpb/log.proto";
 import "roachpb/api.proto";
 import "ts/catalog/chart_catalog.proto";
 import "util/metric/metric.proto";
@@ -210,8 +210,6 @@ message TableDetailsResponse {
   // for this table. It is a SQL statement that would re-configure the table's current
   // zone if executed.
   string configure_zone_statement = 9;
-  // stats_last_created_at is the time at which statistics were last created.
-  google.protobuf.Timestamp stats_last_created_at = 10 [(gogoproto.stdtime) = true];
 }
 
 // TableStatsRequest is a request for detailed, computationally expensive
@@ -388,7 +386,10 @@ message ClusterResponse {
 
 // DrainRequest instructs the receiving node to drain.
 message DrainRequest {
-  reserved 1;
+  // pre_201_marker represents a field that clients stopped using in 20.1. It's
+  // maintained to reject requests from such clients, since they're not setting
+  // other required fields.
+  repeated int32 pre201_marker= 1;
   reserved 2;
   // When true, terminates the process after the server has started draining.
   // Setting both shutdown and do_drain to false causes
@@ -401,14 +402,6 @@ message DrainRequest {
   // shutdown for an explanation of the interaction between the two.
   // do_drain is also implied by a non-nil deprecated_probe_indicator.
   bool do_drain = 4;
-  // node_id is a string so that "local" can be used to specify that no
-  // forwarding is necessary.
-  // For compatibility with v21.2 nodes, an empty node_id is
-  // interpreted as "local". This behavior might be removed
-  // in subsequent versions.
-  string node_id = 5;
-  // When true, more detailed information is logged during the range lease drain phase.
-  bool verbose = 6;
 }
 
 // DrainResponse is the response to a successful DrainRequest.
@@ -619,23 +612,6 @@ message JobResponse {
   google.protobuf.Timestamp last_run = 17 [(gogoproto.stdtime) = true];
   google.protobuf.Timestamp next_run = 18 [(gogoproto.stdtime) = true];
   int64 num_runs = 19;
-
-  // ExecutionFailure corresponds to a failure to execute the job with the
-  // attempt starting at start and ending at end.
-  message ExecutionFailure {
-    // Status is the status of the job during the execution.
-    string status = 1;
-    // Start is the time at which the execution started.
-    google.protobuf.Timestamp start = 2 [(gogoproto.stdtime) = true];
-    // End is the time at which the error occurred.
-    google.protobuf.Timestamp end = 3 [(gogoproto.stdtime) = true];
-    // Error is the error which occurred.
-    string error = 4;
-  }
-  // ExecutionFailures is a log of execution failures of the job. It is not
-  // guaranteed to contain all execution failures and some execution failures
-  // may not contain an error or end.
-  repeated ExecutionFailure execution_failures = 20;
 }
 
 // LocationsRequest requests system locality location information.
@@ -1043,6 +1019,9 @@ service Admin {
 
   // SendKVBatch proxies the given BatchRequest into KV, returning the
   // response. It is used by the CLI `debug send-kv-batch` command.
+  //
+  // Callers must check the BatchResponse's Error field before interpreting
+  // the response as a success.
   rpc SendKVBatch(roachpb.BatchRequest) returns (roachpb.BatchResponse) {
   }
 }
