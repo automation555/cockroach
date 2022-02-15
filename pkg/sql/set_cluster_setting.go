@@ -67,10 +67,20 @@ func checkPrivilegesForSetting(ctx context.Context, p *planner, name string, act
 	if err != nil {
 		return err
 	}
-	if !hasModify {
+	if action == "set" && !hasModify {
 		return pgerror.Newf(pgcode.InsufficientPrivilege,
 			"only users with the %s privilege are allowed to %s cluster setting '%s'",
 			roleoption.MODIFYCLUSTERSETTING, action, name)
+	}
+	hasView, err := p.HasRoleOption(ctx, roleoption.VIEWCLUSTERSETTING)
+	if err != nil {
+		return err
+	}
+	// check that for "show" action user has either MODIFYCLUSTERSETTING or VIEWCLUSTERSETTING privileges.
+	if action == "show" && !(hasModify || hasView) {
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"only users with either %s or %s privileges are allowed to %s cluster setting '%s'",
+			roleoption.MODIFYCLUSTERSETTING, roleoption.VIEWCLUSTERSETTING, action, name)
 	}
 	return nil
 }
@@ -299,11 +309,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			}
 
 			if knobs := params.p.execCfg.TenantTestingKnobs; knobs != nil && knobs.ClusterSettingsUpdater != nil {
-				encVal := settings.EncodedValue{
-					Value: encoded,
-					Type:  n.setting.Typ(),
-				}
-				if err := params.p.execCfg.TenantTestingKnobs.ClusterSettingsUpdater.Set(ctx, n.name, encVal); err != nil {
+				if err := params.p.execCfg.TenantTestingKnobs.ClusterSettingsUpdater.Set(ctx, n.name, encoded, n.setting.Typ()); err != nil {
 					return err
 				}
 			}

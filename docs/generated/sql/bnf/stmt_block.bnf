@@ -399,7 +399,6 @@ alter_ddl_stmt ::=
 	| alter_schema_stmt
 	| alter_type_stmt
 	| alter_default_privileges_stmt
-	| alter_changefeed_stmt
 
 alter_role_stmt ::=
 	'ALTER' role_or_group_or_user role_spec opt_role_options
@@ -969,7 +968,7 @@ unreserved_keyword ::=
 	| 'INCLUDING'
 	| 'INCREMENT'
 	| 'INCREMENTAL'
-	| 'INCREMENTAL_LOCATION'
+	| 'INCREMENTAL_STORAGE'
 	| 'INDEXES'
 	| 'INHERITS'
 	| 'INJECT'
@@ -1046,6 +1045,7 @@ unreserved_keyword ::=
 	| 'NOSQLLOGIN'
 	| 'NOVIEWACTIVITY'
 	| 'NOVIEWACTIVITYREDACTED'
+	| 'NOVIEWCLUSTERSETTING'
 	| 'NOWAIT'
 	| 'NULLS'
 	| 'IGNORE_FOREIGN_KEYS'
@@ -1206,6 +1206,7 @@ unreserved_keyword ::=
 	| 'VIEW'
 	| 'VIEWACTIVITY'
 	| 'VIEWACTIVITYREDACTED'
+	| 'VIEWCLUSTERSETTING'
 	| 'VISIBLE'
 	| 'VOTERS'
 	| 'WITHIN'
@@ -1385,9 +1386,6 @@ alter_default_privileges_stmt ::=
 	| 'ALTER' 'DEFAULT' 'PRIVILEGES' opt_for_roles opt_in_schemas abbreviated_revoke_stmt
 	| 'ALTER' 'DEFAULT' 'PRIVILEGES' 'FOR' 'ALL' 'ROLES' opt_in_schemas abbreviated_grant_stmt
 	| 'ALTER' 'DEFAULT' 'PRIVILEGES' 'FOR' 'ALL' 'ROLES' opt_in_schemas abbreviated_revoke_stmt
-
-alter_changefeed_stmt ::=
-	'ALTER' 'CHANGEFEED' a_expr alter_changefeed_cmds
 
 role_or_group_or_user ::=
 	'ROLE'
@@ -1883,9 +1881,6 @@ abbreviated_revoke_stmt ::=
 	'REVOKE' privileges 'ON' alter_default_privileges_target_object 'FROM' role_spec_list opt_drop_behavior
 	| 'REVOKE' 'GRANT' 'OPTION' 'FOR' privileges 'ON' alter_default_privileges_target_object 'FROM' role_spec_list opt_drop_behavior
 
-alter_changefeed_cmds ::=
-	( alter_changefeed_cmd ) ( ( alter_changefeed_cmd ) )*
-
 role_options ::=
 	( role_option ) ( ( role_option ) )*
 
@@ -1894,7 +1889,7 @@ backup_options ::=
 	| 'REVISION_HISTORY'
 	| 'DETACHED'
 	| 'KMS' '=' string_or_placeholder_opt_list
-	| 'INCREMENTAL_LOCATION' '=' string_or_placeholder_opt_list
+	| 'INCREMENTAL_STORAGE' '=' string_or_placeholder_opt_list
 
 c_expr ::=
 	d_expr
@@ -2138,7 +2133,7 @@ restore_options ::=
 	| 'SKIP_LOCALITIES_CHECK'
 	| 'DEBUG_PAUSE_ON' '=' string_or_placeholder
 	| 'NEW_DB_NAME' '=' string_or_placeholder
-	| 'INCREMENTAL_LOCATION' '=' string_or_placeholder_opt_list
+	| 'INCREMENTAL_STORAGE' '=' string_or_placeholder_opt_list
 
 scrub_option_list ::=
 	( scrub_option ) ( ( ',' scrub_option ) )*
@@ -2365,10 +2360,6 @@ alter_default_privileges_target_object ::=
 	| 'TYPES'
 	| 'SCHEMAS'
 
-alter_changefeed_cmd ::=
-	'ADD' changefeed_targets
-	| 'DROP' changefeed_targets
-
 role_option ::=
 	'CREATEROLE'
 	| 'NOCREATEROLE'
@@ -2392,6 +2383,8 @@ role_option ::=
 	| 'NOMODIFYCLUSTERSETTING'
 	| 'SQLLOGIN'
 	| 'NOSQLLOGIN'
+	| 'VIEWCLUSTERSETTING'
+	| 'NOVIEWCLUSTERSETTING'
 	| password_clause
 	| valid_until_clause
 
