@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -61,8 +62,15 @@ func (n *explainVecNode) startExec(params runParams) error {
 	}
 
 	distSQLPlanner.finalizePlanWithRowCount(planCtx, physPlan, n.plan.mainRowCount)
-	flows := physPlan.GenerateFlowSpecs()
 	flowCtx := newFlowCtxForExplainPurposes(planCtx, params.p)
+	flows := physPlan.GenerateFlowSpecs()
+	willDistribute := physPlan.Distribution.WillDistribute()
+	if len(flows) == 1 {
+		// We ended up planning everything locally even if we thought the plan
+		// would be distributed.
+		willDistribute = false
+		flowCtx.Local = true
+	}
 
 	// We want to get the vectorized plan which would be executed with the
 	// current 'vectorize' option. If 'vectorize' is set to 'off', then the
@@ -74,10 +82,9 @@ func (n *explainVecNode) startExec(params runParams) error {
 		return errors.New("vectorize is set to 'off'")
 	}
 	verbose := n.options.Flags[tree.ExplainFlagVerbose]
-	willDistribute := physPlan.Distribution.WillDistribute()
 	n.run.lines, n.run.cleanup, err = colflow.ExplainVec(
 		params.ctx, flowCtx, flows, physPlan.LocalProcessors, nil, /* opChains */
-		distSQLPlanner.gatewaySQLInstanceID, verbose, willDistribute,
+		distSQLPlanner.gatewayNodeID, verbose, willDistribute,
 	)
 	if err != nil {
 		return err
@@ -91,12 +98,14 @@ func newFlowCtxForExplainPurposes(planCtx *PlanningCtx, p *planner) *execinfra.F
 		EvalCtx: planCtx.EvalContext(),
 		Cfg: &execinfra.ServerConfig{
 			Settings:       p.execCfg.Settings,
-			ClusterID:      p.DistSQLPlanner().rpcCtx.ClusterID,
+			ClusterID:      &p.DistSQLPlanner().rpcCtx.ClusterID,
 			VecFDSemaphore: p.execCfg.DistSQLSrv.VecFDSemaphore,
 			NodeDialer:     p.DistSQLPlanner().nodeDialer,
-			PodNodeDialer:  p.DistSQLPlanner().podNodeDialer,
 		},
-		Descriptors: p.Descriptors(),
+		Local: planCtx.isLocal,
+		TypeResolverFactory: &descs.DistSQLTypeResolverFactory{
+			Descriptors: p.Descriptors(),
+		},
 		DiskMonitor: &mon.BytesMonitor{},
 	}
 }

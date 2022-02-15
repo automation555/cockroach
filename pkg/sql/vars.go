@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -106,11 +107,6 @@ type sessionVar struct {
 	// during session initialization when no default value was provided
 	// by the client.
 	GlobalDefault func(sv *settings.Values) string
-
-	// Equal returns whether the value of the given variable is equal between the
-	// two SessionData references. This is only required if the variable is
-	// expected to send updates through ParamStatusUpdate in pgwire.
-	Equal func(a, b *sessiondata.SessionData) bool
 }
 
 func formatBoolAsPostgresSetting(b bool) string {
@@ -166,31 +162,7 @@ var varGen = map[string]sessionVar{
 		GetFromSessionData: func(sd *sessiondata.SessionData) string {
 			return sd.ApplicationName
 		},
-		GlobalDefault: func(_ *settings.Values) string {
-			return ""
-		},
-		Equal: func(a, b *sessiondata.SessionData) bool {
-			return a.ApplicationName == b.ApplicationName
-		},
-	},
-
-	// CockroachDB extension.
-	`avoid_buffering`: {
-		Get: func(evalCtx *extendedEvalContext) (string, error) {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData().AvoidBuffering), nil
-		},
-		GetStringVal: makePostgresBoolGetStringValFn("avoid_buffering"),
-		Set: func(ctx context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar(`avoid_buffering`, s)
-			if err != nil {
-				return err
-			}
-			m.SetAvoidBuffering(b)
-			return nil
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return "false"
-		},
+		GlobalDefault: func(_ *settings.Values) string { return "" },
 	},
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-client.html
@@ -338,9 +310,6 @@ var varGen = map[string]sessionVar{
 		GlobalDefault: func(sv *settings.Values) string {
 			return dateStyleEnumMap[dateStyle.Get(sv)]
 		},
-		Equal: func(a, b *sessiondata.SessionData) bool {
-			return a.GetDateStyle() == b.GetDateStyle()
-		},
 	},
 	`datestyle_enabled`: {
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
@@ -351,6 +320,13 @@ var varGen = map[string]sessionVar{
 			b, err := paramparse.ParseBoolVar(`datestyle_enabled`, s)
 			if err != nil {
 				return err
+			}
+			if b && !m.settings.Version.IsActive(ctx, clusterversion.DateAndIntervalStyle) {
+				return pgerror.Newf(
+					pgcode.ObjectNotInPrerequisiteState,
+					`DateStyle changes requires all nodes to be upgraded to %s`,
+					clusterversion.ByKey(clusterversion.DateAndIntervalStyle),
+				)
 			}
 			m.SetDateStyleEnabled(b)
 			return nil
@@ -502,23 +478,6 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
-	`index_recommendations_enabled`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`index_recommendations_enabled`),
-		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar("index_recommendations_enabled", s)
-			if err != nil {
-				return err
-			}
-			m.SetIndexRecommendationsEnabled(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) (string, error) {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData().IndexRecommendationsEnabled), nil
-		},
-		GlobalDefault: globalTrue,
-	},
-
-	// CockroachDB extension.
 	`distsql`: {
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
 			mode, ok := sessiondatapb.DistSQLExecModeFromString(s)
@@ -591,7 +550,9 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().PartiallyDistributedPlansDisabled), nil
 		},
-		GlobalDefault: globalFalse,
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(false)
+		},
 	},
 
 	// CockroachDB extension.
@@ -689,7 +650,9 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().TestingVectorizeInjectPanics), nil
 		},
-		GlobalDefault: globalFalse,
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(false)
+		},
 	},
 
 	// CockroachDB extension.
@@ -958,9 +921,6 @@ var varGen = map[string]sessionVar{
 		GlobalDefault: func(sv *settings.Values) string {
 			return strings.ToLower(duration.IntervalStyle_name[int32(intervalStyle.Get(sv))])
 		},
-		Equal: func(a, b *sessiondata.SessionData) bool {
-			return a.GetIntervalStyle() == b.GetIntervalStyle()
-		},
 	},
 	`intervalstyle_enabled`: {
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
@@ -971,6 +931,13 @@ var varGen = map[string]sessionVar{
 			b, err := paramparse.ParseBoolVar(`intervalstyle_enabled`, s)
 			if err != nil {
 				return err
+			}
+			if b && !m.settings.Version.IsActive(ctx, clusterversion.DateAndIntervalStyle) {
+				return pgerror.Newf(
+					pgcode.ObjectNotInPrerequisiteState,
+					`IntervalStyle changes requires all nodes to be upgraded to %s`,
+					clusterversion.ByKey(clusterversion.DateAndIntervalStyle),
+				)
 			}
 			m.SetIntervalStyleEnabled(b)
 			return nil
@@ -987,10 +954,9 @@ var varGen = map[string]sessionVar{
 		GetFromSessionData: func(sd *sessiondata.SessionData) string {
 			return formatBoolAsPostgresSetting(sd.IsSuperuser)
 		},
-		GetStringVal:  makePostgresBoolGetStringValFn("is_superuser"),
-		GlobalDefault: globalFalse,
-		Equal: func(a, b *sessiondata.SessionData) bool {
-			return a.IsSuperuser == b.IsSuperuser
+		GetStringVal: makePostgresBoolGetStringValFn("is_superuser"),
+		GlobalDefault: func(sv *settings.Values) string {
+			return "off"
 		},
 	},
 
@@ -1033,20 +999,11 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
-	// See https://www.postgresql.org/docs/12/runtime-config-client.html.
-	`default_table_access_method`: makeCompatStringVar(`default_table_access_method`, `heap`),
-
 	// See https://www.postgresql.org/docs/13/runtime-config-compatible.html
 	// CockroachDB only supports safe_encoding for now. If `client_encoding` is updated to
 	// allow encodings other than UTF8, then the default value of `backslash_quote` should
 	// be changed to `on`.
 	`backslash_quote`: makeCompatStringVar(`backslash_quote`, `safe_encoding`),
-
-	// See https://www.postgresql.org/docs/9.5/runtime-config-compatible.html
-	`default_with_oids`: makeCompatBoolVar(`default_with_oids`, false, false),
-
-	// See https://www.postgresql.org/docs/current/datatype-xml.html.
-	`xmloption`: makeCompatStringVar(`xmloption`, `content`),
 
 	// Supported for PG compatibility only.
 	// See https://www.postgresql.org/docs/10/static/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
@@ -1089,23 +1046,6 @@ var varGen = map[string]sessionVar{
 			return nil
 		},
 		GlobalDefault: globalFalse,
-	},
-
-	// See https://www.postgresql.org/docs/13/runtime-config-client.html.
-	`check_function_bodies`: {
-		Get: func(evalCtx *extendedEvalContext) (string, error) {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData().CheckFunctionBodies), nil
-		},
-		GetStringVal: makePostgresBoolGetStringValFn("check_function_bodies"),
-		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar("check_function_bodies", s)
-			if err != nil {
-				return err
-			}
-			m.SetCheckFunctionBodies(b)
-			return nil
-		},
-		GlobalDefault: globalTrue,
 	},
 
 	// CockroachDB extension.
@@ -1262,15 +1202,6 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
-	// See https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-PASSWORD-ENCRYPTION
-	// We only support reading this setting in clients: it is not desirable to let clients choose
-	// their own password hash algorithm.
-	`password_encryption`: {
-		Get: func(evalCtx *extendedEvalContext) (string, error) {
-			return security.GetConfiguredPasswordHashMethod(evalCtx.Ctx(), &evalCtx.Settings.SV).String(), nil
-		},
-	},
-
 	// Supported for PG compatibility only.
 	// See https://www.postgresql.org/docs/10/static/runtime-config-compatible.html#GUC-STANDARD-CONFORMING-STRINGS
 	// If this gets properly implemented, we will need to re-evaluate how escape_string_warning is implemented
@@ -1343,10 +1274,6 @@ var varGen = map[string]sessionVar{
 		GetStringVal:  timeZoneVarGetStringVal,
 		Set:           timeZoneVarSet,
 		GlobalDefault: func(_ *settings.Values) string { return "UTC" },
-		Equal: func(a, b *sessiondata.SessionData) bool {
-			// NB: (*time.Location).String does not heap allocate.
-			return a.GetLocation().String() == b.GetLocation().String()
-		},
 	},
 
 	// This is not directly documented in PG's docs but does indeed behave this way.
@@ -1549,7 +1476,9 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
 			return formatBoolAsPostgresSetting(true), nil
 		},
-		GlobalDefault: globalTrue,
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(true)
+		},
 	},
 
 	// CockroachDB extension.
@@ -1719,7 +1648,9 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().NullOrderedLast), nil
 		},
-		GlobalDefault: globalFalse,
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(false)
+		},
 	},
 
 	`propagate_input_ordering`: {
@@ -1872,41 +1803,23 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
-	`parallelize_multi_key_lookup_joins_enabled`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`parallelize_multi_key_lookup_joins_enabled`),
+	`experimental_enable_hash_group_joins`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_hash_group_joins`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar("parallelize_multi_key_lookup_joins_enabled", s)
+			b, err := paramparse.ParseBoolVar(`experimental_enable_hash_group_joins`, s)
 			if err != nil {
 				return err
 			}
-			m.SetParallelizeMultiKeyLookupJoinsEnabled(b)
+			m.SetExperimentalHashGroupJoinEnabled(b)
 			return nil
 		},
 		Get: func(evalCtx *extendedEvalContext) (string, error) {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData().ParallelizeMultiKeyLookupJoinsEnabled), nil
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().ExperimentalHashGroupJoinEnabled), nil
 		},
 		GlobalDefault: func(sv *settings.Values) string {
-			return rowexec.ParallelizeMultiKeyLookupJoinsEnabled.String(sv)
+			// TODO: use "false".
+			return "true"
 		},
-	},
-
-	// TODO(harding): Remove this when costing scans based on average column size
-	// is fully supported.
-	// CockroachDB extension.
-	`cost_scans_with_default_col_size`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`cost_scans_with_default_col_size`),
-		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar(`cost_scans_with_default_col_size`, s)
-			if err != nil {
-				return err
-			}
-			m.SetCostScansWithDefaultColSize(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) (string, error) {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData().CostScansWithDefaultColSize), nil
-		},
-		GlobalDefault: globalFalse,
 	},
 }
 
@@ -1937,11 +1850,6 @@ func init() {
 	for k, v := range DummyVars {
 		varGen[k] = v
 	}
-
-	// Alias `idle_session_timeout` to match the PG 14 name.
-	// We create `idle_in_session_timeout` before its existence.
-	varGen[`idle_session_timeout`] = varGen[`idle_in_session_timeout`]
-
 	// Initialize delegate.ValidVars.
 	for v := range varGen {
 		delegate.ValidVars[v] = struct{}{}
@@ -2004,7 +1912,6 @@ func displayPgBool(val bool) func(_ *settings.Values) string {
 }
 
 var globalFalse = displayPgBool(false)
-var globalTrue = displayPgBool(true)
 
 // sessionDataTimeZoneFormat returns the appropriate timezone format
 // to output when the `timezone` is required output.

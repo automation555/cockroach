@@ -78,7 +78,7 @@ regions: <hidden>
       table: kv@kv_pkey
       spans: FULL SCAN
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzslt9u2jwUwO-_p7DOFf1klL-01FfdUCdVW8sEtLuYUOUmRywisTPbobCKx9oL7MkmkmYjtA1B08QkeulzfOKTn3-2_AD6awwMhucfznsjEshMmNb_R-TdoH9JpjOgIGSIVzxBDewzOEDBBQoeUPCBQgfGFFIlA9RaqtWUh7zgIpwDsylEIs3MKjymEEiFwB7ARCZGYDDidzEOkIeoLBsohGh4FOfLTGdn09ltOsUFUOjJOEuEZkBhmHKhGWlbqx7e3xATJciI_eO7LsaBFAaFiaR4klLyXhOFPGTEKSJ3C4NlqEveAoXLm16PaINpwYG0cG6sSJgjRuy8xWIC4vSlCQmfkwQTqRaEx7EMuMGQETv_-h03wRfURGYmzQwjq_l5V2XAgfGSQjF6ZKYNnyAwZ0mbc30zmSiccCOV1ali7fWvr0a3g_6nYesIKOAcg-wprD_o032xz9_tZUKqEBWGld7Gy_o_cTYMGV5f3l5cjVpnzt_5E6_yJ05zk52dTLbctuUdsstbyK4ZcLxXl93mBri7GeC1Lf-QDdhCds2Ak70a4DU3wNvNAL-dX9QHa8AWsmsGdPdqgN_cAH83AzrtQ97_LVzX9v_0n3nPPNPnAHUqhcaNd83zX7ZX7x0MJ1g8jrTMVIAflQzyZYphP6_LAyFqU2SdYnAhitSqwfVip7bYrRQ7m8Vu_cpblvZqq_36Yn-XvnOKOVAQaO6lmpKYGxTB4teml_F7HpmqDiFqVBGPo2_8qStl2ePpCjCa4eMJK1PlMStzxVErswlqzSeVCXZjB6tIOrVIjut5Hr_y3ERyUoukW8-z-8pzE8lp_W1hb7mo6q-5wyA6Xv73MwAA__-5gsoy
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzslt9u0zwUwO-_p7DOVffJVf5263I1qIY0wVrUduMCVZOXHJWoiR1sZ2uZ-li8AE-GkizQdFtqhFCR6KXP8YmPf_nZ8gOozwkEMDl_dz6YklDkXHf-PyJvxqNLsrgDClxEOGQpKgg-ggMUXKDgAQUfKPRgRiGTIkSlhCymPJQFF9ESAptCzLNcF-EZhVBIhOABdKwThACm7DbBMbIIpWUDhQg1i5NymcXdWSbjlMkVUJhkjKuAdK1i4VGuAzIUHIHC22ui4xQDYn_7qqpxKLhGrmPBn6SkuFdEIosC4lSR25XGOtQnr4HC5fVgQJTGrAJBOrjUVsz1UUDsssdqAuLipQkpW5IUUyFXhCWJCJnGKCB2-fVbpsNPqIjIdVZso5hfdlUHHJitKVSjR2hKszlC4KypOdhX87nEOdNCWr0m18Hoaji9GY8-TDpHQAGXGOZPYf1Gn-6Lff5sL-dCRigxavQ2W7fvxNlSZHJ1eXMxnHbOnD-zE6-xE8dcZWe3ypbbtbyDzEZoNxQ43qvMrrkCroECXtfyDwoYod1Q4GSvCnjmCngGCvjd8n4-KLAb7YYC_b0q4Jsr4Bso0OseBDACuyHA6V_zpnmmzzGqTHCFW2-b579sF28ejOZYPZCUyGWI76UIy2Wq4aisKwMRKl1lnWpwwatU0eBmsdNa7DaKne1it33lHUt7rdV-e7H_K32XFEugwFHfC7kgCdPIw9WPn17H71msmzpEqFDGLIm_sKeu1GWPpyvE-A4fT1idqo9ZnauOWp1NUSk2b0ywjR1sIum1Ijlu53l84LmN5KQVSb-dZ__AcxvJafttYe-4qNqvuX-D6Gz93_cAAAD__2VFyow=
 
 query T
 EXPLAIN ANALYZE (DISTSQL) SELECT * FROM kv JOIN kw ON kv.k = kw.k
@@ -128,7 +128,7 @@ regions: <hidden>
       table: kw@kw_pkey
       spans: FULL SCAN
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsmt9u2zYUxu_3FMS5ale6MiU7TQQUMBZ0QLolGdKiN4MxKNKZLUgWXZG24wV5rL3AnmyQNDf1H1GW0IGspbtIJKXD3zn89IXmI4jPMbjw4d2v7y4_kh_Jz3e31yRakve3VzckWpHbGxItX0fkLYlWryOgkPAAb7wZCnB_BwYUbKDgAIUBUBjCmMI85T4KwdOsy2M-4Cp4ALdPIUzmC5ndHlPweYrgPoIMZYzgwkfvPsY79AJMrT5QCFB6YZy_JlqOouUf8wjXQOGSx4tZIlwSUbIECh_mXnbVs7JAfvlEZDhDl_T_-VsU1z5PJCYy5MleU8pXgqToBS5hxZ37tcTNrXPyE1C4_nR5SYTEOfH5IpHkBT5IK0zkS5f08ziLDohRWYeZ90BmOOPpmnhxzH1PYuCSfv70e0_6UxSEL-R8IV2S9c-j2txgMH6iUFwVPDe87tdk6onpNqlR1n9MQUhvguCyJ9osAWc7CViNotWhBKyeE2CxLgUHUmCXpuD5OTwNMMVg9zmvshcf1etANq8xneB7HiaYWmxnPcX4p3wxYq9evk3DybT4EyjcZrMdMTqy6ciho2xB4wP6i_3EqXhmbeJzTCTO5iQIRUQWwptgY9zPKJ0jUC6SQ5gOErrhPT632HCbTcmMK8MeloY92AqbHb8IWX0VtOye5XSLUK2DNVLwpoEOdimo1kGmRwfZCeqgfXw12w0ExelZg66a1YJSIwXnDQSlS0G1oNh6BMU-QUFxjq9mp4GgDHrWsKtmtaDUSMFFA0HpUlAtKI4eQXFOUFAGx1fzoIGgDHtdLavlpEYChvXlpGcx4iUBYYTLKaZdMtTCMtAjLIMTFJaKDc07FHOeCNzZCjr85H5GEIMJFnkRfJH6-FvK_fw1xeVtPi7_7zVAIYtWu7i4SjZNQnpStZX0f5LrF_VyfPRnpdEnKFc8jUjsSUz89ZfwN_dXXii3JxagwDT04vAvb3_Wm2H_rXYfw2U-7a-aNsv-S1s-503rDEWGYnfwt0dyoRkJUyA5_yZIWF0krLzIW1smbNhGJqyGFtrGaaE6-rPS6Fub0AvNSLRooRoJKy_y1pbJjha2hIm9y6T_NRNn-_OwO9hRDmbbWtQ3TkkHDT3xCZeDGkm50f4eEqrbExuY0HZ64gomuj2xFr8wbOiJT7hM1EjKjbYZWqiOXrcnNjCh7fTEFUx0e2ItWnhWxxO3A8mbzirXQ9LKPWk1knL_bcYXUx29dqts4LrXbpW1VPl5Z5XrIWnlnrQaSbn_NkML1dFrt8patLCCiW6rrKXKLzqrvPcrQ9OjFidcJhVMdJtlE-uklbvVFUwUHtyMz2ZV_K30y6zpeYv2MtHtmPUIotnHOEysE4URN0QQuzMXB6DUOnTRksW_d5bEKNdsIhPdrlnP2lEzaadrVjPRvnNtJJRyK27Il7PO6bS2OMQ6x9PaYibqHHrrmBixfW0klHIrbogg7h1VaaFrHj_98G8AAAD__zZQwWk=
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzsmt9u2zYUxu_3FASv2lWuTMlOEwEFjAUdkG5JhrTozeALRjqzBcmiStJxvCCPtRfYkw2S5rb-I0oyOpAzdReJpHT44-GnL_R5wuJzigP84d2v7y4_oh_Rz3e31yh5QO9vr25QskK3Nyh5eJ2gtyhZvU6wgzMWwQ1dgMDB75hgB3vYwT528Ag7eIynDs45C0EIxosuT-WAq-gRB0MHx1m-lMXtqYNDxgEHT1jGMgUc4I_0PoU7oBFwd4gdHIGkcVq-JnmY5DxeUL7GDv6Q00wEaOAWL_7lE5LxAgI0_PsvUV2HLJOQyZhle02crQTiQKMAkerO_VrC5tY5-gk7-PrT5SUSEnIUsmUm0Qt4lG6cyZcBGpZxVR0AkroOC_qIFrBgfI1omrKQSogCNCyffk9lOAeB2FLmSxmgon8Z1eYGwdNnB1dXFb8Nn_s1mlMx3yYzKfpPHSwknQEOyLNzHPCzHeCrfeAu6ZEfQO7VIv_6HMYj4BDtPudV8eJWvQ6s3jXwGbxncQbcJTv7JYU_5IsJefXyLY9n8-pP7ODbYrYT4kw8Z-I7k2LDwiOEy_2FU_Es2sTnFElY5CiKRYKWgs7gaNxfUfotUC6zQ5gOErphA5a7ZLzNpmbGjWGPa8MebYVN2m860qxyrjdw_X7TqXWuA_I3LXSuR96sc0SPzpET1DmvffZ6LQTDH7ijPnvVgtEB-XkLweiRNwuGp0cwvBMUDL999votBGM0cMd99qoFowPyixaC0SNvFgxfj2D4JygYo_bZO2ohGONBn7tquegAfNwsFwOXIJpFiCAm58B7-GrhGOkRjtEJCkfDAeIdiJxlAnaOYg4_eVgQhGgG1boItuQh_MZZWL6murwtx5X_XUYgZNXqVRdX2aZJSCpVRzn_JblhlS_toz-rjT4DuWI8QSmVkIXrL-Fv7q9oLLcnFoEAHtM0_pPuz3oz7N_dHkL8UE77m6bNtv_SVs5507oAUaDYHfz9kVxoRkIUSM6_CxLSFQmpT3Jr04SMbWRCOmihZ5wWqqM_q43e2gW90IxEixaqkZD6JLc2TXa00BIm3i6T4bdM_O3Pw-5gXzmYbGvR0DglHR3piU84HdRI6o32_2FBdXtiAxfUTk_cwES3J9biF8ZHeuITThM1knqjbYYWqqPX7YkNXFA7PXEDE92eWIsWnnXxxHYgedNb5W5IrDyTViOp999mfDHV0Wu3ygbue-1WWUuWn_dWuRsSK8-k1Ujq_bcZWqiOXrtV1qKFDUx0W2UtWX7RW-W9XxmOLbU44TRpYKLbLJuYJ1aeVjcwUXhwMz6bTfFb6ZfJsfUW9jLR7Zj1CKLZZRwm5onCiBsiiH3NxQEonYouLNn8e7UkRrlmE5nods169o6aiZ2uWc1E-8m1kVDqrbghX84u1Wm2OMQu5Wm2mIkuRW89EyOOr42EUm_FDRHEvVIVC13z9PmHfwIAAP__GzeRXQ==
 
 query T
 EXPLAIN (VEC, VERBOSE) SELECT count(*) FROM kv
@@ -208,7 +208,7 @@ EXPLAIN (VEC, VERBOSE) SELECT count(*) FROM kv NATURAL INNER HASH JOIN kv kv2
 │             │   └ *colexec.invariantsChecker
 │             │     └ *colexecbase.simpleProjectOp
 │             │       └ *colexec.diskSpillerBase
-│             │         ├ *colexecjoin.hashJoiner
+│             │         ├ *colexecjoin.HashJoiner
 │             │         │ ├ *colexec.invariantsChecker
 │             │         │ │ └ *colexec.ParallelUnorderedSynchronizer
 │             │         │ │   ├ *colexec.invariantsChecker
@@ -264,7 +264,7 @@ EXPLAIN (VEC, VERBOSE) SELECT count(*) FROM kv NATURAL INNER HASH JOIN kv kv2
 │         └ *colexec.invariantsChecker
 │           └ *colexecbase.simpleProjectOp
 │             └ *colexec.diskSpillerBase
-│               ├ *colexecjoin.hashJoiner
+│               ├ *colexecjoin.HashJoiner
 │               │ ├ *colexec.invariantsChecker
 │               │ │ └ *colexec.ParallelUnorderedSynchronizer
 │               │ │   ├ *colexec.invariantsChecker
@@ -312,7 +312,7 @@ EXPLAIN (VEC, VERBOSE) SELECT count(*) FROM kv NATURAL INNER HASH JOIN kv kv2
 │         └ *colexec.invariantsChecker
 │           └ *colexecbase.simpleProjectOp
 │             └ *colexec.diskSpillerBase
-│               ├ *colexecjoin.hashJoiner
+│               ├ *colexecjoin.HashJoiner
 │               │ ├ *colexec.invariantsChecker
 │               │ │ └ *colexec.ParallelUnorderedSynchronizer
 │               │ │   ├ *colexec.invariantsChecker
@@ -360,7 +360,7 @@ EXPLAIN (VEC, VERBOSE) SELECT count(*) FROM kv NATURAL INNER HASH JOIN kv kv2
 │         └ *colexec.invariantsChecker
 │           └ *colexecbase.simpleProjectOp
 │             └ *colexec.diskSpillerBase
-│               ├ *colexecjoin.hashJoiner
+│               ├ *colexecjoin.HashJoiner
 │               │ ├ *colexec.invariantsChecker
 │               │ │ └ *colexec.ParallelUnorderedSynchronizer
 │               │ │   ├ *colexec.invariantsChecker
@@ -408,7 +408,7 @@ EXPLAIN (VEC, VERBOSE) SELECT count(*) FROM kv NATURAL INNER HASH JOIN kv kv2
           └ *colexec.invariantsChecker
             └ *colexecbase.simpleProjectOp
               └ *colexec.diskSpillerBase
-                ├ *colexecjoin.hashJoiner
+                ├ *colexecjoin.HashJoiner
                 │ ├ *colexec.invariantsChecker
                 │ │ └ *colexec.ParallelUnorderedSynchronizer
                 │ │   ├ *colexec.invariantsChecker
