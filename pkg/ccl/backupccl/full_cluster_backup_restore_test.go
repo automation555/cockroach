@@ -23,10 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -47,21 +45,9 @@ func TestFullClusterBackup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params := base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			DisableSpanConfigs: true, // TODO(irfansharif): #75060.
-			Knobs: base.TestingKnobs{
-				SpanConfig: &spanconfig.TestingKnobs{
-					// We compare job progress before and after a restore. Disable
-					// the automatic jobs checkpointing which could possibly mutate
-					// the progress data during the backup/restore process.
-					JobDisablePersistingCheckpoints: true,
-				},
-			},
-		}}
 	const numAccounts = 10
-	tcBackup, sqlDB, tempDir, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, params)
-	tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, params)
+	_, tcBackup, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
 
@@ -120,7 +106,7 @@ USE data2;
 CREATE SCHEMA empty_schema;
 CREATE TABLE data2.foo (a int);
 `)
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(backupKVDB, keys.SystemSQLCodec, "data2", "foo")
+	tableDesc := catalogkv.TestingGetTableDescriptor(backupKVDB, keys.SystemSQLCodec, "data2", "foo")
 	// Store the highest user-table ID for later assertions.
 	maxBackupTableID := tableDesc.GetID()
 
@@ -157,15 +143,16 @@ CREATE TABLE data2.foo (a int);
 	)
 	// Populate system.role_members.
 	sqlDB.Exec(t, `CREATE ROLE system_ops;`)
+	sqlDB.Exec(t, `GRANT CREATE, SELECT ON DATABASE data TO system_ops;`)
 	sqlDB.Exec(t, `GRANT system_ops TO maxroach1;`)
 
 	// Populate system.scheduled_jobs table with a first run in the future to prevent immediate adoption.
 	firstRun := timeutil.Now().Add(time.Hour).Format(timeutil.TimestampWithoutTZFormat)
-	sqlDB.Exec(t, `CREATE SCHEDULE FOR BACKUP data.bank INTO $1 RECURRING '@hourly' FULL BACKUP ALWAYS WITH SCHEDULE OPTIONS first_run = $2`, localFoo, firstRun)
+	sqlDB.Exec(t, `CREATE SCHEDULE FOR BACKUP data.bank INTO $1 RECURRING '@hourly' FULL BACKUP ALWAYS WITH SCHEDULE OPTIONS first_run = $2`, LocalFoo, firstRun)
 	sqlDB.Exec(t, `PAUSE SCHEDULES SELECT id FROM [SHOW SCHEDULES FOR BACKUP]`)
 
 	injectStats(t, sqlDB, "data.bank", "id")
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
 
 	// Create a bunch of user tables on the restoring cluster that we're going
 	// to delete.
@@ -187,25 +174,22 @@ CREATE TABLE data2.foo (a int);
 
 	doneRestore := make(chan struct{})
 	go func() {
-		sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
+		sqlDBRestore.Exec(t, `RESTORE FROM $1`, LocalFoo)
 		close(doneRestore)
 	}()
 
 	// Check that zones are restored during pre-restore.
 	t.Run("ensure zones are restored during pre-restore", func(t *testing.T) {
 		<-restoredZones
-		// Not specifying the schema makes the query search using defaultdb first.
-		// which ends up returning the error
-		// pq: database "defaultdb" is offline: restoring
-		checkZones := "SELECT * FROM system.public.zones"
+		checkZones := "SELECT * FROM system.zones"
 		sqlDBRestore.CheckQueryResults(t, checkZones, sqlDB.QueryStr(t, checkZones))
 
 		// Check that the user tables are still offline.
-		sqlDBRestore.ExpectErr(t, "database \"data\" is offline: restoring", "SELECT * FROM data.public.bank")
+		sqlDBRestore.ExpectErr(t, "database \"data\" is offline: restoring", "SELECT * FROM data.bank")
 
 		// Check there is no data in the span that we expect user data to be imported.
 		store := tcRestore.GetFirstStoreFromServer(t, 0)
-		startKey := keys.SystemSQLCodec.TablePrefix(bootstrap.TestingUserDescID(0))
+		startKey := keys.SystemSQLCodec.TablePrefix(keys.MinUserDescID)
 		endKey := keys.SystemSQLCodec.TablePrefix(uint32(maxBackupTableID)).PrefixEnd()
 		it := store.Engine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 			UpperBound: endKey,
@@ -291,7 +275,7 @@ CREATE TABLE data2.foo (a int);
 	t.Run("ensure table IDs have not changed", func(t *testing.T) {
 		// Check that all tables have been restored. DISTINCT is needed in order to
 		// deal with the inclusion of schemas in the system.namespace table.
-		tableIDCheck := "SELECT * FROM system.namespace ORDER BY id"
+		tableIDCheck := "SELECT DISTINCT name, id FROM system.namespace"
 		sqlDBRestore.CheckQueryResults(t, tableIDCheck, sqlDB.QueryStr(t, tableIDCheck))
 	})
 
@@ -374,16 +358,16 @@ func TestIncrementalFullClusterBackup(t *testing.T) {
 
 	const numAccounts = 10
 	const incrementalBackupLocation = "nodelocal://0/inc-full-backup"
-	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
-	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
 
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
 	sqlDB.Exec(t, "CREATE USER maxroach1")
 
-	sqlDB.Exec(t, `BACKUP TO $1 INCREMENTAL FROM $2`, incrementalBackupLocation, localFoo)
-	sqlDBRestore.Exec(t, `RESTORE FROM $1, $2`, localFoo, incrementalBackupLocation)
+	sqlDB.Exec(t, `BACKUP TO $1 INCREMENTAL FROM $2`, incrementalBackupLocation, LocalFoo)
+	sqlDBRestore.Exec(t, `RESTORE FROM $1, $2`, LocalFoo, incrementalBackupLocation)
 
 	checkQuery := "SELECT * FROM system.users"
 	sqlDBRestore.CheckQueryResults(t, checkQuery, sqlDB.QueryStr(t, checkQuery))
@@ -396,14 +380,14 @@ func TestEmptyFullClusterRestore(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	sqlDB, tempDir, cleanupFn := createEmptyCluster(t, singleNode)
-	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
 
 	sqlDB.Exec(t, `CREATE USER alice`)
 	sqlDB.Exec(t, `CREATE USER bob`)
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
-	sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
+	sqlDBRestore.Exec(t, `RESTORE FROM $1`, LocalFoo)
 
 	checkQuery := "SELECT * FROM system.users"
 	sqlDBRestore.CheckQueryResults(t, checkQuery, sqlDB.QueryStr(t, checkQuery))
@@ -415,15 +399,15 @@ func TestClusterRestoreEmptyDB(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 10
-	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
-	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
 
 	sqlDB.Exec(t, `CREATE DATABASE some_db`)
 	sqlDB.Exec(t, `CREATE DATABASE some_db_2`)
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
-	sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
+	sqlDBRestore.Exec(t, `RESTORE FROM $1`, LocalFoo)
 
 	checkQuery := "SHOW DATABASES"
 	sqlDBRestore.CheckQueryResults(t, checkQuery, sqlDB.QueryStr(t, checkQuery))
@@ -434,16 +418,16 @@ func TestDisallowFullClusterRestoreOnNonFreshCluster(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 10
-	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
-	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
 
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
 	sqlDBRestore.Exec(t, `CREATE DATABASE foo`)
 	sqlDBRestore.ExpectErr(t,
-		"pq: full cluster restore can only be run on a cluster with no tables or databases but found 2 descriptors: foo, public",
-		`RESTORE FROM $1`, localFoo,
+		"pq: full cluster restore can only be run on a cluster with no tables or databases but found 1 descriptors: \\[foo\\]",
+		`RESTORE FROM $1`, LocalFoo,
 	)
 }
 
@@ -452,8 +436,8 @@ func TestClusterRestoreSystemTableOrdering(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 10
-	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
-	tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode,
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode,
 		tempDir,
 		InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
@@ -474,8 +458,8 @@ func TestClusterRestoreSystemTableOrdering(t *testing.T) {
 		}
 	}
 
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
-	sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
+	sqlDBRestore.Exec(t, `RESTORE FROM $1`, LocalFoo)
 	// Check that the settings table is the last of the system tables to be
 	// restored.
 	require.Equal(t, restoredSystemTables[len(restoredSystemTables)-1],
@@ -487,15 +471,15 @@ func TestDisallowFullClusterRestoreOfNonFullBackup(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 10
-	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
-	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
 
-	sqlDB.Exec(t, `BACKUP data.bank TO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP data.bank TO $1`, LocalFoo)
 	sqlDBRestore.ExpectErr(
 		t, "pq: full cluster RESTORE can only be used on full cluster BACKUP files",
-		`RESTORE FROM $1`, localFoo,
+		`RESTORE FROM $1`, LocalFoo,
 	)
 }
 
@@ -504,12 +488,12 @@ func TestAllowNonFullClusterRestoreOfFullBackup(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 10
-	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
 	sqlDB.Exec(t, `CREATE DATABASE data2`)
-	sqlDB.Exec(t, `RESTORE data.bank FROM $1 WITH into_db='data2'`, localFoo)
+	sqlDB.Exec(t, `RESTORE data.bank FROM $1 WITH into_db='data2'`, LocalFoo)
 
 	checkResults := "SELECT * FROM data.bank"
 	sqlDB.CheckQueryResults(t, checkResults, sqlDB.QueryStr(t, checkResults))
@@ -520,14 +504,14 @@ func TestRestoreFromFullClusterBackup(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 10
-	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
 	sqlDB.Exec(t, `DROP DATABASE data`)
 
 	t.Run("database", func(t *testing.T) {
-		sqlDB.Exec(t, `RESTORE DATABASE data FROM $1`, localFoo)
+		sqlDB.Exec(t, `RESTORE DATABASE data FROM $1`, LocalFoo)
 		defer sqlDB.Exec(t, `DROP DATABASE data`)
 		sqlDB.CheckQueryResults(t, "SELECT count(*) FROM data.bank", [][]string{{"10"}})
 	})
@@ -535,20 +519,20 @@ func TestRestoreFromFullClusterBackup(t *testing.T) {
 	t.Run("table", func(t *testing.T) {
 		sqlDB.Exec(t, `CREATE DATABASE data`)
 		defer sqlDB.Exec(t, `DROP DATABASE data`)
-		sqlDB.Exec(t, `RESTORE data.bank FROM $1`, localFoo)
+		sqlDB.Exec(t, `RESTORE data.bank FROM $1`, LocalFoo)
 		sqlDB.CheckQueryResults(t, "SELECT count(*) FROM data.bank", [][]string{{"10"}})
 	})
 
 	t.Run("tables", func(t *testing.T) {
 		sqlDB.Exec(t, `CREATE DATABASE data`)
 		defer sqlDB.Exec(t, `DROP DATABASE data`)
-		sqlDB.Exec(t, `RESTORE data.* FROM $1`, localFoo)
+		sqlDB.Exec(t, `RESTORE data.* FROM $1`, LocalFoo)
 		sqlDB.CheckQueryResults(t, "SELECT count(*) FROM data.bank", [][]string{{"10"}})
 	})
 
 	t.Run("system tables", func(t *testing.T) {
 		sqlDB.Exec(t, `CREATE DATABASE temp_sys`)
-		sqlDB.Exec(t, `RESTORE system.users FROM $1 WITH into_db='temp_sys'`, localFoo)
+		sqlDB.Exec(t, `RESTORE system.users FROM $1 WITH into_db='temp_sys'`, LocalFoo)
 		sqlDB.CheckQueryResults(t, "SELECT * FROM temp_sys.users", sqlDB.QueryStr(t, "SELECT * FROM system.users"))
 	})
 }
@@ -557,15 +541,15 @@ func TestCreateDBAndTableIncrementalFullClusterBackup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, 0, InitManualReplication)
+	_, _, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, 0, InitManualReplication)
 	defer cleanupFn()
 
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
 	sqlDB.Exec(t, `CREATE DATABASE foo`)
 	sqlDB.Exec(t, `CREATE TABLE foo.bar (a int)`)
 
 	// Ensure that the new backup succeeds.
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
 }
 
 // TestClusterRestoreFailCleanup tests that a failed RESTORE is cleaned up.
@@ -585,7 +569,7 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 	}
 
 	const numAccounts = 1000
-	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 
 	// Setup the system systemTablesToVerify to ensure that they are copied to the new cluster.
@@ -616,17 +600,17 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 	// should appear in the restore.
 	// This job will eventually fail since it will run from a new cluster.
 	sqlDB.Exec(t, `BACKUP data.bank TO 'nodelocal://0/throwawayjob'`)
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
 
 	t.Run("during restoration of data", func(t *testing.T) {
-		_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+		_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 		defer cleanupEmptyCluster()
 		sqlDBRestore.ExpectErr(t, "sst: no such file", `RESTORE FROM 'nodelocal://1/missing-ssts'`)
 		// Verify the failed RESTORE added some DROP tables.
 		// Note that the system tables here correspond to the temporary tables
 		// imported, not the system tables themselves.
 		sqlDBRestore.CheckQueryResults(t,
-			`SELECT name FROM system.crdb_internal.tables WHERE state = 'DROP' ORDER BY name`,
+			`SELECT name FROM crdb_internal.tables WHERE state = 'DROP' ORDER BY name`,
 			[][]string{
 				{"bank"},
 				{"comments"},
@@ -660,7 +644,7 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 				args := base.TestClusterArgs{ServerArgs: base.TestServerArgs{
 					Knobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
 				}}
-				tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, args)
+				_, tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, args)
 				defer cleanupEmptyCluster()
 
 				// Inject a retry error, that returns once.
@@ -682,7 +666,7 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 					}
 				}
 				// The initial restore will return an error, and restart.
-				sqlDBRestore.ExpectErr(t, `running execution from '.*' to '.*' on \d+ failed: injected error`, `RESTORE FROM $1`, localFoo)
+				sqlDBRestore.ExpectErr(t, `running execution from '.*' to '.*' on \d+ failed: injected error`, `RESTORE FROM $1`, LocalFoo)
 				// Reduce retry delays.
 				sqlDBRestore.Exec(t, "SET CLUSTER SETTING jobs.registry.retry.initial_delay = '1ms'")
 				// Expect the restore to succeed.
@@ -694,7 +678,7 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 	})
 
 	t.Run("during system table restoration", func(t *testing.T) {
-		tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+		_, tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 		defer cleanupEmptyCluster()
 
 		// Bugger the backup by injecting a failure while restoring the system data.
@@ -711,12 +695,12 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 			}
 		}
 
-		sqlDBRestore.ExpectErr(t, "injected error", `RESTORE FROM $1`, localFoo)
+		sqlDBRestore.ExpectErr(t, "injected error", `RESTORE FROM $1`, LocalFoo)
 		// Verify the failed RESTORE added some DROP tables.
 		// Note that the system tables here correspond to the temporary tables
 		// imported, not the system tables themselves.
 		sqlDBRestore.CheckQueryResults(t,
-			`SELECT name FROM system.crdb_internal.tables WHERE state = 'DROP' ORDER BY name`,
+			`SELECT name FROM crdb_internal.tables WHERE state = 'DROP' ORDER BY name`,
 			[][]string{
 				{"bank"},
 				{"comments"},
@@ -735,7 +719,7 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 	})
 
 	t.Run("after offline tables", func(t *testing.T) {
-		tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+		_, tcRestore, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 		defer cleanupEmptyCluster()
 
 		// Bugger the backup by injecting a failure while restoring the system data.
@@ -752,7 +736,97 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 			}
 		}
 
-		sqlDBRestore.ExpectErr(t, "injected error", `RESTORE FROM $1`, localFoo)
+		sqlDBRestore.ExpectErr(t, "injected error", `RESTORE FROM $1`, LocalFoo)
+	})
+}
+
+func TestRestoreFromFullClusterBackupWithPreservingPrivilegeGrants(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const numAccounts = 10
+	_, _, sqlDB, _, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	defer cleanupFn()
+
+	sqlDB.Exec(t, "CREATE USER app")
+	sqlDB.Exec(t, "GRANT DROP ON DATABASE data TO app")
+	sqlDB.Exec(t, "GRANT DELETE ON TABLE bank TO app")
+	fmt.Println("SHOW GRANTS BEFORE BACKUP:")
+	for _, row := range sqlDB.QueryStr(t, "SHOW GRANTS FOR app") {
+		fmt.Println(row)
+	}
+	sqlDB.Exec(t, `BACKUP TO $1`, LocalFoo)
+	sqlDB.Exec(t, `DROP DATABASE data`)
+
+	// Specified user doesn't exist in restoring cluster.
+	t.Run("database", func(t *testing.T) {
+		sqlDB.Exec(t, "DROP USER app")
+		defer sqlDB.Exec(t, "CREATE USER app")
+		sqlDB.ExpectErr(t,
+			"Failed to keep privilege grants for non-existent user app in the restoring cluster",
+			`RESTORE DATABASE data FROM $1 WITH preserve_grants_for = 'app'`, LocalFoo)
+	})
+
+	// Create a user that doesn't exist in the backup
+	sqlDB.Exec(t, `CREATE USER app2`)
+	t.Run("table", func(t *testing.T) {
+		sqlDB.Exec(t, `CREATE DATABASE data`)
+		sqlDB.Exec(t, `RESTORE TABLE bank FROM $1 WITH preserve_grants_for = 'app,app2'`, LocalFoo)
+		defer sqlDB.Exec(t, `DROP DATABASE data`)
+		sqlDB.CheckQueryResults(t, "SHOW GRANTS FOR app", [][]string{
+			{"data", "public", "bank", "app", "DELETE"},
+		})
+		sqlDB.CheckQueryResults(t, "SHOW GRANTS ON DATABASE data", [][]string{
+			{"data", "admin", "ALL"},
+			{"data", "root", "ALL"},
+		})
+		sqlDB.CheckQueryResults(t, "SHOW GRANTS ON TABLE bank", [][]string{
+			{"data", "public", "bank", "admin", "ALL"},
+			{"data", "public", "bank", "app", "DELETE"}, // preserved from the table backed up
+			{"data", "public", "bank", "root", "ALL"},
+		})
+	})
+
+	t.Run("database", func(t *testing.T) {
+		sqlDB.Exec(t, `RESTORE DATABASE data FROM $1 WITH preserve_grants_for = 'app'`, LocalFoo)
+		defer sqlDB.Exec(t, `DROP DATABASE data`)
+		sqlDB.CheckQueryResults(t, "SHOW GRANTS FOR app", [][]string{
+			{"data", "NULL", "NULL", "app", "DROP"},
+			{"data", "public", "bank", "app", "DELETE"},
+			{"data", "public", "bank", "app", "DROP"},
+		})
+		sqlDB.CheckQueryResults(t, "SHOW GRANTS ON DATABASE data", [][]string{
+			{"data", "admin", "ALL"},
+			{"data", "app", "DROP"},
+			{"data", "root", "ALL"},
+		})
+		sqlDB.CheckQueryResults(t, "SHOW GRANTS ON TABLE bank", [][]string{
+			{"data", "public", "bank", "admin", "ALL"},
+			{"data", "public", "bank", "app", "DELETE"}, // preserved from the table backed up
+			{"data", "public", "bank", "app", "DROP"},   // inherited from parent DB
+			{"data", "public", "bank", "root", "ALL"},
+		})
+	})
+
+	t.Run("database", func(t *testing.T) {
+		sqlDB.Exec(t, `RESTORE DATABASE data FROM $1 WITH preserve_grants_for = '*'`, LocalFoo)
+		defer sqlDB.Exec(t, `DROP DATABASE data`)
+		sqlDB.CheckQueryResults(t, "SHOW GRANTS FOR app", [][]string{
+			{"data", "NULL", "NULL", "app", "DROP"},
+			{"data", "public", "bank", "app", "DELETE"},
+			{"data", "public", "bank", "app", "DROP"},
+		})
+		sqlDB.CheckQueryResults(t, "SHOW GRANTS ON DATABASE data", [][]string{
+			{"data", "admin", "ALL"},
+			{"data", "app", "DROP"},
+			{"data", "root", "ALL"},
+		})
+		sqlDB.CheckQueryResults(t, "SHOW GRANTS ON TABLE bank", [][]string{
+			{"data", "public", "bank", "admin", "ALL"},
+			{"data", "public", "bank", "app", "DELETE"}, // preserved from the table backed up
+			{"data", "public", "bank", "app", "DROP"},   // inherited from parent DB
+			{"data", "public", "bank", "root", "ALL"},
+		})
 	})
 }
 
@@ -763,20 +837,20 @@ func TestDropDatabaseRevisionHistory(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const numAccounts = 1
-	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 
-	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, LocalFoo)
 	sqlDB.Exec(t, `
 CREATE DATABASE same_name_db;
 DROP DATABASE same_name_db;
 CREATE DATABASE same_name_db;
 `)
-	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, LocalFoo)
 
-	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+	_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupEmptyCluster()
-	sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
+	sqlDBRestore.Exec(t, `RESTORE FROM $1`, LocalFoo)
 	sqlDBRestore.ExpectErr(t, `database "same_name_db" already exists`, `CREATE DATABASE same_name_db`)
 }
 
@@ -796,7 +870,7 @@ func TestClusterRevisionHistory(t *testing.T) {
 
 	var tc testCase
 	const numAccounts = 1
-	_, sqlDB, tempDir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	_, _, sqlDB, tempDir, cleanupFn := BackupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 	sqlDB.Exec(t, `CREATE DATABASE d1`)
 	sqlDB.Exec(t, `CREATE TABLE d1.t (a INT)`)
@@ -835,7 +909,7 @@ func TestClusterRevisionHistory(t *testing.T) {
 		},
 	}
 	testCases = append(testCases, tc)
-	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, LocalFoo)
 
 	sqlDB.QueryRow(t, `SELECT cluster_logical_timestamp()`).Scan(&ts[3])
 	sqlDB.Exec(t, `DROP DATABASE d2;`)
@@ -849,7 +923,7 @@ func TestClusterRevisionHistory(t *testing.T) {
 		},
 	}
 	testCases = append(testCases, tc)
-	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, LocalFoo)
 
 	sqlDB.Exec(t, `CREATE DATABASE d1`)
 	sqlDB.Exec(t, `CREATE TABLE d1.t (a INT)`)
@@ -877,14 +951,14 @@ func TestClusterRevisionHistory(t *testing.T) {
 		},
 	}
 	testCases = append(testCases, tc)
-	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, localFoo)
+	sqlDB.Exec(t, `BACKUP TO $1 WITH revision_history`, LocalFoo)
 
 	for i, testCase := range testCases {
 		t.Run(fmt.Sprintf("t%d", i), func(t *testing.T) {
-			_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+			_, _, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 			defer cleanupEmptyCluster()
 
-			sqlDBRestore.Exec(t, `RESTORE FROM $1 AS OF SYSTEM TIME `+testCase.ts, localFoo)
+			sqlDBRestore.Exec(t, `RESTORE FROM $1 AS OF SYSTEM TIME `+testCase.ts, LocalFoo)
 			testCase.check(t, sqlDBRestore)
 		})
 	}
@@ -926,8 +1000,7 @@ func TestReintroduceOfflineSpans(t *testing.T) {
 	params.ServerArgs.Knobs = knobs
 
 	const numAccounts = 1000
-	ctx := context.Background()
-	_, srcDB, tempDir, cleanupSrc := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, params)
+	ctx, _, srcDB, tempDir, cleanupSrc := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, params)
 	defer cleanupSrc()
 
 	dbBackupLoc := "nodelocal://0/my_db_backup"
@@ -936,10 +1009,6 @@ func TestReintroduceOfflineSpans(t *testing.T) {
 	// the small test-case will get entirely buffered/merged by small-file merging
 	// and not report any progress in the meantime unless it is disabled.
 	srcDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.file_size = '1'`)
-
-	// Test servers only have 128MB root memory monitors, reduce the buffer size
-	// so we don't see memory errors.
-	srcDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.merge_file_buffer_size = '1MiB'`)
 
 	// Take a backup that we'll use to create an OFFLINE descriptor.
 	srcDB.Exec(t, `CREATE INDEX new_idx ON data.bank (balance)`)
@@ -981,7 +1050,7 @@ func TestReintroduceOfflineSpans(t *testing.T) {
 	srcDB.Exec(t, `BACKUP TO $1 WITH revision_history`, clusterBackupLoc)
 
 	t.Run("spans-reintroduced", func(t *testing.T) {
-		_, destDB, cleanupDst := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
+		_, _, destDB, cleanupDst := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 		defer cleanupDst()
 
 		// Restore the incremental backup chain that has missing writes.
@@ -1002,7 +1071,7 @@ func TestReintroduceOfflineSpans(t *testing.T) {
 		args := base.TestClusterArgs{ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()}},
 		}
-		_, destDB, cleanupDst := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, args)
+		_, _, destDB, cleanupDst := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, args)
 		defer cleanupDst()
 
 		destDB.Exec(t, `RESTORE FROM $1 AS OF SYSTEM TIME `+tsMidRestore, clusterBackupLoc)
@@ -1035,7 +1104,7 @@ func TestClusterRevisionDoesNotBackupOptOutSystemTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	tc, _, _, cleanup := backupRestoreTestSetup(t, singleNode, 10, InitManualReplication)
+	_, tc, _, _, cleanup := BackupRestoreTestSetup(t, singleNode, 10, InitManualReplication)
 	conn := tc.Conns[0]
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 	defer cleanup()
@@ -1049,75 +1118,4 @@ BACKUP TO 'nodelocal://1/foo' WITH revision_history;
 CREATE TABLE bar (id INT);
 BACKUP TO 'nodelocal://1/foo' WITH revision_history;
 `)
-}
-
-func TestRestoreWithRecreatedDefaultDB(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	sqlDB, tempDir, cleanupFn := createEmptyCluster(t, singleNode)
-	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
-	defer cleanupFn()
-	defer cleanupEmptyCluster()
-
-	sqlDB.Exec(t, `
-DROP DATABASE defaultdb;
-CREATE DATABASE defaultdb; 
-`)
-	row := sqlDB.QueryRow(t, `SELECT id FROM system.namespace WHERE name = 'defaultdb'`)
-	var expectedDefaultDBID string
-	row.Scan(&expectedDefaultDBID)
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
-
-	sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
-
-	sqlDBRestore.CheckQueryResults(t, `SELECT * FROM system.namespace WHERE name = 'defaultdb'`, [][]string{
-		{"0", "0", "defaultdb", expectedDefaultDBID},
-	})
-}
-
-func TestRestoreWithDroppedDefaultDB(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	sqlDB, tempDir, cleanupFn := createEmptyCluster(t, singleNode)
-	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
-	defer cleanupFn()
-	defer cleanupEmptyCluster()
-
-	sqlDB.Exec(t, `
-DROP DATABASE defaultdb;
-`)
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
-
-	sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
-
-	sqlDBRestore.CheckQueryResults(t, `SELECT count(*) FROM system.namespace WHERE name = 'defaultdb'`, [][]string{
-		{"0"},
-	})
-}
-
-func TestRestoreToClusterWithDroppedDefaultDB(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	sqlDB, tempDir, cleanupFn := createEmptyCluster(t, singleNode)
-	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
-	defer cleanupFn()
-	defer cleanupEmptyCluster()
-
-	expectedRow := sqlDB.QueryRow(t, `SELECT * FROM system.namespace WHERE name = 'defaultdb'`)
-	var parentID, parentSchemaID, ID int
-	var name string
-	expectedRow.Scan(&parentID, &parentSchemaID, &name, &ID)
-
-	sqlDB.Exec(t, `BACKUP TO $1`, localFoo)
-
-	sqlDBRestore.Exec(t, `
-DROP DATABASE defaultdb;
-`)
-	sqlDBRestore.Exec(t, `RESTORE FROM $1`, localFoo)
-	sqlDBRestore.CheckQueryResults(t, `SELECT * FROM system.namespace WHERE name = 'defaultdb'`, [][]string{
-		{fmt.Sprint(parentID), fmt.Sprint(parentSchemaID), name, fmt.Sprint(ID)},
-	})
 }
