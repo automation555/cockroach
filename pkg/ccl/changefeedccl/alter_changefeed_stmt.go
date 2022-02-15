@@ -102,15 +102,17 @@ func alterChangefeedPlanHook(
 				targetDescs = append(targetDescs, descs...)
 			}
 
-			newTargets, err := getTargets(ctx, p, targetDescs, details.Opts)
+			newTargets, newTables, err := getTargetsAndTables(ctx, p, targetDescs, details.Opts)
 			if err != nil {
 				return err
 			}
 			// add old targets
-			for id, target := range details.Targets {
-				newTargets[id] = target
+			for id, table := range details.Tables {
+				newTables[id] = table
 			}
-			details.Targets = newTargets
+			details.Tables = newTables
+			details.TargetSpecifications = append(details.TargetSpecifications, newTargets...)
+
 		}
 
 		if opts.DropTargets != nil {
@@ -129,12 +131,15 @@ func alterChangefeedPlanHook(
 					if err := p.CheckPrivilege(ctx, desc, privilege.SELECT); err != nil {
 						return err
 					}
-					delete(details.Targets, table.GetID())
+					delete(details.Tables, table.GetID())
 				}
 			}
+
+			//TODO (zinger): Remove TargetSpecifications from Details
+
 		}
 
-		if len(details.Targets) == 0 {
+		if len(details.Tables) == 0 {
 			return errors.Errorf("cannot drop all targets for changefeed job %d", jobID)
 		}
 
@@ -152,7 +157,7 @@ func alterChangefeedPlanHook(
 		}
 
 		var targets tree.TargetList
-		for _, target := range details.Targets {
+		for _, target := range details.Tables {
 			targetName := tree.MakeTableNameFromPrefix(tree.ObjectNamePrefix{}, tree.Name(target.StatementTimeName))
 			targets.Tables = append(targets.Tables, &targetName)
 		}

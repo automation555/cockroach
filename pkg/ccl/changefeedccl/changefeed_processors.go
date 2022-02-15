@@ -160,7 +160,7 @@ func newChangeAggregatorProcessor(
 	}
 
 	var err error
-	if ca.encoder, err = getEncoder(ca.spec.Feed.Opts, ca.spec.Feed.Targets); err != nil {
+	if ca.encoder, err = getEncoder(ca.spec.Feed.Opts, AllTargets(ca.spec.Feed)); err != nil {
 		return nil, err
 	}
 
@@ -346,7 +346,7 @@ func (ca *changeAggregator) makeKVFeedCfg(
 	if schemaChangePolicy == changefeedbase.OptSchemaChangePolicyIgnore {
 		sf = schemafeed.DoNothingSchemaFeed
 	} else {
-		sf = schemafeed.New(ctx, cfg, schemaChangeEvents, ca.spec.Feed.Targets,
+		sf = schemafeed.New(ctx, cfg, schemaChangeEvents, AllTargets(ca.spec.Feed),
 			initialHighWater, &ca.metrics.SchemaFeedMetrics)
 	}
 
@@ -359,7 +359,7 @@ func (ca *changeAggregator) makeKVFeedCfg(
 		Gossip:             cfg.Gossip,
 		Spans:              spans,
 		BackfillCheckpoint: ca.spec.Checkpoint.Spans,
-		Targets:            ca.spec.Feed.Targets,
+		Targets:            AllTargets(ca.spec.Feed),
 		Metrics:            &ca.metrics.KVFeedMetrics,
 		OnBackfillCallback: ca.sliMetrics.getBackfillCallback(),
 		MM:                 ca.kvFeedMemMon,
@@ -928,8 +928,7 @@ type changeFrontier struct {
 	// `passthroughBuf` being sent, so that one needs to be emptied first.
 	resolvedBuf *encDatumRowBuffer
 	// metrics are monitoring counters shared between all changefeeds.
-	metrics    *Metrics
-	sliMetrics *sliMetrics
+	metrics *Metrics
 	// metricsID is used as the unique id of this changefeed in the
 	// metrics.MaxBehindNanos map.
 	metricsID int
@@ -1082,7 +1081,7 @@ func newChangeFrontierProcessor(
 		cf.freqEmitResolved = emitNoResolved
 	}
 
-	if cf.encoder, err = getEncoder(spec.Feed.Opts, spec.Feed.Targets); err != nil {
+	if cf.encoder, err = getEncoder(spec.Feed.Opts, AllTargets(spec.Feed)); err != nil {
 		return nil, err
 	}
 
@@ -1116,7 +1115,6 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 		cf.MoveToDraining(err)
 		return
 	}
-	cf.sliMetrics = sli
 	cf.sink, err = getSink(ctx, cf.flowCtx.Cfg, cf.spec.Feed, nilOracle,
 		cf.spec.User(), cf.spec.JobID, sli)
 
@@ -1175,7 +1173,7 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 	cf.metrics.mu.Lock()
 	cf.metricsID = cf.metrics.mu.id
 	cf.metrics.mu.id++
-	sli.RunningCount.Inc(1)
+	cf.metrics.Running.Inc(1)
 	cf.metrics.mu.Unlock()
 	// TODO(dan): It's very important that we de-register from the metric because
 	// if we orphan an entry in there, our monitoring will lie (say the changefeed
@@ -1212,7 +1210,7 @@ func (cf *changeFrontier) closeMetrics() {
 	// considered by the gauge.
 	cf.metrics.mu.Lock()
 	if cf.metricsID > 0 {
-		cf.sliMetrics.RunningCount.Dec(1)
+		cf.metrics.Running.Dec(1)
 	}
 	delete(cf.metrics.mu.resolved, cf.metricsID)
 	cf.metricsID = -1
@@ -1517,7 +1515,7 @@ func (cf *changeFrontier) maybeProtectTimestamp(
 	}
 
 	jobID := cf.spec.JobID
-	targets := cf.spec.Feed.Targets
+	targets := AllTargets(cf.spec.Feed)
 	return createProtectedTimestampRecord(ctx, cf.flowCtx.Codec(), pts, txn, jobID, targets, resolved, progress)
 }
 
