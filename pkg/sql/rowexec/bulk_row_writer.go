@@ -59,7 +59,7 @@ func newBulkRowWriterProcessor(
 		flowCtx:        flowCtx,
 		processorID:    processorID,
 		batchIdxAtomic: 0,
-		tableDesc:      flowCtx.TableDescriptor(&spec.Table),
+		tableDesc:      spec.BuildTableDescriptor(),
 		spec:           spec,
 		input:          input,
 		output:         output,
@@ -78,7 +78,9 @@ func (sp *bulkRowWriter) Start(ctx context.Context) {
 	ctx = sp.StartInternal(ctx, "bulkRowWriter")
 	sp.input.Start(ctx)
 	err := sp.work(ctx)
-	sp.MoveToDraining(err)
+	if err != nil {
+		sp.MoveToDraining(err)
+	}
 }
 
 // Next is part of the RowSource interface.
@@ -139,12 +141,8 @@ func (sp *bulkRowWriter) ingestLoop(ctx context.Context, kvCh chan row.KVBatch) 
 		ctx, sp.flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
 			MinBufferSize: bufferSize,
 			// We disallow shadowing here to ensure that we report errors when builds
-			// of unique indexes fail when there are duplicate values. Note that while
-			// the timestamp passed does allow shadowing other writes by the same job,
-			// the check for allowed shadowing also requires the values match, so a
-			// conflicting unique index entry would still be rejected as its value
-			// would point to a different owning row.
-			DisallowShadowingBelow: writeTS,
+			// of unique indexes fail when there are duplicate values.
+			DisallowShadowing: true,
 		},
 	)
 	if err != nil {
@@ -184,7 +182,7 @@ func (sp *bulkRowWriter) convertLoop(
 	defer close(kvCh)
 
 	done := false
-	alloc := &tree.DatumAlloc{}
+	alloc := &rowenc.DatumAlloc{}
 	typs := sp.input.OutputTypes()
 
 	for {
