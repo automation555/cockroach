@@ -34,8 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -362,7 +360,7 @@ func PrependToMaybeNullArray(typ *types.T, left Datum, right Datum) (Datum, erro
 func initArrayElementConcatenation() {
 	for _, t := range types.Scalar {
 		typ := t
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
 			LeftType:     types.MakeArray(typ),
 			RightType:    typ,
 			ReturnType:   types.MakeArray(typ),
@@ -373,7 +371,7 @@ func initArrayElementConcatenation() {
 			Volatility: VolatilityImmutable,
 		})
 
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
 			LeftType:     typ,
 			RightType:    types.MakeArray(typ),
 			ReturnType:   types.MakeArray(typ),
@@ -433,6 +431,26 @@ func ArrayContains(ctx *EvalContext, haystack *DArray, needles *DArray) (*DBool,
 	return DBoolTrue, nil
 }
 
+// ArrayOverlaps return true if there is even one element
+// common between the left and right arrays.
+func ArrayOverlaps(ctx *EvalContext, array, other *DArray) (*DBool, error) {
+	if !array.ParamTyp.Equivalent(other.ParamTyp) {
+		return nil, pgerror.New(pgcode.DatatypeMismatch, "cannot compare arrays with different element types")
+	}
+	for _, needle := range array.Array {
+		// Nulls don't compare to each other in && syntax.
+		if needle == DNull {
+			continue
+		}
+		for _, hay := range other.Array {
+			if needle.Compare(ctx, hay) == 0 {
+				return DBoolTrue, nil
+			}
+		}
+	}
+	return DBoolFalse, nil
+}
+
 // JSONExistsAny return true if any value in dArray is exist in the json
 func JSONExistsAny(_ *EvalContext, json DJSON, dArray *DArray) (*DBool, error) {
 	// TODO(justin): this can be optimized.
@@ -454,7 +472,7 @@ func JSONExistsAny(_ *EvalContext, json DJSON, dArray *DArray) (*DBool, error) {
 func initArrayToArrayConcatenation() {
 	for _, t := range types.Scalar {
 		typ := t
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
 			LeftType:     types.MakeArray(typ),
 			RightType:    types.MakeArray(typ),
 			ReturnType:   types.MakeArray(typ),
@@ -471,7 +489,7 @@ func initArrayToArrayConcatenation() {
 // and nonarrayelement + string concatenation.
 func initNonArrayToNonArrayConcatenation() {
 	addConcat := func(leftType, rightType *types.T, volatility Volatility) {
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
 			LeftType:     leftType,
 			RightType:    rightType,
 			ReturnType:   types.String,
@@ -558,8 +576,8 @@ func GetJSONPath(j json.JSON, ary DArray) (json.JSON, error) {
 }
 
 // BinOps contains the binary operations indexed by operation type.
-var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
-	treebin.Bitand: {
+var BinOps = map[BinaryOperatorSymbol]binOpOverload{
+	Bitand: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -599,7 +617,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Bitor: {
+	Bitor: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -639,7 +657,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Bitxor: {
+	Bitxor: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -667,7 +685,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Plus: {
+	Plus: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -962,7 +980,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Minus: {
+	Minus: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1276,7 +1294,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Mult: {
+	Mult: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1420,7 +1438,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Div: {
+	Div: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1530,7 +1548,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.FloorDiv: {
+	FloorDiv: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1610,7 +1628,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Mod: {
+	Mod: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1690,7 +1708,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Concat: {
+	Concat: {
 		&BinOp{
 			LeftType:   types.String,
 			RightType:  types.String,
@@ -1738,7 +1756,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 	},
 
 	// TODO(pmattis): Check that the shift is valid.
-	treebin.LShift: {
+	LShift: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1779,7 +1797,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.RShift: {
+	RShift: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1820,7 +1838,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Pow: {
+	Pow: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1883,7 +1901,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.JSONFetchVal: {
+	JSONFetchVal: {
 		&BinOp{
 			LeftType:   types.Jsonb,
 			RightType:  types.String,
@@ -1919,7 +1937,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.JSONFetchValPath: {
+	JSONFetchValPath: {
 		&BinOp{
 			LeftType:   types.Jsonb,
 			RightType:  types.MakeArray(types.String),
@@ -1938,7 +1956,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.JSONFetchText: {
+	JSONFetchText: {
 		&BinOp{
 			LeftType:   types.Jsonb,
 			RightType:  types.String,
@@ -1988,7 +2006,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.JSONFetchTextPath: {
+	JSONFetchTextPath: {
 		&BinOp{
 			LeftType:   types.Jsonb,
 			RightType:  types.MakeArray(types.String),
@@ -2057,10 +2075,10 @@ func (op *CmpOp) preferred() bool {
 }
 
 func cmpOpFixups(
-	cmpOps map[treecmp.ComparisonOperatorSymbol]cmpOpOverload,
-) map[treecmp.ComparisonOperatorSymbol]cmpOpOverload {
-	findVolatility := func(op treecmp.ComparisonOperatorSymbol, t *types.T) Volatility {
-		for _, impl := range cmpOps[treecmp.EQ] {
+	cmpOps map[ComparisonOperatorSymbol]cmpOpOverload,
+) map[ComparisonOperatorSymbol]cmpOpOverload {
+	findVolatility := func(op ComparisonOperatorSymbol, t *types.T) Volatility {
+		for _, impl := range cmpOps[EQ] {
 			o := impl.(*CmpOp)
 			if o.LeftType.Equivalent(t) && o.RightType.Equivalent(t) {
 				return o.Volatility
@@ -2071,31 +2089,31 @@ func cmpOpFixups(
 
 	// Array equality comparisons.
 	for _, t := range append(types.Scalar, types.AnyEnum) {
-		cmpOps[treecmp.EQ] = append(cmpOps[treecmp.EQ], &CmpOp{
+		cmpOps[EQ] = append(cmpOps[EQ], &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
 			Fn:         cmpOpScalarEQFn,
-			Volatility: findVolatility(treecmp.EQ, t),
+			Volatility: findVolatility(EQ, t),
 		})
-		cmpOps[treecmp.LE] = append(cmpOps[treecmp.LE], &CmpOp{
+		cmpOps[LE] = append(cmpOps[LE], &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
 			Fn:         cmpOpScalarLEFn,
-			Volatility: findVolatility(treecmp.LE, t),
+			Volatility: findVolatility(LE, t),
 		})
-		cmpOps[treecmp.LT] = append(cmpOps[treecmp.LT], &CmpOp{
+		cmpOps[LT] = append(cmpOps[LT], &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
 			Fn:         cmpOpScalarLTFn,
-			Volatility: findVolatility(treecmp.LT, t),
+			Volatility: findVolatility(LT, t),
 		})
 
-		cmpOps[treecmp.IsNotDistinctFrom] = append(cmpOps[treecmp.IsNotDistinctFrom], &CmpOp{
+		cmpOps[IsNotDistinctFrom] = append(cmpOps[IsNotDistinctFrom], &CmpOp{
 			LeftType:     types.MakeArray(t),
 			RightType:    types.MakeArray(t),
 			Fn:           cmpOpScalarIsFn,
 			NullableArgs: true,
-			Volatility:   findVolatility(treecmp.IsNotDistinctFrom, t),
+			Volatility:   findVolatility(IsNotDistinctFrom, t),
 		})
 	}
 
@@ -2152,8 +2170,8 @@ func makeIsFn(a, b *types.T, v Volatility) *CmpOp {
 }
 
 // CmpOps contains the comparison operations indexed by operation type.
-var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
-	treecmp.EQ: {
+var CmpOps = cmpOpFixups(map[ComparisonOperatorSymbol]cmpOpOverload{
+	EQ: {
 		// Single-type comparisons.
 		makeEqFn(types.AnyEnum, types.AnyEnum, VolatilityImmutable),
 		makeEqFn(types.Bool, types.Bool, VolatilityLeakProof),
@@ -2204,13 +2222,13 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			LeftType:  types.AnyTuple,
 			RightType: types.AnyTuple,
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), treecmp.MakeComparisonOperator(treecmp.EQ)), nil
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), MakeComparisonOperator(EQ)), nil
 			},
 			Volatility: VolatilityImmutable,
 		},
 	},
 
-	treecmp.LT: {
+	LT: {
 		// Single-type comparisons.
 		makeLtFn(types.AnyEnum, types.AnyEnum, VolatilityImmutable),
 		makeLtFn(types.Bool, types.Bool, VolatilityLeakProof),
@@ -2260,13 +2278,13 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			LeftType:  types.AnyTuple,
 			RightType: types.AnyTuple,
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), treecmp.MakeComparisonOperator(treecmp.LT)), nil
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), MakeComparisonOperator(LT)), nil
 			},
 			Volatility: VolatilityImmutable,
 		},
 	},
 
-	treecmp.LE: {
+	LE: {
 		// Single-type comparisons.
 		makeLeFn(types.AnyEnum, types.AnyEnum, VolatilityImmutable),
 		makeLeFn(types.Bool, types.Bool, VolatilityLeakProof),
@@ -2316,13 +2334,13 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			LeftType:  types.AnyTuple,
 			RightType: types.AnyTuple,
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), treecmp.MakeComparisonOperator(treecmp.LE)), nil
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), MakeComparisonOperator(LE)), nil
 			},
 			Volatility: VolatilityImmutable,
 		},
 	},
 
-	treecmp.IsNotDistinctFrom: {
+	IsNotDistinctFrom: {
 		&CmpOp{
 			LeftType:     types.Unknown,
 			RightType:    types.Unknown,
@@ -2393,13 +2411,13 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 				if left == DNull || right == DNull {
 					return MakeDBool(left == DNull && right == DNull), nil
 				}
-				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom)), nil
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), MakeComparisonOperator(IsNotDistinctFrom)), nil
 			},
 			Volatility: VolatilityImmutable,
 		},
 	},
 
-	treecmp.In: {
+	In: {
 		makeEvalTupleIn(types.AnyEnum, VolatilityLeakProof),
 		makeEvalTupleIn(types.Bool, VolatilityLeakProof),
 		makeEvalTupleIn(types.Bytes, VolatilityLeakProof),
@@ -2425,7 +2443,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		makeEvalTupleIn(types.VarBit, VolatilityLeakProof),
 	},
 
-	treecmp.Like: {
+	Like: {
 		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
@@ -2436,7 +2454,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.ILike: {
+	ILike: {
 		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
@@ -2447,7 +2465,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.SimilarTo: {
+	SimilarTo: {
 		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
@@ -2459,7 +2477,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.RegMatch: append(
+	RegMatch: append(
 		cmpOpOverload{
 			&CmpOp{
 				LeftType:  types.String,
@@ -2478,7 +2496,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		)...,
 	),
 
-	treecmp.RegIMatch: {
+	RegIMatch: {
 		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
@@ -2490,7 +2508,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.JSONExists: {
+	JSONExists: {
 		&CmpOp{
 			LeftType:  types.Jsonb,
 			RightType: types.String,
@@ -2508,7 +2526,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.JSONSomeExists: {
+	JSONSomeExists: {
 		&CmpOp{
 			LeftType:  types.Jsonb,
 			RightType: types.StringArray,
@@ -2519,7 +2537,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.JSONAllExists: {
+	JSONAllExists: {
 		&CmpOp{
 			LeftType:  types.Jsonb,
 			RightType: types.StringArray,
@@ -2543,7 +2561,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.Contains: {
+	Contains: {
 		&CmpOp{
 			LeftType:  types.AnyArray,
 			RightType: types.AnyArray,
@@ -2568,7 +2586,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.ContainedBy: {
+	ContainedBy: {
 		&CmpOp{
 			LeftType:  types.AnyArray,
 			RightType: types.AnyArray,
@@ -2592,7 +2610,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			Volatility: VolatilityImmutable,
 		},
 	},
-	treecmp.Overlaps: append(
+	Overlaps: append(
 		cmpOpOverload{
 			&CmpOp{
 				LeftType:  types.AnyArray,
@@ -2600,21 +2618,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 				Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 					array := MustBeDArray(left)
 					other := MustBeDArray(right)
-					if !array.ParamTyp.Equivalent(other.ParamTyp) {
-						return nil, pgerror.New(pgcode.DatatypeMismatch, "cannot compare arrays with different element types")
-					}
-					for _, needle := range array.Array {
-						// Nulls don't compare to each other in && syntax.
-						if needle == DNull {
-							continue
-						}
-						for _, hay := range other.Array {
-							if needle.Compare(ctx, hay) == 0 {
-								return DBoolTrue, nil
-							}
-						}
-					}
-					return DBoolFalse, nil
+					return ArrayOverlaps(ctx, array, other)
 				},
 				Volatility: VolatilityImmutable,
 			},
@@ -2727,12 +2731,13 @@ func makeBox2DComparisonOperators(op func(lhs, rhs *geo.CartesianBoundingBox) bo
 
 // This map contains the inverses for operators in the CmpOps map that have
 // inverses.
-var cmpOpsInverse map[treecmp.ComparisonOperatorSymbol]treecmp.ComparisonOperatorSymbol
+var cmpOpsInverse map[ComparisonOperatorSymbol]ComparisonOperatorSymbol
 
 func init() {
-	cmpOpsInverse = make(map[treecmp.ComparisonOperatorSymbol]treecmp.ComparisonOperatorSymbol)
-	for cmpOp := treecmp.ComparisonOperatorSymbol(0); cmpOp < treecmp.NumComparisonOperatorSymbols; cmpOp++ {
-		newOp, _, _, _, _ := FoldComparisonExpr(treecmp.MakeComparisonOperator(cmpOp), DNull, DNull)
+	cmpOpsInverse = make(map[ComparisonOperatorSymbol]ComparisonOperatorSymbol)
+	for cmpOpIdx := range comparisonOpName {
+		cmpOp := ComparisonOperatorSymbol(cmpOpIdx)
+		newOp, _, _, _, _ := FoldComparisonExpr(MakeComparisonOperator(cmpOp), DNull, DNull)
 		if newOp.Symbol != cmpOp {
 			cmpOpsInverse[newOp.Symbol] = cmpOp
 			cmpOpsInverse[cmpOp] = newOp.Symbol
@@ -2740,33 +2745,26 @@ func init() {
 	}
 }
 
-// CmpOpInverse returns the inverse of the comparison operator if it exists. The
-// second return value is true if it exists, and false otherwise.
-func CmpOpInverse(i treecmp.ComparisonOperatorSymbol) (treecmp.ComparisonOperatorSymbol, bool) {
-	inverse, ok := cmpOpsInverse[i]
-	return inverse, ok
-}
-
-func boolFromCmp(cmp int, op treecmp.ComparisonOperator) *DBool {
+func boolFromCmp(cmp int, op ComparisonOperator) *DBool {
 	switch op.Symbol {
-	case treecmp.EQ, treecmp.IsNotDistinctFrom:
+	case EQ, IsNotDistinctFrom:
 		return MakeDBool(cmp == 0)
-	case treecmp.LT:
+	case LT:
 		return MakeDBool(cmp < 0)
-	case treecmp.LE:
+	case LE:
 		return MakeDBool(cmp <= 0)
 	default:
 		panic(errors.AssertionFailedf("unexpected ComparisonOperator in boolFromCmp: %v", errors.Safe(op)))
 	}
 }
 
-func cmpOpScalarFn(ctx *EvalContext, left, right Datum, op treecmp.ComparisonOperator) Datum {
+func cmpOpScalarFn(ctx *EvalContext, left, right Datum, op ComparisonOperator) Datum {
 	// Before deferring to the Datum.Compare method, check for values that should
 	// be handled differently during SQL comparison evaluation than they should when
 	// ordering Datum values.
 	if left == DNull || right == DNull {
 		switch op.Symbol {
-		case treecmp.IsNotDistinctFrom:
+		case IsNotDistinctFrom:
 			return MakeDBool((left == DNull) == (right == DNull))
 
 		default:
@@ -2779,19 +2777,19 @@ func cmpOpScalarFn(ctx *EvalContext, left, right Datum, op treecmp.ComparisonOpe
 }
 
 func cmpOpScalarEQFn(ctx *EvalContext, left, right Datum) (Datum, error) {
-	return cmpOpScalarFn(ctx, left, right, treecmp.MakeComparisonOperator(treecmp.EQ)), nil
+	return cmpOpScalarFn(ctx, left, right, MakeComparisonOperator(EQ)), nil
 }
 func cmpOpScalarLTFn(ctx *EvalContext, left, right Datum) (Datum, error) {
-	return cmpOpScalarFn(ctx, left, right, treecmp.MakeComparisonOperator(treecmp.LT)), nil
+	return cmpOpScalarFn(ctx, left, right, MakeComparisonOperator(LT)), nil
 }
 func cmpOpScalarLEFn(ctx *EvalContext, left, right Datum) (Datum, error) {
-	return cmpOpScalarFn(ctx, left, right, treecmp.MakeComparisonOperator(treecmp.LE)), nil
+	return cmpOpScalarFn(ctx, left, right, MakeComparisonOperator(LE)), nil
 }
 func cmpOpScalarIsFn(ctx *EvalContext, left, right Datum) (Datum, error) {
-	return cmpOpScalarFn(ctx, left, right, treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom)), nil
+	return cmpOpScalarFn(ctx, left, right, MakeComparisonOperator(IsNotDistinctFrom)), nil
 }
 
-func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op treecmp.ComparisonOperator) Datum {
+func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op ComparisonOperator) Datum {
 	cmp := 0
 	sawNull := false
 	for i, leftElem := range left.D {
@@ -2800,7 +2798,7 @@ func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op treecmp.ComparisonOpe
 		// differently than when ordering Datums.
 		if leftElem == DNull || rightElem == DNull {
 			switch op.Symbol {
-			case treecmp.EQ:
+			case EQ:
 				// If either Datum is NULL and the op is EQ, we continue the
 				// comparison and the result is only NULL if the other (non-NULL)
 				// elements are equal. This is because NULL is thought of as "unknown",
@@ -2808,7 +2806,7 @@ func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op treecmp.ComparisonOpe
 				// being proven false, but does prevent it from being proven true.
 				sawNull = true
 
-			case treecmp.IsNotDistinctFrom:
+			case IsNotDistinctFrom:
 				// For IS NOT DISTINCT FROM, NULLs are "equal".
 				if leftElem != DNull || rightElem != DNull {
 					return DBoolFalse
@@ -2887,7 +2885,7 @@ func makeEvalTupleIn(typ *types.T, v Volatility) *CmpOp {
 						sawNull = true
 					} else {
 						// Use the EQ function which properly handles NULLs.
-						if res := cmpOpTupleFn(ctx, *argTuple, *val.(*DTuple), treecmp.MakeComparisonOperator(treecmp.EQ)); res == DNull {
+						if res := cmpOpTupleFn(ctx, *argTuple, *val.(*DTuple), MakeComparisonOperator(EQ)); res == DNull {
 							sawNull = true
 						} else if res == DBoolTrue {
 							return DBoolTrue, nil
@@ -2920,9 +2918,9 @@ func makeEvalTupleIn(typ *types.T, v Volatility) *CmpOp {
 // evalArrayCmp would be called with:
 //   evalDatumsCmp(ctx, LT, Any, CmpOp(LT, leftType, rightParamType), leftDatum, rightArray.Array).
 func evalDatumsCmp(
-	ctx *EvalContext, op, subOp treecmp.ComparisonOperator, fn *CmpOp, left Datum, right Datums,
+	ctx *EvalContext, op, subOp ComparisonOperator, fn *CmpOp, left Datum, right Datums,
 ) (Datum, error) {
-	all := op.Symbol == treecmp.All
+	all := op.Symbol == All
 	any := !all
 	sawNull := false
 	for _, elem := range right {
@@ -4071,7 +4069,7 @@ func (expr *CaseExpr) Eval(ctx *EvalContext) (Datum, error) {
 			if err != nil {
 				return nil, err
 			}
-			d, err := evalComparison(ctx, treecmp.MakeComparisonOperator(treecmp.EQ), val, arg)
+			d, err := evalComparison(ctx, MakeComparisonOperator(EQ), val, arg)
 			if err != nil {
 				return nil, err
 			}
@@ -4470,7 +4468,7 @@ func (expr *NullIfExpr) Eval(ctx *EvalContext) (Datum, error) {
 	if err != nil {
 		return nil, err
 	}
-	cond, err := evalComparison(ctx, treecmp.MakeComparisonOperator(treecmp.EQ), expr1, expr2)
+	cond, err := evalComparison(ctx, MakeComparisonOperator(EQ), expr1, expr2)
 	if err != nil {
 		return nil, err
 	}
@@ -4812,9 +4810,7 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 	return e.Eval(ctx)
 }
 
-func evalComparison(
-	ctx *EvalContext, op treecmp.ComparisonOperator, left, right Datum,
-) (Datum, error) {
+func evalComparison(ctx *EvalContext, op ComparisonOperator, left, right Datum) (Datum, error) {
 	if left == DNull || right == DNull {
 		return DNull, nil
 	}
@@ -4832,41 +4828,41 @@ func evalComparison(
 // this new operation, along with potentially flipped operands and "flipped"
 // and "not" flags.
 func FoldComparisonExpr(
-	op treecmp.ComparisonOperator, left, right Expr,
-) (newOp treecmp.ComparisonOperator, newLeft Expr, newRight Expr, flipped bool, not bool) {
+	op ComparisonOperator, left, right Expr,
+) (newOp ComparisonOperator, newLeft Expr, newRight Expr, flipped bool, not bool) {
 	switch op.Symbol {
-	case treecmp.NE:
+	case NE:
 		// NE(left, right) is implemented as !EQ(left, right).
-		return treecmp.MakeComparisonOperator(treecmp.EQ), left, right, false, true
-	case treecmp.GT:
+		return MakeComparisonOperator(EQ), left, right, false, true
+	case GT:
 		// GT(left, right) is implemented as LT(right, left)
-		return treecmp.MakeComparisonOperator(treecmp.LT), right, left, true, false
-	case treecmp.GE:
+		return MakeComparisonOperator(LT), right, left, true, false
+	case GE:
 		// GE(left, right) is implemented as LE(right, left)
-		return treecmp.MakeComparisonOperator(treecmp.LE), right, left, true, false
-	case treecmp.NotIn:
+		return MakeComparisonOperator(LE), right, left, true, false
+	case NotIn:
 		// NotIn(left, right) is implemented as !IN(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.In), left, right, false, true
-	case treecmp.NotLike:
+		return MakeComparisonOperator(In), left, right, false, true
+	case NotLike:
 		// NotLike(left, right) is implemented as !Like(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.Like), left, right, false, true
-	case treecmp.NotILike:
+		return MakeComparisonOperator(Like), left, right, false, true
+	case NotILike:
 		// NotILike(left, right) is implemented as !ILike(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.ILike), left, right, false, true
-	case treecmp.NotSimilarTo:
+		return MakeComparisonOperator(ILike), left, right, false, true
+	case NotSimilarTo:
 		// NotSimilarTo(left, right) is implemented as !SimilarTo(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.SimilarTo), left, right, false, true
-	case treecmp.NotRegMatch:
+		return MakeComparisonOperator(SimilarTo), left, right, false, true
+	case NotRegMatch:
 		// NotRegMatch(left, right) is implemented as !RegMatch(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.RegMatch), left, right, false, true
-	case treecmp.NotRegIMatch:
+		return MakeComparisonOperator(RegMatch), left, right, false, true
+	case NotRegIMatch:
 		// NotRegIMatch(left, right) is implemented as !RegIMatch(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.RegIMatch), left, right, false, true
-	case treecmp.IsDistinctFrom:
+		return MakeComparisonOperator(RegIMatch), left, right, false, true
+	case IsDistinctFrom:
 		// IsDistinctFrom(left, right) is implemented as !IsNotDistinctFrom(left, right)
 		// Note: this seems backwards, but IS NOT DISTINCT FROM is an extended
 		// version of IS and IS DISTINCT FROM is an extended version of IS NOT.
-		return treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom), left, right, false, true
+		return MakeComparisonOperator(IsNotDistinctFrom), left, right, false, true
 	}
 	return op, left, right, false, false
 }
@@ -5666,7 +5662,7 @@ func anchorPattern(pattern string, caseInsensitive bool) string {
 // FindEqualComparisonFunction looks up an overload of the "=" operator
 // for a given pair of input operand types.
 func FindEqualComparisonFunction(leftType, rightType *types.T) (TwoArgFn, bool) {
-	fn, found := CmpOps[treecmp.EQ].LookupImpl(leftType, rightType)
+	fn, found := CmpOps[EQ].LookupImpl(leftType, rightType)
 	if found {
 		return fn.Fn, true
 	}
@@ -5696,9 +5692,9 @@ func PickFromTuple(ctx *EvalContext, greatest bool, args Datums) (Datum, error) 
 		var eval Datum
 		var err error
 		if greatest {
-			eval, err = evalComparison(ctx, treecmp.MakeComparisonOperator(treecmp.LT), g, d)
+			eval, err = evalComparison(ctx, MakeComparisonOperator(LT), g, d)
 		} else {
-			eval, err = evalComparison(ctx, treecmp.MakeComparisonOperator(treecmp.LT), d, g)
+			eval, err = evalComparison(ctx, MakeComparisonOperator(LT), d, g)
 		}
 		if err != nil {
 			return nil, err
