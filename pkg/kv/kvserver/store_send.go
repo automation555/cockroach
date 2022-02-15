@@ -69,7 +69,7 @@ func (s *Store) Send(
 		ba = newBa
 	}
 
-	if err := ba.SetActiveTimestamp(s.Clock()); err != nil {
+	if err := ba.SetActiveTimestamp(s.Clock().Now); err != nil {
 		return nil, roachpb.NewError(err)
 	}
 
@@ -107,23 +107,6 @@ func (s *Store) Send(
 			} else {
 				if br.Txn == nil {
 					br.Txn = ba.Txn
-				}
-				// Update our clock with the outgoing response txn timestamp
-				// (if timestamp has been forwarded).
-				if ba.Timestamp.Less(br.Txn.WriteTimestamp) {
-					if clockTS, ok := br.Txn.WriteTimestamp.TryToClockTimestamp(); ok {
-						s.cfg.Clock.Update(clockTS)
-					}
-				}
-			}
-		} else {
-			if pErr == nil {
-				// Update our clock with the outgoing response timestamp.
-				// (if timestamp has been forwarded).
-				if ba.Timestamp.Less(br.Timestamp) {
-					if clockTS, ok := br.Timestamp.TryToClockTimestamp(); ok {
-						s.cfg.Clock.Update(clockTS)
-					}
 				}
 			}
 		}
@@ -174,6 +157,10 @@ func (s *Store) Send(
 			return nil, roachpb.NewError(err)
 		}
 		if !repl.IsInitialized() {
+			repl.mu.RLock()
+			replicaID := repl.mu.replicaID
+			repl.mu.RUnlock()
+
 			// If we have an uninitialized copy of the range, then we are
 			// probably a valid member of the range, we're just in the
 			// process of getting our snapshot. If we returned
@@ -189,7 +176,7 @@ func (s *Store) Send(
 				Replica: roachpb.ReplicaDescriptor{
 					NodeID:    repl.store.nodeDesc.NodeID,
 					StoreID:   repl.store.StoreID(),
-					ReplicaID: repl.replicaID,
+					ReplicaID: replicaID,
 				},
 			})
 		}
