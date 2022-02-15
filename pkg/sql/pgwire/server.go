@@ -26,7 +26,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -38,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -55,8 +53,6 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"go.opentelemetry.io/otel/attribute"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // ATTENTION: After changing this value in a unit test, you probably want to
@@ -136,24 +132,6 @@ var (
 		Help:        "Latency to establish and authenticate a SQL connection",
 		Measurement: "Nanoseconds",
 		Unit:        metric.Unit_NANOSECONDS,
-	}
-	MetaPGWireCancelTotal = metric.Metadata{
-		Name:        "sql.pgwire_cancel.total",
-		Help:        "Counter of the number of pgwire query cancel requests",
-		Measurement: "Requests",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaPGWireCancelIgnored = metric.Metadata{
-		Name:        "sql.pgwire_cancel.ignored",
-		Help:        "Counter of the number of pgwire query cancel requests that were ignored due to rate limiting",
-		Measurement: "Requests",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaPGWireCancelSuccessful = metric.Metadata{
-		Name:        "sql.pgwire_cancel.successful",
-		Help:        "Counter of the number of pgwire query cancel requests that were successful",
-		Measurement: "Requests",
-		Unit:        metric.Unit_COUNT,
 	}
 )
 
@@ -251,32 +229,26 @@ type Server struct {
 
 // ServerMetrics is the set of metrics for the pgwire server.
 type ServerMetrics struct {
-	BytesInCount                *metric.Counter
-	BytesOutCount               *metric.Counter
-	Conns                       *metric.Gauge
-	NewConns                    *metric.Counter
-	ConnLatency                 *metric.Histogram
-	PGWireCancelTotalCount      *metric.Counter
-	PGWireCancelIgnoredCount    *metric.Counter
-	PGWireCancelSuccessfulCount *metric.Counter
-	ConnMemMetrics              sql.BaseMemoryMetrics
-	SQLMemMetrics               sql.MemoryMetrics
+	BytesInCount   *metric.Counter
+	BytesOutCount  *metric.Counter
+	Conns          *metric.Gauge
+	NewConns       *metric.Counter
+	ConnLatency    *metric.Histogram
+	ConnMemMetrics sql.BaseMemoryMetrics
+	SQLMemMetrics  sql.MemoryMetrics
 }
 
 func makeServerMetrics(
 	sqlMemMetrics sql.MemoryMetrics, histogramWindow time.Duration,
 ) ServerMetrics {
 	return ServerMetrics{
-		BytesInCount:                metric.NewCounter(MetaBytesIn),
-		BytesOutCount:               metric.NewCounter(MetaBytesOut),
-		Conns:                       metric.NewGauge(MetaConns),
-		NewConns:                    metric.NewCounter(MetaNewConns),
-		ConnLatency:                 metric.NewLatency(MetaConnLatency, histogramWindow),
-		PGWireCancelTotalCount:      metric.NewCounter(MetaPGWireCancelTotal),
-		PGWireCancelIgnoredCount:    metric.NewCounter(MetaPGWireCancelIgnored),
-		PGWireCancelSuccessfulCount: metric.NewCounter(MetaPGWireCancelSuccessful),
-		ConnMemMetrics:              sql.MakeBaseMemMetrics("conns", histogramWindow),
-		SQLMemMetrics:               sqlMemMetrics,
+		BytesInCount:   metric.NewCounter(MetaBytesIn),
+		BytesOutCount:  metric.NewCounter(MetaBytesOut),
+		Conns:          metric.NewGauge(MetaConns),
+		NewConns:       metric.NewCounter(MetaNewConns),
+		ConnLatency:    metric.NewLatency(MetaConnLatency, histogramWindow),
+		ConnMemMetrics: sql.MakeBaseMemMetrics("conns", histogramWindow),
+		SQLMemMetrics:  sqlMemMetrics,
 	}
 }
 
@@ -645,8 +617,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	case versionCancel:
 		// The cancel message is rather peculiar: it is sent without
 		// authentication, always over an unencrypted channel.
-		s.handleCancel(ctx, conn, &buf)
-		return nil
+		return handleCancel(conn)
 
 	case versionGSSENC:
 		// This is a request for an unsupported feature: GSS encryption.
@@ -697,8 +668,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 		// Yet, we've found clients in the wild that send the cancel
 		// after the TLS handshake, for example at
 		// https://github.com/cockroachlabs/support/issues/600.
-		s.handleCancel(ctx, conn, &buf)
-		return nil
+		return handleCancel(conn)
 
 	default:
 		// We don't know this protocol.
@@ -748,7 +718,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 		authOptions{
 			connType:        connType,
 			connDetails:     connDetails,
-			insecure:        s.cfg.Insecure,
+			disableAuthn:    s.cfg.SecurityOverrides.IsSet(base.DisableSQLAuthn),
 			ie:              s.execCfg.InternalExecutor,
 			auth:            hbaConf,
 			identMap:        identMap,
@@ -757,50 +727,12 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	return nil
 }
 
-// handleCancel handles a pgwire query cancellation request. Note that the
-// request is unauthenticated. To mitigate the security risk (i.e., a
-// malicious actor spamming this endpoint with random data to try to cancel
-// a query), the logic is rate-limited by a semaphore. Refer to the comments
-// in the pgwirecancel package for more information.
-//
-// This function does not return an error, so the caller (and possible
-// attacker) will not know if the cancellation attempt succeeded. Errors are
-// logged so that an operator can be aware of any possibly malicious requests.
-func (s *Server) handleCancel(ctx context.Context, conn net.Conn, buf *pgwirebase.ReadBuffer) {
+func handleCancel(conn net.Conn) error {
+	// Since we don't support this, close the door in the client's
+	// face. Make a note of that use in telemetry.
 	telemetry.Inc(sqltelemetry.CancelRequestCounter)
-	s.metrics.PGWireCancelTotalCount.Inc(1)
-
-	resp, err := func() (*serverpb.CancelQueryByKeyResponse, error) {
-		backendKeyDataBits, err := buf.GetUint64()
-		// The connection that issued the cancel is not a SQL session -- it's an
-		// entirely new connection that's created just to send the cancel. We close
-		// the connection as soon as possible after reading the data, since there
-		// is nothing to send back to the client.
-		_ = conn.Close()
-		if err != nil {
-			return nil, err
-		}
-		cancelKey := pgwirecancel.BackendKeyData(backendKeyDataBits)
-		// The request is forwarded to the appropriate node.
-		req := &serverpb.CancelQueryByKeyRequest{
-			SQLInstanceID:  cancelKey.GetSQLInstanceID(),
-			CancelQueryKey: cancelKey,
-		}
-		resp, err := s.execCfg.SQLStatusServer.CancelQueryByKey(ctx, req)
-		if len(resp.Error) > 0 {
-			err = errors.CombineErrors(err, errors.Newf("error from CancelQueryByKeyResponse: %s", resp.Error))
-		}
-		return resp, err
-	}()
-
-	if resp != nil && resp.Canceled {
-		s.metrics.PGWireCancelSuccessfulCount.Inc(1)
-	} else if err != nil {
-		if status := status.Convert(err); status.Code() == codes.ResourceExhausted {
-			s.metrics.PGWireCancelIgnoredCount.Inc(1)
-		}
-		log.Sessions.Warningf(ctx, "unexpected while handling pgwire cancellation request: %v", err)
-	}
+	_ = conn.Close()
+	return nil
 }
 
 // parseClientProvidedSessionParameters reads the incoming k/v pairs
@@ -1109,18 +1041,18 @@ func (s *Server) maybeUpgradeToSecureConn(
 	if version != versionSSL {
 		// The client did not require a SSL connection.
 
-		// Insecure mode: nothing to say, nothing to do.
-		// TODO(knz): Remove this condition - see
-		// https://github.com/cockroachdb/cockroach/issues/53404
-		if s.cfg.Insecure {
-			return
-		}
-
-		// Secure mode: disallow if TCP and the user did not opt into
-		// non-TLS SQL conns.
-		if !s.cfg.AcceptSQLWithoutTLS && connType != hba.ConnLocal {
+		// By default we require TLS. This can be disabled via a security override.
+		// If TLS is required, and the client is using a TCP conn, then reject
+		// a non-TLS connection attempt.
+		requireTLS := !s.cfg.SecurityOverrides.IsSet(base.DisableSQLRequireTLS)
+		if requireTLS && connType != hba.ConnLocal {
 			clientErr = pgerror.New(pgcode.ProtocolViolation, ErrSSLRequired)
 		}
+		return
+	}
+
+	if s.cfg.SecurityOverrides.IsSet(base.DisableSQLTLS) {
+		clientErr = pgerror.New(pgcode.ProtocolViolation, "SSL/TLS disabled on server by configuration")
 		return
 	}
 
