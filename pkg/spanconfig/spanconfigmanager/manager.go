@@ -174,7 +174,8 @@ func (m *Manager) run(ctx context.Context) {
 // hasn't been created already and notifies the jobs registry to adopt it.
 // Returns a boolean indicating if the job was created.
 func (m *Manager) createAndStartJobIfNoneExists(ctx context.Context) (bool, error) {
-	if m.knobs.ManagerDisableJobCreation {
+	if m.knobs.ManagerDisableJobCreation ||
+		!m.settings.Version.IsActive(ctx, clusterversion.EnsureSpanConfigReconciliation-1) {
 		return false, nil
 	}
 	record := jobs.Record{

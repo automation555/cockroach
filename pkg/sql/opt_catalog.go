@@ -15,6 +15,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
@@ -468,7 +469,9 @@ func (oc *optCatalog) getZoneConfig(desc catalog.TableDescriptor) (*zonepb.ZoneC
 	if oc.cfg == nil || desc.IsVirtualTable() {
 		return emptyZoneConfig, nil
 	}
-	zone, err := oc.cfg.GetZoneConfigForObject(oc.codec(), uint32(desc.GetID()))
+	zone, err := oc.cfg.GetZoneConfigForObject(
+		oc.codec(), oc.version(), config.ObjectID(desc.GetID()),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -481,6 +484,12 @@ func (oc *optCatalog) getZoneConfig(desc catalog.TableDescriptor) (*zonepb.ZoneC
 
 func (oc *optCatalog) codec() keys.SQLCodec {
 	return oc.planner.ExecCfg().Codec
+}
+
+func (oc *optCatalog) version() clusterversion.ClusterVersion {
+	return oc.planner.ExecCfg().Settings.Version.ActiveVersionOrEmpty(
+		oc.planner.EvalContext().Context,
+	)
 }
 
 // optView is a wrapper around catalog.TableDescriptor that implements
