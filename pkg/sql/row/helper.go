@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/rowencpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -43,7 +42,6 @@ const (
 )
 
 var maxRowSizeLog = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
 	"sql.guardrails.max_row_size_log",
 	"maximum size of row (or column family if multiple column families are in use) that SQL can "+
 		"write to the database, above which an event is logged to SQL_PERF (or SQL_INTERNAL_PERF "+
@@ -66,7 +64,6 @@ var maxRowSizeLog = settings.RegisterByteSizeSetting(
 ).WithPublic()
 
 var maxRowSizeErr = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
 	"sql.guardrails.max_row_size_err",
 	"maximum size of row (or column family if multiple column families are in use) that SQL can "+
 		"write to the database, above which an error is returned; use 0 to disable",
@@ -173,9 +170,8 @@ func (rh *rowHelper) encodePrimaryIndex(
 	colIDtoRowIndex catalog.TableColMap, values []tree.Datum,
 ) (primaryIndexKey []byte, err error) {
 	if rh.primaryIndexKeyPrefix == nil {
-		rh.primaryIndexKeyPrefix = rowenc.MakeIndexKeyPrefix(
-			rh.Codec, rh.TableDesc.GetID(), rh.TableDesc.GetPrimaryIndexID(),
-		)
+		rh.primaryIndexKeyPrefix = rowenc.MakeIndexKeyPrefix(rh.Codec, rh.TableDesc,
+			rh.TableDesc.GetPrimaryIndexID())
 	}
 	primaryIndexKey, _, err = rowenc.EncodeIndexKey(
 		rh.TableDesc, rh.TableDesc.GetPrimaryIndex(), colIDtoRowIndex, values, rh.primaryIndexKeyPrefix)
@@ -304,7 +300,7 @@ func (rh *rowHelper) checkRowSize(
 	return nil
 }
 
-var deleteEncoding protoutil.Message = &rowencpb.IndexValueWrapper{
+var deleteEncoding protoutil.Message = &descpb.IndexValueWrapper{
 	Value:   nil,
 	Deleted: true,
 }

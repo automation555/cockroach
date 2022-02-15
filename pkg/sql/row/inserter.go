@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -48,7 +48,7 @@ func MakeInserter(
 	codec keys.SQLCodec,
 	tableDesc catalog.TableDescriptor,
 	insertCols []catalog.Column,
-	alloc *tree.DatumAlloc,
+	alloc *rowenc.DatumAlloc,
 	sv *settings.Values,
 	internal bool,
 	metrics *Metrics,
@@ -143,13 +143,10 @@ func (ri *Inserter) InsertRow(
 	// Encode the values to the expected column type. This needs to
 	// happen before index encoding because certain datum types (i.e. tuple)
 	// cannot be used as index values.
-	//
-	// TODO(radu): the legacy marshaling is used only in rare cases; this is
-	// wasteful.
 	for i, val := range values {
 		// Make sure the value can be written to the column before proceeding.
 		var err error
-		if ri.marshaled[i], err = valueside.MarshalLegacy(ri.InsertCols[i].GetType(), val); err != nil {
+		if ri.marshaled[i], err = rowenc.MarshalColumnValue(ri.InsertCols[i], val); err != nil {
 			return err
 		}
 	}
@@ -166,6 +163,10 @@ func (ri *Inserter) InsertRow(
 	// because w is null, and the sole resident of that family.
 	// We don't want to insert empty k/v's like this, so we
 	// set includeEmpty to false.
+	if ri.Helper.TableDesc.GetName() == "t" {
+		fmt.Println("break")
+	}
+
 	primaryIndexKey, secondaryIndexEntries, err := ri.Helper.encodeIndexes(
 		ri.InsertColIDtoRowIndex, values, pm.IgnoreForPut, false /* includeEmpty */)
 	if err != nil {
@@ -191,13 +192,7 @@ func (ri *Inserter) InsertRow(
 		if ok {
 			for i := range entries {
 				e := &entries[i]
-
-				if ri.Helper.Indexes[idx].ForcePut() {
-					// See the comemnt on (catalog.Index).ForcePut() for more details.
-					insertPutFn(ctx, b, &e.Key, &e.Value, traceKV)
-				} else {
-					putFn(ctx, b, &e.Key, &e.Value, traceKV)
-				}
+				putFn(ctx, b, &e.Key, &e.Value, traceKV)
 			}
 		}
 	}
