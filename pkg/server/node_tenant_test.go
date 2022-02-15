@@ -39,7 +39,7 @@ func TestRedactRecordingForTenant(t *testing.T) {
 		tagSensitive    = "tag-tenant-hidden"
 	)
 
-	mkRec := func() tracing.Recording {
+	mkRec := func() tracingpb.Recording {
 		t.Helper()
 		tags := (&logtags.Buffer{}).
 			Add("tag_sensitive", tagSensitive).
@@ -47,10 +47,10 @@ func TestRedactRecordingForTenant(t *testing.T) {
 		ctx := logtags.WithTags(context.Background(), tags)
 		tracer := tracing.NewTracer()
 		tracer.SetRedactable(true)
-		ctx, sp := tracer.StartSpanCtx(ctx, "foo", tracing.WithRecording(tracing.RecordingVerbose))
+		ctx, sp := tracer.StartSpanCtx(ctx, "foo", tracing.WithRecording(tracingpb.RecordingVerbose))
 		log.Eventf(ctx, "%s %s", msgSensitive, log.Safe(msgNotSensitive))
 		sp.SetTag("all_span_tags_are_stripped", attribute.StringValue("because_no_redactability"))
-		rec := sp.FinishAndGetRecording(tracing.RecordingVerbose)
+		rec := sp.FinishAndGetRecording(tracingpb.RecordingVerbose)
 		require.Len(t, rec, 1)
 		return rec
 	}

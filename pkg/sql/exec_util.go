@@ -68,7 +68,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -790,14 +789,8 @@ var (
 	}
 	MetaSQLTxnsOpen = metric.Metadata{
 		Name:        "sql.txns.open",
-		Help:        "Number of currently open user SQL transactions",
+		Help:        "Number of currently open SQL transactions",
 		Measurement: "Open SQL Transactions",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaSQLActiveQueries = metric.Metadata{
-		Name:        "sql.statements.active",
-		Help:        "Number of currently active user SQL statements",
-		Measurement: "Active Statements",
 		Unit:        metric.Unit_COUNT,
 	}
 	MetaFullTableOrIndexScan = metric.Metadata{
@@ -1182,7 +1175,6 @@ type ExecutorConfig struct {
 	DistSQLRunTestingKnobs               *execinfra.TestingKnobs
 	EvalContextTestingKnobs              tree.EvalContextTestingKnobs
 	TenantTestingKnobs                   *TenantTestingKnobs
-	TTLTestingKnobs                      *TTLTestingKnobs
 	BackupRestoreTestingKnobs            *BackupRestoreTestingKnobs
 	StreamingTestingKnobs                *StreamingTestingKnobs
 	SQLStatsTestingKnobs                 *sqlstats.TestingKnobs
@@ -1380,7 +1372,7 @@ type ExecutorTestingKnobs struct {
 
 	// WithStatementTrace is called after the statement is executed in
 	// execStmtInOpenState.
-	WithStatementTrace func(trace tracing.Recording, stmt string)
+	WithStatementTrace func(trace tracingpb.Recording, stmt string)
 
 	// RunAfterSCJobsCacheLookup is called after the SchemaChangeJobCache is checked for
 	// a given table id.
@@ -1467,16 +1459,6 @@ var _ base.ModuleTestingKnobs = &TenantTestingKnobs{}
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (*TenantTestingKnobs) ModuleTestingKnobs() {}
-
-// TTLTestingKnobs contains testing knobs for TTL deletion.
-type TTLTestingKnobs struct {
-	// AOSTDuration changes the AOST timestamp duration to add to the
-	// current time.
-	AOSTDuration *time.Duration
-}
-
-// ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
-func (*TTLTestingKnobs) ModuleTestingKnobs() {}
 
 // BackupRestoreTestingKnobs contains knobs for backup and restore behavior.
 type BackupRestoreTestingKnobs struct {
@@ -1882,39 +1864,30 @@ type SessionArgs struct {
 // Use register() and deregister() to modify this registry.
 type SessionRegistry struct {
 	syncutil.Mutex
-	sessions            map[ClusterWideID]registrySession
-	sessionsByCancelKey map[pgwirecancel.BackendKeyData]registrySession
+	sessions map[ClusterWideID]registrySession
 }
 
 // NewSessionRegistry creates a new SessionRegistry with an empty set
 // of sessions.
 func NewSessionRegistry() *SessionRegistry {
-	return &SessionRegistry{
-		sessions:            make(map[ClusterWideID]registrySession),
-		sessionsByCancelKey: make(map[pgwirecancel.BackendKeyData]registrySession),
-	}
+	return &SessionRegistry{sessions: make(map[ClusterWideID]registrySession)}
 }
 
-func (r *SessionRegistry) register(
-	id ClusterWideID, queryCancelKey pgwirecancel.BackendKeyData, s registrySession,
-) {
+func (r *SessionRegistry) register(id ClusterWideID, s registrySession) {
 	r.Lock()
-	defer r.Unlock()
 	r.sessions[id] = s
-	r.sessionsByCancelKey[queryCancelKey] = s
+	r.Unlock()
 }
 
-func (r *SessionRegistry) deregister(id ClusterWideID, queryCancelKey pgwirecancel.BackendKeyData) {
+func (r *SessionRegistry) deregister(id ClusterWideID) {
 	r.Lock()
-	defer r.Unlock()
 	delete(r.sessions, id)
-	delete(r.sessionsByCancelKey, queryCancelKey)
+	r.Unlock()
 }
 
 type registrySession interface {
 	user() security.SQLUsername
 	cancelQuery(queryID ClusterWideID) bool
-	cancelCurrentQueries() bool
 	cancelSession()
 	// serialize serializes a Session into a serverpb.Session
 	// that can be served over RPC.
@@ -1939,22 +1912,6 @@ func (r *SessionRegistry) CancelQuery(queryIDStr string) (bool, error) {
 	}
 
 	return false, fmt.Errorf("query ID %s not found", queryID)
-}
-
-// CancelQueryByKey looks up the associated query in the session registry and
-// cancels it.
-func (r *SessionRegistry) CancelQueryByKey(
-	queryCancelKey pgwirecancel.BackendKeyData,
-) (canceled bool, err error) {
-	r.Lock()
-	defer r.Unlock()
-	if session, ok := r.sessionsByCancelKey[queryCancelKey]; ok {
-		if session.cancelCurrentQueries() {
-			return true, nil
-		}
-		return false, nil
-	}
-	return false, fmt.Errorf("session for cancel key %d not found", queryCancelKey)
 }
 
 // CancelSession looks up the specified session in the session registry and
@@ -2119,7 +2076,7 @@ type SessionTracing struct {
 
 	// If recording==true, recordingType indicates the type of the current
 	// recording.
-	recordingType tracing.RecordingType
+	recordingType tracingpb.RecordingType
 
 	// ex is the connExecutor to which this SessionTracing is tied.
 	ex *connExecutor
@@ -2140,7 +2097,7 @@ func (st *SessionTracing) getSessionTrace() ([]traceRow, error) {
 		return st.lastRecording, nil
 	}
 
-	return generateSessionTraceVTable(st.connSpan.GetRecording(tracing.RecordingVerbose))
+	return generateSessionTraceVTable(st.connSpan.GetRecording(tracingpb.RecordingVerbose))
 }
 
 // StartTracing starts "session tracing". From this moment on, everything
@@ -2162,7 +2119,7 @@ func (st *SessionTracing) getSessionTrace() ([]traceRow, error) {
 //   are per-row.
 // showResults: If set, result rows are reported in the trace.
 func (st *SessionTracing) StartTracing(
-	recType tracing.RecordingType, kvTracingEnabled, showResults bool,
+	recType tracingpb.RecordingType, kvTracingEnabled, showResults bool,
 ) error {
 	if st.enabled {
 		// We're already tracing. Only treat as no-op if the same options
@@ -2241,10 +2198,10 @@ func (st *SessionTracing) StopTracing() error {
 	st.enabled = false
 	st.kvTracingEnabled = false
 	st.showResults = false
-	st.recordingType = tracing.RecordingOff
+	st.recordingType = tracingpb.RecordingOff
 
 	// Accumulate all recordings and finish the tracing spans.
-	rec := st.connSpan.GetRecording(tracing.RecordingVerbose)
+	rec := st.connSpan.GetRecording(tracingpb.RecordingVerbose)
 	// We're about to finish this span, but there might be a child that remains
 	// open - the child corresponding to the current transaction. We don't want
 	// that span to be recording any more.

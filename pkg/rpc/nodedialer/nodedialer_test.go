@@ -235,7 +235,7 @@ func TestConnHealthInternal(t *testing.T) {
 	// Set up an internal server and relevant configuration. The RPC connection
 	// will then be considered internal, and we don't have to dial it.
 	rpcCtx := newTestContext(clock, stopper)
-	rpcCtx.SetLocalInternalServer(&internalServer{})
+	rpcCtx.SetLocalInternalServer(&internalServer{}, nil /* unaryServerInterceptors */, nil /* streamServerInterceptors */)
 	rpcCtx.NodeID.Set(ctx, staticNodeID)
 	rpcCtx.Config.AdvertiseAddr = localAddr.String()
 
@@ -595,6 +595,18 @@ func (*internalServer) GetSpanConfigs(
 func (*internalServer) UpdateSpanConfigs(
 	context.Context, *roachpb.UpdateSpanConfigsRequest,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
+	panic("unimplemented")
+}
+
+func (*internalServer) GetSystemSpanConfigs(
+	context.Context, *roachpb.GetSystemSpanConfigsRequest,
+) (*roachpb.GetSystemSpanConfigsResponse, error) {
+	panic("unimplemented")
+}
+
+func (*internalServer) UpdateSystemSpanConfigs(
+	context.Context, *roachpb.UpdateSystemSpanConfigsRequest,
+) (*roachpb.UpdateSystemSpanConfigsResponse, error) {
 	panic("unimplemented")
 }
 

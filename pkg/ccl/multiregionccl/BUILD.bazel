@@ -33,7 +33,6 @@ go_test(
     ],
     data = glob(["testdata/**"]),
     embed = [":multiregionccl"],
-    shard_count = 16,
     deps = [
         "//pkg/base",
         "//pkg/ccl",
@@ -73,6 +72,7 @@ go_test(
         "//pkg/util/randutil",
         "//pkg/util/syncutil",
         "//pkg/util/tracing",
+        "//pkg/util/tracing/tracingpb",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",

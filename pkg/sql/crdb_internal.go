@@ -41,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -1294,8 +1293,8 @@ CREATE TABLE crdb_internal.session_trace (
 // returns rows when accessed with an index constraint specifying the trace_id
 // for which inflight spans need to be aggregated from all nodes in the cluster.
 //
-// Each row in the virtual table corresponds to a single `tracing.Recording` on
-// a particular node. A `tracing.Recording` is the trace of a single operation
+// Each row in the virtual table corresponds to a single `tracingpb.Recording` on
+// a particular node. A `tracingpb.Recording` is the trace of a single operation
 // rooted at a root span on that node. Under the hood, the virtual table
 // contacts all "live" nodes in the cluster via the trace collector which
 // streams back a recording at a time.
@@ -1304,7 +1303,7 @@ CREATE TABLE crdb_internal.session_trace (
 // The virtual table also produces rows lazily, i.e. as and when they are
 // consumed by the consumer. Therefore, the memory overhead of querying this
 // table will be the size of all the `tracing.Recordings` of a particular
-// `trace_id` on a single node in the cluster. Each `tracing.Recording` has its
+// `trace_id` on a single node in the cluster. Each `tracingpb.Recording` has its
 // own memory protections via ring buffers, and so we do not expect this
 // overhead to grow in an unbounded manner.
 var crdbInternalClusterInflightTracesTable = virtualSchemaTable{
@@ -1399,7 +1398,7 @@ CREATE TABLE crdb_internal.node_inflight_trace_spans (
 				"only users with the admin role are allowed to read crdb_internal.node_inflight_trace_spans")
 		}
 		return p.ExecCfg().AmbientCtx.Tracer.VisitSpans(func(span tracing.RegistrySpan) error {
-			for _, rec := range span.GetFullRecording(tracing.RecordingVerbose) {
+			for _, rec := range span.GetFullRecording(tracingpb.RecordingVerbose) {
 				traceID := rec.TraceID
 				parentSpanID := rec.ParentSpanID
 				spanID := rec.SpanID
@@ -2624,6 +2623,8 @@ CREATE TABLE crdb_internal.table_columns (
 }
 
 // crdbInternalTableIndexesTable exposes the index descriptors.
+//
+// TODO(tbg): prefix with kv_.
 var crdbInternalTableIndexesTable = virtualSchemaTable{
 	comment: "indexes accessible by current user in current database (KV scan)",
 	schema: `
@@ -2635,8 +2636,7 @@ CREATE TABLE crdb_internal.table_indexes (
   index_type       STRING NOT NULL,
   is_unique        BOOL NOT NULL,
   is_inverted      BOOL NOT NULL,
-  is_sharded       BOOL NOT NULL,
-  created_at       TIMESTAMP
+  is_sharded       BOOL NOT NULL
 )
 `,
 	generator: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
@@ -2658,15 +2658,6 @@ CREATE TABLE crdb_internal.table_indexes (
 						if idx.Primary() {
 							idxType = primary
 						}
-						createdAt := tree.DNull
-						if ts := idx.CreatedAt(); !ts.IsZero() {
-							tsDatum, err := tree.MakeDTimestamp(ts, time.Nanosecond)
-							if err != nil {
-								log.Warningf(ctx, "failed to construct timestamp for index: %v", err)
-							} else {
-								createdAt = tsDatum
-							}
-						}
 						row = append(row,
 							tableID,
 							tableName,
@@ -2676,7 +2667,6 @@ CREATE TABLE crdb_internal.table_indexes (
 							tree.MakeDBool(tree.DBool(idx.IsUnique())),
 							tree.MakeDBool(idx.GetType() == descpb.IndexDescriptor_INVERTED),
 							tree.MakeDBool(tree.DBool(idx.IsSharded())),
-							createdAt,
 						)
 						return pusher.pushRow(row...)
 					})
@@ -4465,7 +4455,7 @@ func collectMarshaledJobMetadataMap(
 			continue
 		}
 		for _, j := range tbl.GetMutationJobs() {
-			referencedJobIDs[j.JobID] = struct{}{}
+			referencedJobIDs[jobspb.JobID(j.JobID)] = struct{}{}
 		}
 	}
 	if len(referencedJobIDs) == 0 {
@@ -4919,7 +4909,7 @@ CREATE TABLE crdb_internal.default_privileges (
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, nil /* all databases */, true, /* requiresPrivileges */
 			func(descriptor catalog.DatabaseDescriptor) error {
-				addRowHelper := func(defaultPrivilegesForRole catpb.DefaultPrivilegesForRole) error {
+				addRowHelper := func(defaultPrivilegesForRole descpb.DefaultPrivilegesForRole) error {
 					role := tree.DNull
 					forAllRoles := tree.DBoolTrue
 					if defaultPrivilegesForRole.IsExplicitRole() {
@@ -4981,13 +4971,13 @@ CREATE TABLE crdb_internal.default_privileges (
 					}
 					return nil
 				}
-				addRowForRole := func(role catpb.DefaultPrivilegesRole) error {
+				addRowForRole := func(role descpb.DefaultPrivilegesRole) error {
 					defaultPrivilegeDescriptor := dbContext.GetDefaultPrivilegeDescriptor()
 					defaultPrivilegesForRole, found := defaultPrivilegeDescriptor.GetDefaultPrivilegesForRole(role)
 					if !found {
 						// If an entry is not found for the role, the role still has
 						// the default set of default privileges.
-						newDefaultPrivilegesForRole := catpb.InitDefaultPrivilegesForRole(role, defaultPrivilegeDescriptor.GetDefaultPrivilegeDescriptorType())
+						newDefaultPrivilegesForRole := descpb.InitDefaultPrivilegesForRole(role, defaultPrivilegeDescriptor.GetDefaultPrivilegeDescriptorType())
 						defaultPrivilegesForRole = &newDefaultPrivilegesForRole
 					}
 					if err := addRowHelper(*defaultPrivilegesForRole); err != nil {
@@ -4996,7 +4986,7 @@ CREATE TABLE crdb_internal.default_privileges (
 					return nil
 				}
 				if err := forEachRole(ctx, p, func(username security.SQLUsername, isRole bool, options roleOptions, settings tree.Datum) error {
-					role := catpb.DefaultPrivilegesRole{
+					role := descpb.DefaultPrivilegesRole{
 						Role: username,
 					}
 					return addRowForRole(role)
@@ -5005,7 +4995,7 @@ CREATE TABLE crdb_internal.default_privileges (
 				}
 
 				// Handle ForAllRoles outside of forEachRole since it is a pseudo role.
-				role := catpb.DefaultPrivilegesRole{
+				role := descpb.DefaultPrivilegesRole{
 					ForAllRoles: true,
 				}
 				return addRowForRole(role)
@@ -5132,8 +5122,10 @@ CREATE TABLE crdb_internal.cluster_statement_statistics (
 				transactionFingerprintID := tree.NewDBytes(
 					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(statistics.Key.TransactionFingerprintID))))
 
+				// TODO(azhng): properly update plan_hash value once we can expose it
+				//  from the optimizer.
 				planHash := tree.NewDBytes(
-					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(statistics.Key.PlanHash)))
+					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(0)))
 
 				metadataJSON, err := sqlstatsutil.BuildStmtMetadataJSON(statistics)
 				if err != nil {

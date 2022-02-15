@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 )
 
 // EngineMetrics groups a set of SQL metrics.
@@ -39,7 +39,6 @@ type EngineMetrics struct {
 	SQLServiceLatency     *metric.Histogram
 	SQLTxnLatency         *metric.Histogram
 	SQLTxnsOpen           *metric.Gauge
-	SQLActiveStatements   *metric.Gauge
 
 	// TxnAbortCount counts transactions that were aborted, either due
 	// to non-retriable errors, or retriable errors when the client-side
@@ -164,7 +163,6 @@ func (ex *connExecutor) recordStatementSummary(
 		FullScan:     flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan),
 		Failed:       stmtErr != nil,
 		Database:     planner.SessionData().Database,
-		PlanHash:     planner.instrumentation.planGist.Hash(),
 	}
 
 	// We only populate the transaction fingerprint ID field if we are in an
@@ -206,7 +204,6 @@ func (ex *connExecutor) recordStatementSummary(
 		Nodes:           getNodesFromPlanner(planner),
 		StatementType:   stmt.AST.StatementType(),
 		Plan:            planner.instrumentation.PlanForStats(ctx),
-		PlanGist:        planner.instrumentation.planGist.String(),
 		StatementError:  stmtErr,
 	}
 
@@ -279,7 +276,7 @@ func getNodesFromPlanner(planner *planner) []int64 {
 	// Retrieve the list of all nodes which the statement was executed on.
 	var nodes []int64
 	if planner.instrumentation.sp != nil {
-		trace := planner.instrumentation.sp.GetRecording(tracing.RecordingStructured)
+		trace := planner.instrumentation.sp.GetRecording(tracingpb.RecordingStructured)
 		// ForEach returns nodes in order.
 		execinfrapb.ExtractNodesFromSpans(planner.EvalContext().Context, trace).ForEach(func(i int) {
 			nodes = append(nodes, int64(i))

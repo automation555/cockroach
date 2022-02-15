@@ -90,10 +90,6 @@ gomock(
     library = ":kvcoord",
     package = "kvcoord",
     self_package = "github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord",
-    visibility = [
-        ":__pkg__",
-        "//pkg/gen:__pkg__",
-    ],
 )
 
 # This noop target is a workaround for https://github.com/bazelbuild/bazel-gazelle/issues/1078.
@@ -186,6 +182,7 @@ go_test(
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/tracing",
+        "//pkg/util/tracing/tracingpb",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_circuitbreaker//:circuitbreaker",
         "@com_github_cockroachdb_datadriven//:datadriven",

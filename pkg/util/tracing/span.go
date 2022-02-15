@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/petermattis/goid"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/trace"
 )
@@ -48,7 +49,7 @@ const (
 // rather than reporting to some external sink, the caller's "owner"
 // must propagate the trace data back across process boundaries towards
 // the root of the trace span tree; see WithParent
-// and WithRemoteParentFromSpanMeta, respectively.
+// and WithRemoteParent, respectively.
 //
 // Additionally, the internal span type also supports turning on, stopping,
 // and restarting its data collection (see Span.StartRecording), and this is
@@ -270,9 +271,9 @@ func (sp *Span) finishInternal() {
 //
 // Returns nil if the span is not currently recording (even if it had been
 // recording in the past).
-func (sp *Span) FinishAndGetRecording(recType RecordingType) Recording {
-	rec := Recording(nil)
-	if sp.RecordingType() != RecordingOff {
+func (sp *Span) FinishAndGetRecording(recType tracingpb.RecordingType) tracingpb.Recording {
+	rec := tracingpb.Recording(nil)
+	if sp.RecordingType() != tracingpb.RecordingOff {
 		rec = sp.i.GetRecording(recType, true /* finishing */)
 	}
 	// Reach directly into sp.i to pass the finishing argument.
@@ -286,10 +287,10 @@ func (sp *Span) FinishAndGetRecording(recType RecordingType) Recording {
 //
 // Returns nil if the span is not currently recording (even if it had been
 // recording in the past).
-func (sp *Span) FinishAndGetConfiguredRecording() Recording {
-	rec := Recording(nil)
+func (sp *Span) FinishAndGetConfiguredRecording() tracingpb.Recording {
+	rec := tracingpb.Recording(nil)
 	recType := sp.RecordingType()
-	if recType != RecordingOff {
+	if recType != tracingpb.RecordingOff {
 		rec = sp.i.GetRecording(recType, true /* finishing */)
 	}
 	// Reach directly into sp.i to pass the finishing argument.
@@ -322,11 +323,11 @@ func (sp *Span) FinishAndGetConfiguredRecording() Recording {
 //
 // If recType is RecordingStructured, the return value will be nil if the span
 // doesn't have any structured events.
-func (sp *Span) GetRecording(recType RecordingType) Recording {
+func (sp *Span) GetRecording(recType tracingpb.RecordingType) tracingpb.Recording {
 	if sp.detectUseAfterFinish() {
 		return nil
 	}
-	if sp.RecordingType() == RecordingOff {
+	if sp.RecordingType() == tracingpb.RecordingOff {
 		return nil
 	}
 	return sp.i.GetRecording(recType, false /* finishing */)
@@ -337,12 +338,12 @@ func (sp *Span) GetRecording(recType RecordingType) Recording {
 //
 // Returns nil if the span is not currently recording (even if it had been
 // recording in the past).
-func (sp *Span) GetConfiguredRecording() Recording {
+func (sp *Span) GetConfiguredRecording() tracingpb.Recording {
 	if sp.detectUseAfterFinish() {
 		return nil
 	}
 	recType := sp.RecordingType()
-	if recType == RecordingOff {
+	if recType == tracingpb.RecordingOff {
 		return nil
 	}
 	return sp.i.GetRecording(recType, false /* finishing */)
@@ -359,7 +360,7 @@ func (sp *Span) ImportRemoteSpans(remoteSpans []tracingpb.RecordedSpan) {
 
 // Meta returns the information which needs to be propagated across process
 // boundaries in order to derive child spans from this Span. This may return
-// nil, which is a valid input to WithRemoteParentFromSpanMeta, if the Span has been
+// nil, which is a valid input to WithRemoteParent, if the Span has been
 // optimized out.
 func (sp *Span) Meta() SpanMeta {
 	// It shouldn't be done in practice, but it is allowed to call Meta on
@@ -390,13 +391,13 @@ func (sp *Span) SetVerbose(to bool) {
 }
 
 // RecordingType returns the range's current recording mode.
-func (sp *Span) RecordingType() RecordingType {
+func (sp *Span) RecordingType() tracingpb.RecordingType {
 	return sp.i.RecordingType()
 }
 
 // IsVerbose returns true if the Span is verbose. See SetVerbose for details.
 func (sp *Span) IsVerbose() bool {
-	return sp.RecordingType() == RecordingVerbose
+	return sp.RecordingType() == tracingpb.RecordingVerbose
 }
 
 // Record provides a way to record free-form text into verbose spans. Recordings
@@ -443,11 +444,6 @@ func (sp *Span) SetTag(key string, value attribute.Value) {
 // TraceID retrieves a span's trace ID.
 func (sp *Span) TraceID() tracingpb.TraceID {
 	return sp.i.TraceID()
-}
-
-// SpanID retrieves a span's ID.
-func (sp *Span) SpanID() tracingpb.SpanID {
-	return sp.i.SpanID()
 }
 
 // OperationName returns the name of this span assigned when the span was
@@ -547,6 +543,7 @@ func (sp *Span) reset(
 		})
 	}
 
+	atomic.StoreInt32(&sp.finished, 0)
 	c := sp.i.crdb
 	sp.i = spanInner{
 		tracer:   sp.i.tracer,
@@ -558,7 +555,6 @@ func (sp *Span) reset(
 
 	c.traceID = traceID
 	c.spanID = spanID
-	c.parentSpanID = 0
 	c.operation = operation
 	c.startTime = startTime
 	c.logTags = logTags
@@ -607,6 +603,14 @@ func (sp *Span) reset(
 	// reorderings.
 	atomic.StoreInt32(&sp.finished, 0)
 	sp.finishStack = ""
+}
+
+// SetOtelStatus sets the status of the OpenTelemetry span (if any).
+func (sp *Span) SetOtelStatus(code codes.Code, msg string) {
+	if sp.i.otelSpan == nil {
+		return
+	}
+	sp.i.otelSpan.SetStatus(codes.Error, msg)
 }
 
 // spanRef represents a reference to a span. In addition to a simple *Span, a
@@ -744,7 +748,7 @@ type SpanMeta struct {
 	otelCtx oteltrace.SpanContext
 
 	// If set, all spans derived from this context are being recorded.
-	recordingType RecordingType
+	recordingType tracingpb.RecordingType
 
 	// sterile is set if this span does not want to have children spans. In that
 	// case, trying to create a child span will result in the would-be child being
@@ -814,13 +818,13 @@ func SpanMetaFromProto(info tracingpb.TraceInfo) SpanMeta {
 	}
 	switch info.RecordingMode {
 	case tracingpb.TraceInfo_NONE:
-		sm.recordingType = RecordingOff
+		sm.recordingType = tracingpb.RecordingOff
 	case tracingpb.TraceInfo_STRUCTURED:
-		sm.recordingType = RecordingStructured
+		sm.recordingType = tracingpb.RecordingStructured
 	case tracingpb.TraceInfo_VERBOSE:
-		sm.recordingType = RecordingVerbose
+		sm.recordingType = tracingpb.RecordingVerbose
 	default:
-		sm.recordingType = RecordingOff
+		sm.recordingType = tracingpb.RecordingOff
 	}
 	return sm
 }
