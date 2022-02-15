@@ -18,14 +18,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
@@ -264,10 +265,7 @@ func createPostgresSchemas(
 
 		// We didn't allocate an ID above, so we must assign it a mock ID until it
 		// is assigned an actual ID later in the import.
-		desc.ID, err = getNextPlaceholderDescID(ctx, execCfg)
-		if err != nil {
-			return nil, err
-		}
+		desc.ID = getNextPlaceholderDescID(execCfg.SystemIDChecker)
 		desc.SetOffline("importing")
 		return desc, nil
 	}
@@ -316,22 +314,17 @@ func createPostgresSequences(
 		if err != nil {
 			return nil, err
 		}
-		id, err := getNextPlaceholderDescID(ctx, execCfg)
-		if err != nil {
-			return nil, err
-		}
 		desc, err := sql.NewSequenceTableDesc(
 			ctx,
-			nil, /* planner */
-			execCfg.Settings,
 			schemaAndTableName.table,
 			seq.Options,
 			parentID,
 			schema.GetID(),
-			id,
+			getNextPlaceholderDescID(execCfg.SystemIDChecker),
 			hlc.Timestamp{WallTime: walltime},
-			catpb.NewBasePrivilegeDescriptor(owner),
+			descpb.NewBasePrivilegeDescriptor(owner),
 			tree.PersistencePermanent,
+			nil, /* params */
 			// If this is multi-region, this will get added by WriteDescriptors.
 			false, /* isMultiRegion */
 		)
@@ -387,12 +380,8 @@ func createPostgresTables(
 		// Bundle imports do not support user defined types, and so we nil out the
 		// type resolver to protect against unexpected behavior on UDT resolution.
 		semaCtxPtr := makeSemaCtxWithoutTypeResolver(p.SemaCtx())
-		id, err := getNextPlaceholderDescID(evalCtx.Ctx(), p.ExecCfg())
-		if err != nil {
-			return nil, err
-		}
 		desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), semaCtxPtr, p.ExecCfg().Settings,
-			create, parentDB, schema, id, fks, walltime)
+			create, parentDB, schema, getNextPlaceholderDescID(p.ExecCfg().SystemIDChecker), fks, walltime)
 		if err != nil {
 			return nil, err
 		}
@@ -458,18 +447,13 @@ func resolvePostgresFKs(
 // data. Thus, we pessimistically wait till all the verification steps in the
 // IMPORT have been completed after which we rewrite the descriptor IDs with
 // "real" unique IDs.
-func getNextPlaceholderDescID(
-	ctx context.Context, execCfg *sql.ExecutorConfig,
-) (_ descpb.ID, err error) {
+func getNextPlaceholderDescID(idChecker keys.SystemIDChecker) descpb.ID {
 	if placeholderID == 0 {
-		placeholderID, err = descidgen.PeekNextUniqueDescID(ctx, execCfg.DB, execCfg.Codec)
-		if err != nil {
-			return descpb.InvalidID, err
-		}
+		placeholderID = descpb.ID(catalogkeys.MinNonDefaultUserDescriptorID(idChecker) + 2)
 	}
 	ret := placeholderID
 	placeholderID++
-	return ret, nil
+	return ret
 }
 
 var placeholderID descpb.ID
@@ -653,7 +637,10 @@ func readPostgresStmt(
 			StorageParams:    stmt.StorageParams,
 		}
 		if stmt.Unique {
-			idx = &tree.UniqueConstraintTableDef{IndexTableDef: *idx.(*tree.IndexTableDef)}
+			idx = &tree.UniqueConstraintTableDef{
+				IndexTableDef: *idx.(*tree.IndexTableDef),
+				ExplicitIndex: true,
+			}
 		}
 		create.Defs = append(create.Defs, idx)
 	case *tree.AlterSchema:
@@ -875,14 +862,15 @@ func readPostgresStmt(
 		// Otherwise, we silently ignore the drop statement and continue with the import.
 		for _, name := range names {
 			tableName := name.ToUnresolvedObjectName().String()
-			if err := sql.DescsTxn(ctx, p.ExecCfg(), func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-				dbDesc, err := col.Direct().MustGetDatabaseDescByID(ctx, txn, parentID)
+			if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				dbDesc, err := catalogkv.GetDatabaseDescByID(ctx, txn, p.ExecCfg().Codec, parentID)
 				if err != nil {
 					return err
 				}
-				err = col.Direct().CheckObjectCollision(
+				err = catalogkv.CheckObjectCollision(
 					ctx,
 					txn,
+					p.ExecCfg().Codec,
 					parentID,
 					dbDesc.GetSchemaID(tree.PublicSchema),
 					tree.NewUnqualifiedTableName(tree.Name(tableName)),
@@ -1199,20 +1187,12 @@ func (m *pgDumpReader) readFile(
 					conv.TargetColOrds.Add(idx)
 					targetColMapIdx[j] = idx
 				}
-				// For any missing columns, fill those to NULL.
-				// These will get filled in with the correct default / computed
-				// expression if there are any for these columns.
-				for idx := range conv.VisibleCols {
-					if !conv.TargetColOrds.Contains(idx) {
-						conv.Datums[idx] = tree.DNull
-					}
-				}
 			}
 			for {
 				row, err := ps.Next()
 				// We expect an explicit copyDone here. io.EOF is unexpected.
 				if err == io.EOF {
-					return makeRowErr(count, pgcode.ProtocolViolation,
+					return makeRowErr("", count, pgcode.ProtocolViolation,
 						"unexpected EOF")
 				}
 				if row == errCopyDone {
@@ -1221,7 +1201,7 @@ func (m *pgDumpReader) readFile(
 				count++
 				tableNameToRowsProcessed[name.String()]++
 				if err != nil {
-					return wrapRowErr(err, count, pgcode.Uncategorized, "")
+					return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 				}
 				if !importing {
 					continue
@@ -1232,7 +1212,7 @@ func (m *pgDumpReader) readFile(
 				switch row := row.(type) {
 				case copyData:
 					if expected, got := conv.TargetColOrds.Len(), len(row); expected != got {
-						return makeRowErr(count, pgcode.Syntax,
+						return makeRowErr("", count, pgcode.Syntax,
 							"expected %d values, got %d", expected, got)
 					}
 					if rowLimit != 0 && tableNameToRowsProcessed[name.String()] > rowLimit {
@@ -1249,7 +1229,7 @@ func (m *pgDumpReader) readFile(
 							conv.Datums[idx], _, err = tree.ParseAndRequireString(conv.VisibleColTypes[idx], *s, conv.EvalCtx)
 							if err != nil {
 								col := conv.VisibleCols[idx]
-								return wrapRowErr(err, count, pgcode.Syntax,
+								return wrapRowErr(err, "", count, pgcode.Syntax,
 									"parse %q as %s", col.GetName(), col.GetType().SQLString())
 							}
 						}
@@ -1258,7 +1238,7 @@ func (m *pgDumpReader) readFile(
 						return err
 					}
 				default:
-					return makeRowErr(count, pgcode.Uncategorized,
+					return makeRowErr("", count, pgcode.Uncategorized,
 						"unexpected: %v", row)
 				}
 			}
@@ -1385,7 +1365,7 @@ func (m *pgDumpReader) readFile(
 				}
 				key, val, err := sql.MakeSequenceKeyVal(m.evalCtx.Codec, seq, val, isCalled)
 				if err != nil {
-					return wrapRowErr(err, count, pgcode.Uncategorized, "")
+					return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 				}
 				kv := roachpb.KeyValue{Key: key}
 				kv.Value.SetInt(val)

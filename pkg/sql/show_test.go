@@ -108,7 +108,8 @@ func TestShowCreateTable(t *testing.T) {
 )`,
 			Expect: `CREATE TABLE public.%[1]s (
 	i INT8 NOT NULL,
-	CONSTRAINT %[1]s_pkey PRIMARY KEY (i ASC)
+	CONSTRAINT %[1]s_pkey PRIMARY KEY (i ASC),
+	FAMILY "primary" (i)
 )`,
 		},
 		{
@@ -127,7 +128,7 @@ func TestShowCreateTable(t *testing.T) {
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
 	INDEX idx_if (f ASC, i ASC) STORING (s, d),
-	UNIQUE INDEX %[1]s_d_key (d ASC),
+	UNIQUE INDEX %[1]s_d_idx (d ASC),
 	FAMILY "primary" (i, f, d, rowid),
 	FAMILY fam_1_s (s)
 )`,
@@ -135,11 +136,13 @@ func TestShowCreateTable(t *testing.T) {
 		{
 			CreateStatement: `CREATE TABLE %s (
 	"te""st" INT8 NOT NULL,
-	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC)
+	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC),
+	FAMILY "primary" ("te""st")
 )`,
 			Expect: `CREATE TABLE public.%[1]s (
 	"te""st" INT8 NOT NULL,
-	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC)
+	CONSTRAINT "pri""mary" PRIMARY KEY ("te""st" ASC),
+	FAMILY "primary" ("te""st")
 )`,
 		},
 		{
@@ -153,19 +156,9 @@ func TestShowCreateTable(t *testing.T) {
 	b INT8 NULL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
-	INDEX c (a ASC, b DESC)
+	INDEX c (a ASC, b DESC),
+	FAMILY "primary" (a, b, rowid)
 )`,
-		},
-
-		{
-			CreateStatement: `CREATE TABLE %s (
-	pk int8 PRIMARY KEY
-) WITH (ttl_expire_after = '10 minutes')`,
-			Expect: `CREATE TABLE public.%[1]s (
-	pk INT8 NOT NULL,
-	crdb_internal_expiration TIMESTAMPTZ NOT VISIBLE NOT NULL DEFAULT current_timestamp():::TIMESTAMPTZ + '00:10:00':::INTERVAL ON UPDATE current_timestamp():::TIMESTAMPTZ + '00:10:00':::INTERVAL,
-	CONSTRAINT %[1]s_pkey PRIMARY KEY (pk ASC)
-) WITH (ttl = 'on', ttl_automatic_column = 'on', ttl_expire_after = '00:10:00':::INTERVAL)`,
 		},
 		// Check that FK dependencies inside the current database
 		// have their db name omitted.
@@ -183,7 +176,8 @@ func TestShowCreateTable(t *testing.T) {
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
 	CONSTRAINT %[1]s_i_j_fkey FOREIGN KEY (i, j) REFERENCES public.items(a, b),
-	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c)
+	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c),
+	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
 		// Check that FK dependencies using MATCH FULL on a non-composite key still
@@ -202,7 +196,8 @@ func TestShowCreateTable(t *testing.T) {
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
 	CONSTRAINT %[1]s_i_j_fkey FOREIGN KEY (i, j) REFERENCES public.items(a, b) MATCH FULL,
-	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c) MATCH FULL
+	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c) MATCH FULL,
+	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
 		// Check that FK dependencies outside of the current database
@@ -216,7 +211,8 @@ func TestShowCreateTable(t *testing.T) {
 	x INT8 NULL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
-	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.public.foo(x)
+	CONSTRAINT fk_ref FOREIGN KEY (x) REFERENCES o.public.foo(x),
+	FAMILY "primary" (x, rowid)
 )`,
 		},
 		// Check that FK dependencies using SET NULL or SET DEFAULT
@@ -235,7 +231,8 @@ func TestShowCreateTable(t *testing.T) {
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
 	CONSTRAINT %[1]s_i_j_fkey FOREIGN KEY (i, j) REFERENCES public.items(a, b) ON DELETE SET DEFAULT,
-	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c) ON DELETE SET NULL
+	CONSTRAINT %[1]s_k_fkey FOREIGN KEY (k) REFERENCES public.items(c) ON DELETE SET NULL,
+	FAMILY "primary" (i, j, k, rowid)
 )`,
 		},
 		// Check that FK dependencies using MATCH FULL and MATCH SIMPLE are both
@@ -257,21 +254,24 @@ func TestShowCreateTable(t *testing.T) {
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
 	CONSTRAINT %[1]s_i_j_fkey FOREIGN KEY (i, j) REFERENCES public.items(a, b) ON DELETE SET DEFAULT,
-	CONSTRAINT %[1]s_k_l_fkey FOREIGN KEY (k, l) REFERENCES public.items(a, b) MATCH FULL ON UPDATE CASCADE
+	CONSTRAINT %[1]s_k_l_fkey FOREIGN KEY (k, l) REFERENCES public.items(a, b) MATCH FULL ON UPDATE CASCADE,
+	FAMILY "primary" (i, j, k, l, rowid)
 )`,
 		},
 		// Check hash sharded indexes are round trippable.
 		{
 			CreateStatement: `CREATE TABLE %s (
 				a INT,
-				INDEX (a) USING HASH WITH (bucket_count=8)
+				INDEX (a) USING HASH WITH BUCKET_COUNT = 8
 			)`,
 			Expect: `CREATE TABLE public.%[1]s (
 	a INT8 NULL,
 	crdb_internal_a_shard_8 INT4 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(a)), 8:::INT8)) VIRTUAL,
 	rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
 	CONSTRAINT %[1]s_pkey PRIMARY KEY (rowid ASC),
-	INDEX %[1]s_a_idx (a ASC) USING HASH WITH (bucket_count=8)
+	INDEX t12_a_idx (a ASC) USING HASH WITH BUCKET_COUNT = 8,
+	FAMILY "primary" (a, rowid),
+	CONSTRAINT check_crdb_internal_a_shard_8 CHECK (crdb_internal_a_shard_8 IN (0:::INT8, 1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8, 6:::INT8, 7:::INT8))
 )`,
 		},
 	}
@@ -874,14 +874,12 @@ func TestShowSessionPrivileges(t *testing.T) {
 	sqlDBroot := sqlutils.MakeSQLRunner(rawSQLDBroot)
 	defer s.Stopper().Stop(context.Background())
 
-	// Create four users: one with no special permissions, one with the
-	// VIEWACTIVITY role option, one with VIEWACTIVITYREDACTED option,
-	// and one admin. We'll check that the VIEWACTIVITY, VIEWACTIVITYREDACTED
+	// Create three users: one with no special permissions, one with the
+	// VIEWACTIVITY role option, and one admin. We'll check that the VIEWACTIVITY
 	// users and the admin can see all sessions and the unpermissioned user can
 	// only see their own session.
 	_ = sqlDBroot.Exec(t, `CREATE USER noperms`)
 	_ = sqlDBroot.Exec(t, `CREATE USER viewactivity VIEWACTIVITY`)
-	_ = sqlDBroot.Exec(t, `CREATE USER viewactivityredacted VIEWACTIVITYREDACTED`)
 	_ = sqlDBroot.Exec(t, `CREATE USER adminuser`)
 	_ = sqlDBroot.Exec(t, `GRANT admin TO adminuser`)
 
@@ -894,7 +892,6 @@ func TestShowSessionPrivileges(t *testing.T) {
 	users := []user{
 		{"noperms", false, nil},
 		{"viewactivity", true, nil},
-		{"viewactivityredacted", true, nil},
 		{"adminuser", true, nil},
 	}
 	for i, tc := range users {

@@ -49,7 +49,6 @@ type CreateDatabase struct {
 	Regions         NameList
 	SurvivalGoal    SurvivalGoal
 	Placement       DataPlacement
-	Owner           RoleSpec
 }
 
 // Format implements the NodeFormatter interface.
@@ -115,11 +114,6 @@ func (node *CreateDatabase) Format(ctx *FmtCtx) {
 	if node.Placement != DataPlacementUnspecified {
 		ctx.WriteString(" ")
 		ctx.FormatNode(&node.Placement)
-	}
-
-	if node.Owner.Name != "" {
-		ctx.WriteString(" OWNER = ")
-		ctx.FormatNode(&node.Owner)
 	}
 }
 
@@ -421,10 +415,9 @@ type ColumnTableDef struct {
 		ConstraintName Name
 	}
 	PrimaryKey struct {
-		IsPrimaryKey  bool
-		Sharded       bool
-		ShardBuckets  Expr
-		StorageParams StorageParams
+		IsPrimaryKey bool
+		Sharded      bool
+		ShardBuckets Expr
 	}
 	Unique struct {
 		IsUnique       bool
@@ -601,14 +594,12 @@ func NewColumnTableDef(
 			d.Nullable.ConstraintName = c.Name
 		case PrimaryKeyConstraint:
 			d.PrimaryKey.IsPrimaryKey = true
-			d.PrimaryKey.StorageParams = c.Qualification.(PrimaryKeyConstraint).StorageParams
 			d.Unique.ConstraintName = c.Name
 		case ShardedPrimaryKeyConstraint:
 			d.PrimaryKey.IsPrimaryKey = true
 			constraint := c.Qualification.(ShardedPrimaryKeyConstraint)
 			d.PrimaryKey.Sharded = true
 			d.PrimaryKey.ShardBuckets = constraint.ShardBuckets
-			d.PrimaryKey.StorageParams = constraint.StorageParams
 			d.Unique.ConstraintName = c.Name
 		case UniqueConstraint:
 			d.Unique.IsUnique = true
@@ -714,26 +705,9 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 		}
 		if node.PrimaryKey.IsPrimaryKey {
 			ctx.WriteString(" PRIMARY KEY")
-
-			// Always prefer to output hash sharding bucket count as a storage param.
-			pkStorageParams := node.PrimaryKey.StorageParams
 			if node.PrimaryKey.Sharded {
-				ctx.WriteString(" USING HASH")
-				bcStorageParam := node.PrimaryKey.StorageParams.GetVal(`bucket_count`)
-				if _, ok := node.PrimaryKey.ShardBuckets.(DefaultVal); !ok && bcStorageParam == nil {
-					pkStorageParams = append(
-						pkStorageParams,
-						StorageParam{
-							Key:   `bucket_count`,
-							Value: node.PrimaryKey.ShardBuckets,
-						},
-					)
-				}
-			}
-			if len(pkStorageParams) > 0 {
-				ctx.WriteString(" WITH (")
-				ctx.FormatNode(&pkStorageParams)
-				ctx.WriteString(")")
+				ctx.WriteString(" USING HASH WITH BUCKET_COUNT=")
+				ctx.FormatNode(node.PrimaryKey.ShardBuckets)
 			}
 		} else if node.Unique.IsUnique {
 			ctx.WriteString(" UNIQUE")
@@ -904,16 +878,13 @@ type NullConstraint struct{}
 type HiddenConstraint struct{}
 
 // PrimaryKeyConstraint represents PRIMARY KEY on a column.
-type PrimaryKeyConstraint struct {
-	StorageParams StorageParams
-}
+type PrimaryKeyConstraint struct{}
 
 // ShardedPrimaryKeyConstraint represents `PRIMARY KEY .. USING HASH..`
 // on a column.
 type ShardedPrimaryKeyConstraint struct {
-	Sharded       bool
-	ShardBuckets  Expr
-	StorageParams StorageParams
+	Sharded      bool
+	ShardBuckets Expr
 }
 
 // UniqueConstraint represents UNIQUE on a column.
@@ -1022,6 +993,12 @@ type UniqueConstraintTableDef struct {
 	PrimaryKey   bool
 	WithoutIndex bool
 	IfNotExists  bool
+
+	// ExplicitIndex is true when the unique index was created explicitly using
+	// a UNIQUE INDEX clause in either CREATE TABLE or CREATE INDEX. It is false
+	// when the unique index was implicitly created from a CONSTRAINT ... UNIQUE
+	// clause in CREATE TABLE or ALTER TABLE.
+	ExplicitIndex bool
 }
 
 // SetName implements the TableDef interface.
@@ -1251,10 +1228,6 @@ type ShardedIndexDef struct {
 
 // Format implements the NodeFormatter interface.
 func (node *ShardedIndexDef) Format(ctx *FmtCtx) {
-	if _, ok := node.ShardBuckets.(DefaultVal); ok {
-		ctx.WriteString(" USING HASH")
-		return
-	}
 	ctx.WriteString(" USING HASH WITH BUCKET_COUNT = ")
 	ctx.FormatNode(node.ShardBuckets)
 }
@@ -1433,18 +1406,6 @@ func (o *StorageParams) Format(ctx *FmtCtx) {
 	}
 }
 
-// GetVal returns corresponding value if a key exists, otherwise nil is
-// returned.
-func (o *StorageParams) GetVal(key string) Expr {
-	k := Name(key)
-	for _, param := range *o {
-		if param.Key == k {
-			return param.Value
-		}
-	}
-	return nil
-}
-
 // CreateTableOnCommitSetting represents the CREATE TABLE ... ON COMMIT <action>
 // parameters.
 type CreateTableOnCommitSetting uint32
@@ -1528,11 +1489,8 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 		if node.PartitionByTable != nil {
 			ctx.FormatNode(node.PartitionByTable)
 		}
-		if node.StorageParams != nil {
-			ctx.WriteString(` WITH (`)
-			ctx.FormatNode(&node.StorageParams)
-			ctx.WriteByte(')')
-		}
+		// No storage parameters are implemented, so we never list the storage
+		// parameters in the output format.
 		if node.Locality != nil {
 			ctx.WriteString(" ")
 			ctx.FormatNode(node.Locality)
