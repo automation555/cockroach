@@ -1,0 +1,175 @@
+statement ok
+CREATE DATABASE a
+
+query TTTB colnames
+SHOW GRANTS ON DATABASE a
+----
+database_name  grantee  privilege_type  is_grantable
+a              admin    ALL             true
+a              public   CONNECT         false
+a              root     ALL             true
+
+statement error user root must have exactly ALL privileges on database "a"
+REVOKE CONNECT ON DATABASE a FROM root
+
+statement error user admin must have exactly ALL privileges on database "a"
+REVOKE CONNECT ON DATABASE a FROM admin
+
+statement ok
+CREATE USER readwrite
+
+statement error pq: user or role "test-user" does not exist
+GRANT ALL ON DATABASE a TO readwrite, "test-user"
+
+statement ok
+INSERT INTO system.users VALUES('test-user','');
+
+statement ok
+GRANT ALL PRIVILEGES ON DATABASE a TO readwrite, "test-user"
+
+statement error syntax error
+GRANT SELECT,ALL ON DATABASE a TO readwrite
+
+statement error syntax error
+REVOKE SELECT,ALL ON DATABASE a FROM readwrite
+
+query TTTB
+SHOW GRANTS ON DATABASE a
+----
+a  admin      ALL      true
+a  public     CONNECT  false
+a  readwrite  ALL      true
+a  root       ALL      true
+a  test-user  ALL      true
+
+# Create table to inherit DB permissions.
+statement ok
+CREATE TABLE a.t (id INT PRIMARY KEY)
+
+query TTTTTB colnames
+SHOW GRANTS ON a.t
+----
+database_name  schema_name  table_name  grantee    privilege_type  is_grantable
+a              public       t           admin      ALL             true
+a              public       t           readwrite  ALL             true
+a              public       t           root       ALL             true
+a              public       t           test-user  ALL             true
+
+query TTTB
+SHOW GRANTS ON DATABASE a FOR readwrite, "test-user"
+----
+a  readwrite  ALL  true
+a  test-user  ALL  true
+
+statement ok
+REVOKE CONNECT ON DATABASE a FROM "test-user",readwrite
+
+query TTTB
+SHOW GRANTS ON DATABASE a
+----
+a  admin      ALL         true
+a  public     CONNECT     false
+a  readwrite  CREATE      true
+a  readwrite  DROP        true
+a  readwrite  GRANT       true
+a  readwrite  ZONECONFIG  true
+a  root       ALL         true
+a  test-user  CREATE      true
+a  test-user  DROP        true
+a  test-user  GRANT       true
+a  test-user  ZONECONFIG  true
+
+query TTTB
+SHOW GRANTS ON DATABASE a FOR readwrite, "test-user"
+----
+a  readwrite  CREATE      true
+a  readwrite  DROP        true
+a  readwrite  GRANT       true
+a  readwrite  ZONECONFIG  true
+a  test-user  CREATE      true
+a  test-user  DROP        true
+a  test-user  GRANT       true
+a  test-user  ZONECONFIG  true
+
+statement ok
+REVOKE CREATE ON DATABASE a FROM "test-user"
+
+query TTTB
+SHOW GRANTS ON DATABASE a
+----
+a  admin      ALL         true
+a  public     CONNECT     false
+a  readwrite  CREATE      true
+a  readwrite  DROP        true
+a  readwrite  GRANT       true
+a  readwrite  ZONECONFIG  true
+a  root       ALL         true
+a  test-user  DROP        true
+a  test-user  GRANT       true
+a  test-user  ZONECONFIG  true
+
+statement ok
+REVOKE ALL PRIVILEGES ON DATABASE a FROM "test-user"
+
+query TTTB
+SHOW GRANTS ON DATABASE a FOR readwrite, "test-user"
+----
+a  readwrite  CREATE      true
+a  readwrite  DROP        true
+a  readwrite  GRANT       true
+a  readwrite  ZONECONFIG  true
+
+statement ok
+REVOKE ALL ON DATABASE a FROM readwrite,"test-user"
+
+query TTTB
+SHOW GRANTS ON DATABASE a
+----
+a  admin   ALL      true
+a  public  CONNECT  false
+a  root    ALL      true
+
+query TTTB
+SHOW GRANTS ON DATABASE a FOR readwrite, "test-user"
+----
+
+# Verify that the table privileges have not changed.
+query TTTTTB colnames
+SHOW GRANTS ON a.t
+----
+database_name  schema_name  table_name  grantee    privilege_type  is_grantable
+a              public       t           admin      ALL             true
+a              public       t           readwrite  ALL             true
+a              public       t           root       ALL             true
+a              public       t           test-user  ALL             true
+
+# Usage privilege should not be grantable on databases.
+
+statement error pq: invalid privilege type USAGE for database
+GRANT USAGE ON DATABASE a TO testuser
+
+statement ok
+CREATE DATABASE b
+
+statement ok
+GRANT CREATE, CONNECT ON DATABASE b TO testuser
+
+user testuser
+
+statement ok
+CREATE TABLE b.t()
+
+# CONNECT privilege should not be inherited from DB when creating a table.
+
+query TTTTTB colnames
+SHOW GRANTS ON b.t
+----
+database_name  schema_name  table_name  grantee   privilege_type  is_grantable
+b              public       t           admin     ALL             true
+b              public       t           root      ALL             true
+b              public       t           testuser  ALL             false
+
+# Calling SHOW GRANTS on an invalid user should error out.
+
+statement error role/user "invaliduser" does not exist
+SHOW GRANTS FOR invaliduser

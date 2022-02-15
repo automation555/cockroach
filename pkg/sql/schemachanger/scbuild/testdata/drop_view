@@ -1,0 +1,286 @@
+create-table
+CREATE TABLE defaultdb.t1 (id INT PRIMARY KEY, name varchar(256))
+----
+
+create-view
+CREATE VIEW defaultdb.v1 AS (SELECT name FROM defaultdb.t1)
+----
+
+build
+DROP VIEW defaultdb.v1
+----
+- [[Locality:{DescID: 105}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+- [[Namespace:{DescID: 105, Name: v1}, ABSENT], PUBLIC]
+  details:
+    databaseId: 100
+    descriptorId: 105
+    name: v1
+    schemaId: 101
+- [[Owner:{DescID: 105}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+    owner: root
+- [[RelationDependedOnBy:{DescID: 104, ReferencedDescID: 105}, ABSENT], PUBLIC]
+  details:
+    dependedOn: 105
+    tableId: 104
+- [[TableComment:{DescID: 105}, ABSENT], PUBLIC]
+  details:
+    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
+      doing decomposition
+    tableId: 105
+- [[UserPrivileges:{DescID: 105, Username: admin}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+    privileges: 2
+    username: admin
+- [[UserPrivileges:{DescID: 105, Username: public}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+    username: public
+- [[UserPrivileges:{DescID: 105, Username: root}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+    privileges: 2
+    username: root
+- [[View:{DescID: 105}, ABSENT], PUBLIC]
+  details:
+    tableId: 105
+
+create-view
+CREATE VIEW defaultdb.v2 AS (SELECT name AS n1, name AS n2 FROM v1)
+----
+
+create-view
+CREATE VIEW defaultdb.v3 AS (SELECT name, n1 FROM v1, v2);
+----
+
+create-view
+CREATE VIEW defaultdb.v4 AS (SELECT n2, n1 FROM v2);
+----
+
+create-type
+CREATE TYPE defaultdb.typ AS ENUM('a')
+----
+
+create-view
+CREATE VIEW v5 AS (SELECT 'a'::defaultdb.typ::string AS k, n2, n1 from defaultdb.v4)
+----
+
+build
+DROP VIEW defaultdb.v1 CASCADE
+----
+- [[Locality:{DescID: 105}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+- [[Locality:{DescID: 106}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 106
+- [[Locality:{DescID: 107}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 107
+- [[Locality:{DescID: 108}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 108
+- [[Locality:{DescID: 111}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 111
+- [[Namespace:{DescID: 105, Name: v1}, ABSENT], PUBLIC]
+  details:
+    databaseId: 100
+    descriptorId: 105
+    name: v1
+    schemaId: 101
+- [[Namespace:{DescID: 106, Name: v2}, ABSENT], PUBLIC]
+  details:
+    databaseId: 100
+    descriptorId: 106
+    name: v2
+    schemaId: 101
+- [[Namespace:{DescID: 107, Name: v3}, ABSENT], PUBLIC]
+  details:
+    databaseId: 100
+    descriptorId: 107
+    name: v3
+    schemaId: 101
+- [[Namespace:{DescID: 108, Name: v4}, ABSENT], PUBLIC]
+  details:
+    databaseId: 100
+    descriptorId: 108
+    name: v4
+    schemaId: 101
+- [[Namespace:{DescID: 111, Name: v5}, ABSENT], PUBLIC]
+  details:
+    databaseId: 100
+    descriptorId: 111
+    name: v5
+    schemaId: 101
+- [[Owner:{DescID: 105}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+    owner: root
+- [[Owner:{DescID: 106}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 106
+    owner: root
+- [[Owner:{DescID: 107}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 107
+    owner: root
+- [[Owner:{DescID: 108}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 108
+    owner: root
+- [[Owner:{DescID: 111}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 111
+    owner: root
+- [[RelationDependedOnBy:{DescID: 104, ReferencedDescID: 105}, ABSENT], PUBLIC]
+  details:
+    dependedOn: 105
+    tableId: 104
+- [[RelationDependedOnBy:{DescID: 105, ReferencedDescID: 106}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    dependedOn: 106
+    tableId: 105
+- [[RelationDependedOnBy:{DescID: 105, ReferencedDescID: 107}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    dependedOn: 107
+    tableId: 105
+- [[RelationDependedOnBy:{DescID: 106, ReferencedDescID: 107}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    dependedOn: 107
+    tableId: 106
+- [[RelationDependedOnBy:{DescID: 106, ReferencedDescID: 108}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    dependedOn: 108
+    tableId: 106
+- [[RelationDependedOnBy:{DescID: 108, ReferencedDescID: 111}, ABSENT], PUBLIC]
+  details:
+    columnId: 1
+    dependedOn: 111
+    tableId: 108
+- [[TableComment:{DescID: 105}, ABSENT], PUBLIC]
+  details:
+    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
+      doing decomposition
+    tableId: 105
+- [[TableComment:{DescID: 106}, ABSENT], PUBLIC]
+  details:
+    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
+      doing decomposition
+    tableId: 106
+- [[TableComment:{DescID: 107}, ABSENT], PUBLIC]
+  details:
+    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
+      doing decomposition
+    tableId: 107
+- [[TableComment:{DescID: 108}, ABSENT], PUBLIC]
+  details:
+    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
+      doing decomposition
+    tableId: 108
+- [[TableComment:{DescID: 111}, ABSENT], PUBLIC]
+  details:
+    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
+      doing decomposition
+    tableId: 111
+- [[UserPrivileges:{DescID: 105, Username: admin}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+    privileges: 2
+    username: admin
+- [[UserPrivileges:{DescID: 105, Username: public}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+    username: public
+- [[UserPrivileges:{DescID: 105, Username: root}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 105
+    privileges: 2
+    username: root
+- [[UserPrivileges:{DescID: 106, Username: admin}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 106
+    privileges: 2
+    username: admin
+- [[UserPrivileges:{DescID: 106, Username: public}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 106
+    username: public
+- [[UserPrivileges:{DescID: 106, Username: root}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 106
+    privileges: 2
+    username: root
+- [[UserPrivileges:{DescID: 107, Username: admin}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 107
+    privileges: 2
+    username: admin
+- [[UserPrivileges:{DescID: 107, Username: public}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 107
+    username: public
+- [[UserPrivileges:{DescID: 107, Username: root}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 107
+    privileges: 2
+    username: root
+- [[UserPrivileges:{DescID: 108, Username: admin}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 108
+    privileges: 2
+    username: admin
+- [[UserPrivileges:{DescID: 108, Username: public}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 108
+    username: public
+- [[UserPrivileges:{DescID: 108, Username: root}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 108
+    privileges: 2
+    username: root
+- [[UserPrivileges:{DescID: 111, Username: admin}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 111
+    privileges: 2
+    username: admin
+- [[UserPrivileges:{DescID: 111, Username: public}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 111
+    username: public
+- [[UserPrivileges:{DescID: 111, Username: root}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 111
+    privileges: 2
+    username: root
+- [[View:{DescID: 105}, ABSENT], PUBLIC]
+  details:
+    tableId: 105
+- [[View:{DescID: 106}, ABSENT], PUBLIC]
+  details:
+    tableId: 106
+- [[View:{DescID: 107}, ABSENT], PUBLIC]
+  details:
+    tableId: 107
+- [[View:{DescID: 108}, ABSENT], PUBLIC]
+  details:
+    tableId: 108
+- [[View:{DescID: 111}, ABSENT], PUBLIC]
+  details:
+    tableId: 111
+- [[ViewDependsOnType:{DescID: 111, ReferencedDescID: 109}, ABSENT], PUBLIC]
+  details:
+    tableId: 111
+    typeId: 109
+- [[ViewDependsOnType:{DescID: 111, ReferencedDescID: 110}, ABSENT], PUBLIC]
+  details:
+    tableId: 111
+    typeId: 110

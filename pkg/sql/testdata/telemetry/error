@@ -1,0 +1,120 @@
+# This file contains telemetry tests for counters triggered by errors.
+
+feature-allowlist
+othererror.*
+errorcodes.*
+unimplemented.*
+sql.schema.validation_errors.*
+----
+
+rewrite
+((relation|type) "\w*") \(\d+\)
+${1} (...)
+----
+
+# Table descriptor validation failure on read.
+feature-usage
+CREATE TABLE fktbl (id INT PRIMARY KEY);
+CREATE TABLE tbl (customer INT NOT NULL REFERENCES fktbl (id));
+  WITH base AS (
+                SELECT id, crdb_internal.pb_to_json('desc', descriptor) AS d
+                  FROM system.descriptor
+                 WHERE id = 'fktbl'::REGCLASS
+            ),
+       updated AS (
+                SELECT id,
+                       json_set(
+                        json_remove_path(d, ARRAY['table', 'inboundFks', '0']),
+                        ARRAY['table', 'version'],
+                        ((d->'table'->>'version')::INT8 + 1)::STRING::JSONB
+                       ) AS d
+                  FROM base
+               )
+SELECT crdb_internal.unsafe_upsert_descriptor(id, crdb_internal.json_to_pb('desc', d)), d
+  FROM updated;
+SELECT * FROM tbl;
+----
+error: pq: internal error: relation "tbl" (...): missing fk back reference "tbl_customer_fkey" to "tbl" from "fktbl"
+errorcodes.XX000
+sql.schema.validation_errors.read.cross_references.relation
+
+# Type descriptor validation failure on read.
+feature-usage
+CREATE TYPE greeting AS ENUM('hello', 'hi');
+  WITH base AS (
+                SELECT id, crdb_internal.pb_to_json('desc', descriptor) AS d
+                  FROM system.descriptor
+                 WHERE id IN (SELECT id FROM system.namespace WHERE name = 'greeting')
+            ),
+       updated AS (
+                SELECT id,
+                       json_set(
+                        json_set(d, ARRAY['type', 'name'], '""'::JSONB),
+                        ARRAY['type', 'version'],
+                        ((d->'type'->>'version')::INT8 + 1)::STRING::JSONB
+                       ) AS d
+                  FROM base
+               )
+SELECT crdb_internal.unsafe_upsert_descriptor(id, crdb_internal.json_to_pb('desc', d), true)
+  FROM updated;
+SELECT 'hi'::greeting
+----
+error: pq: type "" (...): empty type name
+errorcodes.42601
+sql.schema.validation_errors.read.self.type
+
+# Table descriptor validation failure on transaction commit.
+feature-usage
+CREATE TABLE t (x INT PRIMARY KEY);
+BEGIN;
+ALTER TABLE t DROP CONSTRAINT t_pkey;
+COMMIT;
+----
+error: pq: relation "t" (...): unimplemented: primary key dropped without subsequent addition of new primary key in same transaction
+errorcodes.0A000
+sql.schema.validation_errors.write.pre_txn_commit.relation
+unimplemented.#48026
+
+# 42601 is pgcode.Syntax.
+feature-usage
+some non-parsing garbage
+----
+error: pq: at or near "some": syntax error
+errorcodes.42601
+
+feature-usage
+SELECT crdb_internal.force_error('blah', 'foo')
+----
+error: pq: foo
+errorcodes.blah
+
+# XXUUU is pgcode.Uncategorized.
+feature-usage
+SELECT crdb_internal.force_error('', 'foo')
+----
+error: pq: foo
+errorcodes.XXUUU
+othererror.XXUUU
+
+# XX000 is pgcode.Internal.
+feature-usage
+SELECT crdb_internal.force_assertion_error('woo')
+----
+error: pq: internal error: crdb_internal.force_assertion_error(): woo
+errorcodes.XX000
+
+# XXUUU is pgcode.Uncategorized.
+feature-usage
+SELECT crdb_internal.set_vmodule('invalid')
+----
+error: pq: crdb_internal.set_vmodule(): syntax error: expect comma-separated list of filename=N
+errorcodes.XXUUU
+othererror.XXUUU
+othererror.XXUUU.crdb_internal.set_vmodule()
+
+# 22012 is pgcode.DivisionByZero.
+feature-usage
+SELECT 2/0
+----
+error: pq: division by zero
+errorcodes.22012

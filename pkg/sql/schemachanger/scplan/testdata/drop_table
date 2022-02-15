@@ -1,0 +1,467 @@
+create-table
+CREATE TABLE defaultdb.customers (id INT PRIMARY KEY, email STRING UNIQUE);
+----
+
+create-table
+CREATE TABLE IF NOT EXISTS defaultdb.orders (
+    id INT PRIMARY KEY,
+    customer INT UNIQUE NOT NULL REFERENCES customers (id),
+    orderTotal DECIMAL(9,2),
+    INDEX (customer)
+  );
+----
+
+create-sequence
+CREATE SEQUENCE defaultdb.SQ2;
+----
+
+create-table
+CREATE TABLE defaultdb.shipments (
+    tracking_number UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    carrier STRING,
+    status STRING,
+    customer_id INT,
+    randcol INT DEFAULT nextval('defaultdb.sq2'),
+    CONSTRAINT fk_customers FOREIGN KEY (customer_id) REFERENCES customers(id),
+    CONSTRAINT fk_orders FOREIGN KEY (customer_id) REFERENCES orders(customer)
+  );
+----
+
+create-sequence
+CREATE SEQUENCE defaultdb.SQ1 OWNED BY defaultdb.shipments.carrier
+----
+
+create-view
+CREATE VIEW v1 AS (SELECT customer_id, carrier FROM defaultdb.shipments)
+----
+
+ops
+DROP TABLE defaultdb.shipments CASCADE;
+----
+StatementPhase stage 1 of 1 with 15 MutationType ops
+  transitions:
+    [[Table:{DescID: 107}, ABSENT], PUBLIC] -> TXN_DROPPED
+    [[TableComment:{DescID: 107}, ABSENT], PUBLIC] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 1}, ABSENT], PUBLIC] -> DELETE_AND_WRITE_ONLY
+    [[ColumnComment:{DescID: 107, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 2}, ABSENT], PUBLIC] -> DELETE_AND_WRITE_ONLY
+    [[ColumnComment:{DescID: 107, ColumnID: 2}, ABSENT], PUBLIC] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 3}, ABSENT], PUBLIC] -> DELETE_AND_WRITE_ONLY
+    [[ColumnComment:{DescID: 107, ColumnID: 3}, ABSENT], PUBLIC] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 4}, ABSENT], PUBLIC] -> DELETE_AND_WRITE_ONLY
+    [[ColumnComment:{DescID: 107, ColumnID: 4}, ABSENT], PUBLIC] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 5}, ABSENT], PUBLIC] -> DELETE_AND_WRITE_ONLY
+    [[ColumnComment:{DescID: 107, ColumnID: 5}, ABSENT], PUBLIC] -> ABSENT
+    [[PrimaryIndex:{DescID: 107, IndexID: 1}, ABSENT], PUBLIC] -> VALIDATED
+    [[ConstraintComment:{DescID: 107, ConstraintID: 1}, ABSENT], PUBLIC] -> ABSENT
+    [[IndexComment:{DescID: 107, IndexID: 1}, ABSENT], PUBLIC] -> ABSENT
+    [[ConstraintComment:{DescID: 107, ConstraintID: 2}, ABSENT], PUBLIC] -> ABSENT
+    [[ConstraintComment:{DescID: 107, ConstraintID: 3}, ABSENT], PUBLIC] -> ABSENT
+    [[View:{DescID: 109}, ABSENT], PUBLIC] -> TXN_DROPPED
+    [[TableComment:{DescID: 109}, ABSENT], PUBLIC] -> ABSENT
+    [[Sequence:{DescID: 108}, ABSENT], PUBLIC] -> TXN_DROPPED
+    [[TableComment:{DescID: 108}, ABSENT], PUBLIC] -> ABSENT
+  ops:
+    *scop.MarkDescriptorAsDroppedSynthetically
+      DescID: 107
+    *scop.RemoveTableComment
+      TableID: 107
+    *scop.RemoveColumnComment
+      ColumnID: 1
+      TableID: 107
+    *scop.RemoveColumnComment
+      ColumnID: 2
+      TableID: 107
+    *scop.RemoveColumnComment
+      ColumnID: 3
+      TableID: 107
+    *scop.RemoveColumnComment
+      ColumnID: 4
+      TableID: 107
+    *scop.RemoveColumnComment
+      ColumnID: 5
+      TableID: 107
+    *scop.RemoveConstraintComment
+      ConstraintID: 1
+      TableID: 107
+    *scop.RemoveIndexComment
+      IndexID: 1
+      TableID: 107
+    *scop.RemoveConstraintComment
+      ConstraintID: 2
+      TableID: 107
+    *scop.RemoveConstraintComment
+      ConstraintID: 3
+      TableID: 107
+    *scop.MarkDescriptorAsDroppedSynthetically
+      DescID: 109
+    *scop.RemoveTableComment
+      TableID: 109
+    *scop.MarkDescriptorAsDroppedSynthetically
+      DescID: 108
+    *scop.RemoveTableComment
+      TableID: 108
+PreCommitPhase stage 1 of 1 with 22 MutationType ops
+  transitions:
+    [[Table:{DescID: 107}, ABSENT], TXN_DROPPED] -> DROPPED
+    [[Namespace:{DescID: 107, Name: shipments}, ABSENT], PUBLIC] -> ABSENT
+    [[Owner:{DescID: 107}, ABSENT], PUBLIC] -> ABSENT
+    [[UserPrivileges:{DescID: 107, Username: admin}, ABSENT], PUBLIC] -> ABSENT
+    [[UserPrivileges:{DescID: 107, Username: public}, ABSENT], PUBLIC] -> ABSENT
+    [[UserPrivileges:{DescID: 107, Username: root}, ABSENT], PUBLIC] -> ABSENT
+    [[ColumnName:{DescID: 107, ColumnID: 1, Name: tracking_number}, ABSENT], PUBLIC] -> ABSENT
+    [[DefaultExpression:{DescID: 107, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
+    [[ColumnName:{DescID: 107, ColumnID: 2, Name: carrier}, ABSENT], PUBLIC] -> ABSENT
+    [[SequenceOwnedBy:{DescID: 108, ReferencedDescID: 107}, ABSENT], PUBLIC] -> ABSENT
+    [[ColumnName:{DescID: 107, ColumnID: 3, Name: status}, ABSENT], PUBLIC] -> ABSENT
+    [[ColumnName:{DescID: 107, ColumnID: 4, Name: customer_id}, ABSENT], PUBLIC] -> ABSENT
+    [[ColumnName:{DescID: 107, ColumnID: 5, Name: randcol}, ABSENT], PUBLIC] -> ABSENT
+    [[DefaultExpression:{DescID: 107, ColumnID: 5}, ABSENT], PUBLIC] -> ABSENT
+    [[RelationDependedOnBy:{DescID: 106, ReferencedDescID: 107}, ABSENT], PUBLIC] -> ABSENT
+    [[IndexName:{DescID: 107, IndexID: 1, Name: shipments_pkey}, ABSENT], PUBLIC] -> ABSENT
+    [[ForeignKey:{DescID: 107, ReferencedDescID: 104, Name: fk_customers}, ABSENT], PUBLIC] -> ABSENT
+    [[ForeignKey:{DescID: 107, ReferencedDescID: 105, Name: fk_orders}, ABSENT], PUBLIC] -> ABSENT
+    [[Locality:{DescID: 107}, ABSENT], PUBLIC] -> ABSENT
+    [[RelationDependedOnBy:{DescID: 107, ReferencedDescID: 109}, ABSENT], PUBLIC] -> ABSENT
+    [[View:{DescID: 109}, ABSENT], TXN_DROPPED] -> DROPPED
+    [[Namespace:{DescID: 109, Name: v1}, ABSENT], PUBLIC] -> ABSENT
+    [[Owner:{DescID: 109}, ABSENT], PUBLIC] -> ABSENT
+    [[UserPrivileges:{DescID: 109, Username: admin}, ABSENT], PUBLIC] -> ABSENT
+    [[UserPrivileges:{DescID: 109, Username: public}, ABSENT], PUBLIC] -> ABSENT
+    [[UserPrivileges:{DescID: 109, Username: root}, ABSENT], PUBLIC] -> ABSENT
+    [[Locality:{DescID: 109}, ABSENT], PUBLIC] -> ABSENT
+    [[ForeignKeyBackReference:{DescID: 104, ReferencedDescID: 107, Name: fk_customers}, ABSENT], PUBLIC] -> ABSENT
+    [[ForeignKeyBackReference:{DescID: 105, ReferencedDescID: 107, Name: fk_orders}, ABSENT], PUBLIC] -> ABSENT
+    [[Sequence:{DescID: 108}, ABSENT], TXN_DROPPED] -> DROPPED
+    [[Namespace:{DescID: 108, Name: sq1}, ABSENT], PUBLIC] -> ABSENT
+    [[Owner:{DescID: 108}, ABSENT], PUBLIC] -> ABSENT
+    [[UserPrivileges:{DescID: 108, Username: admin}, ABSENT], PUBLIC] -> ABSENT
+    [[UserPrivileges:{DescID: 108, Username: public}, ABSENT], PUBLIC] -> ABSENT
+    [[UserPrivileges:{DescID: 108, Username: root}, ABSENT], PUBLIC] -> ABSENT
+    [[Locality:{DescID: 108}, ABSENT], PUBLIC] -> ABSENT
+  ops:
+    *scop.MarkDescriptorAsDropped
+      DescID: 107
+    *scop.DrainDescriptorName
+      TableID: 107
+    *scop.RemoveColumnDefaultExpression
+      ColumnID: 1
+      TableID: 107
+    *scop.RemoveColumnSequenceReferences
+      ColumnID: 1
+      SequenceIDs: []
+      TableID: 107
+    *scop.RemoveColumnDefaultExpression
+      ColumnID: 5
+      TableID: 107
+    *scop.RemoveColumnSequenceReferences
+      ColumnID: 5
+      SequenceIDs:
+      - 106
+      TableID: 107
+    *scop.RemoveRelationDependedOnBy
+      DependedOnBy: 107
+      TableID: 106
+    *scop.MarkDescriptorAsDropped
+      DescID: 109
+    *scop.DrainDescriptorName
+      TableID: 109
+    *scop.DropForeignKeyRef
+      Name: fk_customers
+      TableID: 104
+    *scop.DropForeignKeyRef
+      Name: fk_orders
+      TableID: 105
+    *scop.MarkDescriptorAsDropped
+      DescID: 108
+    *scop.DrainDescriptorName
+      TableID: 108
+    *scop.RemoveSequenceOwnedBy
+      SequenceID: 108
+    *scop.RemoveRelationDependedOnBy
+      DependedOnBy: 109
+      TableID: 107
+    *scop.SetJobStateOnDescriptor
+      DescriptorID: 104
+      Initialize: true
+    *scop.SetJobStateOnDescriptor
+      DescriptorID: 105
+      Initialize: true
+    *scop.SetJobStateOnDescriptor
+      DescriptorID: 106
+      Initialize: true
+    *scop.SetJobStateOnDescriptor
+      DescriptorID: 107
+      Initialize: true
+    *scop.SetJobStateOnDescriptor
+      DescriptorID: 108
+      Initialize: true
+    *scop.SetJobStateOnDescriptor
+      DescriptorID: 109
+      Initialize: true
+    *scop.CreateSchemaChangerJob
+      Authorization:
+        UserName: root
+      DescriptorIDs:
+      - 104
+      - 105
+      - 106
+      - 107
+      - 108
+      - 109
+      JobID: 1
+      Statements:
+      - statement: DROP TABLE defaultdb.shipments CASCADE
+        redactedstatement: DROP TABLE ‹defaultdb›.public.‹shipments› CASCADE
+        statementtag: DROP TABLE
+PostCommitNonRevertiblePhase stage 1 of 1 with 13 MutationType ops
+  transitions:
+    [[Table:{DescID: 107}, ABSENT], DROPPED] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 1}, ABSENT], DELETE_AND_WRITE_ONLY] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 2}, ABSENT], DELETE_AND_WRITE_ONLY] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 3}, ABSENT], DELETE_AND_WRITE_ONLY] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 4}, ABSENT], DELETE_AND_WRITE_ONLY] -> ABSENT
+    [[Column:{DescID: 107, ColumnID: 5}, ABSENT], DELETE_AND_WRITE_ONLY] -> ABSENT
+    [[PrimaryIndex:{DescID: 107, IndexID: 1}, ABSENT], VALIDATED] -> ABSENT
+    [[View:{DescID: 109}, ABSENT], DROPPED] -> ABSENT
+    [[Sequence:{DescID: 108}, ABSENT], DROPPED] -> ABSENT
+  ops:
+    *scop.LogEvent
+      Authorization:
+        UserName: root
+      Element:
+        Table:
+          tableId: 107
+      Statement: DROP TABLE ‹defaultdb›.public.‹shipments› CASCADE
+      StatementTag: DROP TABLE
+      TargetMetadata:
+        SourceElementID: 1
+        SubWorkID: 1
+      TargetStatus: 1
+    *scop.CreateGcJobForTable
+      TableID: 107
+    *scop.LogEvent
+      Authorization:
+        UserName: root
+      Element:
+        View:
+          tableId: 109
+      Statement: DROP TABLE ‹defaultdb›.public.‹shipments› CASCADE
+      StatementTag: DROP TABLE
+      TargetMetadata:
+        SourceElementID: 3
+        SubWorkID: 1
+      TargetStatus: 1
+    *scop.CreateGcJobForTable
+      TableID: 109
+    *scop.LogEvent
+      Authorization:
+        UserName: root
+      Element:
+        Sequence:
+          sequenceId: 108
+      Statement: DROP TABLE ‹defaultdb›.public.‹shipments› CASCADE
+      StatementTag: DROP TABLE
+      TargetMetadata:
+        SourceElementID: 2
+        SubWorkID: 1
+      TargetStatus: 1
+    *scop.CreateGcJobForTable
+      TableID: 108
+    *scop.RemoveJobStateFromDescriptor
+      DescriptorID: 104
+      JobID: 1
+    *scop.RemoveJobStateFromDescriptor
+      DescriptorID: 105
+      JobID: 1
+    *scop.RemoveJobStateFromDescriptor
+      DescriptorID: 106
+      JobID: 1
+    *scop.RemoveJobStateFromDescriptor
+      DescriptorID: 107
+      JobID: 1
+    *scop.RemoveJobStateFromDescriptor
+      DescriptorID: 108
+      JobID: 1
+    *scop.RemoveJobStateFromDescriptor
+      DescriptorID: 109
+      JobID: 1
+    *scop.UpdateSchemaChangerJob
+      IsNonCancelable: true
+      JobID: 1
+
+deps
+DROP TABLE defaultdb.shipments CASCADE;
+----
+- from: [Column:{DescID: 107, ColumnID: 1}, DELETE_AND_WRITE_ONLY]
+  to:   [ColumnName:{DescID: 107, ColumnID: 1, Name: tracking_number}, ABSENT]
+  kind: Precedence
+  rule: column unnamed after column no longer public
+- from: [Column:{DescID: 107, ColumnID: 2}, DELETE_AND_WRITE_ONLY]
+  to:   [ColumnName:{DescID: 107, ColumnID: 2, Name: carrier}, ABSENT]
+  kind: Precedence
+  rule: column unnamed after column no longer public
+- from: [Column:{DescID: 107, ColumnID: 3}, DELETE_AND_WRITE_ONLY]
+  to:   [ColumnName:{DescID: 107, ColumnID: 3, Name: status}, ABSENT]
+  kind: Precedence
+  rule: column unnamed after column no longer public
+- from: [Column:{DescID: 107, ColumnID: 4}, DELETE_AND_WRITE_ONLY]
+  to:   [ColumnName:{DescID: 107, ColumnID: 4, Name: customer_id}, ABSENT]
+  kind: Precedence
+  rule: column unnamed after column no longer public
+- from: [Column:{DescID: 107, ColumnID: 5}, DELETE_AND_WRITE_ONLY]
+  to:   [ColumnName:{DescID: 107, ColumnID: 5, Name: randcol}, ABSENT]
+  kind: Precedence
+  rule: column unnamed after column no longer public
+- from: [ColumnName:{DescID: 107, ColumnID: 1, Name: tracking_number}, ABSENT]
+  to:   [Column:{DescID: 107, ColumnID: 1}, ABSENT]
+  kind: Precedence
+  rule: column unnamed before column no longer exists
+- from: [ColumnName:{DescID: 107, ColumnID: 2, Name: carrier}, ABSENT]
+  to:   [Column:{DescID: 107, ColumnID: 2}, ABSENT]
+  kind: Precedence
+  rule: column unnamed before column no longer exists
+- from: [ColumnName:{DescID: 107, ColumnID: 3, Name: status}, ABSENT]
+  to:   [Column:{DescID: 107, ColumnID: 3}, ABSENT]
+  kind: Precedence
+  rule: column unnamed before column no longer exists
+- from: [ColumnName:{DescID: 107, ColumnID: 4, Name: customer_id}, ABSENT]
+  to:   [Column:{DescID: 107, ColumnID: 4}, ABSENT]
+  kind: Precedence
+  rule: column unnamed before column no longer exists
+- from: [ColumnName:{DescID: 107, ColumnID: 5, Name: randcol}, ABSENT]
+  to:   [Column:{DescID: 107, ColumnID: 5}, ABSENT]
+  kind: Precedence
+  rule: column unnamed before column no longer exists
+- from: [IndexName:{DescID: 107, IndexID: 1, Name: shipments_pkey}, ABSENT]
+  to:   [PrimaryIndex:{DescID: 107, IndexID: 1}, ABSENT]
+  kind: Precedence
+  rule: index unnamed before index no longer exists
+- from: [Namespace:{DescID: 107, Name: shipments}, ABSENT]
+  to:   [Table:{DescID: 107}, ABSENT]
+  kind: Precedence
+  rule: name must drain before descriptor deletion
+- from: [Namespace:{DescID: 108, Name: sq1}, ABSENT]
+  to:   [Sequence:{DescID: 108}, ABSENT]
+  kind: Precedence
+  rule: name must drain before descriptor deletion
+- from: [Namespace:{DescID: 109, Name: v1}, ABSENT]
+  to:   [View:{DescID: 109}, ABSENT]
+  kind: Precedence
+  rule: name must drain before descriptor deletion
+- from: [PrimaryIndex:{DescID: 107, IndexID: 1}, VALIDATED]
+  to:   [IndexName:{DescID: 107, IndexID: 1, Name: shipments_pkey}, ABSENT]
+  kind: Precedence
+  rule: index unnamed after index no longer public
+- from: [Sequence:{DescID: 108}, DROPPED]
+  to:   [Locality:{DescID: 108}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [Sequence:{DescID: 108}, DROPPED]
+  to:   [Namespace:{DescID: 108, Name: sq1}, ABSENT]
+  kind: Precedence
+  rule: descriptor must be dropped before draining name
+- from: [Sequence:{DescID: 108}, DROPPED]
+  to:   [Owner:{DescID: 108}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [Sequence:{DescID: 108}, DROPPED]
+  to:   [SequenceOwnedBy:{DescID: 108, ReferencedDescID: 107}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [Sequence:{DescID: 108}, DROPPED]
+  to:   [UserPrivileges:{DescID: 108, Username: admin}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [Sequence:{DescID: 108}, DROPPED]
+  to:   [UserPrivileges:{DescID: 108, Username: public}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [Sequence:{DescID: 108}, DROPPED]
+  to:   [UserPrivileges:{DescID: 108, Username: root}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [DefaultExpression:{DescID: 107, ColumnID: 1}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [DefaultExpression:{DescID: 107, ColumnID: 5}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [ForeignKey:{DescID: 107, ReferencedDescID: 104, Name: fk_customers}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [ForeignKey:{DescID: 107, ReferencedDescID: 105, Name: fk_orders}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [ForeignKeyBackReference:{DescID: 104, ReferencedDescID: 107, Name: fk_customers}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [ForeignKeyBackReference:{DescID: 105, ReferencedDescID: 107, Name: fk_orders}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [Locality:{DescID: 107}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [Namespace:{DescID: 107, Name: shipments}, ABSENT]
+  kind: Precedence
+  rule: descriptor must be dropped before draining name
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [Owner:{DescID: 107}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [RelationDependedOnBy:{DescID: 106, ReferencedDescID: 107}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [RelationDependedOnBy:{DescID: 107, ReferencedDescID: 109}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [UserPrivileges:{DescID: 107, Username: admin}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [UserPrivileges:{DescID: 107, Username: public}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [Table:{DescID: 107}, DROPPED]
+  to:   [UserPrivileges:{DescID: 107, Username: root}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [View:{DescID: 109}, DROPPED]
+  to:   [Locality:{DescID: 109}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [View:{DescID: 109}, DROPPED]
+  to:   [Namespace:{DescID: 109, Name: v1}, ABSENT]
+  kind: Precedence
+  rule: descriptor must be dropped before draining name
+- from: [View:{DescID: 109}, DROPPED]
+  to:   [Owner:{DescID: 109}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [View:{DescID: 109}, DROPPED]
+  to:   [RelationDependedOnBy:{DescID: 107, ReferencedDescID: 109}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependency needs relation/type as non-synthetically dropped
+- from: [View:{DescID: 109}, DROPPED]
+  to:   [UserPrivileges:{DescID: 109, Username: admin}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [View:{DescID: 109}, DROPPED]
+  to:   [UserPrivileges:{DescID: 109, Username: public}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal
+- from: [View:{DescID: 109}, DROPPED]
+  to:   [UserPrivileges:{DescID: 109, Username: root}, ABSENT]
+  kind: Precedence
+  rule: relation drop precedes relation deps removal

@@ -1,0 +1,110 @@
+create-type
+CREATE TYPE defaultdb.typ AS ENUM('a')
+----
+
+ops
+DROP TYPE defaultdb.typ
+----
+StatementPhase stage 1 of 1 with 2 MutationType ops
+  transitions:
+    [[Type:{DescID: 104}, ABSENT], PUBLIC] -> TXN_DROPPED
+    [[Type:{DescID: 105}, ABSENT], PUBLIC] -> TXN_DROPPED
+  ops:
+    *scop.MarkDescriptorAsDroppedSynthetically
+      DescID: 104
+    *scop.MarkDescriptorAsDroppedSynthetically
+      DescID: 105
+PreCommitPhase stage 1 of 1 with 7 MutationType ops
+  transitions:
+    [[Type:{DescID: 104}, ABSENT], TXN_DROPPED] -> DROPPED
+    [[Namespace:{DescID: 104, Name: typ}, ABSENT], PUBLIC] -> ABSENT
+    [[Type:{DescID: 105}, ABSENT], TXN_DROPPED] -> DROPPED
+    [[Namespace:{DescID: 105, Name: _typ}, ABSENT], PUBLIC] -> ABSENT
+  ops:
+    *scop.MarkDescriptorAsDropped
+      DescID: 104
+    *scop.DrainDescriptorName
+      TableID: 104
+    *scop.MarkDescriptorAsDropped
+      DescID: 105
+    *scop.DrainDescriptorName
+      TableID: 105
+    *scop.SetJobStateOnDescriptor
+      DescriptorID: 104
+      Initialize: true
+    *scop.SetJobStateOnDescriptor
+      DescriptorID: 105
+      Initialize: true
+    *scop.CreateSchemaChangerJob
+      Authorization:
+        UserName: root
+      DescriptorIDs:
+      - 104
+      - 105
+      JobID: 1
+      Statements:
+      - statement: DROP TYPE defaultdb.typ
+        redactedstatement: DROP TYPE ‹defaultdb›.‹public›.‹typ›
+        statementtag: DROP TYPE
+PostCommitNonRevertiblePhase stage 1 of 1 with 7 MutationType ops
+  transitions:
+    [[Type:{DescID: 104}, ABSENT], DROPPED] -> ABSENT
+    [[Type:{DescID: 105}, ABSENT], DROPPED] -> ABSENT
+  ops:
+    *scop.LogEvent
+      Authorization:
+        UserName: root
+      Element:
+        Type:
+          typeId: 104
+      Statement: DROP TYPE ‹defaultdb›.‹public›.‹typ›
+      StatementTag: DROP TYPE
+      TargetMetadata:
+        SourceElementID: 1
+        SubWorkID: 1
+      TargetStatus: 1
+    *scop.DeleteDescriptor
+      DescriptorID: 104
+    *scop.LogEvent
+      Authorization:
+        UserName: root
+      Element:
+        Type:
+          typeId: 105
+      Statement: DROP TYPE ‹defaultdb›.‹public›.‹typ›
+      StatementTag: DROP TYPE
+      TargetMetadata:
+        SourceElementID: 1
+        SubWorkID: 2
+      TargetStatus: 1
+    *scop.DeleteDescriptor
+      DescriptorID: 105
+    *scop.RemoveJobStateFromDescriptor
+      DescriptorID: 104
+      JobID: 1
+    *scop.RemoveJobStateFromDescriptor
+      DescriptorID: 105
+      JobID: 1
+    *scop.UpdateSchemaChangerJob
+      IsNonCancelable: true
+      JobID: 1
+
+deps
+DROP TYPE defaultdb.typ
+----
+- from: [Namespace:{DescID: 104, Name: typ}, ABSENT]
+  to:   [Type:{DescID: 104}, ABSENT]
+  kind: Precedence
+  rule: name must drain before descriptor deletion
+- from: [Namespace:{DescID: 105, Name: _typ}, ABSENT]
+  to:   [Type:{DescID: 105}, ABSENT]
+  kind: Precedence
+  rule: name must drain before descriptor deletion
+- from: [Type:{DescID: 104}, DROPPED]
+  to:   [Namespace:{DescID: 104, Name: typ}, ABSENT]
+  kind: Precedence
+  rule: descriptor must be dropped before draining name
+- from: [Type:{DescID: 105}, DROPPED]
+  to:   [Namespace:{DescID: 105, Name: _typ}, ABSENT]
+  kind: Precedence
+  rule: descriptor must be dropped before draining name

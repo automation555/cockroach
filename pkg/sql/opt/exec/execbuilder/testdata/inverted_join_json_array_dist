@@ -1,0 +1,495 @@
+# LogicTest: 5node
+
+statement ok
+CREATE TABLE json_tab (
+  a INT PRIMARY KEY,
+  b JSONB
+)
+
+statement ok
+CREATE INVERTED INDEX foo_inv ON json_tab(b)
+
+statement ok
+CREATE TABLE array_tab (
+  a INT PRIMARY KEY,
+  b INT[]
+)
+
+statement ok
+CREATE INVERTED INDEX foo_inv ON array_tab(b)
+
+statement ok
+INSERT INTO json_tab VALUES
+  (1, '{"a": "b"}'),
+  (2, '[1,2,3,4, "foo"]'),
+  (3, '{"a": {"b": "c"}}'),
+  (4, '{"a": {"b": [1]}}'),
+  (5, '{"a": {"b": [1, [2]]}}'),
+  (6, '{"a": {"b": [[2]]}}'),
+  (7, '{"a": "b", "c": "d"}'),
+  (8, '{"a": {"b":true}}'),
+  (9, '{"a": {"b":false}}'),
+  (10, '"a"'),
+  (11, 'null'),
+  (12, 'true'),
+  (13, 'false'),
+  (14, '1'),
+  (15, '1.23'),
+  (16, '[{"a": {"b": [1, [2]]}}, "d"]'),
+  (17, '{}'),
+  (18, '[]'),
+  (19, '["a", "a"]'),
+  (20, '[{"a": "a"}, {"a": "a"}]'),
+  (21, '[[[["a"]]], [[["a"]]]]'),
+  (22, '[1,2,3,1]'),
+  (23, '{"a": 123.123}'),
+  (24, '{"a": 123.123000}'),
+  (25, '{"a": [{}]}'),
+  (26, '[[], {}]'),
+  (27, '[true, false, null, 1.23, "a"]'),
+  (28, '{"a": {}}'),
+  (29, NULL),
+  (30, '{"a": []}'),
+  (31, '{"a": {"b": "c", "d": "e"}, "f": "g"}'),
+  (32, '{"a": [1]}'),
+  (33, '[1, "bar"]')
+
+statement ok
+ALTER TABLE json_tab SPLIT AT VALUES (10), (20)
+
+statement ok
+ALTER TABLE json_tab EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1), (ARRAY[2], 10), (ARRAY[3], 20)
+
+query TTTI colnames
+SELECT start_key, end_key, replicas, lease_holder
+FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE json_tab] ORDER BY lease_holder
+----
+start_key  end_key  replicas  lease_holder
+NULL       /10      {1}       1
+/10        /20      {2}       2
+/20        NULL     {3}       3
+
+# This query performs an inverted join.
+query T
+EXPLAIN (DISTSQL)
+SELECT * FROM json_tab@foo_inv AS j1, json_tab AS j2 WHERE j1.b @> j2.b ORDER BY j1.a, j2.a
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • lookup join
+    │ table: json_tab@json_tab_pkey
+    │ equality: (a) = (a)
+    │ equality cols are key
+    │ pred: b @> b
+    │
+    └── • inverted join
+        │ table: json_tab@foo_inv
+        │
+        └── • scan
+              missing stats
+              table: json_tab@json_tab_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMlN9u2jAUh-_3FNa52lbTxE7on1y5azONiUGXIG3ThlAgZ1UojTMnqToh3n1KoBQQcVIxVb2L7fx8Ph99OnNI_8zAAff7dfei0yNvrzr-wP_afUd8t-teDsh78tHrfyHTVMajLBiL31KOovieXPhkyuh6v1xz8u2T67lkyo7HRPzKTdNCMuXHY9L3rlyPfPhRHAW02AuAQixD7AV3mILzExhQ4EDBgiGFRMkJpqlUxdG8_LETPoBjUojiJM-K7SGFiVQIzhyyKJshODAIxjP0MAhRGSZQCDELoll5_foBjx-j5Bb_AoVLOcvv4tQhASVjoOAnQbFqGcyE4YKCzLOngmkW3CA4bEGbQ3Xie1QZhp9lFKMyrAquVWOBrgPuQ6KIsNedFEV7-nnmEMGo4FRYlYD8OYAF2KppJw2b1pXyNk_IVEYxkbFDRPGqfo-I9j5am4o2LZkrga3nAPtSZaiM821YwY6osI4qS9iVJZ5ulipEhWHVxXtYerIlE4PxrUgVQnsLgTWXmR0ms8HMlsGb-lzDteOz_fI-1wBu-Hz6OnyuAV75zMxDhObNbeIH2sTNVkOVaqB2VGq_vEo1gBsqnb0OlWqAH1Vi_2s27qnhYZrIOMVGI88shiaGN7gctKnM1QSvlZyUZZbLfpkrN0JMs-UpWy468fKoANwMM22Y68NcG7b0YUsbtrfCbDds699cU7qtTZ_owyfa8Kk-fKoNn-nDZ4d07FzfMbNGkxrJ6izTa8ZqPGN60XZfPly8-RcAAP__WK26iA==
+
+# This query performs a cross join followed by a filter.
+# Note that the distribution shows as either full or partial depending on the
+# test config, so we hide it.
+query T
+SELECT info FROM [EXPLAIN (DISTSQL)
+SELECT * FROM json_tab@json_tab_pkey AS j1, json_tab AS j2 WHERE j1.b @> j2.b ORDER BY j1.a, j2.a
+] WHERE info NOT LIKE 'distribution:%'
+----
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • cross join
+    │ pred: b @> b
+    │
+    ├── • scan
+    │     missing stats
+    │     table: json_tab@json_tab_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: json_tab@json_tab_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0k1Fv0zAQx9_5FNZJaMDcJXa6DeUpYwtaoTQjqQRoRJPTHCOls4vtSKCq3x0lHRup2tIu6lvOd__8f2ffzcD8nIAPSdgPz4ekkN8UeRtHH8h1-Pmqf9YbkBcXvWSYfOy_JPc1rxYFY6PkjRVZ8PfjZvoDf5OzhIwZfcjWMSefLsM4JGN2lJHga-m6HpIxP8pIFF-EMXnzpUoJWp2J9L64RhlEQ9LvvQ_JQV4Yq4ustIWS_vMDoCBVjgNxhwb8a2BAgQMFD1IKU61GaIzSVWpWF_byX-C7FAo5LW11nFIYKY3gz8AWdoLgw1BkE4xR5KgdFyjkaEUxqX-_ulmgcK4m5Z00PhGUZEAhmYoq6jjMhXROQZX20dBYcYvgszl9GpS3Ryi-FuqRpZRK56gxb3CklfJ_JSs6uxTm-ztVSNTOSbOxaEAC_jAoQRcoRKX1ScBowGng0aC7tg9vl8tNlLaondOmfcAOaeAdrrXoNizY9u_H2r2fw9yOw7edqx24uvvlao4W356Lt-TibmfLy9oB6niPUOuXcAVUjGaqpMHlZVz5Z7faQMxvcbHRRpV6hFdajWqbRRjVuvogR2MXWb4IerJO1bf2r5jtIObLYr5R7DXE7rLY2yh-vVncbdPzcZueT9o4n-7knM6f_QkAAP__Dt-OaA==
+
+# This query performs an inverted join with an additional filter.
+query T
+EXPLAIN (DISTSQL)
+SELECT j1.*, j2.* FROM json_tab AS j2 INNER INVERTED JOIN json_tab AS j1
+ON j1.b @> j2.b AND j1.b @> '{"a": {}}' AND j2.a < 20
+ORDER BY j1.a, j2.a
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • lookup join
+    │ table: json_tab@json_tab_pkey
+    │ equality: (a) = (a)
+    │ equality cols are key
+    │ pred: (b @> b) AND (b @> '{"a": {}}')
+    │
+    └── • inverted join
+        │ table: json_tab@foo_inv
+        │
+        └── • scan
+              missing stats
+              table: json_tab@json_tab_pkey
+              spans: [ - /19]
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzUk09vm0wQxu_vpxjNJXayMSzYSd49kcRUInIhBatq1VjR2mwjOw5LF4hSWf7uFZB_RGFtqz20N3aY38zzjPSsMPuxRIbul8vRqedDZ-hF4-jTqAuRO3LPx7CgvX0CC6u3Dx_C4CMsMplc53wKpxEsLPB83w3B8z-74dgdwkXg-c0WCoEPnc6C9qbgXBWmaYty2rQLp_4QmvW91RXyK2SwWq_3uk8dVo9D1TADy-xCEA7dEM6-lsp4pYwjwUTGwud3IkP2DSkStHBCMFVyJrJMqrK8qpq8-AGZSXCepEVelicEZ1IJZCvM5_lSIMMxny5FKHgslGEiwVjkfL6sRj95c54-rtNb8RMJnstlcZdkDDiBKRKMUl6-Dg1q4mRNUBb5y8Is5zcCGV2T7UV5yb1QuYgv5DwRyrBadH2X8nqe3CN5BtyHVEHH6T-f2bEeT_uq1jg9Y-wiCvyzLhIMipyBQ4ljEcdudWLt4qR08Hjd_pbXHUl5W6SwkPMEZMLAsUtpPnScwTu2BrvZ6hNn0OrM3sVZJFUulHHUdOXYB8ShB60r-q0rXiZLFQsl4rbB72jx5aFMjZMmUdu2K8-l-VZNg4Ymun1e6O_lxaDmoWFtG5kNut5Exv6LI7PByavIDP6xyGxw9hiZ4z8VmXdWhCJLZZKJxoq2yWaZJRHfiDp_mSzUTFwqOavW1M-g4qpCLLK8_kvrh5fUv0qBr2GqhS09bGlhWw_bWrjfgOlbuK-F_9dvHmjhIz18pIWP9fCxFj7Rwyc7HWyy_u9XAAAA__9uFup9
+
+# This query performs a cross join followed by a filter.
+query T
+SELECT info FROM [EXPLAIN (DISTSQL)
+SELECT * FROM json_tab@json_tab_pkey AS j1, json_tab AS j2
+WHERE j1.b @> j2.b AND j1.b @> '{"a": {}}' AND j2.a < 20
+ORDER BY j1.a, j2.a
+] WHERE info NOT LIKE 'distribution:%'
+----
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • cross join
+    │ pred: b @> b
+    │
+    ├── • scan
+    │     missing stats
+    │     table: json_tab@json_tab_pkey
+    │     spans: [ - /19]
+    │
+    └── • filter
+        │ filter: b @> '{"a": {}}'
+        │
+        └── • scan
+              missing stats
+              table: json_tab@json_tab_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lF1v2j4Uxu__n-LoSH9RVpfEDn3zVfqSqnSMdARpm1pUGeJ1YTRmtiNtQnz3KaGlSwUpDHV3sX2e_J7z6OhM0fwYI8coaAdnPUjSrwouuuEHuAk-X7dPWh3YOW9Fvehjuw6PNe_mBSOj0jsrBv7Tx93ku_wFJxGMKFm8FmcGny6DbgA7OyPaGIB_m7muJ2HEGoM6nHTOoXxfm96iuEUO09msVn-qYA0BRcEQmFuHsHsedOH0C4xoQ5D8X6L_iCma6IQ9aLfeB1CLE2N1MshsolL-fw0JpiqWHfEgDfIbpEiQIUEP-wQnWg2lMUrnT9OisBX_RO4STNJJZvPrPsGh0hL5FG1ixxI59sRgLLtSxFI7LhKMpRXJuPj98piQ4JkaZw-p4SAIDJBgNBH5ac-hLvZnBFVmn4HGinuJnM7I35lib2iKbWLqIhlbqaV29suO5vccfLZ8DDjnV1HYOV3pwlvp4hmepUrHUsu4xO7nytdKlrRyKcy3K5WkUjtH5WbCDvjNRR9-Hn6YWQ4-JT4jvkf85so-mpukGSltpXaOy3jf2yU-3V1Qcx4p2Cup-yUqXX-w6HaD5VB3z2HrDvwGvry39cU28bWY-YM3nXm2fjrNLdNh7t6a0bxiahHN4T9bB0tcdKWZqNTIl2th6Z_dfBfI-F7Od4tRmR7Ka62GBWZ-DAtdcRFLY-ev3vzQSounYrL_FNNKMSuJ3ZditgGZvRR7leJmNblZKaZutXp_m8QOKsWH1eTDbRI7qhQfV5OPNyL3Z__9DgAA__-zyhha
+
+# This query performs a left inverted join with an additional filter.
+query T
+EXPLAIN (DISTSQL)
+SELECT * FROM json_tab AS j2 LEFT INVERTED JOIN json_tab AS j1
+ON j1.b @> j2.b AND j1.b @> '{"a": {}}' AND j2.a < 20
+ORDER BY j1.a, j2.a
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • lookup join (left outer)
+    │ table: json_tab@json_tab_pkey
+    │ equality: (a) = (a)
+    │ equality cols are key
+    │ pred: (b @> b) AND (b @> '{"a": {}}')
+    │
+    └── • inverted join (left outer)
+        │ table: json_tab@foo_inv
+        │ on: a < 20
+        │
+        └── • scan
+              missing stats
+              table: json_tab@json_tab_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzkVdFu4joQfb9fMZqXwq2BOAFK_ZS2pFIqbtIL2dWutqgKxK1CaZx1QtUK8e-rkFIIKg4V-8Zb7PjMnDkzRzPH5PcUGVo_bnsXtgOVrj3wBv_3qjCwetaVB__Cdd_9DyaJiO5TfwQXA5jo0LOuPbCd71bfs7pw49pO8QUF14FKZULrIzDvZppmcJjo9VEVLpwuFO9P5nfo3yGD-WJxUl290Os-LB-MQdeq4Pa7Vh8uf8KE1n2SxfKRYCQC7vjPPEH2CykS1JGggUOCsRRjniRCZr_my4d28IpMIxhG8SzNrocEx0JyZHNMw3TKkaHnj6a8z_2Ay4aGBAOe-uF0GX5Vn7n6uI-f-BsSvBLT2XOUMPAJjJDgIPazU61BNRwuCIpZuk6YpP4jR0YXZH9SdvTCZcqDGxFGXDaMIi_vLeYsb4j7zbP6y24gWfN9EOI-jF6QfASyXmMJFbP50QJTf5d9467QFsbYzcB1LqtI0HXApOveMMZsx-sgwYdQJilMRBhBGEHsh5IHteyYgWYpA5MSUyemQczWTmX0ryiTKfLerfYXVdnuYk-Ip1mcsxcRA9PIS62Y7U9kapfLlPCxiII95GgRs71TDuMrcgyETLlsnBelMI1TYtLTnSmaO1OsIwsZcMmDXYE_4eKImogbVC9AdlFoFSjQ_T1KD_Nog2q1hr6vTUt4bdm0eUQ2LVFmw6Znx2DTEjnebUq1Q3yq728S_UCT6FptT4eUkNpySOuIHFKizIZDOsfgkBI5Vg6hf2uTfZKjz5NYRAnfa0Fp2YrjwSPP12IiZnLMb6UYL9PkR3eJW14EPEnzvzQ_2FH-KyO4CaZKsK4G60qwoQYbSnCzAKbb4Ka65pLULSW6rQa3leAzNfhMCe6owZ1DFDtXK6aVjEnJkJVNmXrMaMmcUfWgbVc-XPzzJwAA___JgoAm
+
+# This query performs a semi inverted join with an additional filter.
+query T
+EXPLAIN (DISTSQL)
+SELECT * FROM json_tab AS j2 WHERE EXISTS (
+  SELECT * FROM json_tab@foo_inv AS j1
+  WHERE j1.b @> j2.b AND j2.a < 20
+)
+ORDER BY j2.a
+----
+distribution: full
+vectorized: true
+·
+• lookup join (semi)
+│ table: json_tab@json_tab_pkey
+│ equality: (a) = (a)
+│ equality cols are key
+│ pred: b @> b
+│
+└── • inverted join
+    │ table: json_tab@foo_inv
+    │
+    └── • scan
+          missing stats
+          table: json_tab@json_tab_pkey
+          spans: [ - /19]
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzck0FP204Qxe__TzGaU_LvhnjtJJV8MgWjGgWH2pFK1UbIsQdkE3bdXRuBUL57ZZsCRtgE9VL15pmd3-57o-d71D83aKN7djrf93wYHHrhMvwyH0Lozt2DJfwPR8HiBDItxXkRrWE_hMyEr5_dwAX3rBqGweujzoWU56m4qRH-gAwyvrcG50dpGBZBZu6th7DvH8IgM_ciqNsxmMZwCIvg0A3g07dqKEKGQibkR9ek0f6OHBmauGKYKxmT1lJV7ft6yEtu0TYYpiIvi6q9YhhLRWjfY5EWG0Ibl9F6QwFFCamxgQwTKqJ0U1_9KP_3x3l-RXfI8EBuymuhbYgYrJFhmEdVNRpzA1dbhrIsnh7URXRJaPMt212UJ25IFZQcy1SQGpsduh7WiuwRcG9zBc7kca1OhV6kSheQyVRAKiCPUkXJqCqR4aIsbHA4c0zmWMyZduo336O_0v2w00lb-_IuJxvm7tESQvfEg-OF5yPrXvVcyqsyb8RLYYNjVaJ9cGZtj5piKZLdTE46TVqdJp-8SZWQoqRty-EfcLV9ZRO-HMl8PGtPP-npVDJpKeG7Z5j_WYbH3BiNzV1j_IauFzG2_roYv6H_WYyn_0aMXzEZkM6l0NQy2HWzUWWckktq_gktSxXTqZJx_UxTLmqubiSki-aUN4UnmqNK4HOY98JmP2z2wlYL5i9hqxf-2P_ypBee9sPTXnjWD8_e5Xm1_e9XAAAA___F_4V5
+
+# This query performs an anti inverted join with an additional filter.
+query T
+EXPLAIN (DISTSQL)
+SELECT * FROM json_tab AS j2 WHERE NOT EXISTS (
+  SELECT * FROM json_tab@foo_inv AS j1
+  WHERE j1.b @> j2.b AND j2.a < 20
+)
+ORDER BY j2.a
+----
+distribution: full
+vectorized: true
+·
+• lookup join (anti)
+│ table: json_tab@json_tab_pkey
+│ equality: (a) = (a)
+│ equality cols are key
+│ pred: b @> b
+│
+└── • inverted join (left outer)
+    │ table: json_tab@foo_inv
+    │ on: a < 20
+    │
+    └── • scan
+          missing stats
+          table: json_tab@json_tab_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzUlUFv2kAQhe_9FaM5QbsErw2E-GSaOKojaqfGVVO1KDJ4EpkQr-u1o0QR_72ySUNMw0KUEzd2d76d98ZPyyPKP3M00b44Hw4cFxonzigYfRs2YWQP7eMAPsKp732FmRTJZR5OYDCCmQ4_vti-Da4XgH1RAtB4vdy6EuIyTu4qjD9hjRk_mID1u9A0g2CmH0yaMHBPoDHTD0Kotqega80meP6J7cPnn2VRiAwTEZEb3pJE8xdyZKgjQwPHDNNMTElKkZVHj1WhE92jqTGMk7TIy-0xw6nICM1HzON8TmhiEE7m5FMYUdbWkGFEeRjPq-ufLfz7cZne0AMyPBbz4jaRJoQMJshwlIblqtXmGo4XDEWRrxrKPLwmNPmC7S7KSe4oyyk6E3FCWduo6woeUjJhaJ8G4H0PbB_OPMdFhusjR_Z8kX2fZmB1nkdulWPzXLD4atqmaTpu0EeGV3Emc5iJOIE4gTSMM4pa5bKEitwEizNLZ5bBrO5Gw_pbDJdGnz5Cb6PZgRs4_3ld_zZDIW6KdCleJCZYxpPTXt28pKlIot1MdjaaNDaaXHkTWUQZRXVbFv-E48Urk3BFS6Tto3r1Ss9GJZ2aEr576Pn7Qt_mWqut75r7LbrWct_Z_9xvMfwi94f7m3t997Tp70ybrrV2jNoWUWtR6-5_1LYYfhG1_v5Gbcv_iE8yFYmkmsFNN2vl-0vRNS3faymKbErnmZhWbZZLr-KqjYhkvjzly4WTLI9KgS9hroR1NawrYaMG83XYUMvW1K07SrqrhrtKuKeGe-8xfaiE--rOfSV8pIaP3iR7vPjwNwAA___5r6FW
+
+statement ok
+INSERT INTO array_tab VALUES
+  (1, '{}'),
+  (2, '{1}'),
+  (3, '{1, 2}'),
+  (4, '{1, 3}'),
+  (5, '{1, 2, 3, 4}')
+
+statement ok
+ALTER TABLE array_tab SPLIT AT VALUES (3), (3)
+
+statement ok
+ALTER TABLE array_tab EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1), (ARRAY[2], 3), (ARRAY[3], 5)
+
+query TTTI colnames
+SELECT start_key, end_key, replicas, lease_holder
+FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE array_tab] ORDER BY lease_holder
+----
+start_key  end_key  replicas  lease_holder
+NULL       /3       {1}       1
+/3         NULL     {3}       3
+
+# This query performs an inverted join.
+query T
+EXPLAIN (DISTSQL)
+SELECT * FROM array_tab@foo_inv AS a1, array_tab AS a2 WHERE a1.b @> a2.b ORDER BY a1.a, a2.a
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • lookup join
+    │ table: array_tab@array_tab_pkey
+    │ equality: (a) = (a)
+    │ equality cols are key
+    │ pred: b @> b
+    │
+    └── • inverted join
+        │ table: array_tab@foo_inv
+        │
+        └── • scan
+              missing stats
+              table: array_tab@array_tab_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMk01v2kAQhu_9FaM5tc0S4w8-6tOmiatSUUhtpLZqEVrwNHJDvO56HSVC_PfKBkGI8AJqpfbGzvDMPBq9XmD-a44-Bl-u-xe9Aby86kWj6FP_FURBP7gcwWt4Fw4_glBKPE60mPIfUk6S9B4uIhA22zaqggOf3wdhAMI-nwL_XjSbLoFwzqcwDK-CEN5-LVuClTWBDFMZ00DcUY7-N7SRoYtjhpmSM8pzqcryovpTL35Av8kwSbNCl-Uxw5lUhP4CdaLnhD6OxHROIYmYlNVEhjFpkcyr0Vv9za9JdkuPyPBSzou7NPdBMJgiwygT5athuTheMpSF3m7Mtbgh9O0lO96ql96T0hR_kElKynLqxNZ3RbYhgodMAfc2d-QlOyy0D9xm3GG83tA5xbA0W5_NO_psfSlviwx-yiQFmfrA3VJuALy1z9djvMUq61pl9xTlSCpNymrv6nL7jHH3rHaFV7tiO1mqmBTFdYP3uAxkQ2ZWd4eoM2jtGNjH59n-0zxbbuPIPB-wepZn9x_k-YDhkzy3_pc8H1Be57nzt_K8Z0VIeSbTnI7KabMMOsU3tPo4clmoGV0rOavWrJ7DiqsKMeV61bVXj166apWCT2HbCDtm2DHCrhl2jbC3A9vPYc8IvzFvbhnhthluG-GOGe4Y4a4Z7p50sPHyxe8AAAD__9-argo=
+
+# This query performs a cross join followed by a filter.
+query T
+SELECT info FROM [EXPLAIN (DISTSQL)
+SELECT * FROM array_tab@array_tab_pkey AS a1, array_tab AS a2 WHERE a1.b @> a2.b ORDER BY a1.a, a2.a
+] WHERE info NOT LIKE 'distribution:%'
+----
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • cross join
+    │ pred: b @> b
+    │
+    ├── • scan
+    │     missing stats
+    │     table: array_tab@array_tab_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: array_tab@array_tab_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0Ul9v0z4Uff99iqsr_TRg3prEHQ958tiCVijNSCoBGtHkNJcRkcXBdiSmqt8dJZlWUjVlZdqb75_jc459lmh-FuhjHEyDsznk5TcFb6PwA1wFny-np5MZvDifxPP44_Ql3O-86hak1vLu2spUPJyuqx90B6cxSJet523Dg08XQRSAdI9TEF9rx-EE0jtOIYzOgwjefGlGkjU9mdwvt2pm4Rymk_cBHGS5sTpPa5ur0v__ABmWKqOZvCWD_hW6yJBjwrDSakHGKN20l-3SJPuFvsMwL6vaNu2E4UJpQn-JNrcFoY9zmRYUkcxIjxxkmJGVedFePeQVGZ6por4tjQ-SQYoM40o21dGIY7JiqGq7ZjRW3hD67or9myrvOVV5g6rWYupS6Yw0ZT0hSYP828oWaxfSfH-n8pL0aNx3Fs5AeA8xEc00rK0PwmXCY4IzMR70wfd53VhpS3p00qcX7iET_HCQYtyjcB__ge5TP3DEjx4Zqz1U8edUNRyrLaoiMpUqDW3Ga-vNTpMpym6oy6hRtV7QpVaLlqYrwxbXNjIytpt6XTEp21H7bH-C3T3A3ibY2wnmPbCzCeY7wa93g8dP8Xyyl-dk9d_vAAAA__-sGwU5
+
+# This query performs an inverted join with an additional filter.
+query T
+EXPLAIN (DISTSQL)
+SELECT * FROM array_tab@array_tab_pkey AS a2
+INNER INVERTED JOIN array_tab@foo_inv AS a1
+ON a1.b @> a2.b AND a1.b @> '{1}' AND a2.a < 5
+ORDER BY a1.a, a2.a
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • lookup join
+    │ table: array_tab@array_tab_pkey
+    │ equality: (a) = (a)
+    │ equality cols are key
+    │ pred: (b @> b) AND (b @> ARRAY[1])
+    │
+    └── • inverted join
+        │ table: array_tab@foo_inv
+        │
+        └── • scan
+              missing stats
+              table: array_tab@array_tab_pkey
+              spans: [ - /4]
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzUk0Fv2k4Qxe__TzGaS-CfDWZtnFCfTIMrOaImNahqlKJowdPIDfG6aztKhPjulQ1NIMIbUHtob-ysfzvvPfEWmP2Yo4Pel8tBzw-g0fdH49GnQRNG3sA7H8P_8CEcfgShlHi6ycXUff51k97RE_RGIEzwg8ALwQ8-e-HY68PF0A82kG9S3sTJQ_Uth2EAjYbgrSm4X4t22yIQZmvahF7Qh-350YIvj5q_bsyWgOpiBnYThmHfC-H9FQjeEqx8QiDDREYUiHvK0LlGjgwtnDBMlZxRlklVjhfVR370iE6bYZykRV6OJwxnUhE6C8zjfE7o4FhM5xSSiEgZbWQYUS7iefV0XRzI8FzOi_skc0AwmCLDUSrK04lh4WTJUBb5y8YsF7eEDl-y_VX5yQOpnKILGSekDLNO2Dp0ZM-E95gqaLid53xdc53txqwXhr2ra-44jh-Mu5MmMhwWuQMuZ67J3HoT5iEmSvHrZDt7JzuQ8q5I4buME5CJA65Vigug4do7LNn7Wuow1651ZR3iaiRVTso43XbkWsfM5ce1Kzq1K15elioiRVHdwzu0BPJEpkZ3i6hTYG8p4Pu3gv9uKwzrxKgPnx-i61UvrL-zF2-Y2OiF_Q_14g1X616c_ale7FgRUpbKJKO9_u_tsjAU3dKqZJks1IwulZxVa1bHYcVVg4iyfHXLVwc_WV2VAjdhroVNPWxqYUsPW1q4swXz13BHC7_Tb7a18KkePtXCZ3r4TAt39XD3oMAmy_9-BgAA___ugec2
+
+# This query performs a cross join followed by a filter.
+query T
+SELECT info FROM [EXPLAIN (DISTSQL)
+SELECT * FROM array_tab@array_tab_pkey AS a1, array_tab AS a2
+WHERE a1.b @> a2.b AND a1.b @> '{1}' AND a2.a < 5
+ORDER BY a1.a, a2.a
+] WHERE info NOT LIKE 'distribution:%'
+----
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • cross join
+    │ pred: b @> b
+    │
+    ├── • scan
+    │     missing stats
+    │     table: array_tab@array_tab_pkey
+    │     spans: [ - /4]
+    │
+    └── • filter
+        │ filter: b @> ARRAY[1]
+        │
+        └── • scan
+              missing stats
+              table: array_tab@array_tab_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8k2Fv2j4Qxt__P8XppL8oq0twAm3lV2FtqrIx6ALSVnVRZciti0ZjZjvSKsR3n5J0dKlKCuu2d_jOj3_PXR6WaL7NUeA4GAQnE0jSzwrOwtE7uAo-Xgx6_SHsnfbHk_H7QRPu77wqL0it5d21lVN__et68ZXuoDcGydlDvyi48OE8CAPY25O8NQX_U9ZuewTSbU2b0BueQrXeWPJVo_mz47YkFI0ZdJswCk-DEF5fguQtyfInZHT_emF_OJrAoP82gEacGKuTaWYTlYr_G8gwVTEN5S0ZFFfIkaGHEcOFVjMyRum8vCwu9ePvKNoMk3SR2bwcMZwpTSiWaBM7JxQ4kdM5hSRj0k4bGcZkZTIvnt60HGR4oubZbWoESAZTZDheyPx04HgYrRiqzD4QjZU3hIKv2O-5cv-mK3cXV2fJ3JIm7XSqlsq6AN9df_teGPYur7gQoj-cHEcb-d5G_gM2S5WOSVNcoUa58rkrTwxxLs2XNypJSTuH1TFGQ_A76wn8fO-jzArwOfNd5nvM72yco7PLHsdKW9LOURXve_vM5_tras5jBXsjtVuh8u0zxV-aKcc7cLpbZn0HX94f8LVl1p9xtc569x9k_Ql-SGahUkOPM__ky-086BTfUPnHMSrTM7rQalZgyuOo0BWFmIwtu1556KdFq_hsv4p5rditiNuPxe4OZPex2KsVd-rJnVrxcb24-5KFHdaKj-rJRzstLFr99yMAAP__tfyPYg==
+
+# This query performs a left inverted join with an additional filter.
+query T
+EXPLAIN (DISTSQL)
+SELECT a1.*, a2.* FROM array_tab@array_tab_pkey AS a2
+LEFT INVERTED JOIN array_tab@foo_inv AS a1
+ON a1.b @> a2.b AND a1.b @> '{1}' AND a2.a < 5
+ORDER BY a1.a, a2.a
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +a,+a
+│
+└── • lookup join (left outer)
+    │ table: array_tab@array_tab_pkey
+    │ equality: (a) = (a)
+    │ equality cols are key
+    │ pred: (b @> b) AND (b @> ARRAY[1])
+    │
+    └── • inverted join (left outer)
+        │ table: array_tab@foo_inv
+        │ on: a < 5
+        │
+        └── • scan
+              missing stats
+              table: array_tab@array_tab_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzkk19v2kgUxd_3U1zdl0Ay_BkbCOunYYMjOWJN1nirRimKBjyJ3BCPOzZRIsR3r2xTgpN4Amqf2jfPXP_uPXOuzgqTbwu00P58ORo4LtSGzsSf_Deqw8Qe2Wc-cNo8JsCN5jGce-N_gSvFn29SPmPbr5v4XjzDYALcgJF97oPjfrI93x7Cxdhxd4hbKW_C6DH_lcLYhVqN0-YM2Jdlu22KbMqsDgN3COX7oxVdH9V_VIwmh7wwh24dxt7Q9uCfq0woz4VyJBjJQLj8QSRoXSNFgiZOCcZKzkWSSJVdr_KfnOAJrTbBMIqXaXY9JTiXSqC1wjRMFwIt9PlsITzBA6FabSQYiJSHi7x1lRtI8Ewulg9RYgEnMEOCk5hnp0bLxOmaoFymLxOTlN8JtOia7K_KiR6FSkVwIcNIqJZRFuY_x8IqtjH-37e9fBVI8M0ykGw72U-xghrrbH1nxsbznbuB5w2urqllWY7r96d1JDh2gdHtSjYVJHgbqiSFrzKMIIwg5qESQSM7ZswytYBRwgzCTMK6lZ4Yh3iSebFZVOdQP94scCTl_TIu9MvIAmYWb62x3jsO9XQOJWIuo2APK7qE9SqtMA-xYiJVKlSrV7aBmSeE0ZPKEZ3KES-dpQqEEkFV43e0uLIh41a_TBTPNgnrkPzxlZq6JU10_6zSn81qy2zsmdUPVL3KqvlHZPUDT3ay2v3ds_qBFZusnv6qrL4zwhNJLKNElEZUdW5nIRbBnSiCn8ilmotLJef5mOI4zrn8IhBJWlRpcXCiopQJ3IWpFjb0sKGFTT1sauFOCaav4Y4W_ls_uauFe3q4p4VP9fCpFu7r4f5Bhk3Xf30PAAD__3nPO48=
+
+# This query performs a semi inverted join.
+query T
+EXPLAIN (DISTSQL)
+SELECT a2.* FROM array_tab@array_tab_pkey AS a2 WHERE EXISTS (
+  SELECT * FROM array_tab@foo_inv AS a1
+  WHERE a1.b @> a2.b
+)
+ORDER BY a2.a
+----
+distribution: full
+vectorized: true
+·
+• lookup join (semi)
+│ table: array_tab@array_tab_pkey
+│ equality: (a) = (a)
+│ equality cols are key
+│ pred: b @> b
+│
+└── • inverted join
+    │ table: array_tab@foo_inv
+    │
+    └── • scan
+          missing stats
+          table: array_tab@array_tab_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzck9FP2zAQxt_3V5zuCTaXNknbSXkKg6AFlZYllca0VchtDpRR7Mx2EAj1f5-cVC1hJBTtZdpb7uyf7_tOXx5R_1qij-HF-egwGsPecZRMky-jfUjCUXg0Be4evIeTeHIGXCn-cGn4PNh8XeY39ACHCXAXvn4O4xDCC8vD3pr-A72S8jITdyXjrBnuHMwh-FH0eh7ZefN9mMTHYQyfvtmSI0MhUxrzW9Lof0cHGXo4Y5gruSCtpbLtx_JSlN6j32OYibwwtj1juJCK0H9Ek5kloY9TPl9STDwl1e0hw5QMz5bl000ekeGRXBa3QvvAGcyRYZJzW3W6Hs5WDGVhthO14deEvrNiu6uKxB0pQ-mpzASprtskbL1BZBsivM8VBP3NCgPLXmVKG_gpMwGZgJxnitKOLZHhpDA-BA4LXBZ4LBg0GnDfYsAKX2-1Xxc_fcjJh1F4MoUkPIvgdBKNkbUteyTlTZFX8qXwIfCs7DEEw7pLTQsp0t1s9htteo02t-6kSklRWjcWOB9wtnphF2PZkXl3WL-91dOopF9T4uyeY-dvc9z1Ojvm-BVVz3Ls_Xs5fsXAkxwP_pccv2AzJp1Loalmsenlng05pddU_RRaFmpB50ouyjFVOSm5spGSNtWpUxWRqI6swKew0wq77bDbCns12HkOe63wx_bJ_VZ40A4PWuFhOzx8k-fZ6t3vAAAA__-DRYqh
+
+# This query performs an anti inverted join.
+query T
+EXPLAIN (DISTSQL)
+SELECT a2.* FROM array_tab@array_tab_pkey AS a2 WHERE NOT EXISTS (
+  SELECT * FROM array_tab@foo_inv AS a1
+  WHERE a1.b @> a2.b
+)
+ORDER BY a2.a
+----
+distribution: full
+vectorized: true
+·
+• lookup join (anti)
+│ table: array_tab@array_tab_pkey
+│ equality: (a) = (a)
+│ equality cols are key
+│ pred: b @> b
+│
+└── • inverted join (left outer)
+    │ table: array_tab@foo_inv
+    │
+    └── • scan
+          missing stats
+          table: array_tab@array_tab_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzck0FP204Qxe__TzGaE_y7IbGdpJJPpmBUo9SmjqtStRHaxANyCbvuro1AKN-9WhslmGAT1FN7y-zum3m_yfMD6l9LdNE_P5scBiHsHQfTZPp5sg9Tf-IfJcDtg__hJI4-AVeK318UfO6tf13k13QPh1PgNnz96Mc-hFEC_rnpAXuPHbbkl1JeZOK20lmPOm4dzMH7UQ4GDpmZ832I4mM_hg_fTMmRoZAphfyGNLrf0UKGDs4Y5kouSGupzPFD9ShI79AdMMxEXhbmeMZwIRWh-4BFViwJXUz4fEkx8ZRUf4AMUyp4tqxat3EiwyO5LG-EdoEzmCPDac5N1es7OFsxlGWxmagLfkXoWiu2u6tA3JIqKD2VmSDVt5vGkvucXJj4JwlEXxI_htMoCJHh1maRrTv5d7kCb7herWd6XmZKF_BTZgIyATnPFKU9UyLDqCxc8Czm2cxzmDdqBbPfAmaAHrc9bIU6DJNgm2nrT5hIeV3mtX0pXPAcYzsEb9yk1LSQIt0Nc9iK6bRibuikSklR2gTzrHc4W72wi1D2ZN4fN19v_LQ6GTacWLvn2_rTfPed3o75fsXVs3w7f0--XwF7ku_Rv5LvFzBj0rkUmhqIbZ0HJvyUXlH9sWhZqgWdKbmoxtRlVOmqg5R0Ud9adRGI-soYfCq2OsV2t9juFDsNsfVc7HSK33dPHnaKR93iUad43C0ev4l5tvrvdwAAAP__X-uY2g==

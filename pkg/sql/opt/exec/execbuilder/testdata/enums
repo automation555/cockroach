@@ -1,0 +1,227 @@
+# LogicTest: local
+
+# Note that we use EXPLAIN (opt) in these tests because the standard explain
+# prints spans after they have been converted into keys. Once converted into
+# keys, enum datums are not human readable. EXPLAIN (OPT) prints these enums
+# as datums, so we can more clearly see what spans are being generated.
+
+statement ok
+CREATE TYPE greeting AS ENUM ('hello', 'howdy', 'hi');
+CREATE TABLE t (x greeting PRIMARY KEY, y greeting, INDEX i (y), FAMILY (x, y));
+INSERT INTO t VALUES ('hello', 'howdy'), ('howdy', 'hi')
+
+# Test that we calculate the correct stats and cardinality.
+query T
+EXPLAIN (OPT,VERBOSE) SELECT * FROM t
+----
+scan t
+ ├── columns: x:1 y:2
+ ├── check constraint expressions
+ │    └── x:1 IN ('hello', 'howdy', 'hi') [outer=(1), constraints=(/1: [/'hello' - /'hello'] [/'howdy' - /'howdy'] [/'hi' - /'hi']; tight)]
+ ├── cardinality: [0 - 3]
+ ├── stats: [rows=3]
+ ├── cost: 18.05
+ ├── key: (1)
+ ├── fd: (1)-->(2)
+ ├── distribution: test
+ └── prune: (1,2)
+
+query T
+EXPLAIN (OPT) SELECT * FROM t WHERE x = 'hello'
+----
+scan t
+ └── constraint: /1: [/'hello' - /'hello']
+
+query T
+EXPLAIN (OPT) SELECT * FROM t WHERE x = 'hello' OR x = 'hi'
+----
+scan t
+ └── constraint: /1
+      ├── [/'hello' - /'hello']
+      └── [/'hi' - /'hi']
+
+query T
+EXPLAIN (OPT) SELECT * FROM t WHERE x > 'hello'
+----
+scan t
+ └── constraint: /1: [/'howdy' - /'hi']
+
+# Test that we can perform constrained scans using secondary indexes too.
+query T
+EXPLAIN (OPT) SELECT * FROM t WHERE y = 'hello'
+----
+scan t@i
+ └── constraint: /2/1: [/'hello'/'hello' - /'hello'/'hi']
+
+query T
+EXPLAIN (OPT) SELECT * FROM t WHERE y > 'hello' AND y < 'hi'
+----
+scan t@i
+ └── constraint: /2/1: [/'howdy'/'hello' - /'howdy'/'hi']
+
+query T
+EXPLAIN (opt) SELECT * FROM t WHERE x IN ('hello', 'hi')
+----
+scan t
+ └── constraint: /1
+      ├── [/'hello' - /'hello']
+      └── [/'hi' - /'hi']
+
+statement ok
+CREATE TABLE checks (x greeting NOT NULL, y int, INDEX (x, y))
+
+# Check that inferred check constraints from enum columns are used in plans.
+query T
+EXPLAIN (OPT) SELECT x, y FROM checks WHERE y = 2
+----
+scan checks@checks_x_y_idx
+ └── constraint: /1/2/3
+      ├── [/'hello'/2 - /'hello'/2]
+      ├── [/'howdy'/2 - /'howdy'/2]
+      └── [/'hi'/2 - /'hi'/2]
+
+
+# Test that changes to enums are picked up in plans.
+statement ok
+BEGIN;
+ALTER TYPE greeting ADD VALUE 'cheers'
+
+query T
+EXPLAIN (opt) SELECT x, y FROM checks WHERE y = 2
+----
+scan checks@checks_x_y_idx
+ └── constraint: /1/2/3
+      ├── [/'hello'/2 - /'hello'/2]
+      ├── [/'howdy'/2 - /'howdy'/2]
+      ├── [/'hi'/2 - /'hi'/2]
+      └── [/'cheers'/2 - /'cheers'/2]
+
+statement ok
+ROLLBACK
+
+statement ok
+ALTER TYPE greeting ADD VALUE 'cheers'
+
+query T
+EXPLAIN (opt) SELECT x, y FROM checks WHERE y = 2
+----
+scan checks@checks_x_y_idx
+ └── constraint: /1/2/3
+      ├── [/'hello'/2 - /'hello'/2]
+      ├── [/'howdy'/2 - /'howdy'/2]
+      ├── [/'hi'/2 - /'hi'/2]
+      └── [/'cheers'/2 - /'cheers'/2]
+
+# Test that we calculate the correct stats and cardinality.
+query T
+EXPLAIN (OPT,VERBOSE) SELECT DISTINCT x FROM checks
+----
+distinct-on
+ ├── columns: x:1
+ ├── grouping columns: x:1
+ ├── internal-ordering: +1
+ ├── cardinality: [0 - 4]
+ ├── stats: [rows=4, distinct(1)=4, null(1)=0, avgsize(1)=4]
+ ├── cost: 1114.88
+ ├── key: (1)
+ ├── distribution: test
+ └── scan checks@checks_x_y_idx
+      ├── columns: x:1
+      ├── stats: [rows=1000, distinct(1)=4, null(1)=0, avgsize(1)=4]
+      ├── cost: 1104.82
+      ├── ordering: +1
+      ├── distribution: test
+      ├── prune: (1)
+      └── interesting orderings: (+1)
+
+# Test that a limited, ordered scan is efficient.
+statement ok
+CREATE TABLE composite_key (x greeting, y INT, PRIMARY KEY (x, y), FAMILY (x, y));
+
+query T
+EXPLAIN (opt) SELECT * FROM composite_key ORDER BY y LIMIT 5
+----
+limit
+ ├── union-all
+ │    ├── union-all
+ │    │    ├── union-all
+ │    │    │    ├── scan composite_key
+ │    │    │    │    ├── constraint: /6/7: [/'hello' - /'hello']
+ │    │    │    │    └── limit: 5
+ │    │    │    └── scan composite_key
+ │    │    │         ├── constraint: /10/11: [/'howdy' - /'howdy']
+ │    │    │         └── limit: 5
+ │    │    └── scan composite_key
+ │    │         ├── constraint: /18/19: [/'hi' - /'hi']
+ │    │         └── limit: 5
+ │    └── scan composite_key
+ │         ├── constraint: /26/27: [/'cheers' - /'cheers']
+ │         └── limit: 5
+ └── 5
+
+statement ok
+CREATE TABLE nulls (x greeting, y int, INDEX (x, y))
+
+# Test that we calculate the correct stats and cardinality including null values.
+query T
+EXPLAIN (OPT,VERBOSE) SELECT x FROM nulls WHERE y < 0 UNION SELECT x FROM nulls WHERE y > 10
+----
+union
+ ├── columns: x:11
+ ├── left columns: nulls.x:1
+ ├── right columns: nulls.x:6
+ ├── internal-ordering: +11
+ ├── cardinality: [0 - 5]
+ ├── stats: [rows=5, distinct(11)=5, null(11)=1, avgsize(11)=4]
+ ├── cost: 2276.86667
+ ├── key: (11)
+ ├── distribution: test
+ ├── interesting orderings: (+11)
+ ├── project
+ │    ├── columns: nulls.x:1
+ │    ├── stats: [rows=333.3333, distinct(1)=5, null(1)=3.33333, avgsize(1)=4]
+ │    ├── cost: 1138.40333
+ │    ├── ordering: +1
+ │    ├── distribution: test
+ │    ├── interesting orderings: (+1)
+ │    └── select
+ │         ├── columns: nulls.x:1 y:2
+ │         ├── stats: [rows=333.3333, distinct(1)=5, null(1)=3.33333, avgsize(1)=4, distinct(2)=33.3333, null(2)=0, avgsize(2)=4]
+ │         ├── cost: 1135.05
+ │         ├── ordering: +1
+ │         ├── distribution: test
+ │         ├── interesting orderings: (+1,+2)
+ │         ├── scan nulls@nulls_x_y_idx
+ │         │    ├── columns: nulls.x:1 y:2
+ │         │    ├── stats: [rows=1000, distinct(1)=5, null(1)=10, avgsize(1)=4, distinct(2)=100, null(2)=10, avgsize(2)=4]
+ │         │    ├── cost: 1125.02
+ │         │    ├── ordering: +1
+ │         │    ├── distribution: test
+ │         │    ├── prune: (1,2)
+ │         │    └── interesting orderings: (+1,+2)
+ │         └── filters
+ │              └── y:2 < 0 [outer=(2), constraints=(/2: (/NULL - /-1]; tight)]
+ └── project
+      ├── columns: nulls.x:6
+      ├── stats: [rows=333.3333, distinct(6)=5, null(6)=3.33333, avgsize(6)=4]
+      ├── cost: 1138.40333
+      ├── ordering: +6
+      ├── distribution: test
+      ├── interesting orderings: (+6)
+      └── select
+           ├── columns: nulls.x:6 y:7
+           ├── stats: [rows=333.3333, distinct(6)=5, null(6)=3.33333, avgsize(6)=4, distinct(7)=33.3333, null(7)=0, avgsize(7)=4]
+           ├── cost: 1135.05
+           ├── ordering: +6
+           ├── distribution: test
+           ├── interesting orderings: (+6,+7)
+           ├── scan nulls@nulls_x_y_idx
+           │    ├── columns: nulls.x:6 y:7
+           │    ├── stats: [rows=1000, distinct(6)=5, null(6)=10, avgsize(6)=4, distinct(7)=100, null(7)=10, avgsize(7)=4]
+           │    ├── cost: 1125.02
+           │    ├── ordering: +6
+           │    ├── distribution: test
+           │    ├── prune: (6,7)
+           │    └── interesting orderings: (+6,+7)
+           └── filters
+                └── y:7 > 10 [outer=(7), constraints=(/7: [/11 - ]; tight)]

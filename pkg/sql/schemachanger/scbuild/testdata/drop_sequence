@@ -1,0 +1,143 @@
+create-sequence
+CREATE SEQUENCE defaultdb.SQ1
+----
+
+build
+DROP SEQUENCE defaultdb.SQ1 CASCADE
+----
+- [[Locality:{DescID: 104}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+- [[Namespace:{DescID: 104, Name: sq1}, ABSENT], PUBLIC]
+  details:
+    databaseId: 100
+    descriptorId: 104
+    name: sq1
+    schemaId: 101
+- [[Owner:{DescID: 104}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+    owner: root
+- [[Sequence:{DescID: 104}, ABSENT], PUBLIC]
+  details:
+    sequenceId: 104
+- [[TableComment:{DescID: 104}, ABSENT], PUBLIC]
+  details:
+    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
+      doing decomposition
+    tableId: 104
+- [[UserPrivileges:{DescID: 104, Username: admin}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+    privileges: 2
+    username: admin
+- [[UserPrivileges:{DescID: 104, Username: public}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+    username: public
+- [[UserPrivileges:{DescID: 104, Username: root}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+    privileges: 2
+    username: root
+
+create-table
+CREATE TABLE defaultdb.blog_posts (id INT PRIMARY KEY, val int DEFAULT nextval('defaultdb.sq1'), title text)
+----
+
+create-table
+CREATE TABLE defaultdb.blog_posts2 (id INT PRIMARY KEY, val int DEFAULT nextval('defaultdb.sq1'), title text)
+----
+
+create-type
+CREATE TYPE defaultdb.typ AS ENUM('a')
+----
+
+create-table
+CREATE TABLE defaultdb.blog_posts3 (id INT PRIMARY KEY, val typ DEFAULT CAST(chr(nextval('defaultdb.sq1')) as TYP ), title text)
+----
+
+build
+DROP SEQUENCE defaultdb.SQ1 CASCADE
+----
+- [[DefaultExprTypeReference:{DescID: 109, ColumnID: 2, ReferencedDescID: 107}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    tableId: 109
+    typeId: 107
+- [[DefaultExprTypeReference:{DescID: 109, ColumnID: 2, ReferencedDescID: 108}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    tableId: 109
+    typeId: 108
+- [[DefaultExpression:{DescID: 105, ColumnID: 2}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    defaultExpr: nextval(104:::REGCLASS)
+    tableId: 105
+    usesSequenceIds:
+    - 104
+- [[DefaultExpression:{DescID: 106, ColumnID: 2}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    defaultExpr: nextval(104:::REGCLASS)
+    tableId: 106
+    usesSequenceIds:
+    - 104
+- [[DefaultExpression:{DescID: 109, ColumnID: 2}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    defaultExpr: CAST(chr(nextval(104:::REGCLASS)) AS @100107)
+    tableId: 109
+    usesSequenceIds:
+    - 104
+- [[Locality:{DescID: 104}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+- [[Namespace:{DescID: 104, Name: sq1}, ABSENT], PUBLIC]
+  details:
+    databaseId: 100
+    descriptorId: 104
+    name: sq1
+    schemaId: 101
+- [[Owner:{DescID: 104}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+    owner: root
+- [[RelationDependedOnBy:{DescID: 104, ReferencedDescID: 105}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    dependedOn: 105
+    tableId: 104
+- [[RelationDependedOnBy:{DescID: 104, ReferencedDescID: 106}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    dependedOn: 106
+    tableId: 104
+- [[RelationDependedOnBy:{DescID: 104, ReferencedDescID: 109}, ABSENT], PUBLIC]
+  details:
+    columnId: 2
+    dependedOn: 109
+    tableId: 104
+- [[Sequence:{DescID: 104}, ABSENT], PUBLIC]
+  details:
+    sequenceId: 104
+- [[TableComment:{DescID: 104}, ABSENT], PUBLIC]
+  details:
+    comment: TODO(fqazi) Comments are not currently fetched from system.comments when
+      doing decomposition
+    tableId: 104
+- [[UserPrivileges:{DescID: 104, Username: admin}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+    privileges: 2
+    username: admin
+- [[UserPrivileges:{DescID: 104, Username: public}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+    username: public
+- [[UserPrivileges:{DescID: 104, Username: root}, ABSENT], PUBLIC]
+  details:
+    descriptorId: 104
+    privileges: 2
+    username: root

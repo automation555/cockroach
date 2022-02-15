@@ -1,0 +1,95 @@
+# LogicTest: 5node
+
+statement ok
+CREATE TABLE t (k INT PRIMARY KEY, v INT, w INT, INDEX v(v))
+
+# Split the index into 5 parts, as if numbers were in the range 1 to 100.
+statement ok
+ALTER INDEX t@v SPLIT AT SELECT (i * 10)::int FROM generate_series(1, 4) AS g(i)
+
+# Relocate the five parts to the five nodes.
+statement ok
+ALTER INDEX t@v EXPERIMENTAL_RELOCATE
+  SELECT ARRAY[i+1], (i * 10)::int FROM generate_series(0, 4) AS g(i)
+
+query TTTI colnames
+SELECT start_key, end_key, replicas, lease_holder from [SHOW RANGES FROM INDEX t@v]
+----
+start_key  end_key  replicas  lease_holder
+NULL       /10      {1}       1
+/10        /20      {2}       2
+/20        /30      {3}       3
+/30        /40      {4}       4
+/40        NULL     {5}       5
+
+query T
+EXPLAIN (DISTSQL) SELECT * FROM t WHERE v > 10 AND v < 50
+----
+distribution: local
+vectorized: true
+·
+• filter
+│ filter: (v > 10) AND (v < 50)
+│
+└── • scan
+      missing stats
+      table: t@t_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkNFK80AQhe__pxjmqv1Z6aYiyF61tCkGalqTgIIGiclQQtNs3N1UpeTdJVlrrVDRyzlnzszH2aF-LlCge7ecjz0felMvjMKbeR9Cd-5OIvgPs2BxDQZur9zAhd4WHmrOzwkc3oexP_1UUrjgfWRYyoz8ZEMaxT06GDOslExJa6laadcteNkrCs4wL6vatHLMMJWKUOzQ5KYgFBglTwUFlGSkBhwZZmSSvOjOmpF5rNb0hgwnsqg3pRawZrBl8IIMwypphTOMG4ayNocX2iQrQuE07PcYs7wwpEgNnGMGqwvojYaHSoQQnh9dfjSzd9pq9s5JqOFfoALSlSw1HSGdusybmCFlK7L9a1mrlJZKpt0bOy66XCdkpI11HTt4pbVawK9h58fw8Fs4bv69BwAA__-QBMHx
+
+query T
+EXPLAIN (DISTSQL) SELECT * FROM t WHERE v > 10 AND v < 50 ORDER BY v
+----
+distribution: local
+vectorized: true
+·
+• sort
+│ order: +v
+│
+└── • filter
+    │ filter: (v > 10) AND (v < 50)
+    │
+    └── • scan
+          missing stats
+          table: t@t_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkdFK80AQhe__pxjmqv1daZIiyF61tikGalqTgIoGiclQQtNs3N1UpeTdJYm1Vmixl3POnjMfsxtUrxlytO_n06HjQmfs-IF_O-2Cb0_tUQD_YeLNbkDD3bXt2dBZw1NpGH0C0-jC0B1_KzFcGF2YeWPbg6sHWCPDXCTkRitSyB_RxJBhIUVMSglZS5vmgZO8IzcYpnlR6loOGcZCEvIN6lRnhByD6CUjj6KEZM9AhgnpKM2aWj3Qz8WSPpDhSGTlKlcclgzWDN6QoV9EtXCOYcVQlHq3QuloQcjNiv0dY5JmmiTJnrnP0OocOgNrdx3OueMGl19H2jr1lbbOQSjrFChfSE2yZ-0jDayzg_X9U-o9UoXIFe3VH2o2qpAhJQtqv1eJUsY0lyJu1rTjrMk1QkJKt67ZDk7eWjXgz7B5NGwdD1tHw_1f4bD69xkAAP__3c733w==
+
+# Here we care about ordering by v, but v is not otherwise used.
+query T
+EXPLAIN (DISTSQL) SELECT w FROM t WHERE v > 10 AND v < 50 ORDER BY v
+----
+distribution: local
+vectorized: true
+·
+• sort
+│ order: +v
+│
+└── • filter
+    │ filter: (v > 10) AND (v < 50)
+    │
+    └── • scan
+          missing stats
+          table: t@t_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkVGLm0AUhd_7Ky73KaFT4hgKZZ5ME0OFVFMV2tJKsXoJssZxZ8Zkl-B_X9TNZrOQsHm858y55-POAfV9iQLdX-vVzPNhtPCiOPqxGkPkrtx5DHtYhsF3MPDzmxu6MNrB38aypgTcGsPMX7woGXy2xhCECzeEr79hhwwrmZOfbkmj-IMcE4a1khlpLVUnHfoHXv6AwmJYVHVjOjlhmElFKA5oClMSCozT_yWFlOakJhYyzMmkRdmvNY75V9_RIzKcy7LZVlrAjsEeGUZ12k2fMGkZysac9muTbggFb9n7GZZFaUiRmvBzgEEXMHL46TRCCM-Pvzxf6Oh0Jzo6F6HsW6AiqQypiX2O5PCPyDBojADHvlg0vaUoJF3LStNZ0aXNVpswpHxDwy9r2aiM1kpmfc0wBn2uF3LSZnD5MHjVYHWAr8P8ati-Hravhqdvwkn74SkAAP__AJr55g==
+
+# The single join reader should be on node 5, and doesn't need to output v.
+query T
+EXPLAIN (DISTSQL) SELECT w FROM t WHERE v > 40 AND v < 50 ORDER BY v
+----
+distribution: full
+vectorized: true
+·
+• index join
+│ table: t@t_pkey
+│
+└── • scan
+      missing stats
+      table: t@v
+      spans: [/41 - /49]
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkdGPmkAQxt_7V0zmSZM1LKAv-6RVmtJYsGDSNi1pKEwMEVnKLvYuhv_9Alw8NZG7e5xv5zffN7MnVP9yFOj82KwXrgejlRtuw2_rMYTO2llu4T98CvyvoOH7ZydwYHSE3zXnNsGUj2Hhrc5KAjM-Bj9YOQF8_AlHZFjIlLz4QArFLzSR4QwjhmUlE1JKVq186prc9AEFZ5gVZa1bOWKYyIpQnFBnOicU6MmJLA0LGaak4yzv2hqGstYvkNLxjlDYDbsYbA4P3sZ_cwooTqky-NV41PN2jaXM60OhBOxZt1ZYxm1lTM2JMWsJv9YC5ibei2O-J84XmRXPaczbNPpPuafHs6N919G6cnzlsgGpUhaK3nRa3kQMKd1R_3tK1lVCm0omnU1f-h3XCSkp3b_afeEW_VMb8BI2B2FrGLYGYX4DR82HpwAAAP__UuLwig==

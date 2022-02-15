@@ -1,0 +1,233 @@
+# LogicTest: local
+
+# SRID of the geometry column is unspecified, so default index bounds are used.
+statement ok
+CREATE TABLE geo_table(
+  k int primary key,
+  geom geometry,
+  INVERTED INDEX geom_index(geom)
+)
+
+# Shapes with SRID 26918. We've taken small X, Y values and added 400,000 to the X coordinate
+# and 4,000,000 to the Y coordinate to place them inside the bounds of SRID 26918.
+statement ok
+INSERT INTO geo_table VALUES
+  (1, 'SRID=26918;POINT(400001 4000001)'),
+  (2, 'SRID=26918;LINESTRING(400001 4000001, 400002 4000002)'),
+  (3, 'SRID=26918;POINT(400003 4000003)'),
+  (4, 'SRID=26918;LINESTRING(400004 4000004, 400005 4000005)'),
+  (5, 'SRID=26918;LINESTRING(400040 4000040, 400041 4000041)'),
+  (6, 'SRID=26918;POLYGON((400001 4000001, 400005 4000001, 400005 4000005, 400001 4000005, 400001 4000001))')
+
+query T
+EXPLAIN ANALYZE (DISTSQL) SELECT k FROM geo_table WHERE ST_Intersects('SRID=26918;POINT(400003 4000003)'::geometry, geom) ORDER BY k
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+rows read from KV: 6 (48 B)
+maximum memory usage: <hidden>
+network usage: <hidden>
+regions: <hidden>
+·
+• sort
+│ nodes: <hidden>
+│ regions: <hidden>
+│ actual row count: 2
+│ estimated max memory allocated: 0 B
+│ estimated max sql temp disk usage: 0 B
+│ order: +k
+│
+└── • filter
+    │ nodes: <hidden>
+    │ regions: <hidden>
+    │ actual row count: 2
+    │ filter: st_intersects('010100002026690000000000000C6A18410000008081844E41', geom)
+    │
+    └── • index join
+        │ nodes: <hidden>
+        │ regions: <hidden>
+        │ actual row count: 2
+        │ KV time: 0µs
+        │ KV contention time: 0µs
+        │ KV rows read: 2
+        │ KV bytes read: 16 B
+        │ estimated max memory allocated: 0 B
+        │ table: geo_table@geo_table_pkey
+        │
+        └── • inverted filter
+            │ nodes: <hidden>
+            │ regions: <hidden>
+            │ actual row count: 2
+            │ estimated max memory allocated: 0 B
+            │ estimated max sql temp disk usage: 0 B
+            │ inverted column: geom_inverted_key
+            │ num spans: 31
+            │
+            └── • scan
+                  nodes: <hidden>
+                  regions: <hidden>
+                  actual row count: 4
+                  KV time: 0µs
+                  KV contention time: 0µs
+                  KV rows read: 4
+                  KV bytes read: 32 B
+                  estimated max memory allocated: 0 B
+                  missing stats
+                  table: geo_table@geom_index
+                  spans: 31 spans
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzMVVFu4zYQ_e8pBvOTGFVhUlJcL4sCbrza1m2zXsjGFovKMBRp6hUskVqSahUEPlYv0JMVkpJtvIaVuPmJP2TPGz565j0OdYvmU44CF8GvwXQJW3gTzq9gQ2pt4-uc4LefgjAAY9eZtKQNJdacny3C2evv3dErPv7u3Xz2dnnuM8aYB-0X8wZnQvwYzK-CZfjBafYqBjAPXwchXH6ALTooVUpv44IMit-R48rBUquEjFG6gW7bBbO0RsEczGRZ2QZeOZgoTShu0WY2JxS4bGoMKU5JDxk6mJKNs7zd9nMLk6aAdSZTqtHBqcqrQhoB264ydHBRxg0wjPAyiuo_0iiqOYuimj32wG9O5fAIIZYpeAyU_UjaoIO_vAebFSSA_fP3XZwoaUnaTMmDlFZ_GdAUpwL8Drm-sXQPeS5cooNX76dTMJZKSFQlLZxTbYeZtAMBrNWpW0C0PbagiGsoqFD6BuI8V0lsKRXA2t2vY5t8JAOqsmVlBTTr27LuAR9XOwe76M44Y-MNoeA75-nmzuSfpC2lb7LckiY95PsO3-eDutSgJEy4ANN4CcbG2orWG-_biyhiLosixh57IJBMT6U1lh54Om9kmDT1tg22rnWGdbGxcZ7ve0s1JdWh5X1GNDnzKQdLRQlpZrZQmXhDT_bJPeqTe4pPP6tM3s2g2zOD3a91uaWb_xRyJu5zRsA9HAE-egkjcFxa7xRpPx99b1_YDhdf3suMM97cwC5zR6NX7OFnOvqBj33eBWM25mPfD3x-Jh5e1RN3cPTwuv_j8D5DJv8UmRZKW9JDf1-kCf_6pc3VxSldhWRKJQ3tdXVsZ7ZbOUjphroXqFGVTuidVkn7N104b3ktkJKxXZZ3wUx2qabAh2TeS3b7yW4v2esne71kv5_s95IvviCvdl_9GwAA__9PR-Lr
+
+statement ok
+DROP TABLE geo_table
+
+# SRID of the geometry column is specified, so SRID specific bounds are used.
+statement ok
+CREATE TABLE geo_table(
+  k int primary key,
+  geom geometry(geometry, 26918),
+  INVERTED INDEX geom_index(geom)
+)
+
+# Same shapes.
+statement ok
+INSERT INTO geo_table VALUES
+  (1, 'SRID=26918;POINT(400001 4000001)'),
+  (2, 'SRID=26918;LINESTRING(400001 4000001, 400002 4000002)'),
+  (3, 'SRID=26918;POINT(400003 4000003)'),
+  (4, 'SRID=26918;LINESTRING(400004 4000004, 400005 4000005)'),
+  (5, 'SRID=26918;LINESTRING(400040 4000040, 400041 4000041)'),
+  (6, 'SRID=26918;POLYGON((400001 4000001, 400005 4000001, 400005 4000005, 400001 4000005, 400001 4000001))')
+
+# The InvertedFilterer stats show "rows read: 2" since all the above shapes are within the index
+# bounds.
+query T
+EXPLAIN ANALYZE (DISTSQL) SELECT k FROM geo_table WHERE ST_Intersects('SRID=26918;POINT(400003 4000003)'::geometry, geom) ORDER BY k
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+rows read from KV: 4 (32 B)
+maximum memory usage: <hidden>
+network usage: <hidden>
+regions: <hidden>
+·
+• sort
+│ nodes: <hidden>
+│ regions: <hidden>
+│ actual row count: 2
+│ estimated max memory allocated: 0 B
+│ estimated max sql temp disk usage: 0 B
+│ order: +k
+│
+└── • filter
+    │ nodes: <hidden>
+    │ regions: <hidden>
+    │ actual row count: 2
+    │ filter: st_intersects('010100002026690000000000000C6A18410000008081844E41', geom)
+    │
+    └── • index join
+        │ nodes: <hidden>
+        │ regions: <hidden>
+        │ actual row count: 2
+        │ KV time: 0µs
+        │ KV contention time: 0µs
+        │ KV rows read: 2
+        │ KV bytes read: 16 B
+        │ estimated max memory allocated: 0 B
+        │ table: geo_table@geo_table_pkey
+        │
+        └── • inverted filter
+            │ nodes: <hidden>
+            │ regions: <hidden>
+            │ actual row count: 2
+            │ estimated max memory allocated: 0 B
+            │ estimated max sql temp disk usage: 0 B
+            │ inverted column: geom_inverted_key
+            │ num spans: 31
+            │
+            └── • scan
+                  nodes: <hidden>
+                  regions: <hidden>
+                  actual row count: 2
+                  KV time: 0µs
+                  KV contention time: 0µs
+                  KV rows read: 2
+                  KV bytes read: 16 B
+                  estimated max memory allocated: 0 B
+                  missing stats
+                  table: geo_table@geom_index
+                  spans: 31 spans
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzkleGO4zQQx7_zFKP5slsRVDvJlp4RUtleDgrs9ZRWh06kqrLJ0Iua2DnbgaxWfSxegCdDTnaP7a02ULEfkOgHtzPjvzv-_2LnFs2HEgWuoh-j-Rr28CpeXsGO1Nam1yXBT99FcQTGbgtpSRvKrDk_W8WLl1_7kxd8-tWb5eL1-jxkjLEAui8WjM6E-DZaXkXr-J3n1qpGsIxfRjFcvoM9eihVTq_TigyKn5HjxsNaq4yMUdqlbrsJi7xFwTwsZN1Yl954mClNKG7RFrYkFLh2PcaU5qTHDD3MyaZF2S37cQsz18C2kDm16OFclU0ljYB93xl6uKpTlxgneJkk7S95krQscAP7mwG_OFXDE4RU5hAwUPY9aYMe_vAWbFGRAPbH73dxpqQlaQslH5W0-s2ApjQX4PeZ6xtL9yk-gUv08OrtfA7GUg2ZaqSFc2rtuJB2JIB1PvUTiPZPTajSFiqqlL6BtCxVllrKBbBu9evUZu_JgGps3VgBbn7X1n3Cx83Bwz66A2dsuiMU_OD9c7gL-StpS_mrorSkSY_5MeH7etTWGpSEGRdgHEswNtVWdGyCLy-ShDk2zCEYHBBI5qfKHNJHTJfOhpnrt9tgR60H1sfGpmV5zJZayprHyIdAuJr5UIKlqoa8MHtoTLqjZ-Dkn8Lpe1XIuzPoD5zB_te23tPNXw55M_9_dgSCU6z9-OgHx8b2efHpvcw44-4G9pk_mbxgDz_zyTd8GvI-mLIpn4ZhFPIz8fCqnvmjZ314_4VN4Sk2rZS2pMfhsUkz_vl_7VxdnLKrmEytpKGjXT21MjtsPKR8R_0L1KhGZ_RGq6z7mz5cdroukZOxfZX3wUL2JdfgQzEfFPvDYn9QHAyLg0FxOCwOB8UXn4g3h8_-DAAA__9h3uLt
+
+# Also works when creating an index.
+statement ok
+DROP INDEX geo_table@geom_index
+
+statement ok
+CREATE INVERTED INDEX geom_index ON geo_table(geom)
+
+query T
+EXPLAIN ANALYZE (DISTSQL) SELECT k FROM geo_table WHERE ST_Intersects('SRID=26918;POINT(400003 4000003)'::geometry, geom) ORDER BY k
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+rows read from KV: 4 (32 B)
+maximum memory usage: <hidden>
+network usage: <hidden>
+regions: <hidden>
+·
+• sort
+│ nodes: <hidden>
+│ regions: <hidden>
+│ actual row count: 2
+│ estimated max memory allocated: 0 B
+│ estimated max sql temp disk usage: 0 B
+│ order: +k
+│
+└── • filter
+    │ nodes: <hidden>
+    │ regions: <hidden>
+    │ actual row count: 2
+    │ filter: st_intersects('010100002026690000000000000C6A18410000008081844E41', geom)
+    │
+    └── • index join
+        │ nodes: <hidden>
+        │ regions: <hidden>
+        │ actual row count: 2
+        │ KV time: 0µs
+        │ KV contention time: 0µs
+        │ KV rows read: 2
+        │ KV bytes read: 16 B
+        │ estimated max memory allocated: 0 B
+        │ table: geo_table@geo_table_pkey
+        │
+        └── • inverted filter
+            │ nodes: <hidden>
+            │ regions: <hidden>
+            │ actual row count: 2
+            │ estimated max memory allocated: 0 B
+            │ estimated max sql temp disk usage: 0 B
+            │ inverted column: geom_inverted_key
+            │ num spans: 31
+            │
+            └── • scan
+                  nodes: <hidden>
+                  regions: <hidden>
+                  actual row count: 2
+                  KV time: 0µs
+                  KV contention time: 0µs
+                  KV rows read: 2
+                  KV bytes read: 16 B
+                  estimated max memory allocated: 0 B
+                  missing stats
+                  table: geo_table@geom_index
+                  spans: 31 spans
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzkleGO4zQQx7_zFKP5slsRVDvJlp4RUtleDgrs9ZRWh06kqrLJ0Iua2DnbgaxWfSxegCdDTnaP7a02ULEfkOgHtzPjvzv-_2LnFs2HEgWuoh-j-Rr28CpeXsGO1Nam1yXBT99FcQTGbgtpSRvKrDk_W8WLl1_7kxd8-tWb5eL1-jxkjLEAui8WjM6E-DZaXkXr-J3n1qpGsIxfRjFcvoM9eihVTq_TigyKn5HjxsNaq4yMUdqlbrsJi7xFwTwsZN1Yl954mClNKG7RFrYkFLh2PcaU5qTHDD3MyaZF2S37cQsz18C2kDm16OFclU0ljYB93xl6uKpTlxgneJkk7S95krQscAP7mwG_OFXDE4RU5hAwUPY9aYMe_vAWbFGRAPbH73dxpqQlaQslH5W0-s2ApjQX4PeZ6xtL9yk-gUv08OrtfA7GUg2ZaqSFc2rtuJB2JIB1PvUTiPZPTajSFiqqlL6BtCxVllrKBbBu9evUZu_JgGps3VgBbn7X1n3Cx83Bwz66A2dsuiMU_OD9c7gL-StpS_mrorSkSY_5MeH7etTWGpSEGRdgHEswNtVWdGyCLy-ShDk2zCEYHBBI5qfKHNJHTJfOhpnrt9tgR60H1sfGpmV5zJZayprHyIdAuJr5UIKlqoa8MHtoTLqjZ-Dkn8Lpe1XIuzPoD5zB_te23tPNXw55M_9_dgSCU6z9-OgHx8b2efHpvcw44-4G9pk_mbxgDz_zyTd8GvI-mLIpn4ZhFPIz8fCqnvmjZ314_4VN4Sk2rZS2pMfhsUkz_vl_7VxdnLKrmEytpKGjXT21MjtsPKR8R_0L1KhGZ_RGq6z7mz5cdroukZOxfZX3wUL2JdfgQzEfFPvDYn9QHAyLg0FxOCwOB8UXn4g3h8_-DAAA__9h3uLt

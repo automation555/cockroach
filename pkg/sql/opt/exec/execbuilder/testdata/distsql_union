@@ -1,0 +1,1107 @@
+# LogicTest: 5node
+
+statement ok
+CREATE TABLE xyz (
+  x INT,
+  y INT,
+  z TEXT
+)
+
+statement ok
+ALTER TABLE xyz SPLIT AT VALUES (2), (3), (4), (5)
+
+statement ok
+ALTER TABLE xyz EXPERIMENTAL_RELOCATE VALUES
+  (ARRAY[1], 1),
+  (ARRAY[2], 2),
+  (ARRAY[3], 3),
+  (ARRAY[4], 4),
+  (ARRAY[5], 5)
+
+query TTTI colnames
+SELECT start_key, end_key, replicas, lease_holder from [SHOW RANGES FROM TABLE xyz]
+----
+start_key  end_key  replicas  lease_holder
+NULL       /2       {1}       1
+/2         /3       {2}       2
+/3         /4       {3}       3
+/4         /5       {4}       4
+/5         NULL     {5}       5
+
+subtest Union
+
+# Simple UNION ALL and UNION. (The ORDER BY applies to the UNION, not the last select.)
+query T
+EXPLAIN (DISTSQL) SELECT x FROM xyz UNION ALL SELECT x FROM xyz ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• union all
+│
+├── • sort
+│   │ order: +x
+│   │
+│   └── • scan
+│         missing stats
+│         table: xyz@xyz_pkey
+│         spans: FULL SCAN
+│
+└── • sort
+    │ order: +x
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0lt-L2k4Uxd-_f0W4T9_SCfHOTPZHnna7a0GwulULLUVKaoZF6jppEiEq_u_FKOxazJ3MxL6ZjOeee858HrKF_PcCIuh-ferf9wbe_4-98WT8uf_OG3f73YeJV3ofR8NPXrneeF8GveHAu-_3z5wNR4_dkffhm1cCg6VO1CB-UTlE3wGBAQcGAhhIYBDClEGa6ZnKc53t_7KtBL2khKjDYL5MV8X-9ZTBTGcKoi0U82KhIIJJ_HOhRipOVBZ0gEGiini-qGzK9eauXG9-pL_UGhg86MXqZZlH1T7jNN7_9AMO0x0DvSpeLfIiflYQ4Y41X2Oss0JlQXi6wR2-rx3Pbca_TYmXjSkcYqJFTlk7_3WszhKVqeTc0DNLDLSv04Cf1lBn3_lX9mEj-_DEHi1u2fqSA-4HoiHNhkWO13zlSrNNzksHFQ5B0SKprJ3fEih04Jk3L5rb9yz8QDYEyrDIsedrV6AscuKlgwqHoGiRVNbObwkUdwBKNC9a2Pcs_SBsCJRhkWPPN65AWeTESwcVDkHRIqmsnd8SKOEAlGxetLTvOfQb4mRY49jyrStOFinxsjGFQ0y0yClr57eESbb8fDszeaTyVC9z1XDylIFKntUhS65X2Uw9ZXpW2Rweh5WuepGovDic4uGhtzwc7Rd8K0ZSLE_E-LeYk2JBO4s2zpIUh7Q4JMX8it77ilRf0-Jr-q469OI3pPqWtr5tZY00ZYbGkcYMuQFSGjQ0udOooTS407AZ3WncTGoaNzTwhjRw3HTrNHFoQA5p5kzuvBVznGaOG5jjNHPc5E4zxw3McZo5o7sdc9Pdf38CAAD__9qqSRU=
+
+query T
+EXPLAIN (DISTSQL) SELECT x FROM xyz UNION SELECT x FROM xyz ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • union
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJysll-L2kAUxd_7KcJ9aulInEninzxtu2tBsLpVCy1FSmoui9TN2EyEqPjdi_Eh1eqdmSRvm2TPPb859yBzAPVnDSEMvj2PPgzHztun4Ww--zJ658wGo8Hj3MmdT9PJZyff7Z2v4-FkfOP9ZPo0mDofvzs5MEhkjOPoFRWEP4ADAwEMPGDgA4MAFgw2qVyiUjI9_cuhEAzjHMI2g1Wy2Wan1wsGS5kihAfIVtkaIYR59GuNU4xiTN02MIgxi1brwibf7R_y3f7n5jfugMGjXG9fExUWPLNNdPqz5QpYHBnIbVZaqCx6QQj5kVXDCBrFEDYYTyuVrZJl5vKrLB74XQOvmkFgbODfNSjnbhOZxphifDF1caQQhPkZA5szzmSaYeoKfj3-_d35nYv53Lwr3Lorrmi5nmFpLUA6DYMIG5CyVf9lblhbY4NOxdoK8yiFfZRey_UNd2oB0m0YRNiAlJGLijs1NuhW3KlnHqVnH6XfcgPDnVqA9BoGETYgZeRexZ0aG_Qq7tQ3j9K3jzJoGW7UAqPfKIawwSjj9ivu09ig38B14YbBFNVGJgqvrg23J7dP1wmMX_B891Bymy7xOZXLwub8OCl0xYsYVXb-6p0fhsn50wnwXzEnxYIWC1LsX4j5tdirI_ZJcUBjB_SZNYfukOo-Le6S4h4t7tVJrF9HzOmOcV3J6JZxTeK8Vs94raJxumm8q0Gnu8Y7GjldNh073Tadmq6b4Bp0unCirflpoRunYRd04a7Vi-ObvwEAAP__qRtNYw==
+
+# UNION with no overlap.
+query T
+EXPLAIN (DISTSQL) SELECT x FROM xyz WHERE x < 3 UNION SELECT x FROM xyz WHERE x >= 3 ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • union
+    │
+    ├── • filter
+    │   │ filter: x < 3
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x >= 3
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJysl91u2kAQhe_7FKu5alUjM7s2P5YqpU2IipRCClRt1aKK2qsIldjUNpJJxLtXgIQDDTO7ju_in7Nn9sw3G_wI2d8FBND7dnvzvj8Qr6_648n4880bMe7d9C4nohDXo-EnUawfxNePvVFPFOLnqtlUoVDiy6A_HHAv6ndCieHoqjcSH76LAhyIk0gPZvc6g-AHIDggwQEFDnjggA9TB5ZpEuosS9LtK487QT8qIGg6MI-Xq3x7e-pAmKQagkfI5_lCQwCT2e-FHulZpFO3CQ5EOp_NFzubYv1wUawffi3_6DU4cJksVvdxFuzqGS9n2z8broTpxoFklZcWWT670xDgxjEv43q-yHWqU9c_rmF_PxAXWCYTBEF_MOmcNZY2xk_3j_UGoCoFgEwCIR-AZ2N8Nc_yeRzmrjzZ_QWeNfCrGfjGBq2zBuW6qzhJI53q6GjV6YYqQZnvsW2zx3GS5jp1FZ4u__bs-p2j9dGCUmtIXdlwleGcMoUcMG3VPac2CdQdgaoUATIZWE8qY1wO0n-YGU6qsUGr4qRK8yZK-x6qhusZYswUcuhhu26MLRLAuiNQlSJAJgNrjBnjkjJZEWNjg3ZFjJV5E5V9D72G6xtizBRy6GGnbowtEsC6I1CVIkAmA2uMGeOSMlURY2ODTkWMPfMmevY99BuGEDNlHDrYrRtii_1jvQGoSgEgk4A1woxxSZhXEWFjg24NP_2fMRjpbJnEmT75BHh-5eb200BHd3r_HZElqzTUt2kS7mz2l8Odbncj0lm-f4r7i368f7Qt8KkYSbFPiyUpVrRYkWKPFnukuHUkxlOx_xJxixS36bLbdGCSVndIdZcWd2lKmGYhAxlHGY0ZMhtHGjSmY0iTxqlp1JAZEaRhQ6ZrSOOGDG9IA4cdRk4TxyVHI8eoJU2cZIiTNHGSO9lo4iQzLpJGTjKnm3zR8SZfdL5JmjjJECeZI45rG02cZMZF0sipJvMviWaOSU7RyJ2qp5tX_wIAAP__jneluA==
+
+# UNION with partial overlap.
+query T
+EXPLAIN (DISTSQL) SELECT x FROM xyz WHERE x <= 4 UNION SELECT x FROM xyz WHERE x > 1 ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • union
+    │
+    ├── • filter
+    │   │ filter: x <= 4
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x > 1
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJysl2-P0kAQxt_7KTbzSmNJmd2WP01MTu-4SHLCCRg1SgzSzYXItdiWpNyF726ABA48Znb3-k4Kzz4zz_xmvT5C_ncOEXS-3d687_bE66vucDT8fPNGDDs3ncuRKMX1oP9JlKsH8fVjZ9ARpfi5rNfV9J0IxJdet9_jfqkFiv7gqjMQH76LEjxI0lj3Jvc6h-gHIHggwQMFHgTgQQhjDxZZOtV5nmabnzxuBd24hKjuwSxZLIvN47EH0zTTED1CMSvmGiIYTX7P9UBPYp35dfAg1sVkNt_alKuHi3L18GvxR6_Ag8t0vrxP8mhbz3Ax2fyz5ksYrz1Il8XBIi8mdxoiXHvmZVzP5oXOdOaHxzXsnkfiAvfBRFHU7Y1aZ32lje_T9rHa_pVT_8gEsGGISyCwcb6a5cUsmRa-PGn_As8ahG4GobFB46zB4dxlkmaxznR8dOp4TZWgzHts2vQ4TLNCZ77C0-Pfnj2_dXQ-WmBqTakva74y3FOmkD2njYr31CaAqhNQTgkgE4H9pjLOh0X6DzPDTTU2aDhuqjSforQfoqr5gSHGTCH7ITYrxtgiAKw6AeWUADIR2GPMOB8ok44YGxs0HTFW5lNU9kMMan5oiDFTyH6IrYoxtggAq05AOSWATAT2GDPOB8qUI8bGBi1HjAPzKQb2QwxrhhAzZexH2K4YYov2sdr-lVP_yARgjzDjfCAscETY2KBdwZ_-zxgMdL5Ik1yfvAI8f3J982qg4zu9e4_I02U21bdZOt3a7D72t7rtg1jnxe5b3H3oJruvNgU-FSMpDmmxJMWKFitSHNDigBQ3jsR4Kg5fIm6Q4iZddpMOTNLqFqlu0-I2TQkzLGQg4yijMUOmcaRBYyaGNGmcmkYNmRVBGjZkpoY0bsjwhjRw2GLkNHFccjRyjFrSxEmGOEkTJ7mbjSZOMusiaeQkc7vJF11v8kX3m6SJkwxxkrniuLHRxElmXSSNnKoz_yXRzDHJKRq5U_V4_epfAAAA__-KWaWy
+
+# UNION ALL with swapped column orders.
+query T
+EXPLAIN (DISTSQL) SELECT x, y FROM xyz UNION ALL SELECT y, x from xyz
+----
+distribution: full
+vectorized: true
+·
+• union all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJysldGK2kAUhu_7FMO5amFCnJnEXXPlsrUgWN2qhUIJJTWHRZrNpJkEEsV3L0bareJOJhMvk8mX8-X8P7oH9TuBACbfnmYP0zl5_3G6Wq--zD6Q1WQ2eVyTipKafFouPpOq3pGv8-liTh5ms7_HNSXVv2OgkMoY59ELKgi-AwMKHCgIoOABBR9CClkuN6iUzI-P7BtgGlcQDChs06wsjrdDChuZIwR7KLZFghDAOvqZ4BKjGHN3ABRiLKJt0oyp6t24qnc_sl9YA4VHmZQvqQoadaCwyqLjleMeVRZlEZAxp2MG4YGCLIvXkaqInhECdqB2Wr6t1lsm_E2TVwGF-TZKSJnKPMYc4zOH8HBFeS4dmblscPHkdYWBgUL32b7RbHE2m5kHwWyCcLnjCpuGdBAb2ouZdYTdtiPMoiPcfB3cah3CcT2bnDqI3dmLmeXEb5sTt8hJmK9DWK3Dc5pfxM45dRC7txczy0ncNidhkZNnvg7Pah2-Y5NSB62RrZZZRt5tM_J6_i9eefMSVSZThYZvDilg_Iyn71GyzDf4lMtNM-Z0uWi45kaMqjid8tPFNG2OmrT-h1kfmGthoYeFFmbDM3pwSXtaeqgf7feBh30--k4Lj_TwfR941Eeb6TvG2kqmb1kr3qtnrKVofguub1orru_apXt4ePcnAAD__7KpZ6U=
+
+# UNION ALL and UNION with different ORDER BY types.
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) UNION ALL (SELECT x FROM xyz ORDER BY z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• union all
+│
+├── • sort
+│   │ order: +x
+│   │
+│   └── • scan
+│         missing stats
+│         table: xyz@xyz_pkey
+│         spans: FULL SCAN
+│
+└── • sort
+    │ order: +x
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0ll1r2zAUhu_3K8S5apmCcyS5H75q12YQyJIu6WBjhJHFopSlkWc7YKfkv498QJutPpIldhd_vH7Pc_Rc5BmK3wtIoPf1bnDdH7KT2_7kfvJ5cMpOJr1B7-aeVezjePSJVfWajca3vTH78I3Vp-zLsD8asuvBgHxxffryuwIOS5Pq4exJF5B8BwQOAjhI4KCAQwxTDllu5rooTL595XkX6KcVJF0Oj8tsVW5vTznMTa4heYbysVxoSOB-9nOhx3qW6jzqAodUl7PHxa6mqtdXVb3-kf3SNXC4MYvV07JIWMXZGjhMstn2qhMJmG44mFX50lKUswcNCW64-yQTk5c6j-LjIa7wPXAYrcqEXWFjkWhT9BoZ3ZlrN2bpwYxe0Kqx6aXA5KnOdfrv56ebN8YZmo7JInG8k6b67v-qj53q46N6bHHkPpZHohNJR88tsxzO_Czc8zbQ7tS1K7X0oEYvbNXYFKgaepgu3LcuvFSTnUg5qmaZ5bD083DVWkCjO3XtSi09qNELWzU2BaomPFST7luXXqqpThQ7qmaZ5bD0i3DVWkCjO3XtSi09qNELWzU2BaomPVRT7ltXXqrFHUfRLJMcVn4ZLloLZHRnrt2YpQczekGrxqZAzVTg38Q3vjzWRWaWhXb88pSDTh_0nqUwq3yu73Iz39XsL0e73O5Gqoty_xT3F_3l_tF2wNdhJMPqKIx_hwUZlnSzDGlWZDimwzEZFmf03Gdk-pwOn9Nn1aUHvyDTl3T1ZVA10pZZNo60ZigsktKioa2dVg2VpZ2WzdpO62ZL07qhxTekhRO2U6eNQ4tySDtnaxdBzgnaOWFxTtDOCVs77ZywOCdo56zt7Zybbt79CQAA__-TZW_N
+
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) UNION (SELECT x FROM xyz ORDER BY z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • union
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJysll9v2jwYxe_fT2E9V61eo2An4U-uuhUmITHogEmbJjRlxKrQaMxiR0pAfPcp4SKDtU9ss7s6yfH5-TlHxUdQv3YQwfjL0_TdZEbuRpPlavlpek_uluPp-HFFCvJhMf9IivJA5ovReEHefyXlPfk8m8xn6EeH--bvAiikMhGz-EUoiL4BAwocKPhAIQAKIawp7DO5EUrJrPrkWAsmSQFRl8I23ee6erymsJGZgOgIeqt3AiJYxT92YiHiRGReFygkQsfbXW1TlIeHojx83_8UJVB4lLv8JVURKSg5AIXlPq5WHa9Cmec6Ig8M1icKMteNn9Lxs4CInagbU2jMVNoycRum0VbpbbrRHruaEmLguxmExgbBmwbNvnkqs0RkIrnYdX3CELj5GUObMy5lpkXmcXa9_f9v7t-72J-ZF4e5lNnjHc-3rrMFVc-lzqZU3Iaq6dtfaRgW2tig51hobj5X7pS23_EC67QtqPpOaRtScRuqJgzumLaxQd8xbd98rr5T2kGn_jWxS9uCauCUtiEVt6FqwvAd0zY2GDimHZjPNXBKO-xYZ23BNHTK2oiJ2zA1QQSOSRsbDP_BteQVg4VQe5kqcXU9eX3nbnVtEcmzON9xlMyzjXjK5Ka2OS_nta5-kAilz2_982KSnl9VgH-KGSrmuJij4uBCzK7F_i3iABWHOHaIn7nl0D1UPcTFfVQ8wMWDWyY2vEXM8I6xtpLhLWMtE2c39YzdVDSGN431W9DxrrFeixwvWxs73rY2NV43zlrQ8cLxbsu_FrxxLewcL9y1en3673cAAAD__5bTdBs=
+
+# UNION ALL with conflicting numbers of ORDER BY columns.
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) UNION ALL (SELECT x FROM xyz ORDER BY y, z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• union all
+│
+├── • sort
+│   │ order: +x
+│   │
+│   └── • scan
+│         missing stats
+│         table: xyz@xyz_pkey
+│         spans: FULL SCAN
+│
+└── • sort
+    │ order: +x
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy0ll1rGkEUhu_7K4ZzldCR9czM5mOvkiYWBKupptBSpFh3CKHGsbsrrAb_e_EDEtvsmS96ueu-857nzHPhM5S_Z5BB5-td77rbZye33dH96HPvlJ2MOr3OzT2r2cfh4BOrV2s2GN52huzDN7Y6ZV_63UGfXfd69IecrU9fHmvgMDe57k-edAnZd0DgIICDBA4KOKQw5rAozFSXpSm2nzzvAt28hqzN4XG-WFbb12MOU1NoyJ6heqxmGjK4n_yc6aGe5LpI2sAh19XkcbarqVfrq3q1_rH4pVfA4cbMlk_zMmM1300IHEaLyfZFKxEw3nAwy-qlqKwmDxoy3HD3YUamqHSRpMdzXOF74DBYVhm7wsYi4VP0mho9sN2YZQAzBkGrxqaXAlPkutD5v8ePN2-M0zcts0jE8U6a6tv_qz51qk-P6tHjygNFT0QrkY6qW8Y5XPtZvOo-3B7grtQygBqDsFVjU6RtGCC7cN-6CLVNthLlaJtlnMPez-Nt8-BGD3BXahlAjUHYqrEp0jYRYJt037oMtU21ktTRNss4h71fxNvmwY0e4K7UMoAag7BVY1OkbTLANuW-dRVqW9pydM0yzGHrl_GueVCjB7YbswxgxiBo1dgUaZqK_Mv4xslDXS7MvNSOJ4856PxB71lKsyym-q4w013N_nGwy-1e5Lqs9r_i_qE73_-0HfB1GMmwOgrj32FBhiXdLGOaFRlO6XBKhsUZPfcZmT6nw-f0XbXpwS_I9CVdfRlVjbRllo0jrRkKi6S0aGhrp1VDZWmnZbO207rZ0rRuaPENaeGE7dZp49CiHNLO2dpFlHOCdk5YnBO0c8LWTjsnLM4J2jlru59z4827PwEAAP__IIl0aw==
+
+# Only one distinct processor should be used in the single node UNION case.
+query T
+EXPLAIN (DISTSQL) VALUES (1), (2) UNION VALUES (2), (3)
+----
+distribution: local
+vectorized: true
+·
+• union
+│ estimated row count: 4
+│
+├── • values
+│     size: 1 column, 2 rows
+│
+└── • values
+      size: 1 column, 2 rows
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJysj0FLAzEQhe_-ijCnXQh0N_WUk5X2sFC21doiSA5LMtTFNamZBISy_12aBWvFCkWP82bevO_tgd46kDB7XM4nVc2yabV6WN3Nc7aZzNezFcvKnLNM5GxdV4v6UxUHdZwDB-sM1s0rEsgnKEFx2Hmnkcj5g7RPB5V5B1lwaO0uhoOsOGjnEeQeQhs6BAmbpotIowI4GAxN26WP1-yWZYLp52hfKAfVc3AxHL9QaLYIsuj5xUnlPycdA6J13qBHc5Kg-h9Ypi2F1uowEqc0N-VZgvKSrvdIO2cJv5Gc66Y4oNniUIdc9BqX3ukUM4yL5EuCQQrDVgxDZdMqAX41l38xi1_N4xNz0av-6iMAAP__nsboJg==
+
+subtest Intersect
+
+# Basic INTERSECT ALL and INTERSECT case -- should return every row.
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz) INTERSECT ALL (SELECT y FROM xyz) ORDER BY y
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +y
+│
+└── • intersect all
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzElu9vmkAYx9_vryDPqzY7g3eAP0iWtGtdZuK0E19sWchC5VbNrMcAE2nj_76ANS2i93Bi6DsVPndf7vk8PjxD9G8BNvR-3A2u-0Pt4rbvTJzvg0vtwukNejcTLdG-jEfftHXydKn1h5Pe2El_vR4MDt4xGt_2xtrnn1oCBJbC50PvkUdg_wIKBBgQMICACQQscAkEoZjyKBJhestzBvT9NdhNAvNlsIrTn10CUxFysJ8hnscLDjZMvPsFH3PP56HeBAI-j735IttmnTxdrZOn38Ffnka4EYvV4zKyszxO4KUfGzoDd0NArOKXLV5Xvk-0mRfN8mteUXA3LoEo9h442HRDTotq1R6VHY36us5qKUKfh9zPreSmJHbLgef96kUzh8ejQKd7lZkkAbfzCgGBBf8TX1zRy0_h_GGWfQICo1Vsa9mjvH3018cyVCrgiDDmoU6t_ZP6eHR9s8SxHTqRl0UPhBiKhgh01tw_44PbW7ntaXnBqLJgOmvoxhm7QSFs6x3CsqNha-gHWlM_IDXY9UPr1H5g5WvM1GtsNHTzjEIqhG2_Q1h2NGwNQrKahERqsBOyfaqQRvkaG-o1Nhu6dUYhFcJ23iEsOxq2BiGNmoREarATsnOqkGb5GpvqNbYaZ9RRIWq39qjsaNQaZDRrkhGpwE7G7jleXw-sP-ZRIJYRL_Vm2kzPjPsPfFuDSKzCKb8LxTTbZvt1lHHZa4jPo3h7lW2_9JfZpayu5eF2FZjSSrRVie7KaapwZlQNbleB985MlbYq0V05zfbp5lvayMHNfdiQwqZ8Z1MKMyrf2qrSH3IY6Q85jPUHQiP9gdBIf7Sq9IccRvpDDmP9gdBIfyA00h9tqaUduaSdKv3RrWK4HEYMl8OY4QiNGI7Q2ARQGZvFf1KVualKo0NAaXIq44jmtDBFcqpSJhedyscIYjotzBEV1REacR2hMdkxHLEdwzHdCzNUSXc5jekup1HdERzTHcEx3QuDNK97C9G9MFOUdC_MFCXd5TSmu5xGdUdwTHcEx3QvzFMl3eU0prucRnVHcEx3BMd0L0zV_Lt2U647K8wWqe7u5sP_AAAA__9lZo1N
+
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz) INTERSECT (SELECT y FROM xyz) ORDER BY y
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +y
+│
+└── • intersect
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8mF9v4kYUxd_7Kaz7lKhGZmZs_liqlO2Gqkg0bIGHVlVUsTBNUFlMbSOFRPnuFbCRExvfMxPbeUuAn-f4MuenMU-U_LemkAZ_fBl9Gt44F9fD6Wz6--jSuZgORoPPM2fv_DIZ_-Y87B8vneHNbDCZHl499-54cj2YOD__6ezJpU201Dfzbzqh8C8S5JIklxS55JNLAd26tI2jhU6SKD585OkIDJcPFLZdWm22u_Tw8q1LiyjWFD5RukrXmkKazb-u9UTPlzr22uTSUqfz1fq4zMP-8eph__j39l99iPA5Wu--bZLwmGe6nR_-bHmSbp9dinZptkSSzu80heLZfV-MoNYY0ibG9SpJV5tF6oncLK5EboGM-bp37ufJ_ZnPZyHU-0IEtYbwS0Nk19ltonipY718c6XjVUpjSjSrLELQVAQ0qSxCp0IE910pf50n91Odjreeyk1qtt_q8JUGPo1G5NJa_5NeXInLn-LV3f3xL3JpvEtDh7mtrs0Om0ZxqmNPFab2Y-n1ewZjOzeR7xc9E-ImakVbz2_nZ3x2-f6b5YW5TIS1TDzZ8pSh1SyCdGoOIm2CZEoRDXrNOESnQa-J-qSCZlXmtRojoEmVec0uQmWviQ_yGthhL14rTM3Ua9K8z9K-z6rl-YZisQjSrTmItAmSdVo2KBbjEN0GxSLrazWaVZlYaoyAJlUmFrsIlcUiP0gsYIe9iKUwNVOxKPM-K_s--y0vMBSLRZBezUGkTZCs06pBsRiH6DUoFlVfq9GsysRSYwQ0qTKx2EWoLBb1QWIBO-xFLIWpmYrFN--zb9_noGWoFYsY_VpjSJsYWZ_9BqViHKLfoFT8-hqNZlUmlRojoEmVScUuQmWp-B8kFbDDXqRSmNp7ft45c_2JTrbRJtFGv9y0DzPTyzt9-g6SaBcv9Jc4WhyXOf07PnLHF5Y6SU_vqtM_w83prUPA17BgYcnDMg-L17D_BhZ2sFBVaCkq0f0qtOrytGLpoAoswMh5WsoqtGpXons87bPbtMPDgQUs83CHhbt8QbosDO65x8K-4Jfus7QAzRa8VARYXBS0YmMGQCM1ABy5AeFADgBHdhC8XIAeAI38AHAkCIAjQyAc1EUUDPN2y6LR8YrJ4QVNCF4yogMKw2sG3TrvGdkGi_OmEX2AF1RjVXaehmXncVh2gKOy8zgquyxY1qbsgEZlBzgqO8BR2REOdrwE51Z0eiyohsMLZZe8aqQPjs28atCt86aRPbA4bxoJTjSyoBqrMz9Pw0M_j8NTP8DRsZ_HYdkLlrUqO0_DsvM4LDuPw7IDHO14_iyrwNeuwAOy4MuueNUocJJWvGrArSveNAocKxRvGhUAvKAam7IDGpUd4KjsCAdlBzh8yC9Y1uopn6fhYz6Pw-d8HocP-gBHO54_yyr0vfFn2RxeLDuvGh-cpH1eNflbv33-4f8AAAD__xgiHF0=
+
+# INTERSECT ALL and INTERSECT with MergeJoiner.
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz ORDER BY y) INTERSECT ALL (SELECT y FROM xyz ORDER BY y)
+----
+distribution: full
+vectorized: true
+·
+• intersect all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEll9v2jwUxu_fT2Gdq1YyCnYSWiK9UruWaUgMOuBi0xRNKfEKGsVZHCTSiu8-JUxq-ecTzyjckSY_-7HPT-rzCur3HALofH3o3Xb75OK-OxqPvvQuycWo0-vcjUlOPg4Hn8kqfyGD4X1nSD58I_kl6fbHneGo-OC210M-BgoLGYt-9CwUBN-BAQUOFFyg4AEFH0IKSSonQimZFp-8lkA3XkHQpDBbJMus-HNIYSJTAcErZLNsLiCAcfQ4F0MRxSJ1mkAhFlk0m5fbrPKXm1X-8iP5JXKgcCfny-eFCkjxMEqi4mfD4RCuKchl9neLt5UfczKN1HR7zRsG4TqkoLLoSUDA1vTfovq1R-VHo76ts1zINBapiLdWCgsS--TAeT9FajoS2SBx2M5kxnkigm2FgMJc_Mwubtjl_-nsaVr-AgqDZRaQ8ijvj_52LNfiWAcy92VDJg7zdy_g4N7e1t6s-vSZ8fQd3nDcE6pqELZ1hrD8aNgaZGU1ycqrz4Cbz8BtON4JhTEIe3WGsPxo2BqE4TUJ41afgWs-A6_h-CcUxiDs9RnC8qNhaxDGrUkYr_oMPPMZ-I0T6mIQtV17VH40ag2yeGfoTgcSDYVK5EKJSs2oWZxJxE9ic0dKLtOJeEjlpNxm8zgoufK_eyxUtnnLNw_dRfmqvPfqcMsGbtvAzCo38_U0M7gyZga3bOC2Dcyscu9c2R7Nd-nme9rVw64WZtt31tylPRvB9TAiuB5GBNfDmOAIjQju2wiuhxHB9TAiuB7GBEdoRPCWjeBXNorqYURRPYwoqocxRREaUfTaRlE9jCiqhxFF9TCmKEIjirZtFGVWPQGhEUkRGrEUoTFNMRzrCnZlwa4t2NUFy75gVxiYVWNge5XByFY9jdmqpzFb9TRqK4JjtpqUpf1bN2lLpjRmq1FfMsYxW_fKg9bWcP3fnwAAAP__ud2Lng==
+
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz ORDER BY y) INTERSECT (SELECT y FROM xyz ORDER BY y)
+----
+distribution: full
+vectorized: true
+·
+• intersect
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEmMFu6kYUhvd9CuusEsnIzIwNxFKl3N5QFYmGW2DRqooqLp4mqAS7tpHiRHn3Clg42PH5PbGd7kLij_nnZL7DGV4o-XdLPo1__zb9Mrm1Lm4mi-Xit-mldbEYT8dfl1Zm_Tyf_Wo9Zc_WbH4znls__WFll9bkdjmeLw4P8A-STbsw0LerR52Q_ycJskmSTYpscskmj-5siuJwrZMkjA-PvByBSfBEft-mzS7ap4df39m0DmNN_gulm3Sryafl6vtWz_Uq0LHTJ5sCna422-MyT9nz9VP2_Ff0j87Ipq_hdv-4S3zr8GIRrQ4_9hxJd682hfs0XyJJV_eafPFqfyyG12oMaRLjZpOkm906dUShFteisEDOfM-sh1Xy8M7zeQj1sRBeqyHcyhD5--x3YRzoWAdn73R8l8qYEtUqj-B1FQFVKo8waBDB_lDKX1bJw0Kns8hRhUots0j7b9rAl-mUbNrqv9OLa3H5Y7y5fzj-RDbN9qlvMdsatlvZ27AXRo7yigV4d-3R2dqivunC2HRH9hxVs-UYBBm0HESaBMl9Fx02ndohBh02HdGe8ahWVU2nxQioUlVNxyxC46YjPqnpyPq-SXPfVM9xa4pvEGTYchBpEiR3TnYofu0Qww7Fl-1Zh2pVJX6LEVClqsQ3i9BYfPlJ4qv6vilz39ye49UU3yDIqOUg0iRI7pzqUPzaIUYdiq_asw7Vqkr8FiOgSlWJbxahsfjqk8R36_vmmvvm9WpqbxDjqtUY0iRG7pvbofS1Q1x1KL3bnnGoVlXStxgBVapKerMIjaV3_4fvFt5JNNdJFO4SXeubg_5hTzq416caJeE-Xutvcbg-LnN6OTtyx18EOklPf1WnF5Pd6U-HgG9hwcKSh2URFm9h9wwWZrCQjeirJrQcNKGV4mnF0l4TWDRaWvYb0cMmtAKHxWWPKfh_eQawLMIDFgabHvJqDni9RiwtBE9f8XQf9IVSVzFxG9BIboQDuwGO9AY48luUWqqJ4IBGhgMcKY5wcNwBjiQXpcZ6fmQRXmoxHF4SXfA9Bm2dbzJiBHTj24wYArzUaIxs5WloK8CRrTwObeVxaGupyRrZytPQVh6HtgIcHVkeh7byHzBSgCGKH1sLeMlWyQ-uYOuS7zTSA3Mv32mkC_BSpzGam3kaDs4AR5Mzj8PRmceRrbLUZU1sBTSyFeDIVoSjI8vjyFbJf8DIEcD5SbaAl23lR1m0db7TKHBLVeCCDOZoxQ81oO6ARrYiHNgKcGQrwOFNl78oo6suuOI3WxxedgGObrvgOwJ0avgPGIVKx4-yBbxkq-Jn2eLW715_-C8AAP__VX0c4w==
+
+# INTERSECT ALL and INTERSECT with no overlap.
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz WHERE x < 2) INTERSECT ALL (SELECT x FROM xyz WHERE x >= 2) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • intersect all
+    │
+    ├── • filter
+    │   │ filter: x < 2
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x >= 2
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEmF1v4kYUhu_7K6xzlahGZmbMl6WVst1ltUgUtoDUVi2qWJgmqART20iQKP-9MjQhtsm8PoaYO74ez-TlPO-YPFL474I8av_2rfux07OuPneGo-Ev3Wvratjutj-NrI31ZdD_2dpsH6xfv7YHbWtj_bmuVtXUktdWpzdqD4bxxz52uxDRH2KmP_jcHlg__W5tyKalP9O9yb0OyfuDBNkkySZFNrlkU43GNq0Cf6rD0A_ijzzugM5sQ17VpvlytY7il8c2Tf1Ak_dI0TxaaPJoNPm-0AM9menAqZJNMx1N5ovdMpvtw81m-_DX6h-9JZs--Yv1_TL0dvsZribxw4ojafxkk7-ODkuE0eRWkyee7Pzb-DJfRDrQgVNL7mH_umfdiEM0nud1eqNmauHDtb5vrbtJeJe80I2g8dNhc5KzudcZifOGpAqFJEBK0_OE5L65ucN11ks_mOlAzxJXGsck-siRv_DrJLwb6qi_cmQq59F2pb2kR2TTQv8dXd2I6w_B_PZu94hs6q-jOIo3M69xMh_6QaQDR9bSSf345vXrOWI7lsj_Fz2yiZ5f8VeOqqYzPrp8I7G8YIw2e7IdWXFUzgIAG3mZ7folCoCT0rljUoViEiCnd6kAUW4FiJIqAGT-XAH1ohUg80-X5A-XqjhuTgfBRl6Gq3EJBxkpiXPHpArFJEBO7-KgLNdBWZKDIPNnBxtFHVT5p0vxh8utOLWcDoKNvAxX8xIOMlIS545JFYpJgJzexUFVroOqJAdB5s8ONos66OafLpc_XLVKTgPBNl5Gq3UJAxkZifOGpAqFJEBK7-KfW65_bkn-gcyf_Wud46fokesPdLjyl6HO9SuzGmemZ7d6_x2E_jqY6m-BP90ts3_a33G7F2Y6jPbviv2TznL_VrzB17BIw-I17CZgyYOFOIlunEJLdRLdMtPSmLgyJ64YiQsenEqcSzdOoVOJc-mWmXaNidfMideMcN28ct38XQO9Gka6aYabp7hphpGbgAZummnkJqCBmy1zG1ZBHWbKlGMnoJGeCAd-AhwJinBgqMhUajJ4CYI3dyqQVGTaJbm4CxbP1AvrFDTT8BgEODoHzTg8CAEObBPmbhV1EHymXVm6mWmoG8CRbmYc6gZwpJv5ZBHgaBGZkmXpZi5ZCUpWcko2e_PFKlk2DnQDONIN4ejG01yyEpSszJQsRzdAI90QDnQDONIN4UA3aT5gJDhgpPn-FegmzSUrQclKTslmR45Vsmwc6cYqWTaOdDOXrAQlKzk38NlvnXUHz8aRbqx7eDaOdDMfMAocMMr8L5G0buOnH_4LAAD__5zH6MA=
+
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz WHERE x < 2) INTERSECT (SELECT x FROM xyz WHERE x >= 2) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • intersect
+    │
+    ├── • filter
+    │   │ filter: x < 2
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x >= 2
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy82Ftv4kYcBfD3fgprnhLVyMzFXCytlO2G1SJR2AJSW7VRxcI0QWUxtY0EifLdK6CJw8X_42GGvCWEwxzOmp9YP7H03xmLWOu3r52P7a53ddseDAe_dK69q0Gr0_o09Fbe537vZ2-1fvR-_dLqt7yV9-eyWpVjT1x77e6w1R9snoaerj9snt_r37b63k-_eyvms3k80d3Rd52y6A_Gmc8E85lkPlPMZyG789kiicc6TeNk85SnbaA9WbGo6rPpfLHMNg_f-WwcJ5pFTyybZjPNIjYcfZvpvh5NdBJUmc8mOhtNZ9tjVuvHm9X68a_FP3rNfPYpni2_z9No22ewGG1-rASC3T37LF5m-RFpNrrXLOLPfvkan6ezTCc6CcL9DrvHI--G59NEUdTuDhuFBwuTg9--f-52AHnWABwsMMYDKJODb6dpNp2Ps0AcvPsbfnBAnvm29h5G6cOJ5-clwvNKhE5L1ApL5K-znMfJRCd6svdK21cprCnRVnmF-qUqoKXyCg2LCv5ZLb-M0oeBznqLQB0sNVwvdPTGwo-dDvPZTP-dXd3w6w_J9P5h-xPzWW-ZbS77wrfVNLnCBnGS6SRQR6v9WAxYtcRupyb5_1VPtOjGlXgRhNXDkU-fvy8oN4DM2LFAVAJZknJQ5FWymmvKTRZwPYE8awIONjDGHBycO8oviHnpErULYs7dSYq2KsLcYQW0VBHmZhWsMefvhDm4wl4wP1qtNOaiPCXCXBJZCVRJTEGRV0nqrjE1WIC7nkCeNQEHGxhjCg7OHRMXxLR0ifoFMRXuJENbFWHqsAJaqghTswrWmIp3whRcYS-YHq1WGlNZnhJpLomqBGFJTEGRV0karjE1WIC7nkCeNQEHGxhjCg7OHZMXxLR0icYFMZXuJENbFWHqsAJaqghTswrWmMp3whRcYS-YHq1WGlNVnhJlLklYKUkpqPHqSNM1pQbvn7sdQJ41AAcLGEMKDs4NUxeEtHSJ5gUhVe4UQ1sVQeqwAlqqCFKzCtaQqneCFFxhL5AerXbW_doTB_R1uojnqS51K7a6GU1P7vXuHyGNl8lYf03i8faY3a-9bW77wESn2e6vfPdLe77706bg2zAnwyEdFmRY0mFJhhUdVodh_jZc2wtzszCv26SFVVpapRVIh2TaKswbNmlhlZZWaQXSNfIyBeG6QVgchhtkuEl_QJo0ClW6N6dNCREqtCpcgDjtCq-BOC0LB7Twow_ZfhyYyOnLDdAE0sgmEEc4gTjSCcQRT_zoo2biE0gjoEAcCQXiiCgQR0Zx2hneBHFamoP4kVOctkZUwZcI8P0FUCVoawSwRtDWCGCNoK0RwBpBWyPQ9y8ra0AaWQPiyBoQR9aAOLJGWFkD0sgaEEfWgDiyBsSRNYK2RgBrBG2NANYI2hoJrJF21kjaGgmskeD_S8AaSVsjgTWStkYCa6SVNSCNrAFxZA2II2tAHFkjrawBaWQNiCNrQBxZA-LIGklbI4E1krZGAmskbY0C1ig7axRtjQLWKNoaBaxR4O4Muj1DW6OANcrKGpCG93fsrAFxeIfHzhplZQ1II2tAHFkD4sgaEEfWKNoaBaxRtDUKWKNoa0JgTWhozd3zD_8FAAD__4Iud1s=
+
+# INTERSECT ALL and INTERSECT with some overlap.
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz WHERE x < 3) INTERSECT ALL (SELECT y FROM xyz WHERE x >= 1) ORDER BY y
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +y
+│
+└── • intersect all
+    │
+    ├── • filter
+    │   │ filter: x < 3
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x >= 1
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEmF1v4kYYhe_7K0bvVaIamZkxX5ZWYrvLapEobAGprVpUsTBNUAl2bSNBovz3ytBAbJM5HhPMXfh4PC-Hec6YPFH475Jc6vz2rfex22c3n7uj8eiX3i27GXV6nU9jtmVfhoOf2Wb7yH792hl22Ib9ua5W5YzJW9btjzvDUfy2j70eRNQHxm_ZYPi5M2Q__c62ZNHKm6v-9EGF5P5BnCwSZJEkixyyqEYTi_zAm6kw9IL4LU87oDvfkFu1aLHy11H89MSimRcocp8oWkRLRS6Np9-XaqimcxXYVbJorqLpYrlbZrN9bG-2j3_5_6h4hE_ecv2wCl22sXYjjfxp_KhiC5o8W-Sto-MqYTS9U-TyZyv_JF8Wy0gFKrBryTH2z7uszY_puK7b7Y-bZNFgHbmsnR7heNXvW3Y_De-Tl2xzmjwfxxQmY74OjL97YrJQYhxENmPyfRNz3hzzeJ31ygvmKlDzxJUmMYnecuKzfp2G9yMVDXxbpEIfb33lJg0ji5bq7-imzW8_BIu7-91fh4_O30y_ZpL-yAsiFdiilk7qxzevX88R26lE_r_oiSH6XsXzbVlNZ3xy-UZieW6wz4tsc1tUbJmzGsAsh41ev241mER2gcxkocw4CO3C5cDLLQdeUjmA9F_KoV60HET-rSYK7TRZsZ2cdoJZDjutcV07DSLjF8hMFsqMg9AubKco105Rkp0g_Rc7G0XtlPm3miy005yKXctpJ5jlsNOa17XTIDJ-gcxkocw4CO3Cdspy7ZQl2QnSf7GzWdROJ_9WcwrttFolp5tgksM-a13XTYPA-LsnJgslxkFkFzbTKddMpyQzQfovZrbe4yfviesPVeh7q1Dl-jVbjTNT8zu1_w5Cbx3M1LfAm-2W2T8c7LjdE3MVRvtX-f5Bd7V_KR7wNczTMH8NOwlYmMGcn0U3zqGFPItu6WmhTVzqE5cGiXMzOJW4Kd04h04lbkq39LSjTbymT7ymhev6lev67xro1dDSTT3cPMdNPYzcBDRwU08jNwEN3Gzp27AK6jBTpiZ2AhrpiXDgJ8CRoAgHhvJMpSaDFyB4facCSXmmXZKLO2DxTL0YnYJ6Gh6DAEfnoB6HByHAgW1c3628DoLPtKuRbnoa6gZwpJseh7oBHOmmP1k4OFp4pmSNdNOXrAAlK0xKNnvzZVSyxjjQDeBIN4SjG099yQpQsiJTsia6ARrphnCgG8CRbggHugn9ASPAASP0969AN6EvWQFKVpiUbHbLGZWsMY50MypZYxzppi9ZAUpWmNzAZ791ozt4YxzpZnQPb4wj3fQHjAQHjNT_SySt2-T5h_8CAAD__wcuCQw=
+
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz WHERE x < 3) INTERSECT (SELECT y FROM xyz WHERE x >= 1) ORDER BY y
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +y
+│
+└── • intersect
+    │
+    ├── • filter
+    │   │ filter: x < 3
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x >= 1
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy82G1v2lYcBfD3-xRX91WiGZn7YAKWKqVrqIrEoAOkbdqiicJdgkYxs40EifLdJ2DB4cH_Y_vaeVceDj49vfxE_cyjf-fc5-3fvnY_dnrs6q4zHA1_6V6zq2G72_40Yhv2edD_ma03T-zXL-1Bm63Zn6t6XU2Yumad3qg9GG7fht5uPjBxzfqDu_aA_fQ723CHL4Kp6Y2_m4j7f3DBHS65wxV3uOYO9_i9w5dhMDFRFITbtzzvAp3pmvt1h88Wy1W8ffre4ZMgNNx_5vEsnhvu89H429wMzHhqQrfOHT418Xg2311mvXm6XW-e_lr-Y7YVPgXz1fdF5LO1s6s0XI63j2qu5PcvDg9WcXKVKB4_GO6LFyd7k8-zeWxCE7recY398z67Fck6vu93eqMmd3h_FfvsNr2CzFPh7Rii9DVUoTUEmGPCVPY1dJ4Kd7Moni0msStPprgVJxdIMt827HEcPV54f1LCK1bCK7VEI7VE8jmrRRBOTWimR5-0-5TUmgptlVS4qaoCWiqp0LSo4BRq-WUcPQ5N3F-6-mSp0WZp_DdKfux2ucPn5u_46lZcfwhnD4-7Px2Oefpfq5XnhA2DMDahq89W-zHdtXqG3S5N8v-nXmjRC2rB0vXqpyNfvv4xrCKHakVQc2XNVRmRB10OrDWqQz7PHBXsoQrtIcAgFsyDComwokLmM5doVMi8KM9YtFUa8yVWQEulMZ-vgjXz4p2YByfslfmz1TIzL7O7Iguxomquzsgs6HJg5aY6ZnPMISrYQxXaQ4BBLJgFFRLhZIXMZi5xUyGzsjzj0FZpzJZYAS2Vxmy-CtbMyndiFpywV2bPVsvMrMruiirEiq65XkZmQZcDK83qmM0xh6hgD1VoDwEGsWAWVEiEUxUym7lEs0JmVXnGoa3SmC2xAloqjdl8FayZVe_ELDhhr8yerZaZWZ3dFV2IFa-WEVnQ5IBKqzpkc4whSl9DFVpDgDksiAUVEt10hcRmLtGqkFhdnm9oqzRiS6yAlkojNl8Fa2L1OxELTtgrsWerFbovfOECAxMtg0VkMt3yrW9HM9MHs_9HiIJVODFfw2Cyu8z-YX-X2z0xNVG8f1XsH3QW-5e2Bd-GBRn26LAkw4oOKzKs6bA-DYu34cZRWOQLixubtLRKK6u0BmmPTFuFRdMmLa3SyiqtQbpBHlMQvskRlqfhJhlu0V-QFo1Cne4taFM8hAqtipAgTrsiGiBOyyIALeLsS3YcByYK-rgBmkAa2QTiCCcQRzqBOOJJnH3V8vgE0ggoEEdCgTgiCsSRUYJ2RrRAnJbmJH7mlKCtkXXwIwL8fgFUSdoaCayRtDUSWCNpaySwRtLWSPT7y8oakEbWgDiyBsSRNSCOrJFW1oA0sgbEkTUgjqwBcWSNpK2RwBpJWyOBNZK2RgFrlJ01irZGAWsU-P8SsEbR1ihgjaKtUcAaZWUNSCNrQBxZA-LIGhBH1igra0AaWQPiyBoQR9aAOLJG0dYoYI2irVHAGkVbo4E12s4aTVujgTWatkYDazS4O4Nuz9DWaGCNtrIGpOH9HTtrQBze4bGzRltZA9LIGhBH1oA4sgbEkTWatkYDazRtjQbWaNoaD1jj5bTm_uWH_wIAAP___JqXmA==
+
+# INTERSECT ALL and INTERSECT with swapped column orders.
+query T
+EXPLAIN (DISTSQL) SELECT x, y FROM xyz INTERSECT ALL SELECT y, x from xyz
+----
+distribution: full
+vectorized: true
+·
+• intersect all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEll1v2jAUhu_3K6Jz1UpGwUmgJdIkqo5pSAw64GLSFE0p8QoaxVmcSEkr_vuU0JbyMZ84huzS4Ae_9nkk3mcQf5bgQu_73eCmPzQuPvUn08m3waUx6Q16t1MjJUZmfB6Pvhpp9mT0h9PeeJJ_fjMYvG7JiJG-bQECKx6wof_IBLg_gAIBCwjYQMABAi3wCIQRnzEheJRveS6AfpCC2ySwWIVJnH_sEZjxiIH7DPEiXjJwYerfL9mY-QGLzCYQCFjsL5bFMWn21E2zp5_hb5YBgVu-TB5Xwi3iA4FJ6OerhplHGSWxa3Qt0qXgrQnwJH45cnvSfWbMfTHfPaNLSdcCb-0RELH_wMCla1Itfatqes3A1j8Db38qWfEoYBELdn7My0lsy5Fbf_HFfMLiUWjSvZFNs5C5u0YBgSX7FV8UwS8_RouH-evibW4vd3r_DNv72Rr3OxJ-yBs8NGlr_yWOnu3snE3Ly0CryGBaDdM-o8wK-dvV859UZ1qvzrRuna3yI7EqjcRumM4ZlVLIf1U9_0mVsupVyqpbKbv8SOxKI3EaxX_duZRSyH9dPf9JlbLrVcquWymn_EicSiNpNc4olEL6TtX0J9XJqVcn5392uCPRxkyEfCVYqYbWzC_Hgge2eSzBk2jG7iI-K47ZLEcFV5SJgIl48621WfRXxVfFAMrDbR24owNTrdy0JaepwpNRNbitA3d0YKqVe-_JDmhrn26-p205bEthuvtmzX3a0RFcDiOCy2FEcDmMCY7QiOAtHcHlMCK4HEYEl8OY4AiNCN7WEfxKR1E5jCgqhxFF5TCmKEIjil7rKCqHEUXlMKKoHMYURWhE0Y6OolSrJyA0IilCI5YiNKYphmNdQa8s6LUFvbqg2Rf0CgPVagz0oDIo2SqnMVvlNGarnEZtRXDMVpWydPjqKm1JlcZsVepLyjhm60F5kNrqrT_8DQAA___-Ta0P
+
+query T
+EXPLAIN (DISTSQL) SELECT x, y FROM xyz INTERSECT SELECT y, x from xyz
+----
+distribution: full
+vectorized: true
+·
+• intersect
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEmF1v4kYUhu_7K6xztSsNgpkxH7FUidVuqiLRZBu4qFRFFQvTBJXF1DYSJMp_rzBtnNjxeWf8kV6C8-B3Tvw-zPBI8d8bCujyt6_TT5Mr78OXyWw--3X60ZtdTi8_z72D8I7eTzfXv3iH44M3uZpf3sxO7_97-Si8w_NlErQNV-Zq8d3EFPxOkgQpEqRJkE-C-nQraBeFSxPHYXT6k8cUmKwOFPQErbe7fXJ6-1bQMowMBY-UrJONoYDmi28bc2MWKxN1eyRoZZLFepPe5nB8GB-OD3_s_jJHEvQ53Oy_b-MgjU6CZrvF6VWne4pyvU8Cb6zEWNLtk6Bwn2S3jJPFnaFAPolqsfpVY5UlUS5JvqzjZL1dJl2ZG89YinH-Hhn27ejdL-L7t5Esiq4Wpd9CFL80SvZR-20YrUxkVq8-LP2U0rDKYm5Zin5bKSxGlqUY1EghKgX9eRHfz0xyvevq3Lzmx50JXhji03RKgjbmz-RDuoiPP0bru_v_Xjx3kV3fsNkpX4WdcNfV_fwk3rz36NW9pb0HZBUPdFWnq6sIyiHYoHowO0WBLJkXZOuKso4yaF1Rsjk5WMytTFENprAYWZmi3FLUVpR8b0Up-zaqSm3Una5fRRMOwYbVg9lpAmTJuqla14R1lGHrmlDNFdRibmWaaDCFxcjKNOGWorYm1HtrQtu3UVdqo99JjyPOmnAINqoezE4TIEvWTd26JqyjjFrXhG6uoBZzK9NEgyksRlamCbcUtTWh31sTvn0b_Upt7HeqSMIh1kXVWHaKAEmyXvqtK8I6ykXrivCbK6fF3MoU0WAKi5GVKcItRW1F-P_nbyJvRLsx8S7cxsbqF4_eaXFmdWfOw4rDfbQ0X6Nwmd7m_PI65dI3ViZOzlf1-cVke750CvgSliyseFjlYfkS9l_B0g2WqhZ9UYdWgzq01jytWbpfB5a1bq16tehhHVqDh8VnH1Pw_-o7wCoPD1gYLHrIV3PA12vE0lLy9AVP94AXClZx6TagUbkRDtoNcFRvgKN-y4JSXQoOaNRwgKOKIxw87gBHJZcFsb5-ZBFeUAyHF4ouecegpfOSkSNQN14zcgjwgmic2srTsK0AR23lcdhWHodtLUjWqa08DdvK47CtAEePLI_DtvJfMEqCTRS_bc3hhbYqfuMKlq5406g-2PfyplE-wAumcdo38zTcOAMc7Zx5HG6deRy1VRUs69JWQKO2Ahy1FeHokeVx1FbFf8GoEcD5nWwOL7aV38qipfOm0eCUqsEBGeyjNb-pAXMHNGorwkFbAY7aCnB40uUPyuioC4749W4OD7sAR6dd8BsBemr4LxiNRsdvZXN4oa2a38vml3779MM_AQAA__9OIkqs
+
+# INTERSECT ALL and INTERSECT with different ORDER BY types.
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) INTERSECT ALL (SELECT x FROM xyz ORDER BY z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • intersect all
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8ll-PmkwUh-_fT0HO1Zp3DM4A_iFpsttdm5pY3aoXbRrTsDJdTV2hgAm42e_egGssInMYUO50nWfmMOf57eEV_D9rMKH_7XF4NxgpNw-D6Wz6ddhQbqb9Yf9-poTKp8n4ixJGO2U8eehPlI_flaihDEaz_mQaL7gbDoWLd43j5xAIbBybj6wX7oP5AygQYEBAAwI6EDBgTsD1nAX3fceLl7wmwMAOwWwRWG3cbRD_eU5g4XgczFcIVsGagwkz62nNJ9yyuae2gIDNA2u1To4Jo91tGO1-ur95BATunfX2ZeObSkiUHRCYulb8ranGpYy3gancUpi_EXC2wft5x2OeImVp-cv0Acn6OQE_sJ45mPSNlKvbKFx3dI26WW7dx322G8ezucft1E7zmMSWnHn4z5a_nPJg7Kr0pGezyOVm2jMgsOa_gptb2vjgrZ6XyafcRz8-libTjqnjBdxTqXF6U__n7q8XuLZzN_K-6ZkiRk7TcVXWOr3js8cbqeNpcdtomZSorKlqV8mJROXtMjm5ZOUst_IakkJrSgrSkENS2mWTwoo3nJVSVWuq-lVUlai8U0rVC1bOciuvQVVWk6pIQw6qdsqqqhVvuFZKVb2ZDP_LqypRebeUqhesnOVWXoOqWk2qIg05qNotq6pevOF6KVWN5lVElai7V0rUi9XNcuuuQVO9Jk2Rdhw07V3iNfnM_hPuu87G54XegFvxnXH7me974Dtbb8EfPWeRHLP_Ok645KXG5n6w_5Xtvww2yU9JX4vDnSowpZVooxLdE9NU4s6oHNypAp_cmSxtVKJ7Ypqd0q1_aS0Ft05hTQjr4pN1Icyo-GijSj7EMJIPMYzlA6GRfCA0ko92lXyIYSQfYhjLB0Ij-UBoJB8doaVdsaTdKvnoVTFcDCOGi2HMcIRGDEdobALIjM3sf1KZuSlLo0NAanJK44jmNDNFUqpSJhadiscIYjrNzBEZ1REacR2hMdkxHLEdwzHdMzNUSncxjekuplHdERzTHcEx3TODNK17G9E9M1OkdM_MFCndxTSmu5hGdUdwTHcEx3TPzFMp3cU0pruYRnVHcEx3BMd0z0zV9Lt2S6w7y8wWoe7zt__-BgAA__-aZLNW
+
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) INTERSECT (SELECT x FROM xyz ORDER BY z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • intersect
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8mF1v4kYUhu_7K6xzlahGMDPmU6qU7SZVkWjYAhetqqhiYZqgspjaRgKi_PcK2MgJg88744_chcSP5_Vh3kfjPFP835J6dPfHl8Gn_r13ddsfT8a_D669q_Hd4O7zxNt6v4yGv3nb3d4bjm7vRt7Pf3q7a69_P7kbjQ8XcBfur9Oft-TTKpzr--k3HVPvLxLkkySfFPkUkE9NevBpHYUzHcdhdLjk-Qj051vqNXxarNab5PDrB59mYaSp90zJIllq6tFk-nWpR3o611G9QT7NdTJdLI_LbHf7m-1u__f6X70jnz6Hy823Vdzztr63J5_G6-nhU61-iDLcJD3vRtDDi0_hJknXi5Ppo6aeePHzZWpaZ9q5ZpIumW4XcbJYzZK6OJuSsUDKfN15T9P46cL1aQiVL0Sz1BBBZoj0PptVGM11pOfv7nS8S2ZMiWaVRmhWFQFNKo3QKhDBz5Xy12n8NNbJcF1XZ5Oa7Na698YVnwYD8mmp_0mubsT1T9Hi8en4k8U2b7vssHEYJTqqK2NqP2bev2MxtksT-X7TCyHuw1q4rgeN8xlfXL77bnlhbxaRx3Z1WasrZ985pGrl8Z1tKumSKpWNqNB41iFaFRpPlKcbNKss45UYAU0qy3huEQobT3yQ8cAOezWeMTVb40n7cstcylG1euCsHIdU7VzKsUwlXVKlbZcVKsc6RLtC5cjy-o5mlaWcEiOgSWUpxy1CYeXID1IO2GGvyjGmZqscZV9ulUs5Qe344uWmHIdUnVzKsUwlXVKlbVcVKsc6RKdC5ajy-o5mlaWcEiOgSWUpxy1CYeWoD1IO2GGvyjGmZqucwL7cQS7lNGvOwnHI1M0lHKtM0iVT2vSgQt1Yh-hWqJugvK6jWWXppsQIaFJZunGLUFg3wQfpBuywV90YU8vzb6QL9x_peB2uYm31H6LGYWZ6_qhP30EcbqKZ_hKFs-Myp4_DI3f8xVzHyemv6vShvzr96RDwLSxYWPKwPIfFWzh4Bws3WKgitBSF6G4RWrV5WrF0swgswMh5WsoitGoUojs8HbDbtMXDTQdYnsMtFm7zBWmzMHjmDgsHgl-6y9ICNFvwUhFgcWFoxcUMgEZqADhyA8KBHACO7CB4uQA9ABr5AeBIEABHhkA4qIswDPN-y6LR8Yo5ww1NCF4yogUKw2sGPTrvGdkAi_OmEV2AG6pxKjtPw7LzOCw7wFHZeRyVXRqWdSk7oFHZAY7KDnBUdoSDHS_BuRWdHg3VcLhRdsmrRgbg2MyrBj06bxrZAYvzppHgRCMN1Tid-XkaHvp5HJ76AY6O_TwOy25Y1qnsPA3LzuOw7DwOyw5wtOP5s6wCX7sCL8iCL7viVaPASVrxqgGPrnjTKHCsULxpVBPghmpcyg5oVHaAo7IjHJQd4PAl37Cs01s-T8PXfB6H7_k8Dl_0AY52PH-WVeh748-yZ7hZdl41AThJB7xqzh_94eWH_wMAAP__DkZCZg==
+
+# INTERSECT ALL and INTERSECT with different numbers of ORDER BY columns.
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) INTERSECT ALL (SELECT x FROM xyz ORDER BY y, z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • intersect all
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8ll-PmkwUh-_fT0HO1Zp3DM4A_iFpsttdm5pY3aoXbRrTsDJdTV2hgAm42e_egGssInMYUO5W5Zn5Mec5e-YV_D9rMKH_7XF4NxgpNw-D6Wz6ddhQbqb9Yf9-poTKp8n4ixJGO2U8eehPlI_flaihDEaz_mQaP3A3HIofJsqucfwYAoGNY_OR9cJ9MH8ABQIMCGhAQAcCBswJuJ6z4L7vePEjrwkwsEMwWwRWG3cbxF_PCSwcj4P5CsEqWHMwYWY9rfmEWzb31BYQsHlgrdbJNmG0uw2j3U_3N4-AwL2z3r5sfFMJSZIQCExdK_6iqcZpxtvAVG4pzN8IONvgfcvjTk-RsrT8ZXqP5Pk5AT-wnjmY9I2Ui24Uj36N3Cw393Gd7cbxbO5xO7XSPCaxR868_GfLX055MHZVelK2WeRyM20bEFjzX8HNLW188FbPy-Sv3Fc_vpYmU46p4wXcU6lxelL_566vFzi2cyfyvuiZECOn6bgqa52e8dntjdT2tLhttGSjqKypaldpFYnw7TKtcsnkLDd5Dc1Ca2oWpCCHZmmXbRZWvOCsrK1aU9WvYqtE-E4pWy-YnOUmr8FWVpOtSEEOtnbK2qoVL7hW1la9mdwCLm-rRPhuKVsvmJzlJq_BVq0mW5GCHGztlrVVL15wvaytRvMqrkpE75Vy9WK5WW7uGkzVazIVKcfB1N4lrsxn1p9w33U2Pi90G27FZ8btZ76vge9svQV_9JxFss3-4zjhktuNzf1g_yvbfxhskp-SuhaHO1VgSivRRiW6J6apxJlRObhTBT45M1naqET3xDQ7pVv_0loKbp3CmhDWxTvrQphR8dZGlf4Qw0h_iGGsPxAa6Q-ERvqjXaU_xDDSH2IY6w-ERvoDoZH-6Agt7Yol7Vbpj14Vw8UwYrgYxgxHaMRwhMYmgMzYzP4nlZmbsjQ6BKQmpzSOaE4zUySlKmVi0al4jCCm08wckVEdoRHXERqTHcMR2zEc0z0zQ6V0F9OY7mIa1R3BMd0RHNM9M0jTurcR3TMzRUr3zEyR0l1MY7qLaVR3BMd0R3BM98w8ldJdTGO6i2lUdwTHdEdwTPfMVE3ftVti3Vlmtgh1n7_99zcAAP__nnu39A==
+
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) INTERSECT (SELECT x FROM xyz ORDER BY y, z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • intersect
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8mF1v4kYUhu_7K6xzlahGMDPmU6qU7YaqSDRsgYtWVVSxME1QWUxtI0Gi_PcK2MgJg88744_cBcLjeX2Y99GYZ4r_W1GP-n98GX4a3HlXt4PJdPL78Nq7mvSH_c9Tb-f9Mh795u32T95ofNsfez__6e2vvcHdtD-eHD7AftD3nq7TlzvyaR0u9N3sm46p9xcJ8kmST4p8CsinJt37tInCuY7jMDp85PkIDBY76jV8Wq432-Tw9r1P8zDS1HumZJmsNPVoOvu60mM9W-io3iCfFjqZLVfHZXb7p5vd_unvzb96Tz59Dlfbb-u45-38Y0LyabKZHd6o1Q9pRtuk590Iun_xKdwm6ZJxMnvQ1BMvfr5YTftYrpmkS6bbZZws1_OkLs4GZSyQMl_33uMsfrzw-TSEyheiWWqIIDNEep3tOowWOtKLd1c6XiUzpkSzSiM0q4qAJpVGaBWI4OdK-essfpzoZLSpq7NJTfcb3XtjjE_DIfm00v8kVzfi-qdo-fB4_Mtim7dddtgkjBId1ZUxtR8zr9-xGNuliXy_6IUQd2Et3NSDxvmMLy7ffbe8sDeLyCm8uqzVlbPyHIK18ijPNpV0SZX6RlQoPesQrQqlJ8ozDppVlvRKjIAmlSU9twiFpSc-SHpgh71Kz5iarfSkfbllXuuoWj1wto5DsHYu61imki6p0sLLCq1jHaJdoXVkeZVHs8qyTokR0KSyrOMWobB15AdZB-ywV-sYU7O1jrIvt8prnaB2fAJzs45DsE4u61imki6p0sKrCq1jHaJToXVUeZVHs8qyTokR0KSyrOMWobB11AdZB-ywV-sYU7O1TmBf7iCvdZo1Z-c4xOrmco5VJumSKS17UKFxrEN0KzROUF7d0ayyjFNiBDSpLOO4RShsnOCDjAN22KtxjKnl-UnpwvXHOt6E61hb_VrUOMxMLx706TuIw20011-icH5c5vRydOSObyx0nJz-q04vBuvTvw4B38KChSUPy3NYvIWDd7Bwg4UqQktRiO4WoVWbpxVLN4vAAoycp6UsQqtGIbrD0wG7TVs83HSA5TncYuE2X5A2C4N77rBwIPiluywtQLMFLxUBFheGVlzMAGikBoAjNyAcyAHgyA6ClwvQA6CRHwCOBAFwZAiEg7oIwzDvtywaHa-YM9zQhOAlI1qgMLxm0K3znpENsDhvGtEFuKEap7LzNCw7j8OyAxyVncdR2aVhWZeyAxqVHeCo7ABHZUc42PESnFvR6dFQDYcbZZe8amQAjs28atCt86aRHbA4bxoJTjTSUI3TmZ-n4aGfx-GpH-Do2M_jsOyGZZ3KztOw7DwOy87jsOwARzueP8sq8LUr8IAs-LIrXjUKnKQVrxpw64o3jQLHCsWbRjUBbqjGpeyARmUHOCo7wkHZAQ4f8g3LOj3l8zR8zOdx-JzP4_BBH-Box_NnWYW-N_4se4abZedVE4CTdMCr5vzW719--D8AAP__4x5HBA==
+
+# INTERSECT ALL and INTERSECT with compatible ORDER BY columns that are not in the final result.
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz ORDER BY z) INTERSECT ALL (SELECT y FROM xyz ORDER BY z)
+----
+distribution: full
+vectorized: true
+·
+• intersect all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEll1v2jAUhu_3K6xz1UpGwU6gJdKkdi3TkBh0wMWmCU0p8QoaxVkcJELV_z4lTOr48onxSO6axk_82ueReF9A_Z6DD-2vD93bTo9c3HeGo-GX7iW5GLa77bsRScnHQf8zWaVr0h_ctwfkwzeyviSd3qg9GGYLbrtdZDFQWMhQ9IJnocD_DgwocKDgAgUPKDRgTCGK5UQoJeNsyUsOdMIV-HUKs0W0TLJ_jylMZCzAf4FklswF-DAKHudiIIJQxE4dKIQiCWbzfJtVur5Zpesf0S-RAoU7OV8-L5RPUkrWQGEYBdlTzcmi9JeJT24YjF8pyGXyd7-3bR5TMg3UdHuDfP2YgkqCJwE-e6Wn5W5Um5sfzf32neVCxqGIRbj1pXFGYksOHP5ToKZDkfQjh-3MbJRGwt-WCyjMxc_k4oZdvo9nT9P8r6NHfzuWa3GsA5l7siYjhzV2L-Dg3t7W3qy4CuwUFRxec9yzSGyQvFl1cn40eQkas5I05sUHwk8aiFtzvLOoZJD8qurk_GjyElTiJankFh-Ie9JAvFr-y_b_VTJIfl11cn40eQkquSWp5BUfiHfSQBq1s4hkkLtVbW5-NHcJGnkVdLQDiQZCRXKhRKEGVs_OJMInsbkjJZfxRDzEcpJvs3ns51zeFUKhks1bvnnoLPJX-b0Xh5s2cMsGZla5WUNPM4MrY2Zw0wZu2cDMKvfOle3RfJeu_0u7etjVwmz7zuq7tGcjuB5GBNfDiOB6GBMcoRHBGzaC62FEcD2MCK6HMcERGhG8aSP4lY2iehhRVA8jiuphTFGERhS9tlFUDyOK6mFEUT2MKYrQiKItG0WZVU9AaERShEYsRWhMUwzHuoJdWbBrC3Z1wbIv2BUGZtUY2F5lMLJVT2O26mnMVj2N2orgmK0mZWn_1k3akimN2WrUl4xxzNa98qC1dfz67k8AAAD__7vNq9o=
+
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz ORDER BY z) INTERSECT ALL (SELECT y FROM xyz ORDER BY z)
+----
+distribution: full
+vectorized: true
+·
+• intersect all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEll1v2jAUhu_3K6xz1UpGwU6gJdKkdi3TkBh0wMWmCU0p8QoaxVkcJELV_z4lTOr48onxSO6axk_82ueReF9A_Z6DD-2vD93bTo9c3HeGo-GX7iW5GLa77bsRScnHQf8zWaVr0h_ctwfkwzeyviSd3qg9GGYLbrtdZDFQWMhQ9IJnocD_DgwocKDgAgUPKDRgTCGK5UQoJeNsyUsOdMIV-HUKs0W0TLJ_jylMZCzAf4FklswF-DAKHudiIIJQxE4dKIQiCWbzfJtVur5Zpesf0S-RAoU7OV8-L5RPUkrWQGEYBdlTzcmi9JeJT24YjF8pyGXyd7-3bR5TMg3UdHuDfP2YgkqCJwE-e6Wn5W5Um5sfzf32neVCxqGIRbj1pXFGYksOHP5ToKZDkfQjh-3MbJRGwt-WCyjMxc_k4oZdvo9nT9P8r6NHfzuWa3GsA5l7siYjhzV2L-Dg3t7W3qy4CuwUFRxec9yzSGyQvFl1cn40eQkas5I05sUHwk8aiFtzvLOoZJD8qurk_GjyElTiJankFh-Ie9JAvFr-y_b_VTJIfl11cn40eQkquSWp5BUfiHfSQBq1s4hkkLtVbW5-NHcJGnkVdLQDiQZCRXKhRKEGVs_OJMInsbkjJZfxRDzEcpJvs3ns51zeFUKhks1bvnnoLPJX-b0Xh5s2cMsGZla5WUNPM4MrY2Zw0wZu2cDMKvfOle3RfJeu_0u7etjVwmz7zuq7tGcjuB5GBNfDiOB6GBMcoRHBGzaC62FEcD2MCK6HMcERGhG8aSP4lY2iehhRVA8jiuphTFGERhS9tlFUDyOK6mFEUT2MKYrQiKItG0WZVU9AaERShEYsRWhMUwzHuoJdWbBrC3Z1wbIv2BUGZtUY2F5lMLJVT2O26mnMVj2N2orgmK0mZWn_1k3akimN2WrUl4xxzNa98qC1dfz67k8AAAD__7vNq9o=
+
+# INTERSECT ALL and INTERSECT with a projection on the result.
+query T
+EXPLAIN (DISTSQL) SELECT x FROM ((SELECT x, y FROM xyz) INTERSECT ALL (SELECT x, y FROM xyz))
+----
+distribution: full
+vectorized: true
+·
+• intersect all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEll1v2jAUhu_3K6JzBZJRsJPQEmkSVcc0JAYdcDFpQlNKvIJGcRYHibTqf58SVjG-fGKMkksneeLXx8_F-wryzxJ86H5_6N_1BlbtU288GX_r161xt9-9n1gb6_No-NWq1d7XxEq3jzbpS93qDSbd0Th7cdfvW6c_qgOBlQj5IHjmEvwfQIEAAwIOEHCBgAdTAlEsZlxKEWefvOZAL9yA3ySwWEXrJHs8JTATMQf_FZJFsuTgwyR4XPIRD0Ie200gEPIkWCzzbTbpS2eTvvyMfvMUCNyL5fp5Jf08HRAYR0G2atgMpm8ExDr5t8vu54-pNQ_kfP-3HUo6GTIlIJPgiYNP38hlgb2KArOzgXe_Wq9EHPKYh3s_m2Yk9smJU38J5HzMk2Fk04NbmqQR9_c9AgJL_iup5cHrH-PF0_x9AQSG68S3OvRgBrvDOQaHO5F8IBoisql3OIaTe7t7e9PiJtBLTLBZw3auK69G5FZlkdnZyCXoS0vVlxW_D3bRfTgN272uQhqRbyqLzM5GLkEhVqpCTvH7cC66D7dhe9dVSCPybWWR2dnIJSjklKqQW_w-3Ivuw2tcVyCNwO2KArOzgUvQx62sg53INeIyEivJCzWsZnYyHj7x7aSkWMcz_hCLWb7NdjnMubwZhFwm27dsu-it8lf59IvDLRO4bQJTo9zUU9NUY2RUD26ZwG0TmBrlPhjZEc0O6eb_tKOGHSVM92fWPKRdE8HVMCK4GkYEV8OY4AiNCO6ZCK6GEcHVMCK4GsYER2hE8JaJ4DcmiqphRFE1jCiqhjFFERpR9NZEUTWMKKqGEUXVMKYoQiOKtk0UpUY9AaERSREasRShMU0xHOsKZmXBrC2Y1QXDvmBWGKhRY6BHlUHLVjWN2aqmMVvVNGorgmO26pSl46nrtCVdGrNVqy9p45itR-VBaev07cPfAAAA___gVp9j
+
+query T
+EXPLAIN (DISTSQL) SELECT x FROM ((SELECT x, y FROM xyz) INTERSECT (SELECT x, y FROM xyz))
+----
+distribution: full
+vectorized: true
+·
+• intersect
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEmFFv4kYUhd_7K6z7lEiDzMzYQCxVymo3VZFosg08VKqiioVpgspiahsJEuW_V4BWTmx8zwy208ex-TxnLnOO7_iF0n-XFNHNH19Hn4a33sWX4Xgy_n106Y1vRjefJ97W--X-7jfv4uLHWHi746Xt7vnSG95Obu7H-xunf3BJglbx3NxOv5uUoj9JkiBFgjQJCkhQSA-C1kk8M2kaJ_ufvByA4XxLUVfQYrXeZPvLD4JmcWIoeqFskS0NRTSZfluaezOdm8TvkqC5yaaL5WGa7e75ert7_mv9j9mRoM_xcvN9lUYHdSRovJ7uRx1f0cOroHiT5bOk2fTRUCRfxXlKwqaVKBclXxZptljNMl8WKnItxXVxjhz7tvOepunTaSSXos-TErYgJaiUkj9qs4qTuUnM_N3DDk-pFKss6parCNtSYVGyXEWvhgpxltBfp-nT2GR3a18X6jXZrU30Jhc-jUYkaGn-zi4Oi7j8OVk8Pv0YkKC7TRZ517Jycf1mS3wbd-K1r8NiGU7OPXg3t7QPAXlOCPiq42vLQHLQ0mtei3LRkueAbD2SrKX0Wo8k2VwYWNStKpIaVGFRsqpIclNRO5Lkh0aSsreiOsuKuuMHlrHgoKXfvBbloiX3omo9Fqyl9FuPBdWcIS3qVhULDaqwKFlVLLipqB0L6kNjQdtbUZ9lxaDjh5ax4KBl0LwW5aIl96JuPRaspQxajwXdnCEt6lYVCw2qsChZVSy4qagdC_pDYyGwt2JwlhXDjmUoOCi5alqJclGS-zBoPRKspVy1HglBc2a0qFtVJDSowqJkVZHgpqJ2JAT_2zeNE7ruTbqOV6mx-mLR3a_MzB_NsVJpvElm5msSzw7THId3B-5wYW7S7HhXHwfD1fHWXuBbWLKw4mFVhOVbOHgHSzdYqlr0VR1a9erQWvO0ZumwDixrTa26teh-HVqDzRKw2xT8X6EDrIpwj4XBovu8NXu8vQYsLSVPX_F0F-RCKVVcvA1oZG6EA3cDHNkb4MjfshSpLgYHNHI4wJHFEQ62O8CRyWUpWN9vWYSXIobDS0aXfMagpfMhIwfAbnzMyD7AS0Hj5Faehm4FOHIrj0O38jh0aylkndzK09CtPA7dCnC0ZXkcupV_wSgJmii-bS3gJbcqvnEFS1d80qgQ9L180qgA4KWkceqbeRo2zgBHnTOPw9aZx5FbVSllXdwKaORWgCO3IhxtWR5HblX8C0YNAM53sgW87Fa-lUVL55NGg1OqBgdk0EdrvqkBdQc0civCgVsBjtwKcHjS5Q_K6KgLjvj1JoeHXYCj0y74RoB2Df-C0ah0fCtbwEtu1XwvW1z6w-tP_wUAAP__SNw9AA==
+
+subtest Except
+
+# Basic EXCEPT ALL and EXCEPT case.
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz) EXCEPT ALL (SELECT x AS y FROM xyz) ORDER BY y
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +y
+│
+└── • except all
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lt9vokoUx9_vX0HOU5s7BmYAf5DcpL2tmzVxa1d86GZDNlRmq1krLGAibfzfN2DdFtE5jGN4k8Jn5sucz-nhFZLfC3Cg_3A_vB7caRe3A3fifh1eahduf9i_mWiZ9mk8-qKts5dLrf9w07-faNfD4d_ba-3aLT0zGt_2x9r_37QMCCzDgN_5zzwB5ztQIMCAgAkELCBgg0cgisMpT5Iwzh95LYBBsAbHIDBfRqs0_7NHYBrGHJxXSOfpgoMDE_9xwcfcD3isG0Ag4Kk_XxTbrLOXq3X28iP6xfMIN-Fi9bxMnCKPG_n5z5bOwNsQCFfp2xbvKz9m2sxPZuU1ryh4G49AkvpPHBy6IadFtetFXZ8vKjsa9X2d1TKMAx7zoLSSl5PYIwfe97OfzFyejiKd7lVmkkXc-SAREFjwn-nFFb38L54_zYpfQGC0Sh2teI-P7_3-TqbM8bthnPJYp_b-Mf17dH2rxpkdOo63RQ-EuAtbYaQzY_-AD25vl7an9e2i0o2gs5ZunrEVJMK2pVtBPSw7GraBZqBNNANSgF0ztE9tBla_wEzeRrOlW2e0USJsR95G5bDsaNgGbGRN2IgUYGdj51QbzfoFNuVttFq6fUYbJcJ25W1UDsuOhm3ARrMJG5EC7GzsnmqjVb_AlryNduuMLkpE7cm7qBiVHY3agIlWEyYix78zsXeOT9YD6495EoXLhNf6GjXyA-PBE98WIAlX8ZTfx-G02GZ7OSq44usj4Em6vcu2F4Pl9lYesD7cUYEpVaJtJbonpqnEmTE5uKMC752ZLG0r0T0xzfZp4yNtlmBjHzaFsCWuliWEGRVvbav0hxhG-kMMY_2B0Eh_IDTSH22V_hDDSH-IYaw_EBrpD4RG-qMjtLQrlrSr0h89FcPFMGK4GMYMR2jEcITGJoDM2Kz-J5WZm7I0OgSkJqc0jmhOK1OkpCplYtGpeIwgptPKHJFRHaER1xEakx3DEdsxHNO9MkOldBfTmO5iGtUdwTHdERzTvTJIy7q3Ed0rM0VK98pMkdJdTGO6i2lUdwTHdEdwTPfKPJXSXUxjuotpVHcEx3RHcEz3ylQtf2sbYt1ZZbYIdfc2__wJAAD__5mGiSQ=
+
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz) EXCEPT (SELECT x AS y FROM xyz) ORDER BY y
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +y
+│
+└── • except
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8mF9v6jYYxu_3KSJftVpQsJ3wJ9Kkdi3TKrHSARdnmqqJA16LxiEsCRK06nefgHFSYvI-dpP0rm36i5-8-PnJ4ZUl_y5YyHpfHvrXd_fOxe3daDz6vX_pXIx6_d7N2Nk6vwwHvzmb7cul0_ty03sYf7-0ca5HJ9cHw9ve0Pn5D2fLXLaMZup-8k0lLPyTceYywVwmmct85rKAPbpsFUdTlSRRvPuX1z1wN9uwsOmy-XK1Tnd_fnTZNIoVC19ZOk8XioVsPPm6UEM1manYazKXzVQ6mS_2y2y2L1eb7ctfq3_ULsJNtFh_WybhPs9oNdn92PAEe3xzWbROsyWSdPKkWMjf3I_FCMxibMxiCJsYt_MknS-nqcdzs7jiuQUy5uvWeZ4kz2f-PwshPxYiqDSEXxgiu896GcUzFavZyZ32dymMKdCssghBXRHQpLIIrRIR3A-l_HWSPI9UOlh5Mjep8XalwqMIrvt95rKF-ju9uOKXP8Xzp-f9T8xlg3UaOsQztW221yiKUxV7UhvZj4X37xjM7Nw4_r_pmRD3USNaeX4zP-Czy3dPlufmJuHWQvNEw5OGSrMI0rJWGh1E2ATJfMJrlJpxiFaNUuPVGQXNqkhqFUZAkyqSml2E0lLjnyE1sL2OUtNGZio1YV5mYW8V2fB8Q6tYBGnbW4UMImyCZIUWNVrFOES7RquI6iqNZlVklQojoEkVWcUuQmmriM-wCtheR6toIzO1ijQvs7S3it_wAkOrWATp2FuFDCJsgmSFljVaxThEp0aryOoqjWZVZJUKI6BJFVnFLkJpq8jPsArYXkeraCMztYpvXmbf3ipBw9ApFjG69k4hYgibGFmZ_RqNYhyiW6NR_OrqjGZVZJQKI6BJFRnFLkJpo_ifYRSwvY5G0Ub2ka90ztx_qJJVtEyU0bc1zd3A1OxJHT6AJFrHU_UQR9P9ModfB3tu_4eZStLDVXH45W55uLQL-B7mJCxpWORh_h72T2BuB3NZhha8FN0tQ8s2TUuSDsrAHIycpoUoQ8tmKbpD0z65TVs0HFjAIg-3SLhNF6RNwuCZOyTsc3rpLklzQHNaKhxZRdOKjRkAjdQAcOQGhAM5ABzZgdNyAXoANPIDwJEgAI4MgXBQF64Z5nTLotHRisnhmiY4LRneAoWhNYMenfYM74LFadOIJsA11ViVnaZh2Wkclh3gqOw0jsouNMvalB3QqOwAR2UHOCo7wsGOF_S5VaDTo6YaCtfKLmjVCB8cm2nVoEenTSPAkUTQphEdgGuqsTrz0zQ89NM4PPUDHB37aRyWXbOsVdlpGpadxmHZaRyWHeBox9NnWQk-dkmfZXO4VnYJXpHBUVjSqgGPLmnTyAAsTptGglOJ1FRjU3ZAo7IDHJUd4aDsAIcv-Zplrd7yaRq-5tM4fM-ncfiiD3C04-mzrESfG32WzeF62WnV-OAo7NOqyT_649sP_wUAAP__00wYNA==
+
+# EXCEPT ALL and EXCEPT with MergeJoiner.
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz ORDER BY y) EXCEPT ALL (SELECT y FROM xyz ORDER BY y)
+----
+distribution: full
+vectorized: true
+·
+• except all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEll1r2zAUhu_3K8S5akHBkWynjWHQrs1YIGu6JBcdwww31pqwNPIsB-KW_PdhZ9DmS8eagnMX136kVzoP9H0F9WcGAXQe7nvX3TtydtsdjobfeufkbNjpdW5GJCefB_2vZJm_kP7gtjMgn76T_Jx0Hm469yNy3eshXwKFuYzFXfQsFAQ_gAEFDhRcoOABBR9CCkkqx0IpmRafvJZAN15C0KQwnSeLrPhzSGEsUwHBK2TTbCYggFH0OBMDEcUidZpAIRZZNJ2V2yzzl6tl_vIz-S1yoHAjZ4vnuQpI8TBMouJnw-EQrijIRfZvi7eVH3MyidRkc80rBuEqpKCy6ElAwFb0_6L6tUflB6O-rbOYyzQWqYg3VgoLEvtkz3m_RGoyFFk_cdjWZEZ5IoJ3_gCFmfiVnV2x84_p9GlS_gIK_UUWkPIc78_9dibX4kx7At_Jhkwc5m-ffu_e3sberPromfHoHd5w3CN6ahC2dYKw_GDYGkxldZjKqw-Amw_AbTjeEW0xCHtxgrD8YNgabOF12OJWH4BrPgCv4fhHtMUg7OUJwvKDYWuwxa3DFq_6ADzzAfiNI7piELVde1R-MGoNpnh196U9cQZCJXKuRKU21CwOJOInsb4gJRfpWNynclxus37sl1z5Hz0WKlu_5euH7nz9qghYHW7ZwG0bmFnlZr6eZgZXxs3glg3ctoGZVe6tK9uh-TbdfE-7-vt2tTDbvLPmNu3ZCK6HEcH1MCK4HsYER2hEcN9GcD2MCK6HEcH1MCY4QiOCt2wEv7BRVA8jiuphRFE9jCmK0IiilzaK6mFEUT2MKKqHMUURGlG0baMos-oJCI1IitCIpQiNaYrhWFewKwt2bcGuLlj2BbvCwKwaA9upDEa26mnMVj2N2aqnUVsRHLPVpCztzsykLZnSmK1GfckYx2zdKQ9aW8PVh78BAAD__-Sohi4=
+
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz ORDER BY y) EXCEPT (SELECT y FROM xyz ORDER BY y)
+----
+distribution: full
+vectorized: true
+·
+• except
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8mF1v4kYUhu_7K6xzlUhGZmZsIJYqZZtQNRINKXCxVRVVLJ4mqCx2bSPFifLfK0ArJ3Z8Xk9scxc-Huadk3kOZ3ih5L8N-TT-ejf5cnNrnV3fzBfzPybn1tl8PBlfLazM-nU2_d16yp6t6ex6PLN--dPKzq3x16vx3QK8i2zahoG-XX7XCfl_kSCbJNmkyCaXbPLo3qYoDlc6ScJ4_5aXA3ATPJHft2m9jXbp_ul7m1ZhrMl_oXSdbjT5tFh-2-iZXgY6dvpkU6DT5XpzWOYpe758yp7_jv7VGdl0FW5237eJb-0fzKPl_s-eI-n-1aZwl-ZLJOnyQZMvXu3PxfBajSFNYlyvk3S9XaWOKNTiUhQWyJlvmfW4TB4_eH8eQn0uhNdqCLcyRP45u20YBzrWwbtPOnxKZUyJapVH8LqKgCqVRxg0iGB_KuVvy-RxrtNp5KhCpRZZpP0fPeDLZEI2bfQ_6dmlOP85Xj88Hv4im6a71LeYPQ3bLett2AsjR3nF3X-49ujd2qK-5sJYc0f2HFWz3xgEGbQcRJoEyWUXHXac2iEGHXYc0Z7uqFZVHafFCKhSVR3HLELjjiNO0XFkfdmkuWyq57g1rTcIMmw5iDQJkgsnO7S-dohhh9bL9pRDtaqyvsUIqFJV1ptFaGy9PIX1qr5sylw2t-d4Na03CDJqOYg0CZILpzq0vnaIUYfWq_aUQ7Wqsr7FCKhSVdabRWhsvTqF9W592Vxz2bxeTecNYly0GkOaxMhlczs0vnaIiw6Nd9vTDdWqyvgWI6BKVRlvFqGx8e6pf0_4IM5MJ1G4TXStXwv6-w3p4EEfC5SEu3il7-JwdVjm-HB64A5PBDpJj6_K44Ob7fGlfcC3sGBhxcOyCIu3sPsOFmawkI3oiya0HDShleJpxdJeE1g0Wlr2G9HDJrQCh8Vljyn4f3kGsCzCAxYGmx7ydg14vUYsLfo8fcHTAvSFUlcxcRvQSG6EA7sBjvQGOPJblFqqieCARoYDHCmOcHDcAY4kF6XG-v7IIrzUYji8JLrgewzaOt9kxBDoxrcZMQJ4qdEY2crT0FaAI1t5HNrK49DWUpM1spWnoa08Dm0FODqyPA5t5b9gpABDFBhbBW-r5AdXsHXJdxrpgrmX7zTSA3ip0xjNzTwNB2eAo8mZx-HozOPIVlnqsia2AhrZCnBkK8LRkeVxZKvkv2DkCOD8JFvAy7byoyzaOt9pFBhlFd9pFLghK36oAXUHNLIV4cBWgCNbAQ5vuvxFGV11wRW_2eLwsgtwdNsFvxGgU8N_wShUOn6ULeAlWxU_yxa3fv_60_8BAAD__--aF3M=
+
+# EXCEPT ALL and EXCEPT with no overlap.
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz WHERE x < 2) EXCEPT ALL (SELECT x FROM xyz WHERE x >= 2) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • except all
+    │
+    ├── • filter
+    │   │ filter: x < 2
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x >= 2
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEmF1v4kYUhu_7K6xzlahGZmbMl6WVss2yWiQaUkDqVi2qWJgmqCx2bSNBovz3yrAhwSbz-hhi7vh6Zk5eznNmyCNF_83Jo_bX2-7Hzo118akzGA5-615aF4N2t309tFbW537vV2u1frB-_9Lut62V9deyWlUTS15a7a_X7duh9bHbhZ_XHxKg1__U7lu__GGtyKaFP9U34-86Iu9PEmSTJJsU2eSSTTUa2RSE_kRHkR8mH3ncAJ3piryqTbNFsIyTl0c2TfxQk_dI8Syea_JoOP421309nurQqZJNUx2PZ_PNNqv1w9Vq_fB38K9ek03X_nz5fRF5m3oGwTh5WHEkjZ5s8pfxyxZRPL7T5IknO38Zn2fzWIc6dGr7NWxf96wrsYvS87zOzbCZ2vdlqW9r634c3e-vcyVo9PRSm-TU9joicdqMVKGMBAgp6Z9TpOS-Wd3LOsuFH051qKd7K40SEn3kwJ_4ZRzdD3TcCxyZCnq4DrT3SiKyaa7_iS-uxOWHcHZ3v3lENvWWcRLEm4nXOIkP_DDWoSNr6Zh-fnP9eo7MDsXxY9EDRdz4FT9wVDUd8MHtG3vbC0Zjs_vakRVH5bQfFLLr7PoZ7OeEdOqUVKGUBIjpffwX5fovyvAfJP7sf72o_zJ_b0l-a6mK4-YUEBSya63GGQRkhCROnZIqlJIAMb2PgLJcAWUZAoLEnwVsFBVQ5e8txW8tt-LUcgoICtm1VvMMAjJCEqdOSRVKSYCY3kdAVa6AqgwBQeLPAjaLCujm7y2X31q1Sk79QBm7xmqdQT9GROK0GalCGQkQ0vvI55Yrn1uGfCDxZ_lap_j5eWD9vo4CfxHpXL8sq0lgenqnt19A5C_Dib4N_clmm-3T3obbvDDVUbx9V2yfdBbbt5ICX8MiDYvXsLsHCx4sxFF04xhaqqPolpmWxsSVOXHFSFzy4FTiXLpxDJ1KnEu3zLRrTLxmTrxmhOvm77pu_q6BXg0j3TTDzWPcNMPITUADN800chPQwM2WeRpWwTjMDFOOnYBGeiIc-AlwJCjCgaEiM1L3g5cgePNMBZKKzHTZ39wFm2fGC-sUNNPwGAQ4OgfNODwIAQ5sE-bZKuog-Mx0ZelmpqFuAEe6mXGoG8CRbuaTRYCjRWSGLEs385CVYMhKzpDNXr5YQ5aNA90AjnRDOLp4moesBENWZoYsRzdAI90QDnQDONIN4UA3aT5gJDhgpPn-CnST5iErwZCVnCGb3Zw1ZNk40o01ZNk40s08ZCUYspJzgc-2HOsGz8aRbqw7PBtHupkPGAUOGGX-l0hat9HTT_8HAAD__2ST41A=
+
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz WHERE x < 2) EXCEPT (SELECT x FROM xyz WHERE x >= 2) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • except
+    │
+    ├── • filter
+    │   │ filter: x < 2
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x >= 2
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy82Ftv4kYfBvD791NYc5XoNTJzMAdLK2WbsFokGlJA6lZtVLEwTVBZTG0jQaJ89wooOBz8fzyMnbsAfjz_eXb4ifUri_-ZsoC1vj10Prfvnau7dn_Q_6Vz7Vz1W53W7cBZOl963Z-d5erF-fVrq9dyls4fi2pVjhxx7bS-3bYeBvBa_Wl9cbd31-o5P_3mLJnLZuFY3w9_6JgFvzPOXCaYyyRzmWIu89mjy-ZRONJxHEbrS143gfZ4yYKqyyaz-SJZv_3oslEYaRa8smSSTDUL2GD4fap7ejjWkVdlLhvrZDiZbpZZrl5ulquXP-d_6xVz2W04XfyYxcFmnv58uP6z4gn2-OaycJGkS8TJ8EmzgL-5-cf4MpkmOtKR5x_OsH0_cG74vsYgCNr3g0bmusJk3ffb58XuX160fw4KWJ8N1IAyWfluEieT2SjxxNH2b_jRAmnm-8p5HsbPZ65Ph_AvG8IvdIha5hDpfRazMBrrSI8P7rS5S-aYEnWVjlAvawTUVDpCw2IE96Ipvw7j575OunNPHTU1WM11sIPwc6fDXDbVfyVXN_z6UzR5et78xVzWXSTrQ5-5p6bJ8eqHUaIjT51U9v9svao5SjvXx393PTPFfVgJ555fPW74_PqHfHIDxowV80TFkzkdB4PsHasV7LhJAUU3IC9qgIMKzCUHK6eI8hIlzz1ErUTJeXGMoq6yJC9wBNRUluRmI1hLzj9CcnC8dpKfVJZbcpEfEmHuiKx4KqekYJC9I_WCJTUogBfdgLyoAQ4qMJcUrJwiJkqUNPcQ9RIlFcUxhrrKkrTAEVBTWZKajWAtqfgIScHx2kl6UlluSWV-SKS5I6ri-TklBYPsHWkULKlBAbzoBuRFDXBQgbmkYOUUMVmipLmHaJQoqSyOMdRVlqQFjoCaypLUbARrSeVHSAqO107Sk8pyS6ryQ6LMHfErOR0FY-wVaRbsqMH2ebH7lxftn4MCzBUFK6eAqRIVzT1Es0RFVXGEoa6yFC1wBNRUlqJmI1grqj5CUXC8doqeVHbRM9ozC_R0PA9nsc71-LW6bkyPn_T2XyAOF9FIP0ThaLPM9mV3k9u8MdZxsv2Ub1-0Z9uP1gO-D3MyrOiwIMOSDksy7NNhdRzm78O1gzA3C_O6TVpYpaVVWoG0T6atwrxhkxZWaWmVViBdI48pCNcNwuI43CDDTfoL0qRRqNJzc9oUH6FCq8IFiNOucGADp2XhADV-8iU7jNdAnD5ugCaQRjaBOMIJxJFOII544idfNROfQBoBBeJIKBBHRIE4MorTzvAmiNPSHMVPnOK0NaIKfkSA3y-AKkFbI4A1grZGAGsEbY1AP6BoawSwRlhZA9LIGhBH1oA4sgbEkTXCyhqQRtaAOLIGxJE1II6sEbQ1AlgjaGsEsEbQ1khgjbSzRtLWSGCNBP9fAtZI2hoJrJG0NRJYI62sAWlkDYgja0AcWQPiyBppZQ1II2tAHFkD4sgaEEfWSNoaCayRtDUSWCNpaxSwRtlZo8CTGWCNoq1R6PkKbY0C1ijaGgWsUVbWgDR8vmNnDYjDJzx21igra0AaWQPiyBoQR9aAOLJG0dYoYI2irVHAGkVb4wNrfENrHt_-928AAAD__yHBces=
+
+# EXCEPT ALL and EXCEPT with some overlap.
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz WHERE x >= 1) EXCEPT ALL (SELECT y FROM xyz WHERE x < 3) ORDER BY y
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +y
+│
+└── • except all
+    │
+    ├── • filter
+    │   │ filter: x >= 1
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x < 3
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEmF1v4kYYhe_7K0bvVaIamZkxX5ZWYptltUg0pIDUrVpUefE0QWWxaxsJEuW_V8AGgk3meEwwd-Hj8bwc5jlj8kTxfzNyqfP1rvexe8uuPnWHo-FvvWt2Nez0OjcjtmKfB_1f2XL1yH7_0hl02JL9tahWpfrA-DXrfL3p3I3Yx14PAhMmr1l_8KkzYL_8wVZk0Tzw1a33XcXk_kmcLBJkkSSLHLKoRmOLwiiYqDgOovVbnjZA11-SW7VoOg8XyfrpsUWTIFLkPlEyTWaKXBp532ZqoDxfRXaVLPJV4k1nm2WWq8f2cvX4d_ivWo9wE8wW3-exy5bWZqRh6K0fVWxB42eLgkWyXyVOvHtFLn-28k_yeTpLVKQiu3Y4xvZ5l7X5Pk3Xdbu3oyZZ1F8kLmunR9hf9duKPXjxw-El25zGz_sxhcmYrwPj756YLJQYB5FNmHzfxJw3x9xfZzEPIl9Fyj-40nhNorcc-axfvPhhqJJ-aItU6KNVqNxXdpFFM_VPctXm1x-i6f3D5q_d5-ZvRl8ziX4YRImKbFFLx_Tzm9ev58jsWBw_LnpkiNugEoS2rKYDPrp842B5brDJi-xxW1RsmbMXwCy7XV6_bC-YRHaGzGShzDgI7czNwMttBl5GM4DoX5qhXrQZRP59JgptM1mxnZxqgll226xxWTUNIuNnyEwWyoyD0M6spihXTVGGmiD6FzUbRdWU-feZLLTNnIpdy6kmmGW3zZqXVdMgMn6GzGShzDgI7cxqynLVlGWoCaJ_UbNZVE0n_z5zCm2zWiWnmGCS3SZrXVZMg8D4uycmCyXGQWRn1tIpV0unDC1B9C9att7jZ-6R6w9UHAbzWOX6BVtdB6b8e7X9AuJgEU3UXRRMNstsH_Y33OYJX8XJ9lW-fdCdb19aD_ga5mmYv4adA5ibwZyfRDdOoYU8iW7paaFNXOoTlwaJCzM4lbgp3TiFTiVuSrf0tKNNvKZPvKaF6_rvuq7_roFeDS3d1MPNU9zUw8hNQAM39TRyE9DAzZa-DaugDjNlamInoJGeCAd-AhwJinBgKM9U6mHwAgSv71QgKc-0y-HiDlg8Uy9Gp6CehscgwNE5qMfhQQhwYBvXdyuvg-Az7Wqkm56GugEc6abHoW4AR7rpTxYOjhaeKVkj3fQlK0DJCpOSzd58GZWsMQ50AzjSDeHoxlNfsgKUrMiUrIlugEa6IRzoBnCkG8KBbkJ_wAhwwAj9_SvQTehLVoCSFSYlm13cqGSNcaSbUcka40g3fckKULLC5AY-u-WM7uCNcaSb0T28MY500x8wEhwwUv8vkbRu4-ef_g8AAP__3foDnA==
+
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz WHERE x >= 1) EXCEPT (SELECT y FROM xyz WHERE x < 3) ORDER BY y
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +y
+│
+└── • except
+    │
+    ├── • filter
+    │   │ filter: x >= 1
+    │   │
+    │   └── • scan
+    │         missing stats
+    │         table: xyz@xyz_pkey
+    │         spans: FULL SCAN
+    │
+    └── • filter
+        │ filter: x < 3
+        │
+        └── • scan
+              missing stats
+              table: xyz@xyz_pkey
+              spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy82Ftv4kYcBfD3fgprnhLVyMzFXCytxDZhtUg0pIDUrdqoYmGaoBJMbSNBonz3ClhwuPh_bI-dt-Vy8Nmzw0-sX1n434x5rP3tvvu5c2dd3XYGw8Fv3WvratDutm-G1tr60u_9aq3WL9bvX9v9trWy_lpWq1J_svi11f52074fwjePLXlt9fq37b71yx_Wmtls7k_03ehZh8z7k3FmM8FsJpnNFLOZyx5stgj8sQ5DP9i85XUb6ExWzKvabDpfLKPN0w82G_uBZt4ri6bRTDOPDUffZ7qvRxMdOFVms4mORtPZ9jKr9UtrtX75e_Gv3lS48WfL53noWSt7W2mwGG0eVRzBHt5s5i-j-CphNHrUzONvdvomX6azSAc6cNzjGrvnPavF4yU9z-vcDRvMZr1l5Fmt5AoiS4X3Y_DC15C51uBgjrEl06-hslS4nYbRdD6OHHEyRYufXCDOfF9bT6Pw6cL74xJuvhJuoSVqiSXiz1nO_WCiAz05-qTtpyTWlGiruEK9rApoqbhCw6CCnavl11H4NNBRb-Gok6WG64X29kJ-7naZzWb6n-iqxa8_BdPHp-2fDmc8-e_UzHK8Bn4Q6cBRZ5P9nIxaNcVol_b48akXWtz5FX_huNXThS9f_1hVnoG0PKI5ouLIlMKDLgfTauUJn2WOEvaQufbgYBAD40GFmFdeovGpS9RKNJ4XByzaKsn4AiugpZKMz1bB2Hj-EcaD47U3_myy1MaL9KiIXKbIiqNSGgu6HEypl2dshjl4CXvIXHtwMIiBsaBCzJso0djUJeolGiuKAw5tlWRsgRXQUknGZqtgbKz4CGPB8dobezZZamNlelRkLlNUxXFTGgu6HExplGdshjl4CXvIXHtwMIiBsaBCzJss0djUJRolGiuLAw5tlWRsgRXQUknGZqtgbKz8CGPB8dobezZZamNVelRULlPcSkphQZODKM3yhM0wBi98DZlrDQ7mMPAVVIhpUyX6mrpEs0RfVXG4oa2SfC2wAloqyddsFYx9VR_hKzhee1_PJst1L_jCBfo6XPjzUKe6zVvdLKYnj3r3LxD6y2Cs7wN_vL3M7mFvm9s-MdFhtHuV7x505ruXNgXfhzkZVnRYkGFJhyUZdumwOg3z9-HaUZhnC_O6SVoYpaVRWoG0S6aNwrxhkhZGaWmUViBdI48pCNczhMVpuEGGm_QXpEmjUKV7c9oUF6FCq8IFiNOucGADp2XhADV-9iU7jtdAnD5ugCaQRjaBOMIJxJFOII544mdftSw-gTQCCsSRUCCOiAJxZBSnneFNEKelOYmfOcVpa0QV_IgAv18AVYK2RgBrBG2NANYI2hqBfkDR1ghgjTCyBqSRNSCOrAFxZA2II2uEkTUgjawBcWQNiCNrQBxZI2hrBLBG0NYIYI2grZHAGmlmjaStkcAaCf6_BKyRtDUSWCNpaySwRhpZA9LIGhBH1oA4sgbEkTXSyBqQRtaAOLIGxJE1II6skbQ1ElgjaWsksEbS1ihgjTKzRoE7M8AaRVuj0P0V2hoFrFG0NQpYo4ysAWl4f8fMGhCHd3jMrFFG1oA0sgbEkTUgjqwBcWSNoq1RwBpFW6OANYq2xgXWuBmteXj76f8AAAD__7hNkig=
+
+# EXCEPT ALL and EXCEPT with swapped column orders.
+query T
+EXPLAIN (DISTSQL) SELECT x, y FROM xyz EXCEPT ALL SELECT y, x from xyz
+----
+distribution: full
+vectorized: true
+·
+• except all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEll1v2jwUx--fTxGdq1YyCnYSWiI9ElXHNCRWusJFpQlNKfEKGsVZnEhJq373KaFvvMwnjiG7DOEX_33O7-L_BPL3Enzo314PLwZX1smnwXgy_jY8tcb9Yf9yYmXEyq3PN6OvVpY_Wv3by_71xLoYDl_f58TK3t4DgZUI-VXwwCX434ECAQYEHCDgAgEPpgSiWMy4lCIu_vJUAoMwA79NYLGK0qT4eUpgJmIO_hMki2TJwYdJcLfkNzwIeWy3gUDIk2CxLI_J8sdelj_-iH7xHAhcimX6sJJ-mR0IjKOgeGrZDKbPBESavJzy_vG73JoHcr752R4lvQKZEpBJcM_Bp8-kXmCvbmACozTxrR4jPWqanv01_fun0pWIQx7zcONj04LE_rJnBF8COR_zZBTZdGtlkzzi_gedgMCS_0xOytSn_8eL-_nrw9sMXi70cQbvl3MMLrcn-ZVoicim3vYY9p7tbpxNq2tB62hhs5btHNZkjcid-pGP5zJt1mXaqMus-nJYreU4Lds9rE8akc_qRz6eT6xZn1ijPjnVl-PUWo7bsr3D-qQR-bx-5OP55DTrk9OoT2715bi1luO1DmuTRuBu3cDHc8lt1iX3n_W2PbluuIzESvJKraxd3IyH93w9KSnSeMavYzErj1k_jkquLBAhl8n6LVs_DFbrV0XA6nDHBO6awNQoN_XUNNUYGdODOyZw1wSmRrm3RrZDs226_ZF21PN2lDDdnFl7m3ZNBFfDiOBqGBFcDWOCIzQiuGciuBpGBFfDiOBqGBMcoRHBOyaCn5koqoYRRdUwoqgaxhRFaETRcxNF1TCiqBpGFFXDmKIIjSjaNVGUGvUEhEYkRWjEUoTGNMVwrCuYlQWztmBWFwz7gllhoEaNge5UBi1b1TRmq5rGbFXTqK0IjtmqU5Z2d6bTlnRpzFatvqSNY7bulAelrdPn__4EAAD__yskp58=
+
+query T
+EXPLAIN (DISTSQL) SELECT x, y FROM xyz EXCEPT SELECT y, x from xyz
+----
+distribution: full
+vectorized: true
+·
+• except
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEmF9v4kYUxd_7Kaz7tCsNMjNjA7FUiVWWqpFokgYeVqqiioVpgspiahsJEuW7V4CyXuz4nvG_7KPj_eEzd-f8GPNM8X8rCmj05Xb86era-fD5ajKd_Dn-6ExG49Hl1NkJZ-_8dnfzh7PbPzmjL5ej2-nrvb1wdt_vkaB1uDDXs28mpuAvkiRIkSBNgjwS5NO9oE0Uzk0ch9HhnzwfgavFjoKuoOV6s00Of74XNA8jQ8EzJctkZSig6ezrytyZ2cJEbpcELUwyW66Oj9ntn4a7_dPfm3_NngRdhqvtt3UcHHOToMlmdrjquIruXwSF2yR9SpzMHgwF8kVUS-JXTSLoZpsEzlCJoSyMpcrE-ryMk-V6nrgyM56hFMPs0lPs6955nMWPbyNpFF0tit9CFK8wSvpR23UYLUxkFmcfdvyUwrDKYm5pCr-tFBYjS1P0aqQQlYL-PosfJya52bg6M6_pfmOCVz18Go9J0Mr8k3w4ruDjr9Hy4fH14vv2ZxfXb3bE12En3Ljaz47hzWcPzp4t7Y0gqxjBVR1XW9qpRJZe9SwV_ASCpVKQrfvJOkqvdT_J5sxgMbciPzWYwmJkRX4ql6K2n-S7-knZ91JV6qXuuJ6lI0pk6VfPUsERIFhaTNW6I6yj9Ft3hGqunRZzK3JEgyksRlbkiHIpajtCvasjtH0vdaVeeh3Xt3REiSyD6lkqOAIES4upW3eEdZRB647QzbXTYm5FjmgwhcXIihxRLkVtR-h3dYRn30uvUi_9jqUhSiS5qJqkgh9ArLSUXut-sI5y0bofvOaaaTG3Ij80mMJiZEV-KJeith-8n_Y7yBu57ky8CdexsfqVo3tYmVk8mNOk4nAbzc1tFM6Pjzld3hy54x8WJk5Od9Xp4mp9unUI-CMsWVjzsMrC8kfYO4NlOViqWvRFHVr16tBa87Rmab8OLGs9WnVr0f06tAabxWO3Kfj_8kvAKgv3WBgsus-3q8fXa8DSssvTFzwtgRdyVinTbUCjciMctBvgqN4AR_2WOaWWKTigUcMBjiqOcLDdAY5KLnNiPd-yCM8phsNzRZe8Y9DSecnIPqgbrxk5AHhONKXaytOwrQBHbeVx2FYeh23NSbZUW3katpXHYVsBjrYsj8O28l8wSoJDFDi2Sr6tij-4gqUr3jTKA-de3jTKB3jONKXOzTwND84ARydnHodHZx5HbVU5y5ZpK6BRWwGO2opwtGV5HLVV8V8wagBw_iSbwfNt5Y-yaOm8aTQ4ymreNBq8IWv-UAPmDmjUVoSDtgIctRXg8E2Xf1FGr7rgFb_ew-HLLsDR2y74jQDtGv4LRqPR8UfZDJ5rq-bPstml37_88n8AAAD__xxSRTw=
+
+# EXCEPT ALL and EXCEPT with different ORDER BY types.
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) EXCEPT ALL (SELECT y AS x FROM xyz ORDER BY z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • except all
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8lt9vokoUx9_vXzE5TzV3DM4A_iC5SXtbN2vi1q760M3GbKjMVrNWWMBEbPq_b8C6VpE5DChvUucz83XO5_TwCsHvBVjQfXzo3_TuydVdbzQefe3XyNWo2-_ejsmafBoOvpB1tCGD4V13SP7_RqIa6T7edh_G5Kbf_7syIjejk8s3tf3nNVBYuo64t19EANZ3YECBAwUdKBhAwYQJBc93pyIIXD9e8poAPWcNVoPCfOmtwvjPEwpT1xdgvUI4DxcCLBjbTwsxFLYjfK0BFBwR2vNFcsw62lyvo80P75eIgMKtu1i9LAOLrCmJn0eeHT_VtTjKYBVa5JrB5I2Cuwrfz9sf8xSRmR3MDg9I1k8oBKH9LMBib7RYbjNf7oiSzSVy88zc-31WS9d3hC-cg50mMYktOfHjP9vBbCTCgaexo5qNI09YH0wDCgvxM7y6ZrX__PnzLPmU-bv3v0lXqcXI9UPha8w8vqZ_M_c3ctzZqet43_REiHu37noabxxf8MnjzYPjWX7VWJEW0Xhd0y_SJArJm0Wa5JzJeWbyCtqEVdEmSDV2bdIs2iY8f7V5IU_1umZcxFOF5K1Cnp4xOc9MXoGnvApPkWrsPG0V9VTPX229kKdGPZn55_dUIXm7kKdnTM4zk1fgqV6Fp0g1dp62i3pq5K-2UchTs34RSxVydwpZerbcPDN3BY4aVTiK1GLnaOccr8Yn9h-KwHOXgcj11tuIL0w4z2JbgMBd-VPx4LvT5Jjt4yDhkncZRwTh9lu-fegtt1_FAfPDrTIwY6VosxTdkdNM4c64GtwqAx_dmSptlqI7cpof042PtH4AN45hXQob8moZUpgz-dFmmf6Qw0h_yGGsPxAa6Q-ERvqjWaY_5DDSH3IY6w-ERvoDoZH-aEktbcslbZfpj04Zw-UwYrgcxgxHaMRwhMYmgMrYTP8nVZmbqjQ6BJQmpzKOaM5SU-RAVcblojP5GEFMZ6k5oqI6QiOuIzQmO4YjtmM4pntqhirpLqcx3eU0qjuCY7ojOKZ7apAe6t5EdE_NFCXdUzNFSXc5jekup1HdERzTHcEx3VPzVEl3OY3pLqdR3REc0x3BMd1TU_XwXbsh152nZotU98nbP38CAAD__5wmrzg=
+
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) EXCEPT (SELECT y AS x FROM xyz ORDER BY z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • except
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8mN1u6kYbhc-_q7DmKNFnBDNj_ixVSppQNRINKXCwqyqq2DBNUNmY2kbCRLn3Cij1jge_a8Y_OQuJH8_yy6xH47yx6O8V89ngy9Pw9uHRubp_mEwnvw6vnavJYDi4mzo756fx6Bdnl-yd0fh-MHZ-_M1Jrp3Bl7vB0_S_qxLndnLx0v11-vOOuWwdLNTj7JuKmP8748xlgrlMMpd5zGVt9uyyTRjMVRQF4eGStyPwsNgxv-Wy5XqzjQ-_fnbZPAgV899YvIxXivlsOvu6UmM1W6iw2WIuW6h4tlwdl9kl-5tdsv9j85dKmMvugtX22zrynZ3rHD5PNrPDp0bzEGW0jX3nhrPnd5cF2zhdL4pnL4r5_N0tlqltlilxnb1tJmGT6X4Zxcv1PG7yzJS0BVLma-K8zqLXC9enIWSxEO1KQ3i5IdL7bNdBuFChWny40_EuuTEFmlUaoV1XBDSpNEKnRAS3UMqfZ9HrRMWjTVNmJjVNNso_2-J2OGQuW6k_46sbfv1DuHx5Pf5ksMe7NttrEoSxCptSG9n_c-_fM5jZpXH8e9MLIR6DRrBpeq3sgC8u3_-wPDfXCi-iuqZoNKW17CxSdYrIzjSVsEmVmobXqDvjEJ0adcercw2aVZ7uKoyAJpWnO7sIpXXHP0N3YHuddaeNzFR3wrzZopBvZKPpWfvGIlW3kG8MUwmbVGnVRY2-MQ7RrdE3orqyo1nl-abCCGhSeb6xi1DaN-IzfAO219k32shMfSPNmy0L-cZrHN-37HxjkapXyDeGqYRNqrTqskbfGIfo1egbWV3Z0azyfFNhBDSpPN_YRSjtG_kZvgHb6-wbbWSmvvHMm-0V8k27YW0bi0z9QrYxyiRsMqU192p0jXGIfo2u8aorOppVnmsqjIAmlecauwilXeN9hmvA9jq7RhtZkX8dXbj_WEWbYB0po_8KtQ4DU4sXdfoComAbztVTGMyPy5w-jo7c8RcLFcWnv4rTh4f16U-HgN_DnIQlDYsszL-HvQ8wt4O5LEMLXorul6Fll6YlSbfLwByMnKaFKEPLVim6R9MeuU07NNy2gEUW7pBwly5Il4TBM_dI2OP00n2S5oDmtFQ4soqmFRszABqpAeDIDQgHcgA4sgOn5QL0AGjkB4AjQQAcGQLhoC5cM8zHLYtGRysmg2ua4LRkeAcUhtYMenTaM7wPFqdNI1oA11RjVXaahmWncVh2gKOy0zgqu9Asa1N2QKOyAxyVHeCo7AgHO17Q51aBTo-aaihcK7ugVSM8cGymVYMenTaNAEcSQZtG9ACuqcbqzE_T8NBP4_DUD3B07KdxWHbNslZlp2lYdhqHZadxWHaAox1Pn2Ul-NolfZbN4FrZJXhFBkdhSasGPLqkTSPbYHHaNBKcSqSmGpuyAxqVHeCo7AgHZQc4fMnXLGv1lk_T8DWfxuF7Po3DF32Aox1Pn2Ul-t7os2wG18tOq8YDR2GPVk320Z_f__dPAAAA__8Oij5I
+
+# EXCEPT ALL and EXCEPT with different numbers of ORDER BY columns.
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) EXCEPT ALL (SELECT x FROM xyz ORDER BY y, z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • except all
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8ll9v2jwUh-_fT2Gdq6LXKNhJ-BNpUruWaUisdMBFpwlNKfEKGiVZEiSg6nefEopoCPGJE8jdPPLYv_g8pyevEPxdgAXdx4f-Te-eXN31RuPR936NXI26_e7tmKzJl-HgG1lvtmQwvOsOyecfZFMj3cfb7sOY3PT78icp2dYOyzVQWLqOuLdfRADWT2BAgQMFHSgYQMGECQXPd6ciCFw_euQ1BnrOGqwGhfnSW4XRf08oTF1fgPUK4TxcCLBgbD8txFDYjvC1BlBwRGjPF_Ex6832er3Z_vL-iA1QuHUXq5dlYJE1JdF65NnRqq5FUQar0CLXDCZvFNxV-H7e4ZinDZnZwSx5QPz8hEIQ2s8CLPZGi-U28-emZHuJ6Dwz-mGf1dL1HeELJ7HTJCKxR068_1c7mI1EOPA0dlS28cYT1gfVgMJC_A6vrlntkz9_nsX_ynzvwzvpKuUYuX4ofI2Zx9f0f-b-Ro47O3Ud75ueCHHv1l1P443jCz55vJk4nuW3jRXpEo3XNf0ifaKQvFmwT84ZnmeGr6BTWBWdghRk3ynNop3C8xecF1JVr2vGRVRVSN4qquoZw_PM8BWoyqtQFSnIXtVWUVX1_AXXC6lq1OPhf35VFZK3i6p6xvA8M3wFqupVqIoUZK9qu6iqRv6CG4VUNesXEVUhd6eoqGeLzjOjV6CpUYWmSDn2mnbO8Zl8Yv-hCDx3GYhcX8CN6MKE8yx2BQjclT8VD747jY_ZLQcxF3_UOCIId7_y3aK33P0UBcwPt8rAjJWizVJ0R04zhTvjanCrDHx0Z6q0WYruyGl-TDc-0noCbhzDuhQ25NUypDBn8qPNMv0hh5H-kMNYfyA00h8IjfRHs0x_yGGkP-Qw1h8IjfQHQiP90ZJa2pZL2i7TH50yhsthxHA5jBmO0IjhCI1NAJWxmf5LqjI3VWl0CChNTmUc0ZylpkhCVcblojP5GEFMZ6k5oqI6QiOuIzQmO4YjtmM4pntqhirpLqcx3eU0qjuCY7ojOKZ7apAmdW8iuqdmipLuqZmipLucxnSX06juCI7pjuCY7ql5qqS7nMZ0l9Oo7giO6Y7gmO6pqZr81m7Ideep2SLVffL2378AAAD__wgnsoQ=
+
+query T
+EXPLAIN (DISTSQL) (SELECT x FROM xyz ORDER BY y) EXCEPT (SELECT x FROM xyz ORDER BY y, z) ORDER BY x
+----
+distribution: full
+vectorized: true
+·
+• sort
+│ order: +x
+│
+└── • except
+    │
+    ├── • scan
+    │     missing stats
+    │     table: xyz@xyz_pkey
+    │     spans: FULL SCAN
+    │
+    └── • scan
+          missing stats
+          table: xyz@xyz_pkey
+          spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8mF1v6jYcxu_3KSJftVpQsB3eIk3qWcu0Sqx0wMWZpmrigNeicQhLggRU_e4TMJQ2Jv_HzkvvmpZf_OSPn5-cvrL43yULWP_r4-DL_YNzdXc_nox_H1w7V-P-oH87cbbOL6Phb852t3eGo7v-yPn5D2d37fS_3vYfJ_SnXGd_nV5umctW4Vw9TL-rmAV_Ms5cJpjLJHOZz1zWYk8uW0fhTMVxGB0-8noE7udbFjRdtlitN8nh108um4WRYsErSxbJUrGATabflmqkpnMVeU3msrlKpovlcZntbn-z3e3_Wv-jdsxlt-Fy830VB87WdQ7X4_X0cNXwDlGGmyRwbjh7enNZuEnS9eJk-qxYwN_cYpla5plcZ28bS9jEulvEyWI1SzyeGZS2QMp82zkv0_jlwufTELJYiFalIfzcEOl9NqswmqtIzT_c6XiX3JgCzSqN0KorAppUGqFdIoJbKOWv0_hlrJLh2pOZSU12axWcdfFlMGAuW6q_k6sbfv1TtHh-Of5ksMc7NttrHEaJijypjezH3Pt3DWZ2aRz_3_RCiIewEa49v5kd8MXlex-W5-Zm4UVs54mGJ619Z5GqXdB3psGETbBUNrxG4xmHaNdoPF6dbtCs8oxXYQQ0qTzj2UUobTz-GcYD2-tsPG1kpsYT5uUWhZQjG55vrRyLVJ2iyjEMJmyCpW0XNSrHOESnRuWI6vqOZpWnnAojoEnlKccuQmnliM9QDtheZ-VoIzNVjjQvtyykHL9xfPGyU45Fqm5R5RgGEzbB0rbLGpVjHKJbo3JkdX1Hs8pTToUR0KTylGMXobRy5GcoB2yvs3K0kZkqxzcvt19IOa2GtXAsMvWKCscolrCJlTbdr1E3xiF6NerGr67raFZ5uqkwAppUnm7sIpTWjf8ZugHb66wbbWRF_o104f4jFa_DVayM_kPUPAxMzZ_V6QuIw000U49RODsuc7ocHrnjL-YqTk5_FaeL-9XpT4eA72FOwpKGRRbm72H_A8ztYC7L0IKXontlaNmhaUnSrTIwByOnaSHK0LJZiu7StE9u0zYNtyxgkYXbJNyhC9IhYfDMXRL2Ob10j6Q5oDktFY6somnFxgyARmoAOHIDwoEcAI7swGm5AD0AGvkB4EgQAEeGQDioC9cM83HLotHRisngmiY4LRneBoWhNYMenfYM74HFadOIJsA11ViVnaZh2Wkclh3gqOw0jsouNMvalB3QqOwAR2UHOCo7wsGOF_S5VaDTo6YaCtfKLmjVCB8cm2nVoEenTSPAkUTQphFdgGuqsTrz0zQ89NM4PPUDHB37aRyWXbOsVdlpGpadxmHZaRyWHeBox9NnWQm-dkmfZTO4VnYJXpHBUVjSqgGPLmnTyBZYnDaNBKcSqanGpuyARmUHOCo7wkHZAQ5f8jXLWr3l0zR8zadx-J5P4_BFH-Box9NnWYm-N_osm8H1stOq8cFR2KdVk330p7cf_gsAAP__46ZBlA==
+
+# EXCEPT ALL and EXCEPT with compatible ORDER BY columns that are not in the final result.
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz ORDER BY z) EXCEPT ALL (SELECT y FROM xyz ORDER BY z)
+----
+distribution: full
+vectorized: true
+·
+• except all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEll1v2jAUhu_3K6xz1UpGwU6gJdKkdi3TkFjpgItOE5pS4hU0irM4SISq_31KmNTyEZ8Yj3DXNH7i1z6PxPsC6s8MfGg_3HevO3fk7LYzGA6-dc_J2aDdbd8MSUo-93tfyTJdkV7_tt0nn76T1TlpP9y074fkuttFVgKFuQzFXfAsFPg_gAEFDhRcoOABhQaMKESxHAulZJwtecmBTrgEv05hOo8WSfbvEYWxjAX4L5BMk5kAH4bB40z0RRCK2KkDhVAkwXSWb7NMV1fLdPUz-i1SoHAjZ4vnufJJSskKKAyiIHuqOVmU3iLxyRWD0SsFuUj-7fe2zWNKJoGabG6Qrx9RUEnwJMBnr_Sw3I3T5uaFud--s5jLOBSxCDe-NMpIbMmew38J1GQgkl7ksK2ZDdNI-O_MAgoz8Ss5u2LnH-Pp0yT_q_Dcb2dyLc60J_CdrMnIYY3t0-_d29vYm5X3gB3igcNrjnsUgw2SN0-dnBcmr8BhVoXDvPw0-EHTcGuOdxSPDJJfnDo5L0xegUe8Co_c8tNwD5qGV8t_0P6_RwbJL0-dnBcmr8AjtwqPvPLT8A6aRqN2FIsMcrdOm5sX5q7AIa_qXrYnTl-oSM6VKNW66tmBRPgk1hek5CIei_tYjvNt1o-9nMv7QShUsn7L1w-d-fpVFrA83LSBWzYws8rNGnqaGVwZN4ObNnDLBmZWubeubIfm23T9Pe3q79vVwmzzzurbtGcjuB5GBNfDiOB6GBMcoRHBGzaC62FEcD2MCK6HMcERGhG8aSP4hY2iehhRVA8jiuphTFGERhS9tFFUDyOK6mFEUT2MKYrQiKItG0WZVU9AaERShEYsRWhMUwzHuoJdWbBrC3Z1wbIv2BUGZtUY2E5lMLJVT2O26mnMVj2N2orgmK0mZWl3ZiZtyZTGbDXqS8Y4ZutOedDaOnr98DcAAP__Yt-mag==
+
+query T
+EXPLAIN (DISTSQL) (SELECT y FROM xyz ORDER BY z) EXCEPT (SELECT y FROM xyz ORDER BY z)
+----
+distribution: full
+vectorized: true
+·
+• except
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJy8mF9v4kYUxd_7Kaz7lEiDYGZsIJYqZZtQNRINKfCwVRVVLEwTVBZT20iBKN-9wmjlxI7v8WCbN_zn5zlzmXN8x68U_bcinwZfH4Zf7u6di9u7yXTyx_DSuZgMhoObqbNzfh2PfndedntnNL4djJ1f_nT2l87g683gYQruIkHrYGHuZ99NRP5fJEmQIkGaBLkkyKNHQZswmJsoCsLDLa8JcLd4Ib8jaLnebOPD6UdB8yA05L9SvIxXhnyazr6tzNjMFiZsd0jQwsSz5SoZ5mW3v37Z7f_e_Gt2JOgmWG2_ryPf2QlnT4Imm9nhqNU-SBltY9-5lvT4JijYxul4UTx7MuTLN3GaJq85TcpG0-0yipfredyWmSrlBkiZbzvneRY9f3J_KkKfJsKrVYRbKCJ9znYdhAsTmsWHJyVPKZSpUK1SCV5TElClUgndChLESSp_m0XPExOPNm2dqdR0tzH-j3T4MhySoJX5J764lpc_h8un5-RXiTXeq7es90Er2LS1l539p2P3P4wty3tenuL5tmq1tXUSWajqNqlK2ahKY0A2mEWlRXQbzCJZXxCgWhVlUY0SUKWKsshOQuUskufIIlXeeeok5-lW27XOAwtVvSZVKRtVqRVVg3lQWkSvwTxQ9ZkR1aooD2qUgCpVlAd2EirngTpHHujyztMnOc9tJZsJuzywUNVvUpWyUZVaUTeYB6VF9BvMA12fGVGtivKgRgmoUkV5YCehch7oc-SBW9557knO81rWaWCh6ao5TcpGU2pDt8EsKC3iqsEscOszIqpVURbUKAFVqigL7CRUzgL33N8tPpEzNtEmWEem1FeJzmFCZvFkjgWKgm04Nw9hME-GOR6OEi45sTBRfLyqjgd36-Olg8D3sGRhzcMqC8v3sPsBlnawVJXoqyq06lahteZpzdJeFVhWGlp1KtG9KrQGi8Vllyn4vzwLWGXhLguDSfd4d3V5e_VZWnZ4-oqnJciFXKrYeBvQyNwIB-4GOLI3wJG_ZS5SbQwOaORwgCOLIxwsd4Ajk8tcsH5csgjPRQyH54wu-YxBU-dDRvaA3fiYkX2A54LGyq08Dd0KcORWHodu5XHo1lzIWrmVp6FbeRy6FeBoyfI4dCv_glESNFGgbZW8WxXfuIKpKz5plAv6Xj5plAfwXNJY9c08DRtngKPOmcdh68zjyK0ql7I2bgU0civAkVsRjpYsjyO3Kv4Fo_oA5zvZDJ53K9_KoqnzSaNBK6v5pNFgh6z5pgbUHdDIrQgHbgU4civA4U6X3yijrS7Y4lcbHG52AY52u-AbAVo1_AtGo9LxrWwGz7lV871sduqPbz_9HwAA__8Esjev
+
+# EXCEPT ALL and EXCEPT with a projection on the result.
+query T
+EXPLAIN (DISTSQL) SELECT x FROM ((SELECT x, y FROM xyz) EXCEPT ALL (SELECT x, y FROM xyz))
+----
+distribution: full
+vectorized: true
+·
+• except all
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzElkFv2jAYhu_7FdF3Asko2EloiTSJqmMaEitd4VBpQlNKvIJGcRYHibTqf58SVrUE8BdjlBwNeezX_p7D-wLy7xJ86N_fDq8GN1bjy2A8Gf8YNq1xf9i_nlgb6-vd6LvVaLytiZVuf9qkz02rf3_dv51YV8OhdfiLJhBYiZDfBE9cgv8TKBBgQMABAi4Q8GBKIIrFjEsp4uyTlxwYhBvw2wQWq2idZD9PCcxEzMF_gWSRLDn4MAkelvyOByGP7TYQCHkSLJb5MZv0ubdJn39Ff3gKBK7Fcv20kn6eDgiMoyBbtWwG01cCYp38P-V984fUmgdyvrttj5JehkwJyCR45ODTV3JaYK-mwOxo4Pet1isRhzzm4c5m04zEPjlw62-BnI95MopsWpjSJI24_0EiILDkv5NGnrr5OV48zt8WQGC0TnyrRwsP8H4zx-BmB2LfiJaIbOoV3-Dg2e7O2bS8BvQUDWzWsp3zmqsRuVNbZHY0cgXu0urcZeWHwU4ahtOy3fP6oxH5orbI7GjkCvxh1fnjlB-Gc9Iw3JbtndcfjciXtUVmRyNX4I9TnT9u-WG4Jw3Da53XHo3A3ZoCs6OBK3DHrad3HQh1x2UkVpKXalXt7Fo8fOTbZ5JiHc_4bSxm-THb5Sjn8jYQcpls_2XbxWC1_SsLWB7umMBdE5ga5aaemqYaT8b04I4J3DWBqVHuwpPt0axItz_Sjvq9HSVMd9-sXaRdE8HVMCK4GkYEV8OY4AiNCO6ZCK6GEcHVMCK4GsYER2hE8I6J4BcmiqphRFE1jCiqhjFFERpR9NJEUTWMKKqGEUXVMKYoQiOKdk0UpUY9AaERSREasRShMU0xHOsKZmXBrC2Y1QXDvmBWGKhRY6B7lUHLVjWN2aqmMVvVNGorgmO26pSl_ZnptCVdGrNVqy9p45ite-VBaev09dO_AAAA__9eK5nz
+
+query T
+EXPLAIN (DISTSQL) SELECT x FROM ((SELECT x, y FROM xyz) EXCEPT (SELECT x, y FROM xyz))
+----
+distribution: full
+vectorized: true
+·
+• except
+│
+├── • scan
+│     missing stats
+│     table: xyz@xyz_pkey
+│     spans: FULL SCAN
+│
+└── • scan
+      missing stats
+      table: xyz@xyz_pkey
+      spans: FULL SCAN
+·
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJzEmFFv4rgXxd__nyK6T61kFGwnQCP9pY46rLYS23YLDyOtqhUD3hYtQ9gkSNCq330FqMo0ae6xSdJ9dMIvPr74nFznhdJ_lhTR8Nvd6Mv1jXf29Xo8Gf8-OvfGw9HwauJtvV_ub3_zzs7exsLbHS9td8_n3vDb1fBu4n1895wEreK5uZn-MClFf5AkQYoEaRIUkKCQHgStk3hm0jRO9j95OQDX8y1FXUGL1XqT7S8_CJrFiaHohbJFtjQU0WT6fWnuzXRuEr9LguYmmy6Wh2m2u-fL7e75z_XfZkeCruLl5scqjQ7qSNB4Pd2POr6ih1dB8SbLZ0mz6aOhSL6K05SETStRLkq-LtJssZplvixU5FKKy-IcOfZ95z1N06ePkVyKPk1K2IKUoFJK_qjNKk7mJjHzdw87PKVSrLKoW64ibEuFRclyFb0aKsRJQn-dpk9jk92ufV2o12S3NtFbKHwZjUjQ0vyVnR1WcP7_ZPH49DYgQbebLPIuZeXK-s3W9ybuxGtfh8UafDj34N3c0j4B5CkJ4KuOry3TyEFLr3ktykVLHgKy9TyyltJrPY9kc0lgUbeqPGpQhUXJqvLITUXtPJKfl0fK3ofqJB_qjh9YZoKDln7zWpSLltyIqvVMsJbSbz0TVHNutKhbVSY0qMKiZFWZ4Kaidiaoz8sEbe9DfZIPg44fWmaCg5ZB81qUi5bciLr1TLCWMmg9E3RzbrSoW1UmNKjComRVmeCmonYm6M_LhMDeh8FJPgw7longoOSiaSXKRUluwqD1PLCWctF6HgTNOdGiblV50KAKi5JV5YGbitp5EPw33zE-EHVv0nW8So3VV4rufllm_miOZUrjTTIzd0k8O0xzHN4euMOFuUmz4111HFyvjrf2An-GJQtrHlZFWP4MB-9g6QZLVYu-qEOrXh1aa57WLB3WgWWtqVW3Ft2vQ2uwWQJ2m4L_K3SAVRHusTBYdJ93V4-314ClZZenL3haglwopYqLtwGNzI1w4G6AI3sDHPlbliLVxeCARg4HOLI4wsF2BzgyuSwF6_sti_BSxHB4yeiSzxi0dD5kZB_YjY8ZOQB4KWic3MrT0K0AR27lcehWHoduLYWsk1t5GrqVx6FbAY62LI9Dt_IvGCVBEwXaVsm7VfGNK1i64pNGBaDv5ZNGhQAvJY1T38zTsHEGOOqceRy2zjyO3KpKKeviVkAjtwIcuRXhaMvyOHKr4l8wagBwvpMt4GW38q0sWjqfNBq0sppPGg1OyJpvakDdAY3cinDgVoAjtwIcnnT5gzI66oIjfr3J4WEX4Oi0C74RoF3Dv2A0Kh3fyhbwkls138sWl_7w-r9_AwAA__8jvDeQ
