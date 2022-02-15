@@ -22,13 +22,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/dumpstore"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
 var (
 	maxProfiles = settings.RegisterIntSetting(
-		settings.TenantWritable,
 		"server.mem_profile.max_profiles",
 		"maximum number of profiles to be kept per ramp-up of memory usage. "+
 			"A ramp-up is defined as a sequence of profiles with increasing usage.",
@@ -36,21 +36,21 @@ var (
 	)
 
 	maxCombinedFileSize = settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
 		"server.mem_profile.total_dump_size_limit",
 		"maximum combined disk size of preserved memory profiles",
-		128<<20, // 128MiB
+		envutil.EnvOrDefaultInt64(
+			"COCKROACH_SERVER_MEMPROFILE_TOTAL_SIZE_LIMIT",
+			128<<20, // 128MiB
+		),
 	)
 )
 
 func init() {
 	s := settings.RegisterIntSetting(
-		settings.TenantWritable,
 		"server.heap_profile.max_profiles", "use server.mem_profile.max_profiles instead", 5)
 	s.SetRetired()
 
 	b := settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
 		"server.heap_profile.total_dump_size_limit",
 		"use server.mem_profile.total_dump_size_limit instead",
 		128<<20, // 128MiB
