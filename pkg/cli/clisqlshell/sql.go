@@ -19,7 +19,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -835,9 +834,7 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 func (c *cliState) refreshTransactionStatus() {
 	c.lastKnownTxnStatus = unknownTxnStatus
 
-	dbVal, dbColType, hasVal := c.conn.GetServerValue(
-		context.Background(),
-		"transaction status", `SHOW TRANSACTION STATUS`)
+	dbVal, dbColType, hasVal := c.conn.GetServerValue("transaction status", `SHOW TRANSACTION STATUS`)
 	if !hasVal {
 		return
 	}
@@ -870,9 +867,7 @@ func (c *cliState) refreshDatabaseName() string {
 		return unknownDbName
 	}
 
-	dbVal, dbColType, hasVal := c.conn.GetServerValue(
-		context.Background(),
-		"database name", `SHOW DATABASE`)
+	dbVal, dbColType, hasVal := c.conn.GetServerValue("database name", `SHOW DATABASE`)
 	if !hasVal {
 		return unknownDbName
 	}
@@ -900,8 +895,20 @@ func (c *cliState) GetCompletions(_ string) []string {
 	sql, _ := c.ins.GetLineInfo()
 
 	if !strings.HasSuffix(sql, "??") {
-		fmt.Fprintf(c.iCtx.stdout,
-			"\ntab completion not supported; append '??' and press tab for contextual help\n\n")
+		query := fmt.Sprintf(`SHOW COMPLETIONS AT OFFSET %d FOR %s`, len(sql), lexbase.EscapeSQLString(sql))
+		_, rows, err := c.sqlExecCtx.RunQuery(c.conn,
+			clisqlclient.MakeQuery(query), true)
+		if err != nil {
+			fmt.Fprintln(c.iCtx.stdout)
+			clierror.OutputError(c.iCtx.stdout, err, true /*showSeverity*/, false /*verbose*/)
+		}
+
+		var completions []string
+		for _, row := range rows {
+			completions = append(completions, row[0])
+		}
+
+		return completions
 	} else {
 		helpText, err := c.serverSideParse(sql)
 		if helpText != "" {
@@ -1022,11 +1029,9 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 			return cliStartLine
 		}
 
-		// If a human is looking, tell them that quitting is done in another way.
-		if c.sqlExecCtx.TerminalOutput {
-			fmt.Fprintf(c.iCtx.stdout, "^C\nUse \\q or terminate input to exit.\n")
-		}
-		return cliStartLine
+		// Otherwise, also terminate with an interrupt error.
+		c.exitErr = err
+		return cliStop
 
 	case errors.Is(err, io.EOF):
 		c.atEOF = true
@@ -1186,11 +1191,8 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		}
 		return c.invalidSyntax(errState)
 	case `\dd`:
-		if len(cmd) == 2 {
-			c.concatLines = `SHOW CONSTRAINTS FROM ` + cmd[1] + ` WITH COMMENT`
-			return cliRunStatement
-		}
-		return c.invalidSyntax(errState)
+		c.concatLines = `SHOW CONSTRAINTS FROM ` + cmd[1] + ` WITH COMMENT`
+		return cliRunStatement
 	case `\connect`, `\c`:
 		return c.handleConnect(cmd[1:], loopState, errState)
 
@@ -1294,9 +1296,6 @@ func (c *cliState) handleConnectInternal(cmd []string) error {
 		newURL.WithTransport(pgurl.TransportTLS(mode, caCertPath))
 	} else {
 		newURL.WithTransport(pgurl.TransportNone())
-	}
-	if err := newURL.AddOptions(currURL.GetExtraOptions()); err != nil {
-		return err
 	}
 
 	// Parse the arguments to \connect:
@@ -1593,9 +1592,7 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 	if c.iCtx.autoTrace != "" {
 		// Clear the trace by disabling tracing, then restart tracing
 		// with the specified options.
-		c.exitErr = c.conn.Exec(
-			context.Background(),
-			"SET tracing = off; SET tracing = "+c.iCtx.autoTrace)
+		c.exitErr = c.conn.Exec("SET tracing = off; SET tracing = "+c.iCtx.autoTrace, nil)
 		if c.exitErr != nil {
 			if !c.singleStatement {
 				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
@@ -1608,11 +1605,8 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 	}
 
 	// Now run the statement/query.
-	c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
-		return c.sqlExecCtx.RunQueryAndFormatResults(ctx,
-			c.conn, c.iCtx.stdout, c.iCtx.stderr,
-			clisqlclient.MakeQuery(c.concatLines))
-	})
+	c.exitErr = c.sqlExecCtx.RunQueryAndFormatResults(c.conn, c.iCtx.stdout, c.iCtx.stderr,
+		clisqlclient.MakeQuery(c.concatLines))
 	if c.exitErr != nil {
 		if !c.singleStatement {
 			clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
@@ -1623,8 +1617,7 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 	// this even if there was an error: a trace on errors is useful.
 	if c.iCtx.autoTrace != "" {
 		// First, disable tracing.
-		if err := c.conn.Exec(context.Background(),
-			"SET tracing = off"); err != nil {
+		if err := c.conn.Exec("SET tracing = off", nil); err != nil {
 			// Print the error for the SET tracing statement. This will
 			// appear below the error for the main query above, if any,
 			clierror.OutputError(c.iCtx.stderr, err, true /*showSeverity*/, false /*verbose*/)
@@ -1642,11 +1635,8 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 			if strings.Contains(c.iCtx.autoTrace, "kv") {
 				traceType = "kv"
 			}
-			if err := c.runWithInterruptableCtx(func(ctx context.Context) error {
-				return c.sqlExecCtx.RunQueryAndFormatResults(ctx,
-					c.conn, c.iCtx.stdout, c.iCtx.stderr,
-					clisqlclient.MakeQuery(fmt.Sprintf("SHOW %s TRACE FOR SESSION", traceType)))
-			}); err != nil {
+			if err := c.sqlExecCtx.RunQueryAndFormatResults(c.conn, c.iCtx.stdout, c.iCtx.stderr,
+				clisqlclient.MakeQuery(fmt.Sprintf("SHOW %s TRACE FOR SESSION", traceType))); err != nil {
 				clierror.OutputError(c.iCtx.stderr, err, true /*showSeverity*/, false /*verbose*/)
 				if c.exitErr == nil {
 					// Both the query and SET tracing had encountered no error
@@ -1708,9 +1698,6 @@ func NewShell(
 
 // RunInteractive implements the Shell interface.
 func (c *cliState) RunInteractive(cmdIn, cmdOut, cmdErr *os.File) (exitErr error) {
-	finalFn := c.maybeHandleInterrupt()
-	defer finalFn()
-
 	return c.doRunShell(cliStart, cmdIn, cmdOut, cmdErr)
 }
 
@@ -1934,9 +1921,7 @@ func (c *cliState) runStatements(stmts []string) error {
 // decomposition in the first return value. If it is not, the function
 // extracts a help string if available.
 func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
-	cols, rows, err := c.sqlExecCtx.RunQuery(
-		context.Background(),
-		c.conn,
+	cols, rows, err := c.sqlExecCtx.RunQuery(c.conn,
 		clisqlclient.MakeQuery("SHOW SYNTAX "+lexbase.EscapeSQLString(sql)),
 		true)
 	if err != nil {
@@ -1991,86 +1976,4 @@ func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 		return helpText, err
 	}
 	return "", nil
-}
-
-func (c *cliState) maybeHandleInterrupt() func() {
-	if !c.cliCtx.IsInteractive {
-		return func() {}
-	}
-	intCh := make(chan os.Signal, 1)
-	signal.Notify(intCh, os.Interrupt)
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		for {
-			select {
-			case <-intCh:
-				c.iCtx.mu.Lock()
-				cancelFn, doneCh := c.iCtx.mu.cancelFn, c.iCtx.mu.doneCh
-				c.iCtx.mu.Unlock()
-				if cancelFn == nil {
-					// No query currently executing; nothing to do.
-					continue
-				}
-
-				fmt.Fprintf(c.iCtx.stderr, "\nattempting to cancel query...\n")
-				// Cancel the query's context, which should make the driver
-				// send a cancellation message.
-				cancelFn()
-
-				// Now wait for the shell to process the cancellation.
-				//
-				// If it takes too long (e.g. server has become unresponsive,
-				// or we're connected to a pre-22.1 server which does not
-				// support cancellation), fall back to the previous behavior
-				// which is to interrupt the shell altogether.
-				tooLongTimer := time.After(3 * time.Second)
-			wait:
-				for {
-					select {
-					case <-doneCh:
-						break wait
-					case <-tooLongTimer:
-						fmt.Fprintln(c.iCtx.stderr, "server does not respond to query cancellation; a second interrupt will stop the shell.")
-						signal.Reset(os.Interrupt)
-					}
-				}
-				// Re-arm the signal handler.
-				signal.Notify(intCh, os.Interrupt)
-
-			case <-ctx.Done():
-				// Shell is terminating.
-				return
-			}
-		}
-	}()
-	return cancel
-}
-
-func (c *cliState) runWithInterruptableCtx(fn func(ctx context.Context) error) error {
-	if !c.cliCtx.IsInteractive {
-		return fn(context.Background())
-	}
-	// The cancellation function can be used by the Ctrl+C handler
-	// to cancel this query.
-	ctx, cancel := context.WithCancel(context.Background())
-	// doneCh will be used on the return path to teach the Ctrl+C
-	// handler that the query has been cancelled successfully.
-	doneCh := make(chan struct{})
-	defer func() { close(doneCh) }()
-
-	// Inform the Ctrl+C handler that this query is executing.
-	c.iCtx.mu.Lock()
-	c.iCtx.mu.cancelFn = cancel
-	c.iCtx.mu.doneCh = doneCh
-	c.iCtx.mu.Unlock()
-	defer func() {
-		c.iCtx.mu.Lock()
-		c.iCtx.mu.cancelFn = nil
-		c.iCtx.mu.doneCh = nil
-		c.iCtx.mu.Unlock()
-	}()
-
-	// Now run the query.
-	err := fn(ctx)
-	return err
 }

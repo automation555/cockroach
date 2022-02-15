@@ -130,7 +130,7 @@ func CanWriteData(stmt Statement) bool {
 	case *CopyFrom, *Import, *Restore:
 		return true
 	// CockroachDB extensions.
-	case *Split, *Unsplit, *Relocate, *RelocateRange, *Scatter:
+	case *Split, *Unsplit, *Relocate, *Scatter:
 		return true
 	}
 	return false
@@ -171,23 +171,11 @@ var _ CCLOnlyStatement = &Backup{}
 var _ CCLOnlyStatement = &ShowBackup{}
 var _ CCLOnlyStatement = &Restore{}
 var _ CCLOnlyStatement = &CreateChangefeed{}
-var _ CCLOnlyStatement = &AlterChangefeed{}
 var _ CCLOnlyStatement = &Import{}
 var _ CCLOnlyStatement = &Export{}
 var _ CCLOnlyStatement = &ScheduledBackup{}
 var _ CCLOnlyStatement = &StreamIngestion{}
 var _ CCLOnlyStatement = &ReplicationStream{}
-
-// StatementReturnType implements the Statement interface.
-func (*AlterChangefeed) StatementReturnType() StatementReturnType { return Rows }
-
-// StatementType implements the Statement interface.
-func (*AlterChangefeed) StatementType() StatementType { return TypeDML }
-
-// StatementTag returns a short string identifying the type of statement.
-func (*AlterChangefeed) StatementTag() string { return `ALTER CHANGEFEED` }
-
-func (*AlterChangefeed) cclOnlyStatement() {}
 
 // StatementReturnType implements the Statement interface.
 func (*AlterDatabaseOwner) StatementReturnType() StatementReturnType { return DDL }
@@ -981,22 +969,12 @@ func (*Relocate) StatementType() StatementType { return TypeDML }
 
 // StatementTag returns a short string identifying the type of statement.
 func (n *Relocate) StatementTag() string {
-	name := "RELOCATE TABLE "
-	if n.TableOrIndex.Index != "" {
-		name = "RELOCATE INDEX "
+	if n.RelocateLease {
+		return "EXPERIMENTAL_RELOCATE LEASE"
+	} else if n.RelocateNonVoters {
+		return "EXPERIMENTAL_RELOCATE NON_VOTERS"
 	}
-	return name + n.SubjectReplicas.String()
-}
-
-// StatementReturnType implements the Statement interface.
-func (*RelocateRange) StatementReturnType() StatementReturnType { return Rows }
-
-// StatementType implements the Statement interface.
-func (*RelocateRange) StatementType() StatementType { return TypeDML }
-
-// StatementTag returns a short string identifying the type of statement.
-func (n *RelocateRange) StatementTag() string {
-	return "RELOCATE RANGE " + n.SubjectReplicas.String()
+	return "EXPERIMENTAL_RELOCATE VOTERS"
 }
 
 // StatementReturnType implements the Statement interface.
@@ -1593,6 +1571,15 @@ func (*ShowDefaultPrivileges) StatementType() StatementType { return TypeDML }
 func (*ShowDefaultPrivileges) StatementTag() string { return "SHOW DEFAULT PRIVILEGES" }
 
 // StatementReturnType implements the Statement interface.
+func (*ShowCompletions) StatementReturnType() StatementReturnType { return Rows }
+
+// StatementType implements the Statement interface.
+func (*ShowCompletions) StatementType() StatementType { return TypeDML }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowCompletions) StatementTag() string { return "SHOW COMPLETIONS" }
+
+// StatementReturnType implements the Statement interface.
 func (*Split) StatementReturnType() StatementReturnType { return Rows }
 
 // StatementType implements the Statement interface.
@@ -1660,8 +1647,6 @@ func (*ValuesClause) StatementType() StatementType { return TypeDML }
 // StatementTag returns a short string identifying the type of statement.
 func (*ValuesClause) StatementTag() string { return "VALUES" }
 
-func (n *AlterChangefeed) String() string                { return AsString(n) }
-func (n *AlterChangefeedCmds) String() string            { return AsString(n) }
 func (n *AlterIndex) String() string                     { return AsString(n) }
 func (n *AlterDatabaseOwner) String() string             { return AsString(n) }
 func (n *AlterDatabaseAddRegion) String() string         { return AsString(n) }
@@ -1742,7 +1727,6 @@ func (n *Prepare) String() string                        { return AsString(n) }
 func (n *ReassignOwnedBy) String() string                { return AsString(n) }
 func (n *ReleaseSavepoint) String() string               { return AsString(n) }
 func (n *Relocate) String() string                       { return AsString(n) }
-func (n *RelocateRange) String() string                  { return AsString(n) }
 func (n *RefreshMaterializedView) String() string        { return AsString(n) }
 func (n *RenameColumn) String() string                   { return AsString(n) }
 func (n *RenameDatabase) String() string                 { return AsString(n) }
@@ -1813,6 +1797,7 @@ func (n *ShowVar) String() string                        { return AsString(n) }
 func (n *ShowZoneConfig) String() string                 { return AsString(n) }
 func (n *ShowFingerprints) String() string               { return AsString(n) }
 func (n *ShowDefaultPrivileges) String() string          { return AsString(n) }
+func (n *ShowCompletions) String() string                { return AsString(n) }
 func (n *Split) String() string                          { return AsString(n) }
 func (n *StreamIngestion) String() string                { return AsString(n) }
 func (n *Unsplit) String() string                        { return AsString(n) }
