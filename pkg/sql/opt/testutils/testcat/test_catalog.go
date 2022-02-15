@@ -350,7 +350,7 @@ func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
 // catalog. This is used to test without spinning up a cluster.
 func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
-	return tc.ExecuteDDLWithIndexVersion(sql, descpb.PrimaryIndexWithStoredColumnsVersion)
+	return tc.ExecuteDDLWithIndexVersion(sql, descpb.LatestNonPrimaryIndexDescriptorVersion)
 }
 
 // ExecuteDDLWithIndexVersion parses the given DDL SQL statement and creates
@@ -958,8 +958,8 @@ func (ti *Index) Predicate() (string, bool) {
 	return ti.predicate, ti.predicate != ""
 }
 
-// ImplicitPartitioningColumnCount is part of the cat.Index interface.
-func (ti *Index) ImplicitPartitioningColumnCount() int {
+// ImplicitColumnCount is part of the cat.Index interface.
+func (ti *Index) ImplicitColumnCount() int {
 	return 0
 }
 

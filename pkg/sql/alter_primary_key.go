@@ -85,9 +85,6 @@ func (p *planner) AlterPrimaryKey(
 		if !p.EvalContext().SessionData().HashShardedIndexesEnabled {
 			return hashShardedIndexesDisabledError
 		}
-		if tableDesc.IsLocalityRegionalByRow() {
-			return pgerror.New(pgcode.FeatureNotSupported, "hash sharded indexes are not compatible with REGIONAL BY ROW tables")
-		}
 	}
 
 	// Ensure that other schema changes on this table are not currently
@@ -179,7 +176,7 @@ func (p *planner) AlterPrimaryKey(
 		CreatedExplicitly: true,
 		EncodingType:      descpb.PrimaryIndexEncoding,
 		Type:              descpb.IndexDescriptor_FORWARD,
-		Version:           descpb.PrimaryIndexWithStoredColumnsVersion,
+		Version:           descpb.LatestNonPrimaryIndexDescriptorVersion,
 		ConstraintID:      tableDesc.GetNextConstraintID(),
 		CreatedAtNanos:    p.EvalContext().GetTxnTimestamp(time.Microsecond).UnixNano(),
 	}
@@ -355,7 +352,7 @@ func (p *planner) AlterPrimaryKey(
 		newUniqueIdx.CompositeColumnIDs = nil
 		newUniqueIdx.KeyColumnIDs = nil
 		// Set correct version and encoding type.
-		newUniqueIdx.Version = descpb.PrimaryIndexWithStoredColumnsVersion
+		newUniqueIdx.Version = descpb.LatestNonPrimaryIndexDescriptorVersion
 		newUniqueIdx.EncodingType = descpb.SecondaryIndexEncoding
 		if err := addIndexMutationWithSpecificPrimaryKey(ctx, tableDesc, &newUniqueIdx, newPrimaryIndexDesc); err != nil {
 			return err
@@ -482,7 +479,7 @@ func (p *planner) AlterPrimaryKey(
 		}
 
 		newIndex.Name = tabledesc.GenerateUniqueName(basename, nameExists)
-		newIndex.Version = descpb.PrimaryIndexWithStoredColumnsVersion
+		newIndex.Version = descpb.LatestNonPrimaryIndexDescriptorVersion
 		newIndex.EncodingType = descpb.SecondaryIndexEncoding
 		if err := addIndexMutationWithSpecificPrimaryKey(ctx, tableDesc, &newIndex, newPrimaryIndexDesc); err != nil {
 			return err
