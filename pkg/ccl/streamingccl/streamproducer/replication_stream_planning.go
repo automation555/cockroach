@@ -10,6 +10,7 @@ package streamproducer
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeeddist"
@@ -240,16 +241,19 @@ func getReplicationStreamSpec(
 		return nil, err
 	}
 
+	fmt.Println("got span", len(spanPartitions))
+	fmt.Println("got spans partitions: ", len(spanPartitions))
+
 	res := &streampb.ReplicationStreamSpec{
 		Partitions: make([]streampb.ReplicationStreamSpec_Partition, 0, len(spanPartitions)),
 	}
 	for _, sp := range spanPartitions {
-		nodeInfo, err := dsp.GetSQLInstanceInfo(sp.SQLInstanceID)
+		nodeInfo, err := dsp.GetNodeInfo(sp.Node)
 		if err != nil {
 			return nil, err
 		}
 		res.Partitions = append(res.Partitions, streampb.ReplicationStreamSpec_Partition{
-			NodeID:     roachpb.NodeID(sp.SQLInstanceID),
+			NodeID:     sp.Node,
 			SQLAddress: nodeInfo.SQLAddress,
 			Locality:   nodeInfo.Locality,
 			PartitionSpec: &streampb.StreamPartitionSpec{
@@ -262,5 +266,5 @@ func getReplicationStreamSpec(
 }
 
 func init() {
-	sql.AddPlanHook("replication stream", createReplicationStreamHook)
+	sql.AddPlanHook(createReplicationStreamHook)
 }

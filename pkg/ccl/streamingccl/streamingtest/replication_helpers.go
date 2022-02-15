@@ -206,6 +206,7 @@ SET CLUSTER SETTING sql.defaults.experimental_stream_replication.enabled = 'on';
 	_, tenantConn := serverutils.StartTenant(t, s, base.TestTenantArgs{TenantID: tenantID})
 
 	// Sink to read data from.
+	// sink, cleanupSink := sqlutils.PGUrlWithOptionalClientCerts(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser), false)
 	sink, cleanupSink := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 
 	h := &ReplicationHelper{

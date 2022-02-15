@@ -10,6 +10,7 @@ package streamingest
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
@@ -37,18 +38,27 @@ func ingest(
 	jobID jobspb.JobID,
 ) error {
 	// Initialize a stream client and resolve topology.
-	client, err := streamclient.NewStreamClient(streamAddress)
+	fmt.Println("ingestion job stream address", streamAddress)
+	streamURL, err := streamAddress.URL()
 	if err != nil {
 		return err
 	}
+	fmt.Println("ingestion job stream url", *streamURL)
+	client, err := streamclient.NewStreamClient(streamAddress, true)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = client.Close()
+	}()
 
 	// TODO(dt): if there is an existing stream ID, reconnect to it.
-	id, err := client.Create(ctx, tenantID)
+	streamID, err := client.Create(ctx, tenantID)
 	if err != nil {
 		return err
 	}
 
-	topology, err := client.Plan(ctx, id)
+	topology, err := client.Plan(ctx, streamID)
 	if err != nil {
 		return err
 	}
@@ -66,21 +76,21 @@ func ingest(
 	evalCtx := execCtx.ExtendedEvalContext()
 	dsp := execCtx.DistSQLPlanner()
 
-	planCtx, sqlInstanceIDs, err := dsp.SetupAllNodesPlanning(ctx, evalCtx, execCtx.ExecCfg())
+	planCtx, nodes, err := dsp.SetupAllNodesPlanning(ctx, evalCtx, execCtx.ExecCfg())
 	if err != nil {
 		return err
 	}
 
 	// Construct stream ingestion processor specs.
 	streamIngestionSpecs, streamIngestionFrontierSpec, err := distStreamIngestionPlanSpecs(
-		streamAddress, topology, sqlInstanceIDs, initialHighWater, jobID)
+		streamAddress, topology, nodes, initialHighWater, jobID, streamID)
 	if err != nil {
 		return err
 	}
 
 	// Plan and run the DistSQL flow.
-	return distStreamIngest(ctx, execCtx, sqlInstanceIDs, jobID, planCtx, dsp, streamIngestionSpecs,
-		streamIngestionFrontierSpec)
+	return distStreamIngest(ctx, execCtx, nodes, jobID, planCtx, dsp, client, streamID,
+		streamIngestionSpecs, streamIngestionFrontierSpec)
 }
 
 // Resume is part of the jobs.Resumer interface.
@@ -99,6 +109,8 @@ func (s *streamIngestionResumer) Resume(resumeCtx context.Context, execCtx inter
 	// processors shut down gracefully, i.e stopped ingesting any additional
 	// events from the replication stream. At this point it is safe to revert to
 	// the cutoff time to leave the cluster in a consistent state.
+	// TODO: after this, we need to complete the producer job into "replication complete state" in the future
+	// but for now, we can make it inactive by stopping sending heartbeats.
 	return s.revertToCutoverTimestamp(resumeCtx, execCtx)
 }
 

@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -47,7 +46,6 @@ type eventStream struct {
 	eventsCh    chan roachpb.RangeFeedEvent // Channel receiving rangefeed events.
 	errCh       chan error                  // Signaled when error occurs in rangefeed.
 	streamCh    chan tree.Datums            // Channel signaled to forward datums to consumer.
-	sp          *tracing.Span               // Span representing the lifetime of the eventStream.
 }
 
 var _ tree.ValueGenerator = (*eventStream)(nil)
@@ -173,9 +171,7 @@ func (s *eventStream) startStreamProcessor(ctx context.Context, frontier *span.F
 	// Context group responsible for coordinating rangefeed event production with
 	// ValueGenerator implementation that consumes rangefeed events and forwards them to the
 	// destination cluster consumer.
-	streamCtx, sp := tracing.ChildSpan(ctx, "event stream")
-	s.sp = sp
-	s.streamGroup = ctxgroup.WithContext(streamCtx)
+	s.streamGroup = ctxgroup.WithContext(ctx)
 	s.streamGroup.GoCtx(withErrCapture(func(ctx context.Context) error {
 		return s.streamLoop(ctx, frontier)
 	}))
@@ -188,6 +184,7 @@ func (s *eventStream) startStreamProcessor(ctx context.Context, frontier *span.F
 func (s *eventStream) Next(ctx context.Context) (bool, error) {
 	select {
 	case <-ctx.Done():
+		// We got context canceled error, what reason?
 		return false, ctx.Err()
 	case err := <-s.errCh:
 		return false, err
@@ -210,13 +207,12 @@ func (s *eventStream) Close(ctx context.Context) {
 		// Note: error in close is normal; we expect to be terminated with context canceled.
 		log.Errorf(ctx, "partition stream %d terminated with error %v", s.streamID, err)
 	}
-
-	s.sp.Finish()
 }
 
 func (s *eventStream) onEvent(ctx context.Context, value *roachpb.RangeFeedValue) {
 	select {
 	case <-ctx.Done():
+		fmt.Println("onEvent done")
 	case s.eventsCh <- roachpb.RangeFeedEvent{Val: value}:
 		if log.V(1) {
 			log.Infof(ctx, "onEvent: %s@%s", value.Key, value.Value.Timestamp)
@@ -227,6 +223,7 @@ func (s *eventStream) onEvent(ctx context.Context, value *roachpb.RangeFeedValue
 func (s *eventStream) onCheckpoint(ctx context.Context, checkpoint *roachpb.RangeFeedCheckpoint) {
 	select {
 	case <-ctx.Done():
+		fmt.Println("onCheckpoint done")
 	case s.eventsCh <- roachpb.RangeFeedEvent{Checkpoint: checkpoint}:
 		if log.V(1) {
 			log.Infof(ctx, "onCheckpoint: %s@%s", checkpoint.Span, checkpoint.ResolvedTS)
@@ -263,6 +260,7 @@ func makeCheckpoint(f *span.Frontier) (checkpoint streampb.StreamEvent_StreamChe
 }
 
 func (s *eventStream) flushEvent(ctx context.Context, event *streampb.StreamEvent) error {
+	fmt.Println("flushed event")
 	data, err := protoutil.Marshal(event)
 	if err != nil {
 		return err
@@ -305,8 +303,10 @@ func (p *checkpointPacer) shouldCheckpoint(
 		if enoughTimeElapsed {
 			p.skipped = false
 			p.next = now.Add(p.pace)
+			//fmt.Println("should")
 			return true
 		}
+		//fmt.Println("1 should not", "now", now, "next", p.next, "enough elapsed", enoughTimeElapsed, "skipped", p.skipped)
 		return false
 	}
 
@@ -316,11 +316,14 @@ func (p *checkpointPacer) shouldCheckpoint(
 	if frontierAdvanced || isInitialScanCheckpoint {
 		if enoughTimeElapsed {
 			p.next = now.Add(p.pace)
+			//fmt.Println("should")
 			return true
 		}
 		p.skipped = true
+		//fmt.Println("2 should not", "now", now, "next", p.next, "enough elapsed", enoughTimeElapsed, "frontierAdvanced", frontierAdvanced, "isInitialScanCheckpoint", isInitialScanCheckpoint)
 		return false
 	}
+	//fmt.Println("3 should not")
 	return false
 }
 
@@ -383,6 +386,7 @@ func (s *eventStream) streamLoop(ctx context.Context, frontier *span.Frontier) e
 					if err := s.flushEvent(ctx, &streampb.StreamEvent{Checkpoint: &checkpoint}); err != nil {
 						return err
 					}
+					fmt.Println("should checkpoint")
 				}
 			default:
 				// TODO(yevgeniy): Handle SSTs.
@@ -410,6 +414,47 @@ func setConfigDefaults(cfg *streampb.StreamPartitionSpec_ExecutionConfig) {
 	}
 }
 
+// This is to rule out network issue
+type fakeEventStream struct {
+	count int
+}
+
+func (f *fakeEventStream) ResolvedType() *types.T {
+	return eventStreamReturnType
+}
+
+func (f *fakeEventStream) Start(ctx context.Context, txn *kv.Txn) error {
+	f.count = 0
+	return nil
+}
+
+func (f *fakeEventStream) Next(ctx context.Context) (bool, error) {
+	if f.count < 5 {
+		f.count++
+		return true, nil
+	}
+	return false, nil
+}
+
+func (f *fakeEventStream) Values() (tree.Datums, error) {
+	var batch streampb.StreamEvent_Batch
+	addValue := func(k roachpb.Key, v roachpb.Value) {
+		keyValue := roachpb.KeyValue{
+			Key:   k,
+			Value: v,
+		}
+		batch.KeyValues = append(batch.KeyValues, keyValue)
+	}
+	addValue([]byte("k"), roachpb.Value{RawBytes: []byte("v")})
+	data, err := protoutil.Marshal(&streampb.StreamEvent{Batch: &batch})
+	if err != nil {
+		return nil, err
+	}
+	return tree.Datums{tree.NewDBytes(tree.DBytes(data))}, nil
+}
+
+func (f *fakeEventStream) Close(ctx context.Context) {}
+
 func streamPartition(
 	evalCtx *tree.EvalContext, streamID streaming.StreamID, opaqueSpec []byte,
 ) (tree.ValueGenerator, error) {
@@ -429,6 +474,8 @@ func streamPartition(
 	setConfigDefaults(&spec.Config)
 
 	execCfg := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
+
+	//return &fakeEventStream{}, nil
 
 	return &eventStream{
 		streamID: streamID,
