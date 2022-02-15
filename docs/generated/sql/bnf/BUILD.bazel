@@ -4,7 +4,6 @@ FILES = [
     "abort_stmt",
     "add_column",
     "add_constraint",
-    "alter_changefeed_stmt",
     "alter_column",
     "alter_database_add_region_stmt",
     "alter_database_drop_region",
@@ -83,6 +82,7 @@ FILES = [
     "create_type",
     "create_view_stmt",
     "deallocate_stmt",
+    "declare_cursor_stmt",
     "default_value_column_level",
     "delete_stmt",
     "discard_stmt",
@@ -107,6 +107,7 @@ FILES = [
     "explainable_stmt",
     "export_stmt",
     "family_def",
+    "fetch_cursor_stmt",
     "for_locking",
     "foreign_key_column_level",
     "foreign_key_table_level",
@@ -242,10 +243,6 @@ genrule(
     $(location //pkg/cmd/docgen) grammar bnf $(RULEDIR) --quiet --addr $(location //pkg/sql/parser:sql.y)
     """,
     exec_tools = ["//pkg/cmd/docgen"],
-    visibility = [
-        ":__pkg__",
-        "//pkg/gen:__pkg__",
-    ],
 )
 
 genrule(
@@ -261,8 +258,4 @@ genrule(
     COCKROACH_REQUIRE_RAILROAD=1 $(location //pkg/cmd/docgen) grammar svg $$bnf_locs $(RULEDIR) --addr $(location //pkg/sql/parser:sql.y) --railroad $(location @railroadjar//:rr.war)
     """,
     exec_tools = ["//pkg/cmd/docgen"],
-    visibility = [
-        ":__pkg__",
-        "//pkg/gen:__pkg__",
-    ],
 )

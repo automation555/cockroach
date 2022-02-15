@@ -11,7 +11,6 @@
 package clisqlexec
 
 import (
-	"context"
 	"database/sql/driver"
 	"fmt"
 	"io"
@@ -27,9 +26,9 @@ import (
 // RunQuery takes a 'query' with optional 'parameters'.
 // It runs the sql query and returns a list of columns names and a list of rows.
 func (sqlExecCtx *Context) RunQuery(
-	ctx context.Context, conn clisqlclient.Conn, fn clisqlclient.QueryFn, showMoreChars bool,
+	conn clisqlclient.Conn, fn clisqlclient.QueryFn, showMoreChars bool,
 ) ([]string, [][]string, error) {
-	rows, _, err := fn(ctx, conn)
+	rows, _, err := fn(conn)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -42,10 +41,10 @@ func (sqlExecCtx *Context) RunQuery(
 // It runs the sql query and writes output to 'w'.
 // Errors and warnings, if any, are printed to 'ew'.
 func (sqlExecCtx *Context) RunQueryAndFormatResults(
-	ctx context.Context, conn clisqlclient.Conn, w, ew io.Writer, fn clisqlclient.QueryFn,
+	conn clisqlclient.Conn, w, ew io.Writer, fn clisqlclient.QueryFn,
 ) (err error) {
 	startTime := timeutil.Now()
-	rows, isMultiStatementQuery, err := fn(ctx, conn)
+	rows, isMultiStatementQuery, err := fn(conn)
 	if err != nil {
 		return err
 	}
@@ -136,7 +135,7 @@ func (sqlExecCtx *Context) RunQueryAndFormatResults(
 			return err
 		}
 
-		sqlExecCtx.maybeShowTimes(ctx, conn, w, ew, isMultiStatementQuery, startTime, queryCompleteTime)
+		sqlExecCtx.maybeShowTimes(conn, w, ew, isMultiStatementQuery, startTime, queryCompleteTime)
 
 		if more, err := rows.NextResultSet(); err != nil {
 			return err
@@ -148,7 +147,6 @@ func (sqlExecCtx *Context) RunQueryAndFormatResults(
 
 // maybeShowTimes displays the execution time if show_times has been set.
 func (sqlExecCtx *Context) maybeShowTimes(
-	ctx context.Context,
 	conn clisqlclient.Conn,
 	w, ew io.Writer,
 	isMultiStatementQuery bool,
@@ -217,7 +215,7 @@ func (sqlExecCtx *Context) maybeShowTimes(
 	}
 
 	// If discrete server/network timings are available, also print them.
-	detailedStats, err := conn.GetLastQueryStatistics(ctx)
+	detailedStats, err := conn.GetLastQueryStatistics()
 	if err != nil {
 		fmt.Fprintln(w, stats.String())
 		fmt.Fprintf(ew, "\nwarning: %v", err)
@@ -280,6 +278,7 @@ var tagsWithRowsAffected = map[string]struct{}{
 	"INSERT":    {},
 	"UPDATE":    {},
 	"DELETE":    {},
+	"MOVE":      {},
 	"DROP USER": {},
 	// This one is used with e.g. CREATE TABLE AS (other SELECT
 	// statements have type Rows, not RowsAffected).
