@@ -1360,6 +1360,11 @@
     "@babel/helper-validator-identifier" "^7.14.5"
     to-fast-properties "^2.0.0"
 
+"@bazel/ibazel@^0.15.10":
+  version "0.15.10"
+  resolved "https://registry.yarnpkg.com/@bazel/ibazel/-/ibazel-0.15.10.tgz#cf0cff1aec6d8e7bb23e1fc618d09fbd39b7a13f"
+  integrity sha512-0v+OwCQ6fsGFa50r6MXWbUkSGuWOoZ22K4pMSdtWiL5LKFIE4kfmMmtQS+M7/ICNwk2EIYob+NRreyi/DGUz5A==
+
 "@bazel/typescript@4.1.0":
   version "4.1.0"
   resolved "https://registry.yarnpkg.com/@bazel/typescript/-/typescript-4.1.0.tgz#883e793c37df70c4ebc44bc4139f6008b3eb92fa"
@@ -1402,11 +1407,6 @@
 "@cockroachlabs/crdb-protobuf-client@link:workspaces/db-console/src/js":
   version "0.0.0"
   uid ""
-
-"@cockroachlabs/design-tokens@0.4.5":
-  version "0.4.5"
-  resolved "https://registry.yarnpkg.com/@cockroachlabs/design-tokens/-/design-tokens-0.4.5.tgz#e3792263000c82020a98ed51a912e9c0e397c935"
-  integrity sha512-az2aIuGjnD0UBN5igLmaKvVWnZJ9r7v2jQ9C4fNR6bxxiF5DkOcD1DXf8EXHIbgwJtorpB74zaic7MQhhMY45w==
 
 "@cockroachlabs/eslint-config@^0.1.11":
   version "0.1.11"
@@ -11461,13 +11461,6 @@ linkify-it@^2.0.0:
   dependencies:
     uc.micro "^1.0.1"
 
-list.js@^2.3.1:
-  version "2.3.1"
-  resolved "https://registry.yarnpkg.com/list.js/-/list.js-2.3.1.tgz#48961989ffe52b0505e352f7a521f819f51df7e7"
-  integrity sha512-jnmm7DYpKtH3DxtO1E2VNCC9Gp7Wrp/FWA2JxQrZUhVJ2RCQBd57pCN6W5w6jpsfWZV0PCAbTX2NOPgyFeeZZg==
-  dependencies:
-    string-natural-compare "^2.0.2"
-
 listr-silent-renderer@^1.1.1:
   version "1.1.1"
   resolved "https://registry.yarnpkg.com/listr-silent-renderer/-/listr-silent-renderer-1.1.1.tgz#924b5a3757153770bf1a8e3fbf74b8bbf3f9242e"
@@ -16405,11 +16398,6 @@ string-length@^3.1.0:
   dependencies:
     astral-regex "^1.0.0"
     strip-ansi "^5.2.0"
-
-string-natural-compare@^2.0.2:
-  version "2.0.3"
-  resolved "https://registry.yarnpkg.com/string-natural-compare/-/string-natural-compare-2.0.3.tgz#9dbe1dd65490a5fe14f7a5c9bc686fc67cb9c6e4"
-  integrity sha512-4Kcl12rNjc+6EKhY8QyDVuQTAlMWwRiNbsxnVwBUKFr7dYPQuXVrtNU4sEkjF9LHY0AY6uVbB3ktbkIH4LC+BQ==
 
 string-replace-webpack-plugin@^0.1.3:
   version "0.1.3"

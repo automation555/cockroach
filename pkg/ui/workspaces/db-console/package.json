@@ -14,13 +14,13 @@
     "cypress:open": "yarn cypress open",
     "cypress:run": "yarn cypress run --browser chrome",
     "cypress:run-visual-regression": "yarn cypress run --browser chrome --spec 'cypress/integration/**/*.visual.spec.ts'",
-    "cypress:update-snapshots": "yarn cypress run --env updateSnapshots=true --spec 'cypress/integration/**/*.visual.spec.ts'"
+    "cypress:update-snapshots": "yarn cypress run --env updateSnapshots=true --spec 'cypress/integration/**/*.visual.spec.ts'",
+    "bazel:watch": "ibazel run //pkg/ui/workspaces/db-console:watch"
   },
   "dependencies": {
     "@cockroachlabs/cluster-ui": "link:../cluster-ui",
     "@cockroachlabs/crdb-protobuf-client": "link:./src/js",
     "@cockroachlabs/icons": "0.3.0",
-    "@cockroachlabs/design-tokens": "0.4.5",
     "analytics-node": "^3.5.0",
     "antd": "^3.25.2",
     "babel-polyfill": "^6.26.0",
@@ -29,7 +29,6 @@
     "connected-react-router": "^6.9.1",
     "create-react-context": "^0.3.0",
     "highlight.js": "^10.6.0",
-    "list.js": "^2.3.1",
     "lodash": "^4.17.21",
     "long": "^4.0.0",
     "mini-create-react-context": "^0.3.2",
@@ -59,6 +58,7 @@
     "@babel/core": "^7.7.7",
     "@babel/preset-env": "^7.7.7",
     "@babel/preset-react": "^7.7.4",
+    "@bazel/ibazel": "^0.15.10",
     "@cockroachlabs/eslint-config": "^0.1.11",
     "@storybook/react": "^6.1.21",
     "@testing-library/react": "^12.1.0",

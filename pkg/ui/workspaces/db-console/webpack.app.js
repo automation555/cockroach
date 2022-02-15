@@ -40,8 +40,8 @@ function shouldProxy(reqPath) {
 
 // tslint:disable:object-literal-sort-keys
 module.exports = (env, argv) => {
-  env = env || {};
-  const isBazelBuild = env.is_bazel_build;
+  const isBazelBuild = env && env.is_bazel_build;
+  const isBazelRun = env && env.is_bazel_run;
 
   let localRoots = [path.resolve(__dirname)];
   if (env.dist === "ccl") {
@@ -53,20 +53,11 @@ module.exports = (env, argv) => {
     new RemoveBrokenDependenciesPlugin(),
     new CopyWebpackPlugin([
       { from: path.resolve(__dirname, "favicon.ico"), to: "favicon.ico" },
-      {
-        from: path.resolve(
-          !isBazelBuild ? __dirname : "",
-          !isBazelBuild ? "../.." : "",
-          "node_modules/list.js/dist/list.min.js",
-        ),
-        to: path.resolve(__dirname, "../../dist_vendor/list.min.js"),
-      },
     ]),
     // use WebpackBar instead of webpack dashboard to fit multiple webpack dev server outputs (db-console and cluster-ui)
     new WebpackBar({
       name: "db-console",
       color: "orange",
-      reporters: [ (env.WEBPACK_WATCH || env.WEBPACK_SERVE) ? "basic" : "fancy" ],
       profile: true,
     }),
   ];
@@ -79,13 +70,28 @@ module.exports = (env, argv) => {
     path.resolve(__dirname, "../..", "node_modules"),
   ];
 
+  const resolve = {
+    // Add resolvable extensions.
+    extensions: [".ts", ".tsx", ".js", ".json", ".styl", ".css"],
+    modules: modules,
+    alias: {
+      oss: path.resolve(__dirname),
+      "src/js/protos": "@cockroachlabs/crdb-protobuf-client",
+    },
+  };
+
   if (isBazelBuild) {
     // required for bazel build to resolve properly dependencies
     modules.push("node_modules");
+
+    // required to properly resolve related path of cluster-ui module to runfiles location
+    if (isBazelRun) {
+      resolve.alias["@cockroachlabs/cluster-ui"] = path.resolve(__dirname, "..", "cluster-ui");
+    }
   }
 
   // Exclude DLLPlugin when build with Bazel because bazel handles caching on its own
-  if (!isBazelBuild && !env.WEBPACK_WATCH && !env.WEBPACK_SERVE) {
+  if (!isBazelBuild) {
     plugins = plugins.concat([
       // See "DLLs for speedy builds" in the README for details.
       new webpack.DllReferencePlugin({
@@ -109,15 +115,7 @@ module.exports = (env, argv) => {
 
     mode: argv.mode || "production",
 
-    resolve: {
-      // Add resolvable extensions.
-      extensions: [".ts", ".tsx", ".js", ".json", ".styl", ".css"],
-      modules: modules,
-      alias: {
-        oss: path.resolve(__dirname),
-        "src/js/protos": "@cockroachlabs/crdb-protobuf-client",
-      },
-    },
+    resolve,
 
     module: {
       rules: [
