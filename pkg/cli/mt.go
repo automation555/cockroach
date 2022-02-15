@@ -19,9 +19,9 @@ func init() {
 	mtCmd.AddCommand(mtTestDirectorySvr)
 
 	mtCertsCmd.AddCommand(
-		mtCreateTenantCACertCmd,
-		mtCreateTenantCertCmd,
-		mtCreateTenantSigningCertCmd,
+		mtCreateSQLNodeCertCmd,
+		mtCreateTenantClientCACertCmd,
+		mtCreateTenantClientCertCmd,
 	)
 
 	mtCmd.AddCommand(mtCertsCmd)
@@ -36,7 +36,7 @@ Commands related to multi-tenancy.
 
 This functionality is **experimental** and for internal use only.
 `,
-	RunE:   UsageAndErr,
+	RunE:   usageAndErr,
 	Hidden: true,
 }
 
@@ -51,5 +51,5 @@ command.
 
 This functionality is **experimental** and for internal use only.
 `,
-	RunE: UsageAndErr,
+	RunE: usageAndErr,
 }

@@ -11,10 +11,8 @@
 package security
 
 import (
-	"bytes"
 	"context"
 	"crypto"
-	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -30,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
+	"github.com/cockroachdb/redact"
 )
 
 const (
@@ -43,14 +42,14 @@ func loadCACertAndKey(sslCA, sslCAKey string) (*x509.Certificate, crypto.Private
 	// LoadX509KeyPair does a bunch of validation, including len(Certificates) != 0.
 	caCert, err := tls.LoadX509KeyPair(sslCA, sslCAKey)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "error loading CA certificate %s and key %s",
-			sslCA, sslCAKey)
+		return nil, nil, errors.Errorf("error loading CA certificate %s and key %s: %s",
+			sslCA, sslCAKey, err)
 	}
 
 	// Extract x509 certificate from tls cert.
 	x509Cert, err := x509.ParseCertificate(caCert.Certificate[0])
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "error parsing CA certificate %s", sslCA)
+		return nil, nil, errors.Errorf("error parsing CA certificate %s: %s", sslCA, err)
 	}
 	return x509Cert, caCert.PrivateKey, nil
 }
@@ -90,16 +89,16 @@ func CreateCAPair(
 	return createCACertAndKey(certsDir, caKeyPath, CAPem, keySize, lifetime, allowKeyReuse, overwrite)
 }
 
-// CreateTenantCAPair creates a tenant client CA pair. The private key is
+// CreateTenantClientCAPair creates a tenant client CA pair. The private key is
 // written to caKeyPath and the public key is created in certsDir.
-func CreateTenantCAPair(
+func CreateTenantClientCAPair(
 	certsDir, caKeyPath string,
 	keySize int,
 	lifetime time.Duration,
 	allowKeyReuse bool,
 	overwrite bool,
 ) error {
-	return createCACertAndKey(certsDir, caKeyPath, TenantCAPem, keySize, lifetime, allowKeyReuse, overwrite)
+	return createCACertAndKey(certsDir, caKeyPath, TenantClientCAPem, keySize, lifetime, allowKeyReuse, overwrite)
 }
 
 // CreateClientCAPair creates a client CA certificate and associated key.
@@ -149,7 +148,7 @@ func createCACertAndKey(
 		return errors.New("the path to the certs directory is required")
 	}
 	if caType != CAPem &&
-		caType != TenantCAPem &&
+		caType != TenantClientCAPem &&
 		caType != ClientCAPem &&
 		caType != UICAPem {
 
@@ -214,8 +213,8 @@ func createCACertAndKey(
 	switch caType {
 	case CAPem:
 		certPath = cm.CACertPath()
-	case TenantCAPem:
-		certPath = cm.TenantCACertPath()
+	case TenantClientCAPem:
+		certPath = cm.TenantClientCACertPath()
 	case ClientCAPem:
 		certPath = cm.ClientCACertPath()
 	case UICAPem:
@@ -261,6 +260,42 @@ func createCACertAndKey(
 func CreateNodePair(
 	certsDir, caKeyPath string, keySize int, lifetime time.Duration, overwrite bool, hosts []string,
 ) error {
+	return createNodePairInternal(
+		certsDir,
+		caKeyPath,
+		keySize,
+		lifetime,
+		overwrite,
+		hosts,
+		false, /* forTenant */
+	)
+}
+
+// CreateSQLNodePair creates a SQL server key and certificate.
+// The CA cert and key must load properly. If multiple certificates
+// exist in the CA cert, the first one is used.
+func CreateSQLNodePair(
+	certsDir, caKeyPath string, keySize int, lifetime time.Duration, overwrite bool, hosts []string,
+) error {
+	return createNodePairInternal(
+		certsDir,
+		caKeyPath,
+		keySize,
+		lifetime,
+		overwrite,
+		hosts,
+		true, /* forTenant */
+	)
+}
+
+func createNodePairInternal(
+	certsDir, caKeyPath string,
+	keySize int,
+	lifetime time.Duration,
+	overwrite bool,
+	hosts []string,
+	forTenant bool,
+) error {
 	if len(caKeyPath) == 0 {
 		return errors.New("the path to the CA key is required")
 	}
@@ -278,6 +313,13 @@ func CreateNodePair(
 		return err
 	}
 
+	var baseNodeUser string
+	if forTenant {
+		baseNodeUser = SQLNodeUser
+	} else {
+		baseNodeUser = NodeUser
+	}
+
 	// Load the CA pair.
 	caCert, caPrivateKey, err := loadCACertAndKey(cm.CACertPath(), caKeyPath)
 	if err != nil {
@@ -293,26 +335,36 @@ func CreateNodePair(
 	// Allow control of the principal to place in the cert via an env var. This
 	// is intended for testing purposes only.
 	nodeUser, _ := MakeSQLUsernameFromUserInput(
-		envutil.EnvOrDefaultString("COCKROACH_CERT_NODE_USER", NodeUser),
+		envutil.EnvOrDefaultString("COCKROACH_CERT_NODE_USER", baseNodeUser),
 		UsernameValidation)
 
 	nodeCert, err := GenerateServerCert(caCert, caPrivateKey,
 		nodeKey.Public(), lifetime, nodeUser, hosts)
 	if err != nil {
-		return errors.Wrap(err, "error creating node server certificate and key")
+		return errors.Errorf("error creating node server certificate and key: %s", err)
 	}
 
-	certPath := cm.NodeCertPath()
+	var certPath, keyPath string
+	var label redact.SafeString
+	if forTenant {
+		label = "SQL server"
+		certPath = cm.SQLNodeCertPath()
+		keyPath = cm.SQLNodeKeyPath()
+	} else {
+		label = "KV node"
+		certPath = cm.NodeCertPath()
+		keyPath = cm.NodeKeyPath()
+	}
+
 	if err := writeCertificateToFile(certPath, nodeCert, overwrite); err != nil {
-		return errors.Wrapf(err, "error writing node server certificate to %s", certPath)
+		return errors.Wrapf(err, "error writing %s certificate to %s", label, certPath)
 	}
-	log.Infof(context.Background(), "generated node certificate: %s", certPath)
+	log.Infof(context.Background(), "generated %s certificate: %s", label, certPath)
 
-	keyPath := cm.NodeKeyPath()
 	if err := writeKeyToFile(keyPath, nodeKey, overwrite); err != nil {
-		return errors.Wrapf(err, "error writing node server key to %s", keyPath)
+		return errors.Wrapf(err, "error writing %s key to %s", label, keyPath)
 	}
-	log.Infof(context.Background(), "generated node key: %s", keyPath)
+	log.Infof(context.Background(), "generated %s key: %s", label, keyPath)
 
 	return nil
 }
@@ -354,7 +406,7 @@ func CreateUIPair(
 
 	uiCert, err := GenerateUIServerCert(caCert, caPrivateKey, uiKey.Public(), lifetime, hosts)
 	if err != nil {
-		return errors.Wrap(err, "error creating UI server certificate and key")
+		return errors.Errorf("error creating UI server certificate and key: %s", err)
 	}
 
 	certPath := cm.UICertPath()
@@ -425,7 +477,7 @@ func CreateClientPair(
 
 	clientCert, err := GenerateClientCert(caCert, caPrivateKey, clientKey.Public(), lifetime, user)
 	if err != nil {
-		return errors.Wrap(err, "error creating client certificate and key")
+		return errors.Errorf("error creating client certificate and key: %s", err)
 	}
 
 	certPath := cm.ClientCertPath(user)
@@ -451,25 +503,21 @@ func CreateClientPair(
 	return nil
 }
 
-// TenantPair are client certs for use with multi-tenancy.
-type TenantPair struct {
+// TenantClientPair are client certs for use with multi-tenancy.
+type TenantClientPair struct {
 	PrivateKey *rsa.PrivateKey
 	Cert       []byte
 }
 
-// CreateTenantPair creates a key and certificate for use as client certs
+// CreateTenantClientPair creates a key and certificate for use as client certs
 // when communicating with the KV layer. The tenant CA cert and key must load
 // properly. If multiple certificates exist in the CA cert, the first one is
 // used.
 //
-// To write the returned TenantPair to disk, use WriteTenantPair.
-func CreateTenantPair(
-	certsDir, caKeyPath string,
-	keySize int,
-	lifetime time.Duration,
-	tenantIdentifier uint64,
-	hosts []string,
-) (*TenantPair, error) {
+// To write the returned TenantClientPair to disk, use WriteTenantClientPair.
+func CreateTenantClientPair(
+	certsDir, caKeyPath string, keySize int, lifetime time.Duration, tenantIdentifier uint64,
+) (*TenantClientPair, error) {
 	if len(caKeyPath) == 0 {
 		return nil, errors.New("the path to the CA key is required")
 	}
@@ -489,7 +537,7 @@ func CreateTenantPair(
 
 	// Load the tenant client CA cert info. Note that this falls back to the regular client CA which in turn falls
 	// back to the CA.
-	clientCA, err := cm.getTenantCACertLocked()
+	clientCA, err := cm.getTenantClientCACertLocked()
 	if err != nil {
 		return nil, err
 	}
@@ -506,20 +554,20 @@ func CreateTenantPair(
 		return nil, errors.Wrap(err, "could not generate new tenant key")
 	}
 
-	clientCert, err := GenerateTenantCert(
-		caCert, caPrivateKey, clientKey.Public(), lifetime, tenantIdentifier, hosts,
+	clientCert, err := GenerateTenantClientCert(
+		caCert, caPrivateKey, clientKey.Public(), lifetime, tenantIdentifier,
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "error creating tenant certificate and key")
+		return nil, errors.Errorf("error creating tenant certificate and key: %s", err)
 	}
-	return &TenantPair{
+	return &TenantClientPair{
 		PrivateKey: clientKey,
 		Cert:       clientCert,
 	}, nil
 }
 
-// WriteTenantPair writes a TenantPair into certsDir.
-func WriteTenantPair(certsDir string, cp *TenantPair, overwrite bool) error {
+// WriteTenantClientPair writes a TenantClientPair into certsDir.
+func WriteTenantClientPair(certsDir string, cp *TenantClientPair, overwrite bool) error {
 	cm, err := NewCertificateManagerFirstRun(certsDir, CommandTLSSettings{})
 	if err != nil {
 		return err
@@ -529,69 +577,17 @@ func WriteTenantPair(certsDir string, cp *TenantPair, overwrite bool) error {
 		return err
 	}
 	tenantIdentifier := cert.Subject.CommonName
-	certPath := cm.TenantCertPath(tenantIdentifier)
+	certPath := cm.TenantClientCertPath(tenantIdentifier)
 	if err := writeCertificateToFile(certPath, cp.Cert, overwrite); err != nil {
 		return errors.Wrapf(err, "error writing tenant certificate to %s", certPath)
 	}
 	log.Infof(context.Background(), "wrote SQL tenant client certificate: %s", certPath)
 
-	keyPath := cm.TenantKeyPath(tenantIdentifier)
+	keyPath := cm.TenantClientKeyPath(tenantIdentifier)
 	if err := writeKeyToFile(keyPath, cp.PrivateKey, overwrite); err != nil {
 		return errors.Wrapf(err, "error writing tenant key to %s", keyPath)
 	}
 	log.Infof(context.Background(), "generated tenant key: %s", keyPath)
-	return nil
-}
-
-// CreateTenantSigningPair creates a tenant signing pair. The private key and
-// public key are both created in certsDir.
-func CreateTenantSigningPair(
-	certsDir string, lifetime time.Duration, overwrite bool, tenantID uint64,
-) error {
-	if len(certsDir) == 0 {
-		return errors.New("the path to the certs directory is required")
-	}
-	if tenantID == 0 {
-		return errors.Errorf("tenantId %d is invalid (requires != 0)", tenantID)
-	}
-
-	tenantIdentifier := fmt.Sprintf("%d", tenantID)
-
-	// Create a certificate manager with "create dir if not exist".
-	cm, err := NewCertificateManagerFirstRun(certsDir, CommandTLSSettings{})
-	if err != nil {
-		return err
-	}
-
-	signingKeyPath := cm.TenantSigningKeyPath(tenantIdentifier)
-	signingCertPath := cm.TenantSigningCertPath(tenantIdentifier)
-	var pubKey crypto.PublicKey
-	var privKey crypto.PrivateKey
-	pubKey, privKey, err = ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return errors.Wrap(err, "could not generate new tenant signing key")
-	}
-
-	if err := writeKeyToFile(signingKeyPath, privKey, overwrite); err != nil {
-		return errors.Wrapf(err, "could not write tenant signing key to file %s", signingKeyPath)
-	}
-
-	log.Infof(context.Background(), "generated tenant signing key %s", signingKeyPath)
-
-	// Generate certificate.
-	certContents, err := GenerateTenantSigningCert(pubKey, privKey, lifetime, tenantID)
-	if err != nil {
-		return errors.Wrap(err, "could not generate tenant signing certificate")
-	}
-
-	certificates := []*pem.Block{{Type: "CERTIFICATE", Bytes: certContents}}
-
-	if err := WritePEMToFile(signingCertPath, certFileMode, overwrite, certificates...); err != nil {
-		return errors.Wrapf(err, "could not write tenant signing certificate file %s", signingCertPath)
-	}
-
-	log.Infof(context.Background(), "wrote certificate to %s", signingCertPath)
-
 	return nil
 }
 
@@ -614,17 +610,4 @@ func PEMContentsToX509(contents []byte) ([]*x509.Certificate, error) {
 	}
 
 	return certs, nil
-}
-
-// AppendCertificatesToBlob adds the passed PEM encoded certificates to the existing
-// byte slice containing PEM encoded certificates, ensuring that there is a newline
-// separating the original byte slice and each subsequent certificate byte slices.
-func AppendCertificatesToBlob(certBlob []byte, newCerts ...[]byte) []byte {
-	return bytes.Join(
-		append(
-			[][]byte{certBlob},
-			newCerts...,
-		),
-		[]byte{'\n'},
-	)
 }
