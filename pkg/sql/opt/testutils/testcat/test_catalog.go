@@ -350,7 +350,7 @@ func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
 // catalog. This is used to test without spinning up a cluster.
 func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
-	return tc.ExecuteDDLWithIndexVersion(sql, descpb.PrimaryIndexWithStoredColumnsVersion)
+	return tc.ExecuteDDLWithIndexVersion(sql, descpb.LatestNonPrimaryIndexDescriptorVersion)
 }
 
 // ExecuteDDLWithIndexVersion parses the given DDL SQL statement and creates
@@ -983,6 +983,11 @@ func (ti *Index) Partition(i int) cat.Partition {
 	return &ti.partitions[i]
 }
 
+// SetPartitions manually sets the partitions.
+func (ti *Index) SetPartitions(partitions []Partition) {
+	ti.partitions = partitions
+}
+
 // Partition implements the cat.Partition interface for testing purposes.
 type Partition struct {
 	name   string
@@ -1005,6 +1010,11 @@ func (p *Partition) Zone() cat.Zone {
 // PartitionByListPrefixes is part of the cat.Partition interface.
 func (p *Partition) PartitionByListPrefixes() []tree.Datums {
 	return p.datums
+}
+
+// SetDatums manually sets the partitioning values.
+func (p *Partition) SetDatums(datums []tree.Datums) {
+	p.datums = datums
 }
 
 // TableStat implements the cat.TableStatistic interface for testing purposes.
