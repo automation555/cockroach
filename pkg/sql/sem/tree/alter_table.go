@@ -25,8 +25,8 @@ type AlterTable struct {
 	Cmds     AlterTableCmds
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTable) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTable) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString("ALTER TABLE ")
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
@@ -38,8 +38,8 @@ func (node *AlterTable) Format(ctx *FmtCtx) {
 // AlterTableCmds represents a list of table alterations.
 type AlterTableCmds []AlterTableCmd
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableCmds) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableCmds) FormatImpl(ctx *FmtCtx) {
 	for i, n := range *node {
 		if i > 0 {
 			ctx.WriteString(",")
@@ -77,8 +77,6 @@ func (*AlterTableSetVisible) alterTableCmd()         {}
 func (*AlterTableValidateConstraint) alterTableCmd() {}
 func (*AlterTablePartitionByTable) alterTableCmd()   {}
 func (*AlterTableInjectStats) alterTableCmd()        {}
-func (*AlterTableSetStorageParams) alterTableCmd()   {}
-func (*AlterTableResetStorageParams) alterTableCmd() {}
 
 var _ AlterTableCmd = &AlterTableAddColumn{}
 var _ AlterTableCmd = &AlterTableAddConstraint{}
@@ -97,8 +95,6 @@ var _ AlterTableCmd = &AlterTableSetVisible{}
 var _ AlterTableCmd = &AlterTableValidateConstraint{}
 var _ AlterTableCmd = &AlterTablePartitionByTable{}
 var _ AlterTableCmd = &AlterTableInjectStats{}
-var _ AlterTableCmd = &AlterTableSetStorageParams{}
-var _ AlterTableCmd = &AlterTableResetStorageParams{}
 
 // ColumnMutationCmd is the subset of AlterTableCmds that modify an
 // existing column.
@@ -118,8 +114,8 @@ func (node *AlterTableAddColumn) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "add_column")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableAddColumn) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableAddColumn) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ADD COLUMN ")
 	if node.IfNotExists {
 		ctx.WriteString("IF NOT EXISTS ")
@@ -214,8 +210,8 @@ func (node *AlterTableAddConstraint) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "add_constraint")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableAddConstraint) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableAddConstraint) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ADD ")
 	ctx.FormatNode(node.ConstraintDef)
 	if node.ValidationBehavior == ValidationSkip {
@@ -236,8 +232,8 @@ func (node *AlterTableAlterColumnType) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "alter_column_type")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableAlterColumnType) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableAlterColumnType) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	ctx.WriteString(" SET DATA TYPE ")
@@ -259,10 +255,9 @@ func (node *AlterTableAlterColumnType) GetColumn() Name {
 
 // AlterTableAlterPrimaryKey represents an ALTER TABLE ALTER PRIMARY KEY command.
 type AlterTableAlterPrimaryKey struct {
-	Columns       IndexElemList
-	Sharded       *ShardedIndexDef
-	Name          Name
-	StorageParams StorageParams
+	Columns IndexElemList
+	Sharded *ShardedIndexDef
+	Name    Name
 }
 
 // TelemetryCounter implements the AlterTableCmd interface.
@@ -270,8 +265,8 @@ func (node *AlterTableAlterPrimaryKey) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "alter_primary_key")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableAlterPrimaryKey) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableAlterPrimaryKey) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ALTER PRIMARY KEY USING COLUMNS (")
 	ctx.FormatNode(&node.Columns)
 	ctx.WriteString(")")
@@ -292,8 +287,8 @@ func (node *AlterTableDropColumn) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "drop_column")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableDropColumn) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableDropColumn) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" DROP COLUMN ")
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
@@ -316,8 +311,8 @@ func (node *AlterTableDropConstraint) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "drop_constraint")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableDropConstraint) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableDropConstraint) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" DROP CONSTRAINT ")
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
@@ -338,8 +333,8 @@ func (node *AlterTableValidateConstraint) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "validate_constraint")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableValidateConstraint) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableValidateConstraint) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" VALIDATE CONSTRAINT ")
 	ctx.FormatNode(&node.Constraint)
 }
@@ -355,8 +350,8 @@ func (node *AlterTableRenameColumn) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "rename_column")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableRenameColumn) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableRenameColumn) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" RENAME COLUMN ")
 	ctx.FormatNode(&node.Column)
 	ctx.WriteString(" TO ")
@@ -374,8 +369,8 @@ func (node *AlterTableRenameConstraint) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "rename_constraint")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableRenameConstraint) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableRenameConstraint) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" RENAME CONSTRAINT ")
 	ctx.FormatNode(&node.Constraint)
 	ctx.WriteString(" TO ")
@@ -399,8 +394,8 @@ func (node *AlterTableSetDefault) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "set_default")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableSetDefault) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableSetDefault) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	if node.Default == nil {
@@ -428,8 +423,8 @@ func (node *AlterTableSetOnUpdate) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "set_on_update")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableSetOnUpdate) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableSetOnUpdate) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	if node.Expr == nil {
@@ -456,8 +451,8 @@ func (node *AlterTableSetVisible) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "set_visible")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableSetVisible) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableSetVisible) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	ctx.WriteString(" SET ")
@@ -483,8 +478,8 @@ func (node *AlterTableSetNotNull) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "set_not_null")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableSetNotNull) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableSetNotNull) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	ctx.WriteString(" SET NOT NULL")
@@ -506,8 +501,8 @@ func (node *AlterTableDropNotNull) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "drop_not_null")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableDropNotNull) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableDropNotNull) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	ctx.WriteString(" DROP NOT NULL")
@@ -529,8 +524,8 @@ func (node *AlterTableDropStored) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "drop_stored")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableDropStored) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableDropStored) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" ALTER COLUMN ")
 	ctx.FormatNode(&node.Column)
 	ctx.WriteString(" DROP STORED")
@@ -547,8 +542,8 @@ func (node *AlterTablePartitionByTable) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "partition_by")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTablePartitionByTable) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTablePartitionByTable) FormatImpl(ctx *FmtCtx) {
 	ctx.FormatNode(node.PartitionByTable)
 }
 
@@ -587,8 +582,8 @@ func (node *AlterTableSetAudit) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "set_audit")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableSetAudit) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableSetAudit) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" EXPERIMENTAL_AUDIT SET ")
 	ctx.WriteString(node.Mode.String())
 }
@@ -603,46 +598,10 @@ func (node *AlterTableInjectStats) TelemetryCounter() telemetry.Counter {
 	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "inject_stats")
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableInjectStats) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableInjectStats) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString(" INJECT STATISTICS ")
 	ctx.FormatNode(node.Stats)
-}
-
-// AlterTableSetStorageParams represents a ALTER TABLE SET command.
-type AlterTableSetStorageParams struct {
-	StorageParams StorageParams
-}
-
-// TelemetryCounter returns the telemetry counter to increment
-// when this command is used.
-func (node *AlterTableSetStorageParams) TelemetryCounter() telemetry.Counter {
-	return sqltelemetry.SchemaChangeAlterCounter("set_storage_param")
-}
-
-// Format implements the NodeFormatter interface.
-func (node *AlterTableSetStorageParams) Format(ctx *FmtCtx) {
-	ctx.WriteString(" SET (")
-	ctx.FormatNode(&node.StorageParams)
-	ctx.WriteString(")")
-}
-
-// AlterTableResetStorageParams represents a ALTER TABLE RESET command.
-type AlterTableResetStorageParams struct {
-	Params NameList
-}
-
-// TelemetryCounter returns the telemetry counter to increment
-// when this command is used.
-func (node *AlterTableResetStorageParams) TelemetryCounter() telemetry.Counter {
-	return sqltelemetry.SchemaChangeAlterCounter("set_storage_param")
-}
-
-// Format implements the NodeFormatter interface.
-func (node *AlterTableResetStorageParams) Format(ctx *FmtCtx) {
-	ctx.WriteString(" RESET (")
-	ctx.FormatNode(&node.Params)
-	ctx.WriteString(")")
 }
 
 // AlterTableLocality represents an ALTER TABLE LOCALITY command.
@@ -654,8 +613,8 @@ type AlterTableLocality struct {
 
 var _ Statement = &AlterTableLocality{}
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableLocality) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableLocality) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString("ALTER TABLE ")
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
@@ -675,8 +634,8 @@ type AlterTableSetSchema struct {
 	IsSequence     bool
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableSetSchema) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableSetSchema) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString("ALTER")
 	if node.IsView {
 		if node.IsMaterialized {
@@ -723,8 +682,8 @@ func (node *AlterTableOwner) TelemetryCounter() telemetry.Counter {
 	)
 }
 
-// Format implements the NodeFormatter interface.
-func (node *AlterTableOwner) Format(ctx *FmtCtx) {
+// FormatImpl implements the NodeFormatter interface.
+func (node *AlterTableOwner) FormatImpl(ctx *FmtCtx) {
 	ctx.WriteString("ALTER")
 	if node.IsView {
 		if node.IsMaterialized {

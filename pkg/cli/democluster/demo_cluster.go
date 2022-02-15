@@ -392,14 +392,14 @@ func (c *transientCluster) Start(
 			for i := 0; i < c.demoCtx.NumNodes; i++ {
 				latencyMap := c.servers[i].Cfg.TestingKnobs.Server.(*server.TestingKnobs).ContextTestingKnobs.ArtificialLatencyMap
 				c.infoLog(ctx, "starting tenant node %d", i)
-				tenantStopper := stop.NewStopper()
+				stopper := stop.NewStopper()
 				ts, err := c.servers[i].StartTenant(ctx, base.TestTenantArgs{
 					// We set the tenant ID to i+2, since tenant 0 is not a tenant, and
 					// tenant 1 is the system tenant. We also subtract 2 for the "starting"
 					// SQL/HTTP ports so the first tenant ends up with the desired default
 					// ports.
 					TenantID:         roachpb.MakeTenantID(uint64(i + 2)),
-					Stopper:          tenantStopper,
+					Stopper:          stopper,
 					ForceInsecure:    c.demoCtx.Insecure,
 					SSLCertsDir:      c.demoDir,
 					StartingSQLPort:  c.demoCtx.SQLPort - 2,
@@ -418,7 +418,7 @@ func (c *transientCluster) Start(
 					if ts != nil {
 						stopCtx = ts.AnnotateCtx(stopCtx)
 					}
-					tenantStopper.Stop(stopCtx)
+					stopper.Stop(stopCtx)
 				}))
 				if err != nil {
 					return err
@@ -1147,8 +1147,7 @@ func (c *transientCluster) getNetworkURLForServer(
 	host, port, _ := addr.SplitHostPort(sqlAddr, "")
 	u.
 		WithNet(pgurl.NetTCP(host, port)).
-		WithDatabase(database).
-		WithUsername(c.adminUser.Normalized())
+		WithDatabase(database)
 
 	// For a demo cluster we don't use client TLS certs and instead use
 	// password-based authentication with the password pre-filled in the
@@ -1157,6 +1156,7 @@ func (c *transientCluster) getNetworkURLForServer(
 		u.WithInsecure()
 	} else {
 		u.
+			WithUsername(c.adminUser.Normalized()).
 			WithAuthn(pgurl.AuthnPassword(true, c.adminPassword)).
 			WithTransport(pgurl.TransportTLS(pgurl.TLSRequire, ""))
 	}

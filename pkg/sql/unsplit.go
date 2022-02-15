@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
@@ -51,7 +52,7 @@ func (n *unsplitNode) Next(params runParams) (bool, error) {
 
 	if err := params.extendedEvalCtx.ExecCfg.DB.AdminUnsplit(params.ctx, rowKey); err != nil {
 		ctx := params.p.EvalContext().FmtCtx(tree.FmtSimple)
-		row.Format(ctx)
+		row.FormatImpl(ctx)
 		return false, errors.Wrapf(err, "could not UNSPLIT AT %s", ctx)
 	}
 
@@ -95,8 +96,8 @@ func (n *unsplitAllNode) startExec(params runParams) error {
 		WHERE
 			database_name=$1 AND table_name=$2 AND index_name=$3 AND split_enforced_until IS NOT NULL
 	`
-	dbDesc, err := params.p.Descriptors().Direct().MustGetDatabaseDescByID(
-		params.ctx, params.p.txn, n.tableDesc.GetParentID(),
+	dbDesc, err := catalogkv.MustGetDatabaseDescByID(
+		params.ctx, params.p.txn, params.ExecCfg().Codec, n.tableDesc.GetParentID(),
 	)
 	if err != nil {
 		return err
