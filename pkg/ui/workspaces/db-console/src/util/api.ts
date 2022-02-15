@@ -131,9 +131,6 @@ export type StatementDiagnosticsReportsResponseMessage = protos.cockroach.server
 export type CreateStatementDiagnosticsReportRequestMessage = protos.cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest;
 export type CreateStatementDiagnosticsReportResponseMessage = protos.cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse;
 
-export type CancelStatementDiagnosticsReportRequestMessage = protos.cockroach.server.serverpb.CancelStatementDiagnosticsReportRequest;
-export type CancelStatementDiagnosticsReportResponseMessage = protos.cockroach.server.serverpb.CancelStatementDiagnosticsReportResponse;
-
 export type StatementDiagnosticsRequestMessage = protos.cockroach.server.serverpb.StatementDiagnosticsRequest;
 export type StatementDiagnosticsResponseMessage = protos.cockroach.server.serverpb.StatementDiagnosticsResponse;
 
@@ -145,8 +142,8 @@ export type ResetSQLStatsResponseMessage = protos.cockroach.server.serverpb.Rese
 export type ResetIndexUsageStatsRequestMessage = protos.cockroach.server.serverpb.ResetIndexUsageStatsRequest;
 export type ResetIndexUsageStatsResponseMessage = protos.cockroach.server.serverpb.ResetIndexUsageStatsResponse;
 
-export type UserSQLRolesRequestMessage = protos.cockroach.server.serverpb.UserSQLRolesRequest;
-export type UserSQLRolesResponseMessage = protos.cockroach.server.serverpb.UserSQLRolesResponse;
+export type HotRangesRequestMessage = protos.cockroach.server.serverpb.HotRangesRequest;
+export type HotRangesV2ResponseMessage = protos.cockroach.server.serverpb.HotRangesResponseV2;
 
 // API constants
 
@@ -725,18 +722,6 @@ export function createStatementDiagnosticsReport(
   );
 }
 
-export function cancelStatementDiagnosticsReport(
-  req: CancelStatementDiagnosticsReportRequestMessage,
-  timeout?: moment.Duration,
-): Promise<CancelStatementDiagnosticsReportResponseMessage> {
-  return timeoutFetch(
-    serverpb.CancelStatementDiagnosticsReportResponse,
-    `${STATUS_PREFIX}/stmtdiagreports/cancel`,
-    req as any,
-    timeout,
-  );
-}
-
 export function getStatementDiagnostics(
   req: StatementDiagnosticsRequestMessage,
   timeout?: moment.Duration,
@@ -810,13 +795,13 @@ export function resetIndexUsageStats(
   );
 }
 
-export function getUserSQLRoles(
-  req: UserSQLRolesRequestMessage,
+export function getHotRanges(
+  req: HotRangesRequestMessage,
   timeout?: moment.Duration,
-): Promise<UserSQLRolesResponseMessage> {
+): Promise<HotRangesV2ResponseMessage> {
   return timeoutFetch(
-    serverpb.UserSQLRolesResponse,
-    `${STATUS_PREFIX}/sqlroles`,
+    serverpb.HotRangesResponseV2,
+    `${STATUS_PREFIX}/v2/hotranges`,
     req as any,
     timeout,
   );
