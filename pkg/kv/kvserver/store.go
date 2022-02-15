@@ -152,7 +152,7 @@ var concurrentRangefeedItersLimit = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"kv.rangefeed.concurrent_catchup_iterators",
 	"number of rangefeeds catchup iterators a store will allow concurrently before queueing",
-	16,
+	64,
 	settings.PositiveInt,
 )
 
@@ -247,6 +247,7 @@ func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 		ScanInterval:                10 * time.Minute,
 		HistogramWindowInterval:     metric.TestSampleInterval,
 		ProtectedTimestampCache:     protectedts.EmptyCache(clock),
+		ProtectedTimestampReader:    spanconfig.EmptyProtectedTSReader(clock),
 	}
 
 	// Use shorter Raft tick settings in order to minimize start up and failover
@@ -724,7 +725,13 @@ type Store struct {
 	txnWaitMetrics     *txnwait.Metrics
 	sstSnapshotStorage SSTSnapshotStorage
 	protectedtsCache   protectedts.Cache
+	protectedtsReader  spanconfig.ProtectedTSReader
 	ctSender           *sidetransport.Sender
+
+	// systemRangeStartUpperBound is a precomputed value used by a replica to
+	// determine if its key range overlaps the system range.
+	// TODO(postamar): stop special-casing the system range
+	systemRangeStartUpperBound roachpb.Key
 
 	// gossipRangeCountdown and leaseRangeCountdown are countdowns of
 	// changes to range and leaseholder counts, after which the store
@@ -741,8 +748,8 @@ type Store struct {
 
 	coalescedMu struct {
 		syncutil.Mutex
-		heartbeats         map[roachpb.StoreIdent][]kvserverpb.RaftHeartbeat
-		heartbeatResponses map[roachpb.StoreIdent][]kvserverpb.RaftHeartbeat
+		heartbeats         map[roachpb.StoreIdent][]RaftHeartbeat
+		heartbeatResponses map[roachpb.StoreIdent][]RaftHeartbeat
 	}
 	// 1 if the store was started, 0 if it wasn't. To be accessed using atomic
 	// ops.
@@ -1040,6 +1047,10 @@ type StoreConfig struct {
 	// AdminVerifyProtectedTimestampRequest.
 	ProtectedTimestampCache protectedts.Cache
 
+	// ProtectedTimestampReader provides a read-only view into the protected
+	// timestamp subsystem. It is queried during the GC process.
+	ProtectedTimestampReader spanconfig.ProtectedTSReader
+
 	// KV Memory Monitor. Must be non-nil for production, and can be nil in some
 	// tests.
 	KVMemoryMonitor *mon.BytesMonitor
@@ -1134,6 +1145,9 @@ func NewStore(
 		nodeDesc: nodeDesc,
 		metrics:  newStoreMetrics(cfg.HistogramWindowInterval),
 		ctSender: cfg.ClosedTimestampSender,
+		systemRangeStartUpperBound: keys.SystemSQLCodec.TablePrefix(
+			keys.MinUserDescriptorID(keys.DeprecatedSystemIDChecker()),
+		),
 	}
 	if cfg.RPCContext != nil {
 		s.allocator = MakeAllocator(
@@ -1158,8 +1172,8 @@ func NewStore(
 	s.metrics.registry.AddMetricStruct(s.raftEntryCache.Metrics())
 
 	s.coalescedMu.Lock()
-	s.coalescedMu.heartbeats = map[roachpb.StoreIdent][]kvserverpb.RaftHeartbeat{}
-	s.coalescedMu.heartbeatResponses = map[roachpb.StoreIdent][]kvserverpb.RaftHeartbeat{}
+	s.coalescedMu.heartbeats = map[roachpb.StoreIdent][]RaftHeartbeat{}
+	s.coalescedMu.heartbeatResponses = map[roachpb.StoreIdent][]RaftHeartbeat{}
 	s.coalescedMu.Unlock()
 
 	s.mu.Lock()
@@ -1211,6 +1225,7 @@ func NewStore(
 		log.Warningf(ctx, "failed to clear snapshot storage: %v", err)
 	}
 	s.protectedtsCache = cfg.ProtectedTimestampCache
+	s.protectedtsReader = cfg.ProtectedTimestampReader
 
 	// On low-CPU instances, a default limit value may still allow ExportRequests
 	// to tie up all cores so cap limiter at cores-1 when setting value is higher.
@@ -1359,7 +1374,7 @@ func (s *Store) AnnotateCtx(ctx context.Context) context.Context {
 // to report work that needed to be done and which may or may not have
 // been done by the time this call returns. See the explanation in
 // pkg/server/drain.go for details.
-func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString), verbose bool) {
+func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString)) {
 	s.draining.Store(drain)
 	if !drain {
 		return
@@ -1430,7 +1445,7 @@ func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString), v
 						// We need this check here because each call of
 						// transferAllAway() traverses all stores/replicas without
 						// checking for the timeout otherwise.
-						if verbose || log.V(1) {
+						if log.V(1) {
 							log.Infof(ctx, "lease transfer aborted due to exceeded timeout")
 						}
 						return
@@ -1469,55 +1484,39 @@ func (s *Store) SetDraining(drain bool, reporter func(int, redact.SafeString), v
 					// manually to a non-draining replica.
 
 					if !needsLeaseTransfer {
-						if verbose || log.V(1) {
+						if log.V(1) {
 							// This logging is useful to troubleshoot incomplete drains.
 							log.Info(ctx, "not moving out")
 						}
 						atomic.AddInt32(&numTransfersAttempted, -1)
 						return
 					}
-
-					desc, conf := r.DescAndSpanConfig()
-
-					if verbose || log.V(1) {
+					if log.V(1) {
 						// This logging is useful to troubleshoot incomplete drains.
-						log.Infof(ctx, "attempting to transfer lease %v for range %s", drainingLeaseStatus.Lease, desc)
+						log.Infof(ctx, "trying to move replica out")
 					}
 
-					start := timeutil.Now()
-					transferStatus, err := s.replicateQueue.shedLease(
-						ctx,
-						r,
-						desc,
-						conf,
-						transferLeaseOptions{},
-					)
-					duration := timeutil.Since(start).Microseconds()
-
-					if transferStatus != transferOK {
-						const failFormat = "failed to transfer lease %s for range %s when draining: %v"
-						const durationFailFormat = "blocked for %d microseconds on transfer attempt"
-
-						infoArgs := []interface{}{
-							drainingLeaseStatus.Lease,
+					if needsLeaseTransfer {
+						desc, conf := r.DescAndSpanConfig()
+						transferStatus, err := s.replicateQueue.shedLease(
+							ctx,
+							r,
 							desc,
-						}
-						if err != nil {
-							infoArgs = append(infoArgs, err)
-						} else {
-							infoArgs = append(infoArgs, transferStatus)
-						}
-
-						if verbose {
-							log.Dev.Infof(ctx, failFormat, infoArgs...)
-							log.Dev.Infof(ctx, durationFailFormat, duration)
-						} else {
-							log.VErrEventf(ctx, 1 /* level */, failFormat, infoArgs...)
-							log.VErrEventf(ctx, 1 /* level */, durationFailFormat, duration)
+							conf,
+							transferLeaseOptions{},
+						)
+						if transferStatus != transferOK {
+							if err != nil {
+								log.VErrEventf(ctx, 1, "failed to transfer lease %s for range %s when draining: %s",
+									drainingLeaseStatus.Lease, desc, err)
+							} else {
+								log.VErrEventf(ctx, 1, "failed to transfer lease %s for range %s when draining: %s",
+									drainingLeaseStatus.Lease, desc, transferStatus)
+							}
 						}
 					}
 				}); err != nil {
-				if verbose || log.V(1) {
+				if log.V(1) {
 					log.Errorf(ctx, "error running draining task: %+v", err)
 				}
 				wg.Done()
@@ -1954,13 +1953,13 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	}
 
 	if !s.cfg.SpanConfigsDisabled {
-		s.cfg.SpanConfigSubscriber.Subscribe(func(ctx context.Context, update roachpb.Span) {
+		s.cfg.SpanConfigSubscriber.Subscribe(func(update roachpb.Span) {
 			s.onSpanConfigUpdate(ctx, update)
 		})
 
-		// When toggling between the system config span and the span
-		// configs infrastructure, we want to re-apply configs on all
-		// replicas from whatever the new source is.
+		// When toggling between the system config span and the span configs
+		// infrastructure, we want to re-apply configs on all replicas from
+		// whatever the new source is.
 		spanconfigstore.EnabledSetting.SetOnChange(&s.ClusterSettings().SV, func(ctx context.Context) {
 			enabled := spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV)
 			if enabled {
@@ -2289,10 +2288,6 @@ func (s *Store) removeReplicaWithRangefeed(rangeID roachpb.RangeID) {
 // systemGossipUpdate is a callback for gossip updates to
 // the system config which affect range split boundaries.
 func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
-	if !s.cfg.SpanConfigsDisabled && spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) {
-		return // nothing to do
-	}
-
 	ctx := s.AnnotateCtx(context.Background())
 	s.computeInitialMetrics.Do(func() {
 		// Metrics depend in part on the system config. Compute them as soon as we
@@ -2320,13 +2315,7 @@ func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
 			}
 			conf = s.cfg.DefaultSpanConfig
 		}
-
-		if s.cfg.SpanConfigsDisabled ||
-			!spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) ||
-			!s.cfg.Settings.Version.IsActive(ctx, clusterversion.EnableSpanConfigStore) {
-			repl.SetSpanConfig(conf)
-		}
-
+		repl.SetSpanConfig(conf)
 		if shouldQueue {
 			s.splitQueue.Async(ctx, "gossip update", true /* wait */, func(ctx context.Context, h queueHelper) {
 				h.MaybeAdd(ctx, repl, now)
@@ -3265,8 +3254,7 @@ func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracing.Rec
 	defer collectAndFinish()
 	canTransferLease := func(ctx context.Context, repl *Replica) bool { return true }
 	_, err := s.replicateQueue.processOneChange(
-		ctx, repl, canTransferLease, false /* scatter */, true, /* dryRun */
-	)
+		ctx, repl, canTransferLease, true /* dryRun */)
 	if err != nil {
 		log.Eventf(ctx, "error simulating allocator on replica %s: %s", repl, err)
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -73,6 +74,7 @@ func New(config Config) *Cache {
 }
 
 var _ protectedts.Cache = (*Cache)(nil)
+var _ spanconfig.ProtectedTSReader = (*Cache)(nil)
 
 // Iterate is part of the protectedts.Cache interface.
 func (c *Cache) Iterate(
@@ -124,6 +126,32 @@ func (c *Cache) Refresh(ctx context.Context, asOf hlc.Timestamp) error {
 		}
 	}
 	return nil
+}
+
+// GetEarliestValidProtectionTimestamp is part of the
+// spanconfig.ProtectedTSReader interface.
+func (c *Cache) GetEarliestValidProtectionTimestamp(
+	ctx context.Context, sp roachpb.Span, GCThreshold hlc.Timestamp,
+) (protectionTimestamp hlc.Timestamp, asOf hlc.Timestamp) {
+	var earliestRecord *ptpb.Record
+	readAt := c.Iterate(ctx,
+		sp.Key,
+		sp.EndKey,
+		func(rec *ptpb.Record) (wantMore bool) {
+			// Check if the timestamp the record was trying to protect is strictly
+			// below the GCThreshold, in which case, we know the record does not apply.
+			if isValid := GCThreshold.LessEq(rec.Timestamp); !isValid {
+				return true
+			}
+			if earliestRecord == nil || rec.Timestamp.Less(earliestRecord.Timestamp) {
+				earliestRecord = rec
+			}
+			return true
+		})
+	if earliestRecord != nil {
+		protectionTimestamp = earliestRecord.Timestamp
+	}
+	return protectionTimestamp, readAt
 }
 
 // Start starts the periodic fetching of the Cache. A Cache must not be used

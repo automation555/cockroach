@@ -24,22 +24,24 @@ import (
 // KVAccessor mediates access to KV span configurations pertaining to a given
 // tenant.
 type KVAccessor interface {
-	// GetSpanConfigRecords returns the span configurations that apply to or
-	// overlap with the supplied targets.
-	GetSpanConfigRecords(ctx context.Context, targets []Target) ([]Record, error)
-
-	// UpdateSpanConfigRecords updates configurations for the given key targets.
-	// This is a "targeted" API: the exact targets being deleted are expected to
-	// have been present; if targets are being updated with new configs, they're
-	// expected to be present exactly as well.
-	//
-	// Targets are not allowed to overlap with each other. When divvying up an
-	// existing target into multiple others with distinct configs, callers must
-	// issue deletes for the previous target and upserts for the new records.
-	UpdateSpanConfigRecords(
+	// GetSpanConfigEntriesFor returns the span configurations that overlap with
+	// the given spans.
+	GetSpanConfigEntriesFor(
 		ctx context.Context,
-		toDelete []Target,
-		toUpsert []Record,
+		spans []roachpb.Span,
+	) ([]roachpb.SpanConfigEntry, error)
+
+	// UpdateSpanConfigEntries updates configurations for the given spans. This
+	// is a "targeted" API: the spans being deleted are expected to have been
+	// present with the exact same bounds; if spans are being updated with new
+	// configs, they're expected to have been present with the same bounds. When
+	// divvying up an existing span into multiple others with distinct configs,
+	// callers are to issue a delete for the previous span and upserts for the
+	// new ones.
+	UpdateSpanConfigEntries(
+		ctx context.Context,
+		toDelete []roachpb.Span,
+		toUpsert []roachpb.SpanConfigEntry,
 	) error
 
 	// WithTxn returns a KVAccessor that runs using the given transaction (with
@@ -78,7 +80,7 @@ type KVAccessor interface {
 type KVSubscriber interface {
 	StoreReader
 	LastUpdated() hlc.Timestamp
-	Subscribe(func(ctx context.Context, updated roachpb.Span))
+	Subscribe(func(updated roachpb.Span))
 }
 
 // SQLTranslator translates SQL descriptors and their corresponding zone
@@ -109,22 +111,20 @@ type SQLTranslator interface {
 	// for each one of these accumulated IDs, we generate <span, config> tuples
 	// by following up the inheritance chain to fully hydrate the span
 	// configuration. Translate also accounts for and negotiates subzone spans.
-	Translate(ctx context.Context, ids descpb.IDs) ([]Record, hlc.Timestamp, error)
+	Translate(ctx context.Context, ids descpb.IDs) ([]roachpb.SpanConfigEntry, hlc.Timestamp, error)
 }
 
 // FullTranslate translates the entire SQL zone configuration state to the span
 // configuration state. The timestamp at which such a translation is valid is
 // also returned.
-func FullTranslate(ctx context.Context, s SQLTranslator) ([]Record, hlc.Timestamp, error) {
+func FullTranslate(
+	ctx context.Context, s SQLTranslator,
+) ([]roachpb.SpanConfigEntry, hlc.Timestamp, error) {
 	// As RANGE DEFAULT is the root of all zone configurations (including other
 	// named zones for the system tenant), we can construct the entire span
 	// configuration state by starting from RANGE DEFAULT.
 	return s.Translate(ctx, descpb.IDs{keys.RootNamespaceID})
 }
-
-// SQLWatcherHandler is the signature of a handler that can be passed into
-// SQLWatcher.WatchForSQLUpdates as described below.
-type SQLWatcherHandler func(context.Context, []SQLUpdate, hlc.Timestamp) error
 
 // SQLWatcher watches for events on system.zones and system.descriptors.
 type SQLWatcher interface {
@@ -147,7 +147,7 @@ type SQLWatcher interface {
 	WatchForSQLUpdates(
 		ctx context.Context,
 		startTS hlc.Timestamp,
-		handler SQLWatcherHandler,
+		handler func(ctx context.Context, updates []DescriptorUpdate, checkpointTS hlc.Timestamp) error,
 	) error
 }
 
@@ -221,7 +221,7 @@ type StoreWriter interface {
 	// [1]: Unless dryrun is true. We'll still generate the same {deleted,added}
 	//      lists.
 	Apply(ctx context.Context, dryrun bool, updates ...Update) (
-		deleted []Target, added []Record,
+		deleted []roachpb.Span, added []roachpb.SpanConfigEntry,
 	)
 }
 
@@ -233,123 +233,36 @@ type StoreReader interface {
 	GetSpanConfigForKey(ctx context.Context, key roachpb.RKey) (roachpb.SpanConfig, error)
 }
 
-// Record ties a target to its corresponding config.
-type Record struct {
-	// Target specifies the target (keyspan(s)) the config applies over.
-	Target Target
-
-	// Config is the set of attributes that apply over the corresponding target.
-	Config roachpb.SpanConfig
-}
-
-// IsEmpty returns true if the receiver is an empty Record.
-func (r *Record) IsEmpty() bool {
-	return r.Target.isEmpty() && r.Config.IsEmpty()
-}
-
-// SQLUpdate captures either a descriptor or a protected timestamp update.
-// It is the unit emitted by the SQLWatcher.
-type SQLUpdate struct {
-	descriptorUpdate         DescriptorUpdate
-	protectedTimestampUpdate ProtectedTimestampUpdate
-}
-
-// MakeDescriptorSQLUpdate returns a SQLUpdate that represents an update to a
-// descriptor.
-func MakeDescriptorSQLUpdate(id descpb.ID, descType catalog.DescriptorType) SQLUpdate {
-	return SQLUpdate{descriptorUpdate: DescriptorUpdate{
-		ID:   id,
-		Type: descType,
-	}}
-}
-
-// GetDescriptorUpdate returns a DescriptorUpdate.
-func (d *SQLUpdate) GetDescriptorUpdate() DescriptorUpdate {
-	return d.descriptorUpdate
-}
-
-// IsDescriptorUpdate returns true if the SQLUpdate represents an update to a
-// descriptor.
-func (d *SQLUpdate) IsDescriptorUpdate() bool {
-	return d.descriptorUpdate != DescriptorUpdate{}
-}
-
-// MakeTenantProtectedTimestampSQLUpdate returns a SQLUpdate that represents an update
-// to a protected timestamp record with a tenant target.
-func MakeTenantProtectedTimestampSQLUpdate(tenantID roachpb.TenantID) SQLUpdate {
-	return SQLUpdate{protectedTimestampUpdate: ProtectedTimestampUpdate{TenantTarget: tenantID}}
-}
-
-// MakeClusterProtectedTimestampSQLUpdate returns a SQLUpdate that represents an update
-// to a protected timestamp record with a cluster target.
-func MakeClusterProtectedTimestampSQLUpdate() SQLUpdate {
-	return SQLUpdate{protectedTimestampUpdate: ProtectedTimestampUpdate{ClusterTarget: true}}
-}
-
-// GetProtectedTimestampUpdate returns the target of the updated protected
-// timestamp record.
-func (d *SQLUpdate) GetProtectedTimestampUpdate() ProtectedTimestampUpdate {
-	return d.protectedTimestampUpdate
-}
-
-// IsProtectedTimestampUpdate returns true if the SQLUpdate represents an update
-// to a protected timestamp record.
-func (d *SQLUpdate) IsProtectedTimestampUpdate() bool {
-	return d.protectedTimestampUpdate != ProtectedTimestampUpdate{}
-}
-
 // DescriptorUpdate captures the ID and the type of descriptor or zone that been
-// updated.
+// updated. It's the unit of what the SQLWatcher emits.
 type DescriptorUpdate struct {
 	// ID of the descriptor/zone that has been updated.
 	ID descpb.ID
 
-	// Type of the descriptor/zone that has been updated. Could be either
+	// DescriptorType of the descriptor/zone that has been updated. Could be either
 	// the specific type or catalog.Any if no information is available.
-	Type catalog.DescriptorType
-}
-
-// ProtectedTimestampUpdate captures a protected timestamp record with a cluster
-// or tenant target that been updated.
-type ProtectedTimestampUpdate struct {
-	// ClusterTarget is set if the pts record targets a cluster.
-	ClusterTarget bool
-	// TenantsTarget is set if the pts record targets a tenant.
-	TenantTarget roachpb.TenantID
-}
-
-// IsClusterUpdate returns true if the ProtectedTimestampUpdate has a cluster
-// target.
-func (p *ProtectedTimestampUpdate) IsClusterUpdate() bool {
-	return p.ClusterTarget
-}
-
-// IsTenantsUpdate returns true if the ProtectedTimestampUpdate has a tenants
-// target.
-func (p *ProtectedTimestampUpdate) IsTenantsUpdate() bool {
-	return !p.ClusterTarget
+	DescriptorType catalog.DescriptorType
 }
 
 // Update captures a span and the corresponding config change. It's the unit of
 // what can be applied to a StoreWriter. The embedded span captures what's being
 // updated; the config captures what it's being updated to. An empty config
 // indicates a deletion.
-type Update Record
+type Update roachpb.SpanConfigEntry
 
-// Deletion constructs an update that represents a deletion over the given
-// target.
-func Deletion(target Target) Update {
+// Deletion constructs an update that represents a deletion over the given span.
+func Deletion(span roachpb.Span) Update {
 	return Update{
-		Target: target,
+		Span:   span,
 		Config: roachpb.SpanConfig{}, // delete
 	}
 }
 
 // Addition constructs an update that represents adding the given config over
-// the given target.
-func Addition(target Target, conf roachpb.SpanConfig) Update {
+// the given span.
+func Addition(span roachpb.Span, conf roachpb.SpanConfig) Update {
 	return Update{
-		Target: target,
+		Span:   span,
 		Config: conf,
 	}
 }
@@ -363,4 +276,36 @@ func (u Update) Deletion() bool {
 // Addition returns true if the update corresponds to a span config being added.
 func (u Update) Addition() bool {
 	return !u.Deletion()
+}
+
+// ProtectedTSReader is the read-only portion for querying protected
+// timestamp information. It doubles up as an adaptor interface for
+// protectedts.Cache.
+type ProtectedTSReader interface {
+	// GetEarliestValidProtectionTimestamp examines all protection timestamps that
+	// apply to the given keyspan and returns the least timestamp that is still
+	// valid. The Supplied GCThreshold is used to make the validity claim; in
+	// particular, a protection timestamp is considered valid iff it is at or
+	// above the GCThreshold.
+	//
+	// An empty protection timestamp is returned if no valid protection applies
+	// over the given span.
+	GetEarliestValidProtectionTimestamp(ctx context.Context, sp roachpb.Span,
+		GCThreshold hlc.Timestamp) (protectionTimestamp hlc.Timestamp, asOf hlc.Timestamp)
+}
+
+// EmptyProtectedTSReader returns a ProtectedTSReader which contains no records
+// and is always up-to date. This is intended for testing.
+func EmptyProtectedTSReader(c *hlc.Clock) ProtectedTSReader {
+	return (*emptyProtectedTSReader)(c)
+}
+
+type emptyProtectedTSReader hlc.Clock
+
+// GetEarliestValidProtectionTimestamp is part of the
+// spanconfig.ProtectedTSReader interface.
+func (r *emptyProtectedTSReader) GetEarliestValidProtectionTimestamp(
+	_ context.Context, _ roachpb.Span, _ hlc.Timestamp,
+) (protectionTimestamp hlc.Timestamp, asOf hlc.Timestamp) {
+	return hlc.Timestamp{}, (*hlc.Clock)(r).Now()
 }

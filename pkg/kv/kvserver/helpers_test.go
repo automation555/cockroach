@@ -226,13 +226,6 @@ func (r *Replica) Breaker() *circuit2.Breaker {
 	return r.breaker.wrapped
 }
 
-func (r *Replica) VisitBreakerContexts(fn func(ctx context.Context)) {
-	r.breaker.cancels.Visit(func(ctx context.Context, _ func()) (remove bool) {
-		fn(ctx)
-		return false // keep
-	})
-}
-
 func (r *Replica) AssertState(ctx context.Context, reader storage.Reader) {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
@@ -485,7 +478,7 @@ func (r *Replica) ReadProtectedTimestamps(ctx context.Context) {
 	defer r.maybeUpdateCachedProtectedTS(&ts)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	ts = r.readProtectedTimestampsRLocked(ctx, nil /* f */)
+	ts = r.readProtectedTimestampsRLocked(ctx)
 }
 
 // ClosedTimestampPolicy returns the closed timestamp policy of the range, which
