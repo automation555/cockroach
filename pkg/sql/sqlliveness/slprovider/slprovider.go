@@ -19,35 +19,35 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slsession"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
 // New constructs a new Provider.
 func New(
-	ambientCtx log.AmbientContext,
 	stopper *stop.Stopper,
 	clock *hlc.Clock,
 	db *kv.DB,
 	codec keys.SQLCodec,
 	settings *cluster.Settings,
-	testingKnobs *sqlliveness.TestingKnobs,
+	testingKnobs *slbase.TestingKnobs,
 ) sqlliveness.Provider {
-	storage := slstorage.NewStorage(ambientCtx, stopper, clock, db, codec, settings)
-	instance := slinstance.NewSQLInstance(stopper, clock, storage, settings, testingKnobs)
+	storage := slstorage.NewStorage(stopper, clock, db, codec, settings, testingKnobs)
+	instance := slsession.NewFactory(
+		stopper, clock, storage, settings, testingKnobs,
+	)
 	return &provider{
-		Storage:  storage,
-		Instance: instance,
+		Storage: storage,
+		Factory: instance,
 	}
 }
 
 func (p *provider) Start(ctx context.Context) {
-	p.Storage.Start(ctx)
-	p.Instance.Start(ctx)
+	p.Factory.Start(ctx)
 }
 
 func (p *provider) Metrics() metric.Struct {
@@ -56,5 +56,5 @@ func (p *provider) Metrics() metric.Struct {
 
 type provider struct {
 	*slstorage.Storage
-	*slinstance.Instance
+	*slsession.Factory
 }
