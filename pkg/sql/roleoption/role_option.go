@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-//go:generate stringer -type=Option -linecomment
+//go:generate stringer -type=Option
 
 // Option defines a role option. This is output by the parser
 type Option uint32
@@ -40,7 +40,7 @@ const (
 	PASSWORD
 	LOGIN
 	NOLOGIN
-	VALIDUNTIL // VALID UNTIL
+	VALIDUNTIL
 	CONTROLJOB
 	NOCONTROLJOB
 	CONTROLCHANGEFEED
@@ -55,11 +55,6 @@ const (
 	NOCANCELQUERY
 	MODIFYCLUSTERSETTING
 	NOMODIFYCLUSTERSETTING
-	DEFAULTSETTINGS
-	VIEWACTIVITYREDACTED
-	NOVIEWACTIVITYREDACTED
-	SQLLOGIN
-	NOSQLLOGIN
 )
 
 // toSQLStmts is a map of Kind -> SQL statement string for applying the
@@ -84,10 +79,6 @@ var toSQLStmts = map[Option]string{
 	NOCANCELQUERY:          `DELETE FROM system.role_options WHERE username = $1 AND option = 'CANCELQUERY'`,
 	MODIFYCLUSTERSETTING:   `UPSERT INTO system.role_options (username, option) VALUES ($1, 'MODIFYCLUSTERSETTING')`,
 	NOMODIFYCLUSTERSETTING: `DELETE FROM system.role_options WHERE username = $1 AND option = 'MODIFYCLUSTERSETTING'`,
-	SQLLOGIN:               `DELETE FROM system.role_options WHERE username = $1 AND option = 'NOSQLLOGIN'`,
-	NOSQLLOGIN:             `UPSERT INTO system.role_options (username, option) VALUES ($1, 'NOSQLLOGIN')`,
-	VIEWACTIVITYREDACTED:   `UPSERT INTO system.role_options (username, option) VALUES ($1, 'VIEWACTIVITYREDACTED')`,
-	NOVIEWACTIVITYREDACTED: `DELETE FROM system.role_options WHERE username = $1 AND option = 'VIEWACTIVITYREDACTED'`,
 }
 
 // Mask returns the bitmask for a given role option.
@@ -102,7 +93,7 @@ var ByName = map[string]Option{
 	"PASSWORD":               PASSWORD,
 	"LOGIN":                  LOGIN,
 	"NOLOGIN":                NOLOGIN,
-	"VALID UNTIL":            VALIDUNTIL,
+	"VALID_UNTIL":            VALIDUNTIL,
 	"CONTROLJOB":             CONTROLJOB,
 	"NOCONTROLJOB":           NOCONTROLJOB,
 	"CONTROLCHANGEFEED":      CONTROLCHANGEFEED,
@@ -117,11 +108,6 @@ var ByName = map[string]Option{
 	"NOCANCELQUERY":          NOCANCELQUERY,
 	"MODIFYCLUSTERSETTING":   MODIFYCLUSTERSETTING,
 	"NOMODIFYCLUSTERSETTING": NOMODIFYCLUSTERSETTING,
-	"DEFAULTSETTINGS":        DEFAULTSETTINGS,
-	"VIEWACTIVITYREDACTED":   VIEWACTIVITYREDACTED,
-	"NOVIEWACTIVITYREDACTED": NOVIEWACTIVITYREDACTED,
-	"SQLLOGIN":               SQLLOGIN,
-	"NOSQLLOGIN":             NOSQLLOGIN,
 }
 
 // ToOption takes a string and returns the corresponding Option.
@@ -156,12 +142,11 @@ func (rol List) GetSQLStmts(op string) (map[string]func() (bool, string, error),
 			op,
 			strings.ToLower(ro.Option.String()),
 		)
-		// Skip PASSWORD and DEFAULTSETTINGS options.
+		// Skip PASSWORD option.
 		// Since PASSWORD still resides in system.users, we handle setting PASSWORD
 		// outside of this set stmt.
-		// DEFAULTSETTINGS is stored in system.database_role_settings.
 		// TODO(richardjcai): migrate password to system.role_options
-		if ro.Option == PASSWORD || ro.Option == DEFAULTSETTINGS {
+		if ro.Option == PASSWORD {
 			continue
 		}
 
@@ -225,11 +210,7 @@ func (rol List) CheckRoleOptionConflicts() error {
 		(roleOptionBits&CANCELQUERY.Mask() != 0 &&
 			roleOptionBits&NOCANCELQUERY.Mask() != 0) ||
 		(roleOptionBits&MODIFYCLUSTERSETTING.Mask() != 0 &&
-			roleOptionBits&NOMODIFYCLUSTERSETTING.Mask() != 0) ||
-		(roleOptionBits&VIEWACTIVITYREDACTED.Mask() != 0 &&
-			roleOptionBits&NOVIEWACTIVITYREDACTED.Mask() != 0) ||
-		(roleOptionBits&SQLLOGIN.Mask() != 0 &&
-			roleOptionBits&NOSQLLOGIN.Mask() != 0) {
+			roleOptionBits&NOMODIFYCLUSTERSETTING.Mask() != 0) {
 		return pgerror.Newf(pgcode.Syntax, "conflicting role options")
 	}
 	return nil
@@ -246,4 +227,17 @@ func (rol List) GetPassword() (isNull bool, password string, err error) {
 	}
 	// Password option not found.
 	return false, "", errors.New("password not found in role options")
+}
+
+// GetValidUntil returns the ValidUntil timestamp or whether the
+// field was set to NULL. Returns error if the timestamp was invalid
+// or if no valid until option is found.
+func (rol List) GetValidUntil() (isNull bool, timestamp string, err error) {
+	for _, ro := range rol {
+		if ro.Option == VALIDUNTIL {
+			return ro.Value()
+		}
+	}
+	// VALIDUNTIL option not found.
+	return false, "", errors.New("timestamp not found in role options")
 }
