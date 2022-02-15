@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -428,11 +427,9 @@ func mysqlTableToCockroach(
 			seqVals[id] = startingValue
 		}
 		var err error
-		privilegeDesc := catpb.NewBasePrivilegeDescriptor(owner)
+		privilegeDesc := descpb.NewBasePrivilegeDescriptor(owner)
 		seqDesc, err = sql.NewSequenceTableDesc(
 			ctx,
-			nil, /* planner */
-			evalCtx.Settings,
 			seqName,
 			opts,
 			parentDB.GetID(),
@@ -441,6 +438,7 @@ func mysqlTableToCockroach(
 			time,
 			privilegeDesc,
 			tree.PersistencePermanent,
+			nil, /* params */
 			// If this is multi-region, this will get added by WriteDescriptors.
 			false, /* isMultiRegion */
 		)
@@ -492,7 +490,11 @@ func mysqlTableToCockroach(
 		}
 		idx := tree.IndexTableDef{Name: idxName, Columns: elems}
 		if raw.Info.Primary || raw.Info.Unique {
-			stmt.Defs = append(stmt.Defs, &tree.UniqueConstraintTableDef{IndexTableDef: idx, PrimaryKey: raw.Info.Primary})
+			stmt.Defs = append(stmt.Defs, &tree.UniqueConstraintTableDef{
+				IndexTableDef: idx,
+				PrimaryKey:    raw.Info.Primary,
+				ExplicitIndex: !raw.Info.Primary,
+			})
 		} else {
 			stmt.Defs = append(stmt.Defs, &idx)
 		}
@@ -602,8 +604,7 @@ func addDelayedFKs(
 		if err := fixDescriptorFKState(def.tbl); err != nil {
 			return err
 		}
-		version := evalCtx.Settings.Version.ActiveVersion(ctx)
-		if err := def.tbl.AllocateIDs(ctx, version); err != nil {
+		if err := def.tbl.AllocateIDs(ctx); err != nil {
 			return err
 		}
 	}

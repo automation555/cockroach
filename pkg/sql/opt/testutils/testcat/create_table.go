@@ -76,7 +76,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 
 	tab := &Table{TabID: tc.nextStableID(), TabName: stmt.Table, Catalog: tc}
 
-	// Find the PK columns.
+	// Find the PK columns; we have to force these to be non-nullable.
 	pkCols := make(map[tree.Name]struct{})
 	for _, def := range stmt.Defs {
 		switch def := def.(type) {
@@ -100,11 +100,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		case *tree.ColumnTableDef:
 			if !isMutationColumn(def) {
 				if _, isPKCol := pkCols[def.Name]; isPKCol {
-					// Force PK columns to be non-nullable and non-virtual.
 					def.Nullable.Nullability = tree.NotNull
-					if def.Computed.Computed {
-						def.Computed.Virtual = false
-					}
 				}
 				tab.addColumn(def)
 			}
@@ -689,7 +685,7 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 }
 
 func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
-	return tt.addIndexWithVersion(def, typ, descpb.PrimaryIndexWithStoredColumnsVersion)
+	return tt.addIndexWithVersion(def, typ, descpb.LatestNonPrimaryIndexDescriptorVersion)
 }
 
 func (tt *Table) addIndexWithVersion(
@@ -700,8 +696,9 @@ func (tt *Table) addIndexWithVersion(
 		tt.addUniqueConstraint(def.Name, def.Columns, def.Predicate, false /* withoutIndex */)
 	}
 
+	isPartial := def.Predicate != nil
 	idx := &Index{
-		IdxName:  tt.makeIndexName(def.Name, def.Columns, typ),
+		IdxName:  tt.makeIndexName(def.Name, def.Columns, typ, isPartial),
 		Unique:   typ != nonUniqueIndex,
 		Inverted: def.Inverted,
 		IdxZone:  &zonepb.ZoneConfig{},
@@ -718,8 +715,7 @@ func (tt *Table) addIndexWithVersion(
 		tt.deleteOnlyIdxCount++
 	}
 
-	// Add explicit columns. Primary key columns definitions have already been
-	// updated to be non-nullable and non-virtual.
+	// Add explicit columns and mark primary key columns as not null.
 	// Add the geoConfig if applicable.
 	idx.ExplicitColCount = len(def.Columns)
 	notNullIndex := true
@@ -913,7 +909,9 @@ func (tt *Table) addIndexWithVersion(
 	return idx
 }
 
-func (tt *Table) makeIndexName(defName tree.Name, cols tree.IndexElemList, typ indexType) string {
+func (tt *Table) makeIndexName(
+	defName tree.Name, cols tree.IndexElemList, typ indexType, isPartial bool,
+) string {
 	name := string(defName)
 	if name != "" {
 		return name
@@ -939,7 +937,9 @@ func (tt *Table) makeIndexName(defName tree.Name, cols tree.IndexElemList, typ i
 		}
 	}
 
-	if typ == uniqueIndex {
+	// Unique partial and unique expression indexes should always have the "idx"
+	// suffix.
+	if typ == uniqueIndex && !isPartial && exprCount == 0 {
 		sb.WriteString("_key")
 	} else {
 		sb.WriteString("_idx")

@@ -16,22 +16,18 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -40,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
+	"google.golang.org/protobuf/proto"
 )
 
 // Mutable is a custom type for TableDescriptors
@@ -65,6 +62,11 @@ var ErrMissingColumns = errors.New("table must contain at least 1 column")
 
 // ErrMissingPrimaryKey indicates a table with no primary key.
 var ErrMissingPrimaryKey = errors.New("table must contain a primary key")
+
+// ErrIndexGCMutationsList is returned by FindIndexWithID to signal that the
+// index with the given ID does not have a descriptor and is in the garbage
+// collected mutations list.
+var ErrIndexGCMutationsList = errors.New("index in GC mutations list")
 
 // PostDeserializationTableDescriptorChanges are a set of booleans to indicate
 // which types of upgrades or fixes occurred when filling in the descriptor
@@ -99,15 +101,6 @@ type PostDeserializationTableDescriptorChanges struct {
 	// one computed column which also had a DEFAULT expression, which therefore
 	// had to be removed. See issue #72881 for details.
 	RemovedDefaultExprFromComputedColumn bool
-
-	// RemovedDuplicateIDsInRefs indicates that the table
-	// has redundant IDs in its DependsOn, DependsOnTypes and DependedOnBy
-	// references.
-	RemovedDuplicateIDsInRefs bool
-
-	// AddedConstraintIDs indicates that table descriptors had constraint ID
-	// added.
-	AddedConstraintIDs bool
 }
 
 // DescriptorType returns the type of this descriptor.
@@ -212,8 +205,9 @@ func BuildIndexName(tableDesc *Mutable, idx *descpb.IndexDescriptor) (string, er
 		segments = append(segments, segmentName)
 	}
 
-	// Add the final segment.
-	if idx.Unique {
+	// Add the final segment. Unique partial and unique expression indexes
+	// should always have the "idx" suffix.
+	if idx.Unique && !idx.CreatedExplicitly {
 		segments = append(segments, "key")
 	} else {
 		segments = append(segments, "idx")
@@ -611,9 +605,6 @@ func (desc *Mutable) initIDs() {
 	if desc.NextMutationID == descpb.InvalidMutationID {
 		desc.NextMutationID = 1
 	}
-	if desc.NextConstraintID == 0 {
-		desc.NextConstraintID = 1
-	}
 }
 
 // MaybeFillColumnID assigns a column ID to the given column if the said column has an ID
@@ -635,7 +626,7 @@ func (desc *Mutable) MaybeFillColumnID(
 // AllocateIDs allocates column, family, and index ids for any column, family,
 // or index which has an ID of 0. It's the same as AllocateIDsWithoutValidation,
 // but does validation on the table elements.
-func (desc *Mutable) AllocateIDs(ctx context.Context, version clusterversion.ClusterVersion) error {
+func (desc *Mutable) AllocateIDs(ctx context.Context) error {
 	if err := desc.AllocateIDsWithoutValidation(ctx); err != nil {
 		return err
 	}
@@ -647,7 +638,7 @@ func (desc *Mutable) AllocateIDs(ctx context.Context, version clusterversion.Clu
 	if desc.ID == 0 {
 		desc.ID = keys.SystemDatabaseID
 	}
-	err := validate.Self(version, desc)
+	err := catalog.ValidateSelf(desc)
 	desc.ID = savedID
 
 	return err
@@ -720,22 +711,15 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 	if desc.NextIndexID == 0 {
 		desc.NextIndexID = 1
 	}
-	if desc.NextConstraintID == 0 {
-		desc.NextConstraintID = 1
-	}
 
 	// Assign names to unnamed indexes.
-	err := catalog.ForEachNonPrimaryIndex(desc, func(idx catalog.Index) error {
+	err := catalog.ForEachDeletableNonPrimaryIndex(desc, func(idx catalog.Index) error {
 		if len(idx.GetName()) == 0 {
 			name, err := BuildIndexName(desc, idx.IndexDesc())
 			if err != nil {
 				return err
 			}
 			idx.IndexDesc().Name = name
-		}
-		if idx.GetConstraintID() == 0 && idx.IsUnique() {
-			idx.IndexDesc().ConstraintID = desc.NextConstraintID
-			desc.NextConstraintID++
 		}
 		return nil
 	})
@@ -756,10 +740,6 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 	for _, idx := range desc.AllIndexes() {
 		if !idx.Primary() {
 			maybeUpgradeSecondaryIndexFormatVersion(idx.IndexDesc())
-		}
-		if idx.Primary() && idx.GetConstraintID() == 0 {
-			idx.IndexDesc().ConstraintID = desc.NextConstraintID
-			desc.NextConstraintID++
 		}
 		if idx.GetID() == 0 {
 			idx.IndexDesc().ID = desc.NextIndexID
@@ -1149,8 +1129,8 @@ func (desc *Mutable) AddPrimaryIndex(idx descpb.IndexDescriptor) error {
 		idx.Name = PrimaryKeyIndexName(desc.Name)
 	}
 	idx.EncodingType = descpb.PrimaryIndexEncoding
-	if idx.Version < descpb.PrimaryIndexWithStoredColumnsVersion {
-		idx.Version = descpb.PrimaryIndexWithStoredColumnsVersion
+	if idx.Version < descpb.LatestPrimaryIndexDescriptorVersion {
+		idx.Version = descpb.LatestPrimaryIndexDescriptorVersion
 		// Populate store columns.
 		names := make(map[string]struct{})
 		for _, name := range idx.KeyColumnNames {
@@ -1294,9 +1274,8 @@ func (desc *Mutable) RenameColumnDescriptor(column catalog.Column, newColName st
 func (desc *Mutable) FindActiveOrNewColumnByName(name tree.Name) (catalog.Column, error) {
 	currentMutationID := desc.ClusterVersion.NextMutationID
 	for _, col := range desc.DeletableColumns() {
-		if col.ColName() == name &&
-			((col.Public()) ||
-				(col.Adding() && col.MutationID() == currentMutationID)) {
+		if (col.Public() && col.ColName() == name) ||
+			(col.Adding() && col.MutationID() == currentMutationID) {
 			return col, nil
 		}
 	}
@@ -1742,15 +1721,8 @@ func (desc *Mutable) MakeMutationComplete(m descpb.DescriptorMutation) error {
 				} else {
 					primaryIndex.Name = args.NewPrimaryIndexName
 				}
-				// This is needed for `ALTER PRIMARY KEY`. Because the new primary index
-				// is initially created as a secondary index before being promoted as a
-				// real primary index here. `StoreColumnNames` and `StoreColumnIDs` are
-				// both filled when the index is first created. So just need to promote
-				// the version number here.
-				// TODO (Chengxiong): this is not needed in 22.2 since all indexes are
-				// created with PrimaryIndexWithStoredColumnsVersion since 22.1.
-				if primaryIndex.Version == descpb.StrictIndexColumnIDGuaranteesVersion {
-					primaryIndex.Version = descpb.PrimaryIndexWithStoredColumnsVersion
+				if primaryIndex.Version == descpb.LatestNonPrimaryIndexDescriptorVersion {
+					primaryIndex.Version = descpb.LatestPrimaryIndexDescriptorVersion
 				}
 				desc.SetPrimaryIndex(primaryIndex)
 			}
@@ -1968,7 +1940,6 @@ func (desc *Mutable) AddUniqueWithoutIndexMutation(
 func MakeNotNullCheckConstraint(
 	colName string,
 	colID descpb.ColumnID,
-	constraintID descpb.ConstraintID,
 	inuseNames map[string]struct{},
 	validity descpb.ConstraintValidity,
 ) *descpb.TableDescriptor_CheckConstraint {
@@ -2000,7 +1971,6 @@ func MakeNotNullCheckConstraint(
 		Validity:            validity,
 		ColumnIDs:           []descpb.ColumnID{colID},
 		IsNonNullConstraint: true,
-		ConstraintID:        constraintID,
 	}
 }
 
@@ -2207,7 +2177,7 @@ func (desc *wrapper) PrimaryIndexSpan(codec keys.SQLCodec) roachpb.Span {
 
 // IndexSpan implements the TableDescriptor interface.
 func (desc *wrapper) IndexSpan(codec keys.SQLCodec, indexID descpb.IndexID) roachpb.Span {
-	prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(codec, desc.GetID(), indexID))
+	prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(codec, desc, indexID))
 	return roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
 
@@ -2349,8 +2319,9 @@ func (desc *immutable) ActiveChecks() []descpb.TableDescriptor_CheckConstraint {
 	return desc.allChecks
 }
 
-// IsShardColumn implements the TableDescriptor interface.
-func (desc *wrapper) IsShardColumn(col catalog.Column) bool {
+// IsShardColumn returns true if col corresponds to a non-dropped hash sharded
+// index. This method assumes that col is currently a member of desc.
+func (desc *Mutable) IsShardColumn(col catalog.Column) bool {
 	return nil != catalog.FindNonDropIndex(desc, func(idx catalog.Index) bool {
 		return idx.IsSharded() && idx.GetShardColumnName() == col.GetName()
 	})
@@ -2420,13 +2391,13 @@ func (desc *wrapper) IsLocalityGlobal() bool {
 }
 
 // GetRegionalByTableRegion implements the TableDescriptor interface.
-func (desc *wrapper) GetRegionalByTableRegion() (catpb.RegionName, error) {
+func (desc *wrapper) GetRegionalByTableRegion() (descpb.RegionName, error) {
 	if !desc.IsLocalityRegionalByTable() {
 		return "", errors.AssertionFailedf("%s is not REGIONAL BY TABLE", desc.Name)
 	}
 	region := desc.LocalityConfig.GetRegionalByTable().Region
 	if region == nil {
-		return catpb.RegionName(tree.PrimaryRegionNotSpecifiedName), nil
+		return descpb.RegionName(tree.PrimaryRegionNotSpecifiedName), nil
 	}
 	return *region, nil
 }
@@ -2443,16 +2414,6 @@ func (desc *wrapper) GetRegionalByRowTableRegionColumnName() (tree.Name, error) 
 	return tree.Name(*colName), nil
 }
 
-// GetRowLevelTTL implements the TableDescriptor interface.
-func (desc *wrapper) GetRowLevelTTL() *descpb.TableDescriptor_RowLevelTTL {
-	return desc.RowLevelTTL
-}
-
-// GetExcludeDataFromBackup implements the TableDescriptor interface.
-func (desc *wrapper) GetExcludeDataFromBackup() bool {
-	return desc.ExcludeDataFromBackup
-}
-
 // GetMultiRegionEnumDependency returns true if the given table has an "implicit"
 // dependency on the multi-region enum. An implicit dependency exists for
 // REGIONAL BY TABLE table's which are homed in an explicit region
@@ -2463,7 +2424,7 @@ func (desc *wrapper) GetExcludeDataFromBackup() bool {
 func (desc *wrapper) GetMultiRegionEnumDependencyIfExists() bool {
 	if desc.IsLocalityRegionalByTable() {
 		regionName, _ := desc.GetRegionalByTableRegion()
-		return regionName != catpb.RegionName(tree.PrimaryRegionNotSpecifiedName)
+		return regionName != descpb.RegionName(tree.PrimaryRegionNotSpecifiedName)
 	}
 	return false
 }
@@ -2481,15 +2442,15 @@ func (desc *Mutable) SetTableLocalityRegionalByTable(region tree.Name) {
 }
 
 // LocalityConfigRegionalByTable returns a config for a REGIONAL BY TABLE table.
-func LocalityConfigRegionalByTable(region tree.Name) catpb.LocalityConfig {
-	l := &catpb.LocalityConfig_RegionalByTable_{
-		RegionalByTable: &catpb.LocalityConfig_RegionalByTable{},
+func LocalityConfigRegionalByTable(region tree.Name) descpb.TableDescriptor_LocalityConfig {
+	l := &descpb.TableDescriptor_LocalityConfig_RegionalByTable_{
+		RegionalByTable: &descpb.TableDescriptor_LocalityConfig_RegionalByTable{},
 	}
 	if region != tree.PrimaryRegionNotSpecifiedName {
-		regionName := catpb.RegionName(region)
+		regionName := descpb.RegionName(region)
 		l.RegionalByTable.Region = &regionName
 	}
-	return catpb.LocalityConfig{Locality: l}
+	return descpb.TableDescriptor_LocalityConfig{Locality: l}
 }
 
 // SetTableLocalityRegionalByRow sets the descriptor's locality config to
@@ -2504,13 +2465,13 @@ func (desc *Mutable) SetTableLocalityRegionalByRow(regionColName tree.Name) {
 }
 
 // LocalityConfigRegionalByRow returns a config for a REGIONAL BY ROW table.
-func LocalityConfigRegionalByRow(regionColName tree.Name) catpb.LocalityConfig {
-	rbr := &catpb.LocalityConfig_RegionalByRow{}
+func LocalityConfigRegionalByRow(regionColName tree.Name) descpb.TableDescriptor_LocalityConfig {
+	rbr := &descpb.TableDescriptor_LocalityConfig_RegionalByRow{}
 	if regionColName != tree.RegionalByRowRegionNotSpecifiedName {
-		rbr.As = (*string)(&regionColName)
+		rbr.As = proto.String(string(regionColName))
 	}
-	return catpb.LocalityConfig{
-		Locality: &catpb.LocalityConfig_RegionalByRow_{
+	return descpb.TableDescriptor_LocalityConfig{
+		Locality: &descpb.TableDescriptor_LocalityConfig_RegionalByRow_{
 			RegionalByRow: rbr,
 		},
 	}
@@ -2526,17 +2487,11 @@ func (desc *Mutable) SetTableLocalityGlobal() {
 	desc.LocalityConfig = &lc
 }
 
-// SetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
-// interface.
-func (desc *Mutable) SetDeclarativeSchemaChangerState(state *scpb.DescriptorState) {
-	desc.DeclarativeSchemaChangerState = state
-}
-
 // LocalityConfigGlobal returns a config for a GLOBAL table.
-func LocalityConfigGlobal() catpb.LocalityConfig {
-	return catpb.LocalityConfig{
-		Locality: &catpb.LocalityConfig_Global_{
-			Global: &catpb.LocalityConfig_Global{},
+func LocalityConfigGlobal() descpb.TableDescriptor_LocalityConfig {
+	return descpb.TableDescriptor_LocalityConfig{
+		Locality: &descpb.TableDescriptor_LocalityConfig_Global_{
+			Global: &descpb.TableDescriptor_LocalityConfig_Global{},
 		},
 	}
 }
@@ -2545,26 +2500,4 @@ func LocalityConfigGlobal() catpb.LocalityConfig {
 // given table.
 func PrimaryKeyIndexName(tableName string) string {
 	return tableName + "_pkey"
-}
-
-// UpdateColumnsDependedOnBy creates, updates or deletes a depended-on-by column
-// reference by ID.
-func (desc *Mutable) UpdateColumnsDependedOnBy(id descpb.ID, colIDs catalog.TableColSet) {
-	ref := descpb.TableDescriptor_Reference{
-		ID:        id,
-		ColumnIDs: colIDs.Ordered(),
-		ByID:      true,
-	}
-	for i := range desc.DependedOnBy {
-		by := &desc.DependedOnBy[i]
-		if by.ID == id {
-			if colIDs.Empty() {
-				desc.DependedOnBy = append(desc.DependedOnBy[:i], desc.DependedOnBy[i+1:]...)
-				return
-			}
-			*by = ref
-			return
-		}
-	}
-	desc.DependedOnBy = append(desc.DependedOnBy, ref)
 }

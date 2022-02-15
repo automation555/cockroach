@@ -12,15 +12,11 @@ package sql
 
 import (
 	"context"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -53,16 +49,6 @@ func (p *planner) AlterPrimaryKey(
 	alterPKNode tree.AlterTableAlterPrimaryKey,
 	alterPrimaryKeyLocalitySwap *alterPrimaryKeyLocalitySwap,
 ) error {
-	if err := paramparse.ValidateUniqueConstraintParams(
-		alterPKNode.StorageParams,
-		paramparse.UniqueConstraintParamContext{
-			IsPrimaryKey: true,
-			IsSharded:    alterPKNode.Sharded != nil,
-		},
-	); err != nil {
-		return err
-	}
-
 	if alterPrimaryKeyLocalitySwap != nil {
 		if err := p.checkNoRegionChangeUnderway(
 			ctx,
@@ -174,21 +160,17 @@ func (p *planner) AlterPrimaryKey(
 		return pgerror.Newf(pgcode.DuplicateRelation, "index with name %s already exists", alterPKNode.Name)
 	}
 	newPrimaryIndexDesc := &descpb.IndexDescriptor{
-		Name:              name,
-		Unique:            true,
-		CreatedExplicitly: true,
-		EncodingType:      descpb.PrimaryIndexEncoding,
-		Type:              descpb.IndexDescriptor_FORWARD,
-		Version:           descpb.PrimaryIndexWithStoredColumnsVersion,
-		ConstraintID:      tableDesc.GetNextConstraintID(),
-		CreatedAtNanos:    p.EvalContext().GetTxnTimestamp(time.Microsecond).UnixNano(),
+		Name:         name,
+		Unique:       true,
+		EncodingType: descpb.PrimaryIndexEncoding,
+		Type:         descpb.IndexDescriptor_FORWARD,
+		Version:      descpb.LatestNonPrimaryIndexDescriptorVersion,
 	}
-	tableDesc.NextConstraintID++
 
 	// If the new index is requested to be sharded, set up the index descriptor
 	// to be sharded, and add the new shard column if it is missing.
 	if alterPKNode.Sharded != nil {
-		shardCol, newColumns, err := setupShardedIndex(
+		shardCol, newColumns, newColumn, err := setupShardedIndex(
 			ctx,
 			p.EvalContext(),
 			&p.semaCtx,
@@ -197,20 +179,21 @@ func (p *planner) AlterPrimaryKey(
 			alterPKNode.Sharded.ShardBuckets,
 			tableDesc,
 			newPrimaryIndexDesc,
-			alterPKNode.StorageParams,
 			false, /* isNewTable */
 		)
 		if err != nil {
 			return err
 		}
 		alterPKNode.Columns = newColumns
-		if err := p.maybeSetupConstraintForShard(
-			ctx,
-			tableDesc,
-			shardCol,
-			newPrimaryIndexDesc.Sharded.ShardBuckets,
-		); err != nil {
-			return err
+		if newColumn {
+			if err := p.setupConstraintForShard(
+				ctx,
+				tableDesc,
+				shardCol,
+				newPrimaryIndexDesc.Sharded.ShardBuckets,
+			); err != nil {
+				return err
+			}
 		}
 		telemetry.Inc(sqltelemetry.HashShardedIndexCounter)
 	}
@@ -241,8 +224,7 @@ func (p *planner) AlterPrimaryKey(
 	if err := tableDesc.AddIndexMutation(newPrimaryIndexDesc, descpb.DescriptorMutation_ADD); err != nil {
 		return err
 	}
-	version := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
-	if err := tableDesc.AllocateIDs(ctx, version); err != nil {
+	if err := tableDesc.AllocateIDs(ctx); err != nil {
 		return err
 	}
 
@@ -259,15 +241,15 @@ func (p *planner) AlterPrimaryKey(
 	if alterPrimaryKeyLocalitySwap != nil {
 		localityConfigSwap := alterPrimaryKeyLocalitySwap.localityConfigSwap
 		switch to := localityConfigSwap.NewLocalityConfig.Locality.(type) {
-		case *catpb.LocalityConfig_RegionalByRow_:
+		case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
 			// Check we are migrating from a known locality.
 			switch localityConfigSwap.OldLocalityConfig.Locality.(type) {
-			case *catpb.LocalityConfig_RegionalByRow_:
+			case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
 				// We want to drop the old PARTITION ALL BY clause in this case for all
 				// the indexes if we were from a REGIONAL BY ROW.
 				dropPartitionAllBy = true
-			case *catpb.LocalityConfig_Global_,
-				*catpb.LocalityConfig_RegionalByTable_:
+			case *descpb.TableDescriptor_LocalityConfig_Global_,
+				*descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
 			default:
 				return errors.AssertionFailedf(
 					"unknown locality config swap: %T to %T",
@@ -298,8 +280,8 @@ func (p *planner) AlterPrimaryKey(
 					*alterPrimaryKeyLocalitySwap.newColumnName,
 				)
 			}
-		case *catpb.LocalityConfig_Global_,
-			*catpb.LocalityConfig_RegionalByTable_:
+		case *descpb.TableDescriptor_LocalityConfig_Global_,
+			*descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
 			// We should only migrating from a REGIONAL BY ROW.
 			if localityConfigSwap.OldLocalityConfig.GetRegionalByRow() == nil {
 				return errors.AssertionFailedf(
@@ -355,7 +337,7 @@ func (p *planner) AlterPrimaryKey(
 		newUniqueIdx.CompositeColumnIDs = nil
 		newUniqueIdx.KeyColumnIDs = nil
 		// Set correct version and encoding type.
-		newUniqueIdx.Version = descpb.PrimaryIndexWithStoredColumnsVersion
+		newUniqueIdx.Version = descpb.LatestNonPrimaryIndexDescriptorVersion
 		newUniqueIdx.EncodingType = descpb.SecondaryIndexEncoding
 		if err := addIndexMutationWithSpecificPrimaryKey(ctx, tableDesc, &newUniqueIdx, newPrimaryIndexDesc); err != nil {
 			return err
@@ -460,7 +442,7 @@ func (p *planner) AlterPrimaryKey(
 
 		// Drop any PARTITION ALL BY clause.
 		if dropPartitionAllBy {
-			tabledesc.UpdateIndexPartitioning(&newIndex, idx.Primary(), nil /* newImplicitCols */, catpb.PartitioningDescriptor{})
+			tabledesc.UpdateIndexPartitioning(&newIndex, idx.Primary(), nil /* newImplicitCols */, descpb.PartitioningDescriptor{})
 		}
 
 		// Create partitioning if we are newly adding a PARTITION BY ALL statement.
@@ -482,7 +464,7 @@ func (p *planner) AlterPrimaryKey(
 		}
 
 		newIndex.Name = tabledesc.GenerateUniqueName(basename, nameExists)
-		newIndex.Version = descpb.PrimaryIndexWithStoredColumnsVersion
+		newIndex.Version = descpb.LatestNonPrimaryIndexDescriptorVersion
 		newIndex.EncodingType = descpb.SecondaryIndexEncoding
 		if err := addIndexMutationWithSpecificPrimaryKey(ctx, tableDesc, &newIndex, newPrimaryIndexDesc); err != nil {
 			return err
@@ -490,28 +472,6 @@ func (p *planner) AlterPrimaryKey(
 
 		oldIndexIDs = append(oldIndexIDs, idx.GetID())
 		newIndexIDs = append(newIndexIDs, newIndex.ID)
-	}
-
-	// Determine if removing this index would lead to the uniqueness for a foreign
-	// key back reference, which will cause this swap operation to be blocked.
-	nonDropIndexes := tableDesc.NonDropIndexes()
-	remainingIndexes := make([]descpb.UniqueConstraint, 0, len(nonDropIndexes))
-	for i := range nonDropIndexes {
-		// We can't copy directly because of the interface conversion.
-		if nonDropIndexes[i].GetID() == tableDesc.GetPrimaryIndex().GetID() {
-			continue
-		}
-		remainingIndexes = append(remainingIndexes, nonDropIndexes[i])
-	}
-	remainingIndexes = append(remainingIndexes, newPrimaryIndexDesc)
-	err = p.tryRemoveFKBackReferences(
-		ctx,
-		tableDesc,
-		tableDesc.GetPrimaryIndex(),
-		tree.DropRestrict,
-		remainingIndexes)
-	if err != nil {
-		return err
 	}
 
 	swapArgs := &descpb.PrimaryKeySwap{
@@ -526,7 +486,7 @@ func (p *planner) AlterPrimaryKey(
 	}
 	tableDesc.AddPrimaryKeySwapMutation(swapArgs)
 
-	if err := descbuilder.ValidateSelf(tableDesc, version); err != nil {
+	if err := catalog.ValidateSelf(tableDesc); err != nil {
 		return err
 	}
 
@@ -580,7 +540,7 @@ func (p *planner) shouldCreateIndexes(
 
 	// Validate if sharding properties are the same.
 	if alterPKNode.Sharded != nil {
-		shardBuckets, err := tabledesc.EvalShardBucketCount(ctx, &p.semaCtx, p.EvalContext(), alterPKNode.Sharded.ShardBuckets, alterPKNode.StorageParams)
+		shardBuckets, err := tabledesc.EvalShardBucketCount(ctx, &p.semaCtx, p.EvalContext(), alterPKNode.Sharded.ShardBuckets)
 		if err != nil {
 			return true, err
 		}

@@ -165,6 +165,7 @@ func RandCreateTableWithColumnIndexNumberGenerator(
 		if unique {
 			defs = append(defs, &tree.UniqueConstraintTableDef{
 				IndexTableDef: indexDef,
+				ExplicitIndex: rng.Intn(2) == 0,
 			})
 		} else {
 			defs = append(defs, &indexDef)
@@ -395,7 +396,7 @@ func TestingMakePrimaryIndexKeyForTenant(
 		colIDToRowIndex.Set(index.GetKeyColumnID(i), i)
 	}
 
-	keyPrefix := rowenc.MakeIndexKeyPrefix(codec, desc.GetID(), index.GetID())
+	keyPrefix := rowenc.MakeIndexKeyPrefix(codec, desc, index.GetID())
 	key, _, err := rowenc.EncodeIndexKey(desc, index, colIDToRowIndex, datums, keyPrefix)
 	if err != nil {
 		return nil, err
