@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -58,11 +59,11 @@ func TestTraceAnalyzer(t *testing.T) {
 			UseDatabase: "test",
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
-					TestingSaveFlows: func(stmt string) func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execinfra.OpChains) error {
+					TestingSaveFlows: func(stmt string) func(map[roachpb.NodeID]*execinfrapb.FlowSpec, execinfra.OpChains) error {
 						if stmt != testStmt {
-							return func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execinfra.OpChains) error { return nil }
+							return func(map[roachpb.NodeID]*execinfrapb.FlowSpec, execinfra.OpChains) error { return nil }
 						}
-						return func(flows map[base.SQLInstanceID]*execinfrapb.FlowSpec, _ execinfra.OpChains) error {
+						return func(flows map[roachpb.NodeID]*execinfrapb.FlowSpec, _ execinfra.OpChains) error {
 							flowsMetadata := execstats.NewFlowsMetadata(flows)
 							analyzer := execstats.NewTraceAnalyzer(flowsMetadata)
 							analyzerChan <- analyzer
@@ -107,14 +108,12 @@ func TestTraceAnalyzer(t *testing.T) {
 	for _, vectorizeMode := range []sessiondatapb.VectorizeExecMode{sessiondatapb.VectorizeOff, sessiondatapb.VectorizeOn} {
 		execCtx, finishAndCollect := tracing.ContextWithRecordingSpan(ctx, execCfg.AmbientCtx.Tracer, t.Name())
 		defer finishAndCollect()
-		ie := execCfg.InternalExecutorFactory(ctx, &sessiondata.SessionData{
-			SessionData: sessiondatapb.SessionData{
-				VectorizeMode: vectorizeMode,
-			},
-			LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
-				DistSQLMode: sessiondatapb.DistSQLOn,
-			},
-		})
+		ie := execCfg.InternalExecutor
+		sd := sessiondata.NewSessionData()
+		sd.SessionData.VectorizeMode = vectorizeMode
+		sd.LocalOnlySessionData.DistSQLMode = sessiondatapb.DistSQLOn
+		ie.SetSessionData(sd)
+
 		_, err := ie.ExecEx(
 			execCtx,
 			t.Name(),

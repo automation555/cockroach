@@ -53,7 +53,7 @@ type SessionData struct {
 // Clone returns a clone of SessionData.
 func (s *SessionData) Clone() *SessionData {
 	var newCustomOptions map[string]string
-	if len(s.CustomOptions) > 0 {
+	if s.CustomOptions != nil {
 		newCustomOptions = make(map[string]string, len(s.CustomOptions))
 		for k, v := range s.CustomOptions {
 			newCustomOptions[k] = v
@@ -148,7 +148,7 @@ func (s *SessionData) GetDateStyle() pgdate.DateStyle {
 // SessionUser retrieves the session_user.
 // The SessionUser is the username that originally logged into the session.
 // If a user applies SET ROLE, the SessionUser remains the same whilst the
-// User() changes.
+// CurrentUser() changes.
 func (s *SessionData) SessionUser() security.SQLUsername {
 	if s.SessionUserProto == "" {
 		return s.User()
@@ -304,4 +304,13 @@ func (s *Stack) PopAll() {
 // Elems returns all elements in the Stack.
 func (s *Stack) Elems() []*SessionData {
 	return s.stack
+}
+
+// DefaultSessionData is a session data initialized with sessionVar initializer copied into new sessions.
+var DefaultSessionData SessionData
+
+// NewSessionData create a new session data with defaults populated.   See init in vars.go.
+func NewSessionData() *SessionData {
+	sd := DefaultSessionData
+	return &sd
 }

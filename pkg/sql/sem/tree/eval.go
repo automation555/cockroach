@@ -14,12 +14,13 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/big"
 	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/apd/v3"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -34,8 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -64,8 +63,7 @@ var (
 	ErrInt2OutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "integer out of range for type int2")
 	// ErrFloatOutOfRange is reported when float arithmetic overflows.
 	ErrFloatOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "float out of range")
-	// ErrDecOutOfRange is reported when decimal arithmetic overflows.
-	ErrDecOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "decimal out of range")
+	errDecOutOfRange   = pgerror.New(pgcode.NumericValueOutOfRange, "decimal out of range")
 	// errCharOutOfRange is reported when int cast to ASCII byte overflows.
 	errCharOutOfRange = pgerror.New(pgcode.NumericValueOutOfRange, "\"char\" out of range")
 
@@ -76,8 +74,8 @@ var (
 	// ErrShiftArgOutOfRange is reported when a shift argument is out of range.
 	ErrShiftArgOutOfRange = pgerror.New(pgcode.InvalidParameterValue, "shift argument out of range")
 
-	big10E6  = apd.NewBigInt(1e6)
-	big10E10 = apd.NewBigInt(1e10)
+	big10E6  = big.NewInt(1e6)
+	big10E10 = big.NewInt(1e10)
 )
 
 // NewCannotMixBitArraySizesError creates an error for the case when a bitwise
@@ -362,7 +360,7 @@ func PrependToMaybeNullArray(typ *types.T, left Datum, right Datum) (Datum, erro
 func initArrayElementConcatenation() {
 	for _, t := range types.Scalar {
 		typ := t
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
 			LeftType:     types.MakeArray(typ),
 			RightType:    typ,
 			ReturnType:   types.MakeArray(typ),
@@ -373,7 +371,7 @@ func initArrayElementConcatenation() {
 			Volatility: VolatilityImmutable,
 		})
 
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
 			LeftType:     typ,
 			RightType:    types.MakeArray(typ),
 			ReturnType:   types.MakeArray(typ),
@@ -454,7 +452,7 @@ func JSONExistsAny(_ *EvalContext, json DJSON, dArray *DArray) (*DBool, error) {
 func initArrayToArrayConcatenation() {
 	for _, t := range types.Scalar {
 		typ := t
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
 			LeftType:     types.MakeArray(typ),
 			RightType:    types.MakeArray(typ),
 			ReturnType:   types.MakeArray(typ),
@@ -471,7 +469,7 @@ func initArrayToArrayConcatenation() {
 // and nonarrayelement + string concatenation.
 func initNonArrayToNonArrayConcatenation() {
 	addConcat := func(leftType, rightType *types.T, volatility Volatility) {
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
+		BinOps[Concat] = append(BinOps[Concat], &BinOp{
 			LeftType:     leftType,
 			RightType:    rightType,
 			ReturnType:   types.String,
@@ -496,19 +494,19 @@ func initNonArrayToNonArrayConcatenation() {
 			Volatility: volatility,
 		})
 	}
-	fromTypeToVolatility := make(map[oid.Oid]Volatility)
-	ForEachCast(func(src, tgt oid.Oid) {
-		if tgt == oid.T_text {
-			fromTypeToVolatility[src] = castMap[src][tgt].volatility
+	fromTypeToVolatility := make(map[types.Family]Volatility)
+	for _, cast := range validCasts {
+		if cast.to == types.StringFamily {
+			fromTypeToVolatility[cast.from] = cast.volatility
 		}
-	})
+	}
 	// We allow tuple + string concatenation, as well as any scalar types.
 	for _, t := range append([]*types.T{types.AnyTuple}, types.Scalar...) {
 		// Do not re-add String+String or String+Bytes, as they already exist
 		// and have predefined correct behavior.
 		if t != types.String && t != types.Bytes {
-			addConcat(t, types.String, fromTypeToVolatility[t.Oid()])
-			addConcat(types.String, t, fromTypeToVolatility[t.Oid()])
+			addConcat(t, types.String, fromTypeToVolatility[t.Family()])
+			addConcat(types.String, t, fromTypeToVolatility[t.Family()])
 		}
 	}
 }
@@ -558,8 +556,8 @@ func GetJSONPath(j json.JSON, ary DArray) (json.JSON, error) {
 }
 
 // BinOps contains the binary operations indexed by operation type.
-var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
-	treebin.Bitand: {
+var BinOps = map[BinaryOperatorSymbol]binOpOverload{
+	Bitand: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -599,7 +597,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Bitor: {
+	Bitor: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -639,7 +637,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Bitxor: {
+	Bitxor: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -667,7 +665,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Plus: {
+	Plus: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -962,7 +960,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Minus: {
+	Minus: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1276,7 +1274,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Mult: {
+	Mult: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1420,7 +1418,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Div: {
+	Div: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1430,11 +1428,10 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 				if rInt == 0 {
 					return nil, ErrDivByZero
 				}
-				var div apd.Decimal
-				div.SetInt64(int64(rInt))
+				div := ctx.getTmpDec().SetInt64(int64(rInt))
 				dd := &DDecimal{}
 				dd.SetInt64(int64(MustBeDInt(left)))
-				_, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, &div)
+				_, err := DecimalCtx.Quo(&dd.Decimal, &dd.Decimal, div)
 				return dd, err
 			},
 			Volatility: VolatilityImmutable,
@@ -1530,7 +1527,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.FloorDiv: {
+	FloorDiv: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1610,7 +1607,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Mod: {
+	Mod: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1690,7 +1687,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Concat: {
+	Concat: {
 		&BinOp{
 			LeftType:   types.String,
 			RightType:  types.String,
@@ -1738,7 +1735,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 	},
 
 	// TODO(pmattis): Check that the shift is valid.
-	treebin.LShift: {
+	LShift: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1779,7 +1776,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.RShift: {
+	RShift: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1820,7 +1817,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.Pow: {
+	Pow: {
 		&BinOp{
 			LeftType:   types.Int,
 			RightType:  types.Int,
@@ -1883,7 +1880,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.JSONFetchVal: {
+	JSONFetchVal: {
 		&BinOp{
 			LeftType:   types.Jsonb,
 			RightType:  types.String,
@@ -1919,7 +1916,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.JSONFetchValPath: {
+	JSONFetchValPath: {
 		&BinOp{
 			LeftType:   types.Jsonb,
 			RightType:  types.MakeArray(types.String),
@@ -1938,7 +1935,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.JSONFetchText: {
+	JSONFetchText: {
 		&BinOp{
 			LeftType:   types.Jsonb,
 			RightType:  types.String,
@@ -1988,7 +1985,7 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		},
 	},
 
-	treebin.JSONFetchTextPath: {
+	JSONFetchTextPath: {
 		&BinOp{
 			LeftType:   types.Jsonb,
 			RightType:  types.MakeArray(types.String),
@@ -2057,10 +2054,10 @@ func (op *CmpOp) preferred() bool {
 }
 
 func cmpOpFixups(
-	cmpOps map[treecmp.ComparisonOperatorSymbol]cmpOpOverload,
-) map[treecmp.ComparisonOperatorSymbol]cmpOpOverload {
-	findVolatility := func(op treecmp.ComparisonOperatorSymbol, t *types.T) Volatility {
-		for _, impl := range cmpOps[treecmp.EQ] {
+	cmpOps map[ComparisonOperatorSymbol]cmpOpOverload,
+) map[ComparisonOperatorSymbol]cmpOpOverload {
+	findVolatility := func(op ComparisonOperatorSymbol, t *types.T) Volatility {
+		for _, impl := range cmpOps[EQ] {
 			o := impl.(*CmpOp)
 			if o.LeftType.Equivalent(t) && o.RightType.Equivalent(t) {
 				return o.Volatility
@@ -2071,31 +2068,31 @@ func cmpOpFixups(
 
 	// Array equality comparisons.
 	for _, t := range append(types.Scalar, types.AnyEnum) {
-		cmpOps[treecmp.EQ] = append(cmpOps[treecmp.EQ], &CmpOp{
+		cmpOps[EQ] = append(cmpOps[EQ], &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
 			Fn:         cmpOpScalarEQFn,
-			Volatility: findVolatility(treecmp.EQ, t),
+			Volatility: findVolatility(EQ, t),
 		})
-		cmpOps[treecmp.LE] = append(cmpOps[treecmp.LE], &CmpOp{
+		cmpOps[LE] = append(cmpOps[LE], &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
 			Fn:         cmpOpScalarLEFn,
-			Volatility: findVolatility(treecmp.LE, t),
+			Volatility: findVolatility(LE, t),
 		})
-		cmpOps[treecmp.LT] = append(cmpOps[treecmp.LT], &CmpOp{
+		cmpOps[LT] = append(cmpOps[LT], &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
 			Fn:         cmpOpScalarLTFn,
-			Volatility: findVolatility(treecmp.LT, t),
+			Volatility: findVolatility(LT, t),
 		})
 
-		cmpOps[treecmp.IsNotDistinctFrom] = append(cmpOps[treecmp.IsNotDistinctFrom], &CmpOp{
+		cmpOps[IsNotDistinctFrom] = append(cmpOps[IsNotDistinctFrom], &CmpOp{
 			LeftType:     types.MakeArray(t),
 			RightType:    types.MakeArray(t),
 			Fn:           cmpOpScalarIsFn,
 			NullableArgs: true,
-			Volatility:   findVolatility(treecmp.IsNotDistinctFrom, t),
+			Volatility:   findVolatility(IsNotDistinctFrom, t),
 		})
 	}
 
@@ -2152,8 +2149,8 @@ func makeIsFn(a, b *types.T, v Volatility) *CmpOp {
 }
 
 // CmpOps contains the comparison operations indexed by operation type.
-var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
-	treecmp.EQ: {
+var CmpOps = cmpOpFixups(map[ComparisonOperatorSymbol]cmpOpOverload{
+	EQ: {
 		// Single-type comparisons.
 		makeEqFn(types.AnyEnum, types.AnyEnum, VolatilityImmutable),
 		makeEqFn(types.Bool, types.Bool, VolatilityLeakProof),
@@ -2204,13 +2201,13 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			LeftType:  types.AnyTuple,
 			RightType: types.AnyTuple,
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), treecmp.MakeComparisonOperator(treecmp.EQ)), nil
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), MakeComparisonOperator(EQ)), nil
 			},
 			Volatility: VolatilityImmutable,
 		},
 	},
 
-	treecmp.LT: {
+	LT: {
 		// Single-type comparisons.
 		makeLtFn(types.AnyEnum, types.AnyEnum, VolatilityImmutable),
 		makeLtFn(types.Bool, types.Bool, VolatilityLeakProof),
@@ -2260,13 +2257,13 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			LeftType:  types.AnyTuple,
 			RightType: types.AnyTuple,
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), treecmp.MakeComparisonOperator(treecmp.LT)), nil
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), MakeComparisonOperator(LT)), nil
 			},
 			Volatility: VolatilityImmutable,
 		},
 	},
 
-	treecmp.LE: {
+	LE: {
 		// Single-type comparisons.
 		makeLeFn(types.AnyEnum, types.AnyEnum, VolatilityImmutable),
 		makeLeFn(types.Bool, types.Bool, VolatilityLeakProof),
@@ -2316,13 +2313,13 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			LeftType:  types.AnyTuple,
 			RightType: types.AnyTuple,
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
-				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), treecmp.MakeComparisonOperator(treecmp.LE)), nil
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), MakeComparisonOperator(LE)), nil
 			},
 			Volatility: VolatilityImmutable,
 		},
 	},
 
-	treecmp.IsNotDistinctFrom: {
+	IsNotDistinctFrom: {
 		&CmpOp{
 			LeftType:     types.Unknown,
 			RightType:    types.Unknown,
@@ -2393,13 +2390,13 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 				if left == DNull || right == DNull {
 					return MakeDBool(left == DNull && right == DNull), nil
 				}
-				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom)), nil
+				return cmpOpTupleFn(ctx, *left.(*DTuple), *right.(*DTuple), MakeComparisonOperator(IsNotDistinctFrom)), nil
 			},
 			Volatility: VolatilityImmutable,
 		},
 	},
 
-	treecmp.In: {
+	In: {
 		makeEvalTupleIn(types.AnyEnum, VolatilityLeakProof),
 		makeEvalTupleIn(types.Bool, VolatilityLeakProof),
 		makeEvalTupleIn(types.Bytes, VolatilityLeakProof),
@@ -2425,7 +2422,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		makeEvalTupleIn(types.VarBit, VolatilityLeakProof),
 	},
 
-	treecmp.Like: {
+	Like: {
 		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
@@ -2436,7 +2433,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.ILike: {
+	ILike: {
 		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
@@ -2447,7 +2444,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.SimilarTo: {
+	SimilarTo: {
 		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
@@ -2459,7 +2456,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.RegMatch: append(
+	RegMatch: append(
 		cmpOpOverload{
 			&CmpOp{
 				LeftType:  types.String,
@@ -2478,7 +2475,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		)...,
 	),
 
-	treecmp.RegIMatch: {
+	RegIMatch: {
 		&CmpOp{
 			LeftType:  types.String,
 			RightType: types.String,
@@ -2490,7 +2487,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.JSONExists: {
+	JSONExists: {
 		&CmpOp{
 			LeftType:  types.Jsonb,
 			RightType: types.String,
@@ -2508,7 +2505,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.JSONSomeExists: {
+	JSONSomeExists: {
 		&CmpOp{
 			LeftType:  types.Jsonb,
 			RightType: types.StringArray,
@@ -2519,7 +2516,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.JSONAllExists: {
+	JSONAllExists: {
 		&CmpOp{
 			LeftType:  types.Jsonb,
 			RightType: types.StringArray,
@@ -2543,7 +2540,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.Contains: {
+	Contains: {
 		&CmpOp{
 			LeftType:  types.AnyArray,
 			RightType: types.AnyArray,
@@ -2568,7 +2565,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		},
 	},
 
-	treecmp.ContainedBy: {
+	ContainedBy: {
 		&CmpOp{
 			LeftType:  types.AnyArray,
 			RightType: types.AnyArray,
@@ -2592,7 +2589,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			Volatility: VolatilityImmutable,
 		},
 	},
-	treecmp.Overlaps: append(
+	Overlaps: append(
 		cmpOpOverload{
 			&CmpOp{
 				LeftType:  types.AnyArray,
@@ -2640,7 +2637,6 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 const experimentalBox2DClusterSettingName = "sql.spatial.experimental_box2d_comparison_operators.enabled"
 
 var experimentalBox2DClusterSetting = settings.RegisterBoolSetting(
-	settings.TenantWritable,
 	experimentalBox2DClusterSettingName,
 	"enables the use of certain experimental box2d comparison operators",
 	false,
@@ -2727,12 +2723,13 @@ func makeBox2DComparisonOperators(op func(lhs, rhs *geo.CartesianBoundingBox) bo
 
 // This map contains the inverses for operators in the CmpOps map that have
 // inverses.
-var cmpOpsInverse map[treecmp.ComparisonOperatorSymbol]treecmp.ComparisonOperatorSymbol
+var cmpOpsInverse map[ComparisonOperatorSymbol]ComparisonOperatorSymbol
 
 func init() {
-	cmpOpsInverse = make(map[treecmp.ComparisonOperatorSymbol]treecmp.ComparisonOperatorSymbol)
-	for cmpOp := treecmp.ComparisonOperatorSymbol(0); cmpOp < treecmp.NumComparisonOperatorSymbols; cmpOp++ {
-		newOp, _, _, _, _ := FoldComparisonExpr(treecmp.MakeComparisonOperator(cmpOp), DNull, DNull)
+	cmpOpsInverse = make(map[ComparisonOperatorSymbol]ComparisonOperatorSymbol)
+	for cmpOpIdx := range comparisonOpName {
+		cmpOp := ComparisonOperatorSymbol(cmpOpIdx)
+		newOp, _, _, _, _ := FoldComparisonExpr(MakeComparisonOperator(cmpOp), DNull, DNull)
 		if newOp.Symbol != cmpOp {
 			cmpOpsInverse[newOp.Symbol] = cmpOp
 			cmpOpsInverse[cmpOp] = newOp.Symbol
@@ -2740,33 +2737,26 @@ func init() {
 	}
 }
 
-// CmpOpInverse returns the inverse of the comparison operator if it exists. The
-// second return value is true if it exists, and false otherwise.
-func CmpOpInverse(i treecmp.ComparisonOperatorSymbol) (treecmp.ComparisonOperatorSymbol, bool) {
-	inverse, ok := cmpOpsInverse[i]
-	return inverse, ok
-}
-
-func boolFromCmp(cmp int, op treecmp.ComparisonOperator) *DBool {
+func boolFromCmp(cmp int, op ComparisonOperator) *DBool {
 	switch op.Symbol {
-	case treecmp.EQ, treecmp.IsNotDistinctFrom:
+	case EQ, IsNotDistinctFrom:
 		return MakeDBool(cmp == 0)
-	case treecmp.LT:
+	case LT:
 		return MakeDBool(cmp < 0)
-	case treecmp.LE:
+	case LE:
 		return MakeDBool(cmp <= 0)
 	default:
 		panic(errors.AssertionFailedf("unexpected ComparisonOperator in boolFromCmp: %v", errors.Safe(op)))
 	}
 }
 
-func cmpOpScalarFn(ctx *EvalContext, left, right Datum, op treecmp.ComparisonOperator) Datum {
+func cmpOpScalarFn(ctx *EvalContext, left, right Datum, op ComparisonOperator) Datum {
 	// Before deferring to the Datum.Compare method, check for values that should
 	// be handled differently during SQL comparison evaluation than they should when
 	// ordering Datum values.
 	if left == DNull || right == DNull {
 		switch op.Symbol {
-		case treecmp.IsNotDistinctFrom:
+		case IsNotDistinctFrom:
 			return MakeDBool((left == DNull) == (right == DNull))
 
 		default:
@@ -2779,19 +2769,19 @@ func cmpOpScalarFn(ctx *EvalContext, left, right Datum, op treecmp.ComparisonOpe
 }
 
 func cmpOpScalarEQFn(ctx *EvalContext, left, right Datum) (Datum, error) {
-	return cmpOpScalarFn(ctx, left, right, treecmp.MakeComparisonOperator(treecmp.EQ)), nil
+	return cmpOpScalarFn(ctx, left, right, MakeComparisonOperator(EQ)), nil
 }
 func cmpOpScalarLTFn(ctx *EvalContext, left, right Datum) (Datum, error) {
-	return cmpOpScalarFn(ctx, left, right, treecmp.MakeComparisonOperator(treecmp.LT)), nil
+	return cmpOpScalarFn(ctx, left, right, MakeComparisonOperator(LT)), nil
 }
 func cmpOpScalarLEFn(ctx *EvalContext, left, right Datum) (Datum, error) {
-	return cmpOpScalarFn(ctx, left, right, treecmp.MakeComparisonOperator(treecmp.LE)), nil
+	return cmpOpScalarFn(ctx, left, right, MakeComparisonOperator(LE)), nil
 }
 func cmpOpScalarIsFn(ctx *EvalContext, left, right Datum) (Datum, error) {
-	return cmpOpScalarFn(ctx, left, right, treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom)), nil
+	return cmpOpScalarFn(ctx, left, right, MakeComparisonOperator(IsNotDistinctFrom)), nil
 }
 
-func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op treecmp.ComparisonOperator) Datum {
+func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op ComparisonOperator) Datum {
 	cmp := 0
 	sawNull := false
 	for i, leftElem := range left.D {
@@ -2800,7 +2790,7 @@ func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op treecmp.ComparisonOpe
 		// differently than when ordering Datums.
 		if leftElem == DNull || rightElem == DNull {
 			switch op.Symbol {
-			case treecmp.EQ:
+			case EQ:
 				// If either Datum is NULL and the op is EQ, we continue the
 				// comparison and the result is only NULL if the other (non-NULL)
 				// elements are equal. This is because NULL is thought of as "unknown",
@@ -2808,7 +2798,7 @@ func cmpOpTupleFn(ctx *EvalContext, left, right DTuple, op treecmp.ComparisonOpe
 				// being proven false, but does prevent it from being proven true.
 				sawNull = true
 
-			case treecmp.IsNotDistinctFrom:
+			case IsNotDistinctFrom:
 				// For IS NOT DISTINCT FROM, NULLs are "equal".
 				if leftElem != DNull || rightElem != DNull {
 					return DBoolFalse
@@ -2887,7 +2877,7 @@ func makeEvalTupleIn(typ *types.T, v Volatility) *CmpOp {
 						sawNull = true
 					} else {
 						// Use the EQ function which properly handles NULLs.
-						if res := cmpOpTupleFn(ctx, *argTuple, *val.(*DTuple), treecmp.MakeComparisonOperator(treecmp.EQ)); res == DNull {
+						if res := cmpOpTupleFn(ctx, *argTuple, *val.(*DTuple), MakeComparisonOperator(EQ)); res == DNull {
 							sawNull = true
 						} else if res == DBoolTrue {
 							return DBoolTrue, nil
@@ -2920,9 +2910,9 @@ func makeEvalTupleIn(typ *types.T, v Volatility) *CmpOp {
 // evalArrayCmp would be called with:
 //   evalDatumsCmp(ctx, LT, Any, CmpOp(LT, leftType, rightParamType), leftDatum, rightArray.Array).
 func evalDatumsCmp(
-	ctx *EvalContext, op, subOp treecmp.ComparisonOperator, fn *CmpOp, left Datum, right Datums,
+	ctx *EvalContext, op, subOp ComparisonOperator, fn *CmpOp, left Datum, right Datums,
 ) (Datum, error) {
-	all := op.Symbol == treecmp.All
+	all := op.Symbol == All
 	any := !all
 	sawNull := false
 	for _, elem := range right {
@@ -3085,18 +3075,6 @@ type DatabaseRegionConfig interface {
 	PrimaryRegionString() string
 }
 
-// HasAnyPrivilegeResult represents the non-error results of calling HasAnyPrivilege
-type HasAnyPrivilegeResult = int8
-
-const (
-	// HasPrivilege means at least one of the specified privileges is granted.
-	HasPrivilege HasAnyPrivilegeResult = 1
-	// HasNoPrivilege means no privileges are granted.
-	HasNoPrivilege HasAnyPrivilegeResult = 0
-	// ObjectNotFound means the object that privileges are being checked on was not found.
-	ObjectNotFound HasAnyPrivilegeResult = -1
-)
-
 // EvalDatabase consists of functions that reference the session database
 // and is to be used from EvalContext.
 type EvalDatabase interface {
@@ -3129,37 +3107,24 @@ type EvalDatabase interface {
 		ctx context.Context, curDB string, searchPath sessiondata.SearchPath, typeID oid.Oid,
 	) (isVisible bool, exists bool, err error)
 
-	// HasAnyPrivilege returns whether the current user has privilege to access
+	// HasPrivilege returns whether the current user has privilege to access
 	// the given object.
-	HasAnyPrivilege(ctx context.Context, specifier HasPrivilegeSpecifier, user security.SQLUsername, privs []privilege.Privilege) (HasAnyPrivilegeResult, error)
+	HasPrivilege(
+		ctx context.Context,
+		specifier HasPrivilegeSpecifier,
+		user security.SQLUsername,
+		kind privilege.Kind,
+	) (bool, error)
 }
 
 // HasPrivilegeSpecifier specifies an object to lookup privilege for.
-// Only one of { DatabaseName, DatabaseOID, SchemaName, TableName, TableOID } is filled.
 type HasPrivilegeSpecifier struct {
-
-	// Database privilege
-	DatabaseName *string
-	DatabaseOID  *oid.Oid
-
-	// Schema privilege
-	// Schema OID must be converted to name before using HasPrivilegeSpecifier.
-	SchemaName *string
-	// SchemaDatabaseName is required when SchemaName is used.
-	SchemaDatabaseName *string
-	// Because schemas cannot be looked up by OID directly,
-	// this controls whether the result is nil (originally queried by OID) or an error (originally queried by name).
-	SchemaIsRequired *bool
-
-	// Table privilege
+	// Only one of these is filled.
 	TableName *string
 	TableOID  *oid.Oid
-	// Sequences are stored internally as a table.
-	IsSequence *bool
 
-	// Column privilege
-	// Requires TableName or TableOID.
-	// Only one of ColumnName, ColumnAttNum is filled.
+	// Only one of these is filled.
+	// Only used if TableName or TableOID is specified.
 	ColumnName   *Name
 	ColumnAttNum *uint32
 }
@@ -3193,9 +3158,6 @@ type TypeResolver interface {
 type EvalPlanner interface {
 	EvalDatabase
 	TypeResolver
-
-	// ExecutorConfig returns *ExecutorConfig
-	ExecutorConfig() interface{}
 
 	// GetImmutableTableInterfaceByID returns an interface{} with
 	// catalog.TableDescriptor to avoid a circular dependency.
@@ -3250,10 +3212,6 @@ type EvalPlanner interface {
 	// the `system.users` table
 	UserHasAdminRole(ctx context.Context, user security.SQLUsername) (bool, error)
 
-	// CheckCanBecomeUser returns an error if the SessionUser cannot become the
-	// becomeUser.
-	CheckCanBecomeUser(ctx context.Context, becomeUser security.SQLUsername) error
-
 	// MemberOfWithAdminOption is used to collect a list of roles (direct and
 	// indirect) that the member is part of. See the comment on the planner
 	// implementation in authorization.go
@@ -3270,34 +3228,6 @@ type EvalPlanner interface {
 
 	// DecodeGist exposes gist functionality to the builtin functions.
 	DecodeGist(gist string) ([]string, error)
-
-	// CreateSessionRevivalToken creates a token that can be used to log in
-	// as the current user, in bytes form.
-	CreateSessionRevivalToken() (*DBytes, error)
-
-	// ValidateSessionRevivalToken checks if the given bytes are a valid
-	// session revival token.
-	ValidateSessionRevivalToken(token *DBytes) (*DBool, error)
-
-	// RevalidateUniqueConstraintsInCurrentDB verifies that all unique constraints
-	// defined on tables in the current database are valid. In other words, it
-	// verifies that for every table in the database with one or more unique
-	// constraints, all rows in the table have unique values for every unique
-	// constraint defined on the table.
-	RevalidateUniqueConstraintsInCurrentDB(ctx context.Context) error
-
-	// RevalidateUniqueConstraintsInTable verifies that all unique constraints
-	// defined on the given table are valid. In other words, it verifies that all
-	// rows in the table have unique values for every unique constraint defined on
-	// the table.
-	RevalidateUniqueConstraintsInTable(ctx context.Context, tableID int) error
-
-	// RevalidateUniqueConstraint verifies that the given unique constraint on the
-	// given table is valid. In other words, it verifies that all rows in the
-	// table have unique values for the columns in the constraint. Returns an
-	// error if validation fails or if constraintName is not actually a unique
-	// constraint on the table.
-	RevalidateUniqueConstraint(ctx context.Context, tableID int, constraintName string) error
 
 	// QueryRowEx executes the supplied SQL statement and returns a single row, or
 	// nil if no row is found, or an error if more that one row is returned.
@@ -3402,6 +3332,14 @@ type ClientNoticeSender interface {
 	BufferClientNotice(ctx context.Context, notice pgnotice.Notice)
 }
 
+// ExecConfigAccessor is a limited interface to access ExecutorConfig's states.
+// It is defined independently to prevent a circular dependency on sql, tree and sqlbase.
+type ExecConfigAccessor interface {
+
+	// JobRegistry returns jobs.Registry from ExecutorConfig
+	JobRegistry() interface{}
+}
+
 // PrivilegedAccessor gives access to certain queries that would otherwise
 // require someone with RootUser access to query a given data source.
 // It is defined independently to prevent a circular dependency on sql, tree and sqlbase.
@@ -3411,7 +3349,7 @@ type PrivilegedAccessor interface {
 	// Returns the id, a bool representing whether the namespace exists, and an error
 	// if there is one.
 	LookupNamespaceID(
-		ctx context.Context, parentID int64, parentSchemaID int64, name string,
+		ctx context.Context, parentID int64, name string,
 	) (DInt, bool, error)
 
 	// LookupZoneConfigByNamespaceID returns the zone config given a namespace id.
@@ -3481,9 +3419,8 @@ type TenantOperator interface {
 	CreateTenant(ctx context.Context, tenantID uint64) error
 
 	// DestroyTenant attempts to uninstall an existing tenant from the system.
-	// It returns an error if the tenant does not exist. If synchronous is true
-	// the gc job will not wait for a GC ttl.
-	DestroyTenant(ctx context.Context, tenantID uint64, synchronous bool) error
+	// It returns an error if the tenant does not exist.
+	DestroyTenant(ctx context.Context, tenantID uint64) error
 
 	// GCTenant attempts to garbage collect a DROP tenant from the system. Upon
 	// success it also removes the tenant record.
@@ -3642,10 +3579,9 @@ type EvalContext struct {
 	// Context holds the context in which the expression is evaluated.
 	Context context.Context
 
-	Planner EvalPlanner
+	ExecConfigAccessor ExecConfigAccessor
 
-	// Not using sql.JobExecContext type to avoid cycle dependency with sql package
-	JobExecContext interface{}
+	Planner EvalPlanner
 
 	PrivilegedAccessor PrivilegedAccessor
 
@@ -3670,6 +3606,7 @@ type EvalContext struct {
 	DB *kv.DB
 
 	ReCache *RegexpCache
+	tmpDec  apd.Decimal
 
 	// TODO(mjibson): remove prepareOnly in favor of a 2-step prepare-exec solution
 	// that is also able to save the plan to skip work during the exec step.
@@ -3727,7 +3664,7 @@ func MakeTestingEvalContextWithMon(st *cluster.Settings, monitor *mon.BytesMonit
 	ctx := EvalContext{
 		Codec:            keys.SystemSQLCodec,
 		Txn:              &kv.Txn{},
-		SessionDataStack: sessiondata.NewStack(&sessiondata.SessionData{}),
+		SessionDataStack: sessiondata.NewStack(sessiondata.NewSessionData()),
 		Settings:         st,
 		NodeID:           base.TestingIDContainer,
 	}
@@ -3840,7 +3777,7 @@ func TimestampToDecimal(ts hlc.Timestamp) apd.Decimal {
 	val := &res.Coeff
 	val.SetInt64(ts.WallTime)
 	val.Mul(val, big10E10)
-	val.Add(val, apd.NewBigInt(int64(ts.Logical)))
+	val.Add(val, big.NewInt(int64(ts.Logical)))
 
 	// val must be positive. If it was set to a negative value above,
 	// transfer the sign to res.Negative.
@@ -3865,7 +3802,7 @@ func DecimalToInexactDTimestampTZ(d *DDecimal) (*DTimestampTZ, error) {
 }
 
 func decimalToHLC(d *DDecimal) (hlc.Timestamp, error) {
-	var coef apd.BigInt
+	var coef big.Int
 	coef.Set(&d.Decimal.Coeff)
 	// The physical portion of the HLC is stored shifted up by 10^10, so shift
 	// it down and clear out the logical component.
@@ -3998,6 +3935,10 @@ func (ctx *EvalContext) Ctx() context.Context {
 	return ctx.Context
 }
 
+func (ctx *EvalContext) getTmpDec() *apd.Decimal {
+	return &ctx.tmpDec
+}
+
 // Eval implements the TypedExpr interface.
 func (expr *AndExpr) Eval(ctx *EvalContext) (Datum, error) {
 	left, err := expr.Left.(TypedExpr).Eval(ctx)
@@ -4071,7 +4012,7 @@ func (expr *CaseExpr) Eval(ctx *EvalContext) (Datum, error) {
 			if err != nil {
 				return nil, err
 			}
-			d, err := evalComparison(ctx, treecmp.MakeComparisonOperator(treecmp.EQ), val, arg)
+			d, err := evalComparison(ctx, MakeComparisonOperator(EQ), val, arg)
 			if err != nil {
 				return nil, err
 			}
@@ -4470,7 +4411,7 @@ func (expr *NullIfExpr) Eval(ctx *EvalContext) (Datum, error) {
 	if err != nil {
 		return nil, err
 	}
-	cond, err := evalComparison(ctx, treecmp.MakeComparisonOperator(treecmp.EQ), expr1, expr2)
+	cond, err := evalComparison(ctx, MakeComparisonOperator(EQ), expr1, expr2)
 	if err != nil {
 		return nil, err
 	}
@@ -4761,11 +4702,6 @@ func (t *DArray) Eval(_ *EvalContext) (Datum, error) {
 }
 
 // Eval implements the TypedExpr interface.
-func (t *DVoid) Eval(_ *EvalContext) (Datum, error) {
-	return t, nil
-}
-
-// Eval implements the TypedExpr interface.
 func (t *DOid) Eval(_ *EvalContext) (Datum, error) {
 	return t, nil
 }
@@ -4812,9 +4748,7 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 	return e.Eval(ctx)
 }
 
-func evalComparison(
-	ctx *EvalContext, op treecmp.ComparisonOperator, left, right Datum,
-) (Datum, error) {
+func evalComparison(ctx *EvalContext, op ComparisonOperator, left, right Datum) (Datum, error) {
 	if left == DNull || right == DNull {
 		return DNull, nil
 	}
@@ -4832,41 +4766,41 @@ func evalComparison(
 // this new operation, along with potentially flipped operands and "flipped"
 // and "not" flags.
 func FoldComparisonExpr(
-	op treecmp.ComparisonOperator, left, right Expr,
-) (newOp treecmp.ComparisonOperator, newLeft Expr, newRight Expr, flipped bool, not bool) {
+	op ComparisonOperator, left, right Expr,
+) (newOp ComparisonOperator, newLeft Expr, newRight Expr, flipped bool, not bool) {
 	switch op.Symbol {
-	case treecmp.NE:
+	case NE:
 		// NE(left, right) is implemented as !EQ(left, right).
-		return treecmp.MakeComparisonOperator(treecmp.EQ), left, right, false, true
-	case treecmp.GT:
+		return MakeComparisonOperator(EQ), left, right, false, true
+	case GT:
 		// GT(left, right) is implemented as LT(right, left)
-		return treecmp.MakeComparisonOperator(treecmp.LT), right, left, true, false
-	case treecmp.GE:
+		return MakeComparisonOperator(LT), right, left, true, false
+	case GE:
 		// GE(left, right) is implemented as LE(right, left)
-		return treecmp.MakeComparisonOperator(treecmp.LE), right, left, true, false
-	case treecmp.NotIn:
+		return MakeComparisonOperator(LE), right, left, true, false
+	case NotIn:
 		// NotIn(left, right) is implemented as !IN(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.In), left, right, false, true
-	case treecmp.NotLike:
+		return MakeComparisonOperator(In), left, right, false, true
+	case NotLike:
 		// NotLike(left, right) is implemented as !Like(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.Like), left, right, false, true
-	case treecmp.NotILike:
+		return MakeComparisonOperator(Like), left, right, false, true
+	case NotILike:
 		// NotILike(left, right) is implemented as !ILike(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.ILike), left, right, false, true
-	case treecmp.NotSimilarTo:
+		return MakeComparisonOperator(ILike), left, right, false, true
+	case NotSimilarTo:
 		// NotSimilarTo(left, right) is implemented as !SimilarTo(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.SimilarTo), left, right, false, true
-	case treecmp.NotRegMatch:
+		return MakeComparisonOperator(SimilarTo), left, right, false, true
+	case NotRegMatch:
 		// NotRegMatch(left, right) is implemented as !RegMatch(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.RegMatch), left, right, false, true
-	case treecmp.NotRegIMatch:
+		return MakeComparisonOperator(RegMatch), left, right, false, true
+	case NotRegIMatch:
 		// NotRegIMatch(left, right) is implemented as !RegIMatch(left, right)
-		return treecmp.MakeComparisonOperator(treecmp.RegIMatch), left, right, false, true
-	case treecmp.IsDistinctFrom:
+		return MakeComparisonOperator(RegIMatch), left, right, false, true
+	case IsDistinctFrom:
 		// IsDistinctFrom(left, right) is implemented as !IsNotDistinctFrom(left, right)
 		// Note: this seems backwards, but IS NOT DISTINCT FROM is an extended
 		// version of IS and IS DISTINCT FROM is an extended version of IS NOT.
-		return treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom), left, right, false, true
+		return MakeComparisonOperator(IsNotDistinctFrom), left, right, false, true
 	}
 	return op, left, right, false, false
 }
@@ -5047,13 +4981,6 @@ type likeKey struct {
 	s               string
 	caseInsensitive bool
 	escape          rune
-}
-
-// LikeEscape converts a like pattern to a regexp pattern.
-func LikeEscape(pattern string) (string, error) {
-	key := likeKey{s: pattern, caseInsensitive: false, escape: '\\'}
-	re, err := key.patternNoAnchor()
-	return re, err
 }
 
 // unescapePattern unescapes a pattern for a given escape token.
@@ -5415,7 +5342,11 @@ func calculateLengthAfterReplacingCustomEscape(s string, escape rune) (bool, int
 	return changed, retLen, nil
 }
 
-func (k likeKey) patternNoAnchor() (string, error) {
+// Pattern implements the RegexpCacheKey interface.
+// The strategy for handling custom escape character
+// is to convert all unescaped escape character into '\'.
+// k.escape can either be empty or a single character.
+func (k likeKey) Pattern() (string, error) {
 	// QuoteMeta escapes all regexp metacharacters (`\.+*?()|[]{}^$`) with a `\`.
 	pattern := regexp.QuoteMeta(k.s)
 	var err error
@@ -5492,18 +5423,6 @@ func (k likeKey) patternNoAnchor() (string, error) {
 		}
 	}
 
-	return pattern, nil
-}
-
-// Pattern implements the RegexpCacheKey interface.
-// The strategy for handling custom escape character
-// is to convert all unescaped escape character into '\'.
-// k.escape can either be empty or a single character.
-func (k likeKey) Pattern() (string, error) {
-	pattern, err := k.patternNoAnchor()
-	if err != nil {
-		return "", err
-	}
 	return anchorPattern(pattern, k.caseInsensitive), nil
 }
 
@@ -5666,7 +5585,7 @@ func anchorPattern(pattern string, caseInsensitive bool) string {
 // FindEqualComparisonFunction looks up an overload of the "=" operator
 // for a given pair of input operand types.
 func FindEqualComparisonFunction(leftType, rightType *types.T) (TwoArgFn, bool) {
-	fn, found := CmpOps[treecmp.EQ].LookupImpl(leftType, rightType)
+	fn, found := CmpOps[EQ].LookupImpl(leftType, rightType)
 	if found {
 		return fn.Fn, true
 	}
@@ -5696,9 +5615,9 @@ func PickFromTuple(ctx *EvalContext, greatest bool, args Datums) (Datum, error) 
 		var eval Datum
 		var err error
 		if greatest {
-			eval, err = evalComparison(ctx, treecmp.MakeComparisonOperator(treecmp.LT), g, d)
+			eval, err = evalComparison(ctx, MakeComparisonOperator(LT), g, d)
 		} else {
-			eval, err = evalComparison(ctx, treecmp.MakeComparisonOperator(treecmp.LT), d, g)
+			eval, err = evalComparison(ctx, MakeComparisonOperator(LT), d, g)
 		}
 		if err != nil {
 			return nil, err
