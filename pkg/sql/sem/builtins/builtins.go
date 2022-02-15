@@ -688,7 +688,7 @@ var builtins = map[string]builtinDefinition{
 				s := string(tree.MustBeDString(args[0]))
 				uv, err := uuid.FromString(s)
 				if err != nil {
-					return nil, err
+					return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "invalid UUID")
 				}
 				return tree.NewDBytes(tree.DBytes(uv.GetBytes())), nil
 			},
@@ -758,7 +758,7 @@ var builtins = map[string]builtinDefinition{
 				s := tree.MustBeDString(args[0])
 				u, err := ulid.Parse(string(s))
 				if err != nil {
-					return nil, err
+					return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "invalid ULID")
 				}
 				b, err := u.MarshalBinary()
 				if err != nil {
@@ -3917,7 +3917,7 @@ value if you rely on the HLC for accuracy.`,
 			pbToJSON := func(typ string, data []byte, flags protoreflect.FmtFlags) (tree.Datum, error) {
 				msg, err := protoreflect.DecodeMessage(typ, data)
 				if err != nil {
-					return nil, err
+					return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "invalid protocol message")
 				}
 				j, err := protoreflect.MessageToJSON(msg, flags)
 				if err != nil {
@@ -3998,11 +3998,11 @@ value if you rely on the HLC for accuracy.`,
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				msg, err := protoreflect.NewMessage(string(tree.MustBeDString(args[0])))
 				if err != nil {
-					return nil, err
+					return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "invalid proto name")
 				}
 				data, err := protoreflect.JSONBMarshalToMessage(tree.MustBeDJSON(args[1]).JSON, msg)
 				if err != nil {
-					return nil, err
+					return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "invalid proto JSON")
 				}
 				return tree.NewDBytes(tree.DBytes(data)), nil
 			},
@@ -4448,7 +4448,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				if !isAdmin {
-					return nil, errInsufficientPriv
+					if err := checkPrivilegedUser(ctx); err != nil {
+						return nil, err
+					}
 				}
 
 				sp := tracing.SpanFromContext(ctx.Context)
@@ -4484,7 +4486,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				if !isAdmin {
-					return nil, errInsufficientPriv
+					if err := checkPrivilegedUser(ctx); err != nil {
+						return nil, err
+					}
 				}
 
 				traceID := tracingpb.TraceID(*(args[0].(*tree.DInt)))
@@ -4975,12 +4979,8 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"msg", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
-				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
 				}
 				s, ok := tree.AsDString(args[0])
 				if !ok {
@@ -5008,12 +5008,8 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"msg", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
-				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
 				}
 				s, ok := tree.AsDString(args[0])
 				if !ok {
@@ -5305,14 +5301,9 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"vmodule_string", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
 				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
-				}
-
 				s, ok := tree.AsDString(args[0])
 				if !ok {
 					return nil, errors.Newf("expected string value, got %T", args[0])
@@ -5337,13 +5328,8 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
-				// The user must be an admin to use this builtin.
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
-				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
 				}
 				return tree.NewDString(log.GetVModule()), nil
 			},
@@ -8891,6 +8877,13 @@ func CleanEncodingName(s string) string {
 var errInsufficientPriv = pgerror.New(
 	pgcode.InsufficientPrivilege, "insufficient privilege",
 )
+
+func checkPrivilegedUser(ctx *tree.EvalContext) error {
+	if !ctx.SessionData().User().IsRootUser() {
+		return errInsufficientPriv
+	}
+	return nil
+}
 
 // EvalFollowerReadOffset is a function used often with AS OF SYSTEM TIME queries
 // to determine the appropriate offset from now which is likely to be safe for
