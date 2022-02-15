@@ -48,8 +48,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
@@ -65,7 +65,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -4077,71 +4076,6 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: tree.VolatilityImmutable,
 		},
 	),
-	"crdb_internal.merge_statement_stats": makeBuiltin(arrayProps(),
-		tree.Overload{
-			Types:      tree.ArgTypes{{"input", types.JSONArray}},
-			ReturnType: tree.FixedReturnType(types.Jsonb),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				arr := tree.MustBeDArray(args[0])
-				var aggregatedStats roachpb.StatementStatistics
-				for _, statsDatum := range arr.Array {
-					if statsDatum == tree.DNull {
-						continue
-					}
-					var stats roachpb.StatementStatistics
-					statsJSON := tree.MustBeDJSON(statsDatum).JSON
-					if err := sqlstatsutil.DecodeStmtStatsStatisticsJSON(statsJSON, &stats); err != nil {
-						return nil, err
-					}
-
-					aggregatedStats.Add(&stats)
-				}
-
-				aggregatedJSON, err := sqlstatsutil.BuildStmtStatisticsJSON(&aggregatedStats)
-				if err != nil {
-					return nil, err
-				}
-
-				return tree.NewDJSON(aggregatedJSON), nil
-			},
-			Info:       "Merge an array of roachpb.StatementStatistics into a single JSONB object",
-			Volatility: tree.VolatilityImmutable,
-		},
-	),
-	"crdb_internal.merge_transaction_stats": makeBuiltin(arrayProps(),
-		tree.Overload{
-			Types:      tree.ArgTypes{{"input", types.JSONArray}},
-			ReturnType: tree.FixedReturnType(types.Jsonb),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				arr := tree.MustBeDArray(args[0])
-				var aggregatedStats roachpb.TransactionStatistics
-				for _, statsDatum := range arr.Array {
-					if statsDatum == tree.DNull {
-						continue
-					}
-					var stats roachpb.TransactionStatistics
-					statsJSON := tree.MustBeDJSON(statsDatum).JSON
-					if err := sqlstatsutil.DecodeTxnStatsStatisticsJSON(statsJSON, &stats); err != nil {
-						return nil, err
-					}
-
-					aggregatedStats.Add(&stats)
-				}
-
-				aggregatedJSON, err := sqlstatsutil.BuildTxnStatisticsJSON(
-					&roachpb.CollectedTransactionStatistics{
-						Stats: aggregatedStats,
-					})
-				if err != nil {
-					return nil, err
-				}
-
-				return tree.NewDJSON(aggregatedJSON), nil
-			},
-			Info:       "Merge an array of roachpb.TransactionStatistics into a single JSONB object",
-			Volatility: tree.VolatilityImmutable,
-		},
-	),
 
 	// Enum functions.
 	"enum_first": makeBuiltin(
@@ -4448,7 +4382,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				if !isAdmin {
-					return nil, errInsufficientPriv
+					if err := checkPrivilegedUser(ctx); err != nil {
+						return nil, err
+					}
 				}
 
 				sp := tracing.SpanFromContext(ctx.Context)
@@ -4484,7 +4420,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				if !isAdmin {
-					return nil, errInsufficientPriv
+					if err := checkPrivilegedUser(ctx); err != nil {
+						return nil, err
+					}
 				}
 
 				traceID := tracingpb.TraceID(*(args[0].(*tree.DInt)))
@@ -4755,11 +4693,14 @@ value if you rely on the HLC for accuracy.`,
 				}
 
 				// Get the referenced table and index.
-				tableDescI, err := ctx.Planner.GetImmutableTableInterfaceByID(ctx.Ctx(), tableID)
+				tableDescIntf, err := ctx.Planner.GetImmutableTableInterfaceByID(
+					ctx.Context,
+					tableID,
+				)
 				if err != nil {
 					return nil, err
 				}
-				tableDesc := tableDescI.(catalog.TableDescriptor)
+				tableDesc := tableDescIntf.(catalog.TableDescriptor)
 				index, err := tableDesc.FindIndexWithID(descpb.IndexID(indexID))
 				if err != nil {
 					return nil, err
@@ -4975,12 +4916,8 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"msg", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
-				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
 				}
 				s, ok := tree.AsDString(args[0])
 				if !ok {
@@ -5008,12 +4945,8 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"msg", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
-				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
 				}
 				s, ok := tree.AsDString(args[0])
 				if !ok {
@@ -5305,14 +5238,9 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"vmodule_string", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
 				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
-				}
-
 				s, ok := tree.AsDString(args[0])
 				if !ok {
 					return nil, errors.Newf("expected string value, got %T", args[0])
@@ -5337,13 +5265,8 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
-				// The user must be an admin to use this builtin.
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
-				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
 				}
 				return tree.NewDString(log.GetVModule()), nil
 			},
@@ -5373,11 +5296,8 @@ value if you rely on the HLC for accuracy.`,
 				tableID := int(tree.MustBeDInt(args[0]))
 				indexID := int(tree.MustBeDInt(args[1]))
 				g := tree.MustBeDGeography(args[2])
-				// TODO(postamar): give the tree.EvalContext a useful interface
-				// instead of cobbling a descs.Collection in this way.
-				cf := descs.NewBareBonesCollectionFactory(ctx.Settings, ctx.Codec)
-				descsCol := cf.MakeCollection(ctx.Context, descs.NewTemporarySchemaProvider(ctx.SessionDataStack))
-				tableDesc, err := descsCol.Direct().MustGetTableDescByID(ctx.Ctx(), ctx.Txn, descpb.ID(tableID))
+				// TODO(ajwerner): This should be able to use the normal lookup mechanisms.
+				tableDesc, err := catalogkv.MustGetTableDescByID(ctx.Context, ctx.Txn, ctx.Codec, descpb.ID(tableID))
 				if err != nil {
 					return nil, err
 				}
@@ -5411,11 +5331,7 @@ value if you rely on the HLC for accuracy.`,
 				tableID := int(tree.MustBeDInt(args[0]))
 				indexID := int(tree.MustBeDInt(args[1]))
 				g := tree.MustBeDGeometry(args[2])
-				// TODO(postamar): give the tree.EvalContext a useful interface
-				// instead of cobbling a descs.Collection in this way.
-				cf := descs.NewBareBonesCollectionFactory(ctx.Settings, ctx.Codec)
-				descsCol := cf.MakeCollection(ctx.Context, descs.NewTemporarySchemaProvider(ctx.SessionDataStack))
-				tableDesc, err := descsCol.Direct().MustGetTableDescByID(ctx.Ctx(), ctx.Txn, descpb.ID(tableID))
+				tableDesc, err := catalogkv.MustGetTableDescByID(ctx.Context, ctx.Txn, ctx.Codec, descpb.ID(tableID))
 				if err != nil {
 					return nil, err
 				}
@@ -6404,43 +6320,10 @@ table's zone configuration this will return NULL.`,
 						"can only deserialize matching session users",
 					)
 				}
-				if err := evalCtx.Planner.CheckCanBecomeUser(evalCtx.Context, sd.User()); err != nil {
-					return nil, err
-				}
 				*evalCtx.SessionData() = *sd
 				return tree.MakeDBool(true), nil
 			},
 			Info:       `This function deserializes the serialized variables into the current session.`,
-			Volatility: tree.VolatilityVolatile,
-		},
-	),
-
-	"crdb_internal.create_session_revival_token": makeBuiltin(
-		tree.FunctionProperties{
-			Category: categorySystemInfo,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{},
-			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return evalCtx.Planner.CreateSessionRevivalToken()
-			},
-			Info:       `Generate a token that can be used to create a new session for the current user.`,
-			Volatility: tree.VolatilityVolatile,
-		},
-	),
-	"crdb_internal.validate_session_revival_token": makeBuiltin(
-		tree.FunctionProperties{
-			Category: categorySystemInfo,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"token", types.Bytes}},
-			ReturnType: tree.FixedReturnType(types.Bool),
-			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				token := tree.MustBeDBytes(args[0])
-				return evalCtx.Planner.ValidateSessionRevivalToken(&token)
-			},
-			Info:       `Validate a token that was created by create_session_revival_token. Intended for testing.`,
 			Volatility: tree.VolatilityVolatile,
 		},
 	),
@@ -6455,7 +6338,7 @@ table's zone configuration this will return NULL.`,
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				arg := []byte(tree.MustBeDBytes(args[0]))
 				ctx := evalCtx.Ctx()
-				isHashed, _, _, schemeName, _, err := security.CheckPasswordHashValidity(ctx, arg)
+				isHashed, _, schemeName, _, err := security.CheckPasswordHashValidity(ctx, arg)
 				if err != nil {
 					return tree.DNull, pgerror.WithCandidateCode(err, pgcode.Syntax)
 				}
@@ -6488,76 +6371,6 @@ table's zone configuration this will return NULL.`,
 				return tree.DBoolTrue, nil
 			},
 			Info:       "This function is used to start a SQL stats compaction job.",
-			Volatility: tree.VolatilityVolatile,
-		},
-	),
-
-	"crdb_internal.revalidate_unique_constraints_in_all_tables": makeBuiltin(
-		tree.FunctionProperties{
-			Category: categorySystemInfo,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{},
-			ReturnType: tree.FixedReturnType(types.Void),
-			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				if err := evalCtx.Planner.RevalidateUniqueConstraintsInCurrentDB(evalCtx.Ctx()); err != nil {
-					return nil, err
-				}
-				return tree.DVoidDatum, nil
-			},
-			Info: `This function is used to revalidate all unique constraints in tables
-in the current database. Returns an error if validation fails.`,
-			Volatility: tree.VolatilityVolatile,
-		},
-	),
-
-	"crdb_internal.revalidate_unique_constraints_in_table": makeBuiltin(
-		tree.FunctionProperties{
-			Category: categorySystemInfo,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"table_name", types.String}},
-			ReturnType: tree.FixedReturnType(types.Void),
-			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				name := tree.MustBeDString(args[0])
-				dOid, err := tree.ParseDOid(evalCtx, string(name), types.RegClass)
-				if err != nil {
-					return nil, err
-				}
-				if err := evalCtx.Planner.RevalidateUniqueConstraintsInTable(evalCtx.Ctx(), int(dOid.DInt)); err != nil {
-					return nil, err
-				}
-				return tree.DVoidDatum, nil
-			},
-			Info: `This function is used to revalidate all unique constraints in the given
-table. Returns an error if validation fails.`,
-			Volatility: tree.VolatilityVolatile,
-		},
-	),
-
-	"crdb_internal.revalidate_unique_constraint": makeBuiltin(
-		tree.FunctionProperties{
-			Category: categorySystemInfo,
-		},
-		tree.Overload{
-			Types:      tree.ArgTypes{{"table_name", types.String}, {"constraint_name", types.String}},
-			ReturnType: tree.FixedReturnType(types.Void),
-			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				tableName := tree.MustBeDString(args[0])
-				constraintName := tree.MustBeDString(args[1])
-				dOid, err := tree.ParseDOid(evalCtx, string(tableName), types.RegClass)
-				if err != nil {
-					return nil, err
-				}
-				if err = evalCtx.Planner.RevalidateUniqueConstraint(
-					evalCtx.Ctx(), int(dOid.DInt), string(constraintName),
-				); err != nil {
-					return nil, err
-				}
-				return tree.DVoidDatum, nil
-			},
-			Info: `This function is used to revalidate the given unique constraint in the given
-table. Returns an error if validation fails.`,
 			Volatility: tree.VolatilityVolatile,
 		},
 	),
@@ -6881,7 +6694,8 @@ func getTimeAdditionalDesc(preferTZOverload bool) (string, string) {
 }
 
 func txnTSOverloads(preferTZOverload bool) []tree.Overload {
-	tzAdditionalDesc, noTZAdditionalDesc := getTimeAdditionalDesc(preferTZOverload)
+	// tzAdditionalDesc, noTZAdditionalDesc := getTimeAdditionalDesc(preferTZOverload)
+	tzAdditionalDesc, _ := getTimeAdditionalDesc(preferTZOverload)
 	return []tree.Overload{
 		{
 			Types:             tree.ArgTypes{},
@@ -6893,23 +6707,23 @@ func txnTSOverloads(preferTZOverload bool) []tree.Overload {
 			Info:       txnTSDoc + tzAdditionalDesc,
 			Volatility: tree.VolatilityStable,
 		},
-		{
-			Types:             tree.ArgTypes{},
-			ReturnType:        tree.FixedReturnType(types.Timestamp),
-			PreferredOverload: !preferTZOverload,
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				return ctx.GetTxnTimestampNoZone(time.Microsecond), nil
-			},
-			Info:       txnTSDoc + noTZAdditionalDesc,
-			Volatility: tree.VolatilityStable,
-		},
-		{
-			Types:      tree.ArgTypes{},
-			ReturnType: tree.FixedReturnType(types.Date),
-			Fn:         currentDate,
-			Info:       txnTSDoc,
-			Volatility: tree.VolatilityStable,
-		},
+		// {
+		// 	Types:             tree.ArgTypes{},
+		// 	ReturnType:        tree.FixedReturnType(types.Timestamp),
+		// 	PreferredOverload: !preferTZOverload,
+		// 	Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+		// 		return ctx.GetTxnTimestampNoZone(time.Microsecond), nil
+		// 	},
+		// 	Info:       txnTSDoc + noTZAdditionalDesc,
+		// 	Volatility: tree.VolatilityStable,
+		// },
+		// {
+		// 	Types:      tree.ArgTypes{},
+		// 	ReturnType: tree.FixedReturnType(types.Date),
+		// 	Fn:         currentDate,
+		// 	Info:       txnTSDoc,
+		// 	Volatility: tree.VolatilityStable,
+		// },
 	}
 }
 
@@ -8891,6 +8705,13 @@ func CleanEncodingName(s string) string {
 var errInsufficientPriv = pgerror.New(
 	pgcode.InsufficientPrivilege, "insufficient privilege",
 )
+
+func checkPrivilegedUser(ctx *tree.EvalContext) error {
+	if !ctx.SessionData().User().IsRootUser() {
+		return errInsufficientPriv
+	}
+	return nil
+}
 
 // EvalFollowerReadOffset is a function used often with AS OF SYSTEM TIME queries
 // to determine the appropriate offset from now which is likely to be safe for
