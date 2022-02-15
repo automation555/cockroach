@@ -25,6 +25,10 @@ feature.restore.enabled	boolean	true	set to true to enable restore, false to dis
 feature.schema_change.enabled	boolean	true	set to true to enable schema changes, false to disable; default is true
 feature.stats.enabled	boolean	true	set to true to enable CREATE STATISTICS/ANALYZE, false to disable; default is true
 jobs.retention_time	duration	336h0m0s	the amount of time to retain records for completed jobs before
+kv.allocator.load_based_lease_rebalancing.enabled	boolean	true	set to enable rebalancing of range leases based on load and latency
+kv.allocator.load_based_rebalancing	enumeration	leases and replicas	whether to rebalance based on the distribution of QPS across stores [off = 0, leases = 1, leases and replicas = 2]
+kv.allocator.qps_rebalance_threshold	float	0.25	minimum fraction away from the mean a store's QPS (such as queries per second) can be before it is considered overfull or underfull
+kv.allocator.range_rebalance_threshold	float	0.05	minimum fraction away from the mean a store's range count can be before it is considered overfull or underfull
 kv.bulk_io_write.max_rate	byte size	1.0 TiB	the rate limit (bytes/sec) to use for writes to disk on behalf of bulk io ops
 kv.bulk_sst.max_allowed_overage	byte size	64 MiB	if positive, allowed size in excess of target size for SSTs from export requests; export requests (i.e. BACKUP) may buffer up to the sum of kv.bulk_sst.target_size and kv.bulk_sst.max_allowed_overage in memory
 kv.bulk_sst.target_size	byte size	16 MiB	target size for SSTs emitted from export requests; export requests (i.e. BACKUP) may buffer up to the sum of kv.bulk_sst.target_size and kv.bulk_sst.max_allowed_overage in memory
@@ -85,7 +89,7 @@ sql.cross_db_views.enabled	boolean	false	if true, creating views that refer to o
 sql.defaults.cost_scans_with_default_col_size.enabled	boolean	false	setting to true uses the same size for all columns to compute scan cost
 sql.defaults.datestyle	enumeration	iso, mdy	default value for DateStyle session setting [iso, mdy = 0, iso, dmy = 1, iso, ymd = 2]
 sql.defaults.datestyle.enabled	boolean	false	default value for datestyle_enabled session setting
-sql.defaults.default_hash_sharded_index_bucket_count	integer	16	used as bucket count if bucket count is not specified in hash sharded index definition
+sql.defaults.default_hash_sharded_index_bucket_count	integer	8	used as bucket count if bucket count is not specified in hash sharded index definition
 sql.defaults.default_int_size	integer	8	the size, in bytes, of an INT type
 sql.defaults.disallow_full_table_scans.enabled	boolean	false	setting to true rejects queries that have planned a full table scan
 sql.defaults.distsql	enumeration	auto	default distributed SQL execution mode [off = 0, auto = 1, on = 2, always = 3]
@@ -127,7 +131,7 @@ sql.defaults.transaction_rows_written_log	integer	0	the threshold for the number
 sql.defaults.vectorize	enumeration	on	default vectorize mode [on = 0, on = 2, experimental_always = 3, off = 4]
 sql.defaults.zigzag_join.enabled	boolean	true	default value for enable_zigzag_join session setting; allows use of zig-zag join by default
 sql.distsql.max_running_flows	integer	-128	the value - when positive - used as is, or the value - when negative - multiplied by the number of CPUs on a node, to determine the maximum number of concurrent remote flows that can be run on the node
-sql.distsql.temp_storage.workmem	byte size	64 MiB	maximum amount of memory in bytes a processor can use before falling back to temp storage
+sql.distsql.temp_storage.workmem	byte size	2 B	maximum amount of memory in bytes a processor can use before falling back to temp storage
 sql.guardrails.max_row_size_err	byte size	512 MiB	maximum size of row (or column family if multiple column families are in use) that SQL can write to the database, above which an error is returned; use 0 to disable
 sql.guardrails.max_row_size_log	byte size	64 MiB	maximum size of row (or column family if multiple column families are in use) that SQL can write to the database, above which an event is logged to SQL_PERF (or SQL_INTERNAL_PERF if the mutating statement was internal); use 0 to disable
 sql.log.slow_query.experimental_full_table_scans.enabled	boolean	false	when set to true, statements that perform a full table/index scan will be logged to the slow query log even if they do not meet the latency threshold. Must have the slow query log enabled for this setting to have any effect.
@@ -167,8 +171,6 @@ sql.trace.log_statement_execute	boolean	false	set to true to enable logging of e
 sql.trace.session_eventlog.enabled	boolean	false	set to true to enable session tracing. Note that enabling this may have a non-trivial negative performance impact.
 sql.trace.stmt.enable_threshold	duration	0s	duration beyond which all statements are traced (set to 0 to disable). This applies to individual statements within a transaction and is therefore finer-grained than sql.trace.txn.enable_threshold.
 sql.trace.txn.enable_threshold	duration	0s	duration beyond which all transactions are traced (set to 0 to disable). This setting is coarser grained thansql.trace.stmt.enable_threshold because it applies to all statements within a transaction as well as client communication (e.g. retries).
-sql.ttl.default_delete_batch_size	integer	100	default amount of rows to delete in a single query during a TTL job
-sql.ttl.default_select_batch_size	integer	500	default amount of rows to select in a single query during a TTL job
 timeseries.storage.enabled	boolean	true	if set, periodic timeseries data is stored within the cluster; disabling is not recommended unless you are storing the data elsewhere
 timeseries.storage.resolution_10s.ttl	duration	240h0m0s	the maximum age of time series data stored at the 10 second resolution. Data older than this is subject to rollup and deletion.
 timeseries.storage.resolution_30m.ttl	duration	2160h0m0s	the maximum age of time series data stored at the 30 minute resolution. Data older than this is subject to deletion.
@@ -176,4 +178,4 @@ trace.debug.enable	boolean	false	if set, traces for recent requests can be seen 
 trace.jaeger.agent	string		the address of a Jaeger agent to receive traces using the Jaeger UDP Thrift protocol, as <host>:<port>. If no port is specified, 6381 will be used.
 trace.opentelemetry.collector	string		address of an OpenTelemetry trace collector to receive traces using the otel gRPC protocol, as <host>:<port>. If no port is specified, 4317 will be used.
 trace.zipkin.collector	string		the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.
-version	version	21.2-62	set the active cluster version in the format '<major>.<minor>'
+version	version	21.2-50	set the active cluster version in the format '<major>.<minor>'

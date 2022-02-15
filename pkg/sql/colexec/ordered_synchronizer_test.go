@@ -198,6 +198,7 @@ func TestOrderedSyncRandomInput(t *testing.T) {
 }
 
 func BenchmarkOrderedSynchronizer(b *testing.B) {
+	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 
 	numInputs := int64(3)
@@ -218,7 +219,7 @@ func BenchmarkOrderedSynchronizer(b *testing.B) {
 	}
 
 	ordering := colinfo.ColumnOrdering{{ColIdx: 0, Direction: encoding.Ascending}}
-	op := NewOrderedSynchronizer(testAllocator, execinfra.DefaultMemoryLimit, inputs, typs, ordering)
+	op := NewOrderedSynchronizer(testAllocator, execinfra.ProductionDefaultMemoryLimit, inputs, typs, ordering)
 	op.Init(ctx)
 
 	b.SetBytes(8 * int64(coldata.BatchSize()) * numInputs)
