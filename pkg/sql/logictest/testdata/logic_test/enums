@@ -375,7 +375,8 @@ t1  CREATE TABLE public.t1 (
     x public.greeting NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
     CONSTRAINT t1_pkey PRIMARY KEY (rowid ASC),
-    INDEX i (x ASC)
+    INDEX i (x ASC),
+    FAMILY "primary" (x, rowid)
 )
 
 # SHOW CREATE uses a virtual index, so also check the code path where a
@@ -387,7 +388,8 @@ CREATE TABLE public.t1 (
    x public.greeting NULL,
    rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
    CONSTRAINT t1_pkey PRIMARY KEY (rowid ASC),
-   INDEX i (x ASC)
+   INDEX i (x ASC),
+   FAMILY "primary" (x, rowid)
 )
 
 # Test that the implicit array type has been created, and that we can use it.
@@ -433,10 +435,10 @@ FROM
 WHERE
   typname IN ('collision', '_collision', '__collision', '___collision')
 ----
-_collision    100139  0       100140
-__collision   100140  100139  0
-collision     100141  0       100142
-___collision  100142  100141  0
+_collision    100089  0       100090
+__collision   100090  100089  0
+collision     100091  0       100092
+___collision  100092  100091  0
 
 # Regression for #49756.
 query TT
@@ -447,7 +449,7 @@ FROM
 WHERE
   descriptor_name = 'enum_array' AND column_name = 'x'
 ----
-x  family:ArrayFamily width:0 precision:0 locale:"" visible_type:0 oid:100121 array_contents:<family: EnumFamily width: 0 precision: 0 locale: "" visible_type: 0 oid: 100120 time_precision_is_set: false udt_metadata: <   array_type_oid: 100121 > > time_precision_is_set:false
+x  family:ArrayFamily width:0 precision:0 locale:"" visible_type:0 oid:100071 array_contents:<family: EnumFamily width: 0 precision: 0 locale: "" visible_type: 0 oid: 100070 time_precision_is_set: false udt_metadata: <   array_type_oid: 100071 > > time_precision_is_set:false
 
 # Test tables using enums in DEFAULT expressions.
 statement ok
@@ -583,6 +585,7 @@ enum_checks  CREATE TABLE public.enum_checks (
              x public.greeting NULL,
              rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
              CONSTRAINT enum_checks_pkey PRIMARY KEY (rowid ASC),
+             FAMILY "primary" (x, rowid),
              CONSTRAINT check_x CHECK (x = 'hello':::public.greeting),
              CONSTRAINT "check" CHECK ('hello':::public.greeting = 'hello':::public.greeting)
 )
@@ -1419,7 +1422,7 @@ statement error pq: could not remove enum value "a" as it is being used in a com
 ALTER TYPE computed_abc DROP VALUE 'a'
 
 statement ok
-CREATE TABLE t6 (k INT PRIMARY KEY, y string AS ('b'::computed_abc::string) STORED)
+CREATE TABLE t6 (k INT PRIMARY KEY, y computed_abc AS ('b'::computed_abc) STORED)
 
 statement error pq: could not remove enum value "b" as it is being used in a computed column of "t6"
 ALTER TYPE computed_abc DROP VALUE 'b'
@@ -1598,33 +1601,3 @@ SELECT
   col1, col2
 FROM
   cte1, cte2;
-
-# Regression test for incorrectly serializing NULL expression type annotation in
-# a enum tuple.
-# Skipped on tenants because of SPLIT AT and SCATTER usage.
-skipif config 3node-tenant
-statement ok
-CREATE TYPE greeting58889 AS ENUM ('hello', 'howdy', 'hi', 'good day', 'morning');
-CREATE TABLE t58889 AS SELECT enum_range('hello'::greeting58889)[g] as _enum FROM generate_series(1, 5) as g;
-ALTER TABLE t58889 SPLIT AT SELECT i FROM generate_series(1, 5) as g(i);
-ALTER TABLE t58889 SCATTER;
-
-skipif config 3node-tenant
-query T
-SELECT _enum FROM t58889 WHERE _enum::greeting58889 IN (NULL, 'hi':::greeting58889);
-----
-hi
-
-subtest cast_from_enum_to_bytes
-
-statement ok
-CREATE TYPE myenum AS ENUM ('foo', 'bar');
-
-statement error invalid cast: myenum -> bytes
-SELECT 'foo'::myenum::bytes;
-
-statement error invalid cast: myenum -> bytes
-SELECT 'foo'::myenum::bytea;
-
-statement error invalid cast: myenum -> bytes
-SELECT 'foo'::myenum::blob;
