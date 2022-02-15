@@ -323,7 +323,8 @@ func (b *stmtBundleBuilder) addTrace() {
 This trace can be imported into Jaeger for visualization. From the Jaeger Search screen, select the JSON File.
 Jaeger can be started using docker with: docker run -d --name jaeger -p 16686:16686 jaegertracing/all-in-one:1.17
 The UI can then be accessed at http://localhost:16686/search`, stmt)
-	jaegerJSON, err := b.trace.ToJaegerJSON(stmt, comment, "")
+	_ = comment
+	jaegerJSON, err := b.trace.ToJaegerZipkinV2(stmt, "")
 	if err != nil {
 		b.z.AddFile("trace-jaeger.txt", err.Error())
 	} else {
@@ -434,6 +435,7 @@ func makeStmtEnvCollector(ctx context.Context, ie *InternalExecutor) stmtEnvColl
 // environmentQuery is a helper to run a query that returns a single string
 // value.
 func (c *stmtEnvCollector) query(query string) (string, error) {
+	var row tree.Datums
 	row, err := c.ie.QueryRowEx(
 		c.ctx,
 		"stmtEnvCollector",
@@ -522,7 +524,7 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 	// printing all session settings.
 	relevantSettings := []struct {
 		sessionSetting string
-		clusterSetting settings.NonMaskedSetting
+		clusterSetting settings.WritableSetting
 		convFunc       func(string) string
 	}{
 		{sessionSetting: "reorder_joins_limit", clusterSetting: ReorderJoinsLimitClusterValue},
@@ -536,7 +538,6 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 		{sessionSetting: "datestyle_enabled", clusterSetting: dateStyleEnabled, convFunc: boolToOnOff},
 		{sessionSetting: "disallow_full_table_scans", clusterSetting: disallowFullTableScans, convFunc: boolToOnOff},
 		{sessionSetting: "large_full_scan_rows", clusterSetting: largeFullScanRows},
-		{sessionSetting: "cost_scans_with_default_col_size", clusterSetting: costScansWithDefaultColSize, convFunc: boolToOnOff},
 		{sessionSetting: "distsql", clusterSetting: DistSQLClusterExecMode, convFunc: distsqlConv},
 		{sessionSetting: "vectorize", clusterSetting: VectorizeClusterMode, convFunc: vectorizeConv},
 	}
