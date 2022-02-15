@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
+	"github.com/cockroachdb/cockroach/pkg/scheduledjobs/schedulebase"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -40,7 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
-	"github.com/robfig/cron/v3"
+	"github.com/gorhill/cronexpr"
 	"github.com/stretchr/testify/require"
 )
 
@@ -97,7 +98,6 @@ func newTestHelper(t *testing.T) (*testHelper, func()) {
 	require.NotNil(t, th.cfg)
 	th.sqlDB = sqlutils.MakeSQLRunner(db)
 	th.server = s
-	th.sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.merge_file_buffer_size = '1MiB'`)
 
 	return th, func() {
 		dirCleanupFn()
@@ -409,6 +409,19 @@ func TestSerializesScheduledBackupExecutionArgs(t *testing.T) {
 			},
 		},
 		{
+			name:  "full-cluster-with-interleaved-table",
+			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup?AWS_SECRET_ACCESS_KEY=neverappears' WITH INCLUDE_DEPRECATED_INTERLEAVES RECURRING '@hourly'",
+			user:  freeUser,
+			expectedSchedules: []expectedSchedule{
+				{
+					nameRe:     "BACKUP .+",
+					backupStmt: "BACKUP INTO 'nodelocal://0/backup?AWS_SECRET_ACCESS_KEY=neverappears' WITH detached, include_deprecated_interleaves",
+					shownStmt:  "BACKUP INTO 'nodelocal://0/backup?AWS_SECRET_ACCESS_KEY=redacted' WITH detached, include_deprecated_interleaves",
+					period:     time.Hour,
+				},
+			},
+		},
+		{
 			name:  "full-cluster-always",
 			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup' WITH revision_history RECURRING '@hourly' FULL BACKUP ALWAYS",
 			user:  enterpriseUser,
@@ -417,25 +430,6 @@ func TestSerializesScheduledBackupExecutionArgs(t *testing.T) {
 					nameRe:     "BACKUP .+",
 					backupStmt: "BACKUP INTO 'nodelocal://0/backup' WITH revision_history, detached",
 					period:     time.Hour,
-				},
-			},
-		},
-		{
-			name:  "full-cluster-remote-incremental-location",
-			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup' WITH incremental_location = 'nodelocal://1/incremental' RECURRING '@hourly'",
-			user:  enterpriseUser,
-			expectedSchedules: []expectedSchedule{
-				{
-					nameRe:     "BACKUP .*",
-					backupStmt: "BACKUP INTO LATEST IN 'nodelocal://0/backup' WITH detached, incremental_location = 'nodelocal://1/incremental'",
-					period:     time.Hour,
-					paused:     true,
-				},
-				{
-					nameRe:     "BACKUP .+",
-					backupStmt: "BACKUP INTO 'nodelocal://0/backup' WITH detached",
-					period:     24 * time.Hour,
-					runsNow:    true,
 				},
 			},
 		},
@@ -1079,10 +1073,8 @@ INSERT INTO t values (1), (10), (100);
 		// to the next scheduled recurrence.
 		for _, id := range []int64{fullID, incID} {
 			s := th.loadSchedule(t, id)
-			e, err := cron.ParseStandard(s.ScheduleExpr())
-			require.NoError(t, err)
 			require.EqualValues(t,
-				e.Next(th.env.Now()).Round(time.Microsecond),
+				cronexpr.MustParse(s.ScheduleExpr()).Next(th.env.Now()).Round(time.Microsecond),
 				s.NextRun())
 		}
 
@@ -1131,26 +1123,15 @@ func constructExpectedScheduledBackupNode(
 
 	backupNode, err := extractBackupNode(sj)
 	require.NoError(t, err)
-	firstRun, err := tree.MakeDTimestampTZ(sj.ScheduledRunTime(), time.Microsecond)
-	require.NoError(t, err)
-	wait, err := parseOnPreviousRunningOption(sj.ScheduleDetails().Wait)
-	require.NoError(t, err)
-	onError, err := parseOnErrorOption(sj.ScheduleDetails().OnError)
-	require.NoError(t, err)
-	scheduleOptions := tree.KVOptions{
-		tree.KVOption{
-			Key:   optFirstRun,
-			Value: firstRun,
-		},
-		tree.KVOption{
-			Key:   optOnExecFailure,
-			Value: tree.NewDString(onError),
-		},
-		tree.KVOption{
-			Key:   optOnPreviousRunning,
-			Value: tree.NewDString(wait),
-		},
+
+	opts := schedulebase.CommonScheduleOptions{
+		FirstRun: sj.ScheduledRunTime(),
+		OnError:  sj.ScheduleDetails().OnError,
+		Wait:     sj.ScheduleDetails().Wait,
 	}
+	scheduleOptions, err := opts.KVOptions()
+	require.NoError(t, err)
+
 	sb := &tree.ScheduledBackup{
 		ScheduleLabelSpec: tree.ScheduleLabelSpec{
 			IfNotExists: false,

@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
+	"github.com/cockroachdb/cockroach/pkg/scheduledjobs/schedulebase"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -242,64 +243,17 @@ func (e *scheduledBackupExecutor) GetCreateScheduleStatement(
 			firstRunTime = dependentScheduleFirstRun
 		}
 	}
+
 	if firstRunTime.IsZero() {
 		firstRunTime = env.Now()
 	}
-
-	firstRun, err := tree.MakeDTimestampTZ(firstRunTime, time.Microsecond)
-	if err != nil {
-		return "", err
+	opts := schedulebase.CommonScheduleOptions{
+		FirstRun: firstRunTime,
+		OnError:  sj.ScheduleDetails().OnError,
+		Wait:     sj.ScheduleDetails().Wait,
 	}
 
-	wait, err := parseOnPreviousRunningOption(sj.ScheduleDetails().Wait)
-	if err != nil {
-		return "", err
-	}
-	onError, err := parseOnErrorOption(sj.ScheduleDetails().OnError)
-	if err != nil {
-		return "", err
-	}
-	scheduleOptions := tree.KVOptions{
-		tree.KVOption{
-			Key:   optFirstRun,
-			Value: firstRun,
-		},
-		tree.KVOption{
-			Key:   optOnExecFailure,
-			Value: tree.NewDString(onError),
-		},
-		tree.KVOption{
-			Key:   optOnPreviousRunning,
-			Value: tree.NewDString(wait),
-		},
-	}
-
-	var destinations []string
-	for i := range backupNode.To {
-		dest, ok := backupNode.To[i].(*tree.StrVal)
-		if !ok {
-			return "", errors.Errorf("unexpected %T destination in backup statement", dest)
-		}
-		destinations = append(destinations, dest.RawString())
-	}
-
-	var kmsURIs []string
-	for i := range backupNode.Options.EncryptionKMSURI {
-		kmsURI, ok := backupNode.Options.EncryptionKMSURI[i].(*tree.StrVal)
-		if !ok {
-			return "", errors.Errorf("unexpected %T kmsURI in backup statement", kmsURI)
-		}
-		kmsURIs = append(kmsURIs, kmsURI.RawString())
-	}
-
-	redactedBackupNode, err := GetRedactedBackupNode(
-		backupNode.Backup,
-		destinations,
-		nil, /* incrementalFrom */
-		kmsURIs,
-		"",
-		nil,
-		false /* hasBeenPlanned */)
+	scheduleOptions, err := opts.KVOptions()
 	if err != nil {
 		return "", err
 	}
@@ -309,9 +263,9 @@ func (e *scheduledBackupExecutor) GetCreateScheduleStatement(
 			IfNotExists: false, Label: tree.NewDString(sj.ScheduleLabel())},
 		Recurrence:      tree.NewDString(recurrence),
 		FullBackup:      fullBackup,
-		Targets:         redactedBackupNode.Targets,
-		To:              redactedBackupNode.To,
-		BackupOptions:   redactedBackupNode.Options,
+		Targets:         backupNode.Targets,
+		To:              backupNode.To,
+		BackupOptions:   backupNode.Options,
 		ScheduleOptions: scheduleOptions,
 	}
 
