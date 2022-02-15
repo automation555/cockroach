@@ -116,7 +116,7 @@ type Table interface {
 	// references (where this is the origin table).
 	OutboundForeignKeyCount() int
 
-	// OutboundForeignKeyCount returns the ith outbound foreign key reference.
+	// OutboundForeignKey returns the ith outbound foreign key reference.
 	OutboundForeignKey(i int) ForeignKeyConstraint
 
 	// InboundForeignKeyCount returns the number of inbound foreign key references
@@ -133,9 +133,6 @@ type Table interface {
 	// Unique returns the ith unique constraint defined on this table, where
 	// i < UniqueCount.
 	Unique(i UniqueOrdinal) UniqueConstraint
-
-	// Zone returns a table's zone.
-	Zone() Zone
 }
 
 // CheckConstraint contains the SQL text and the validity status for a check
@@ -174,10 +171,6 @@ type TableStatistic interface {
 	// NullCount returns the estimated number of rows which have a NULL value on
 	// any column in the statistic.
 	NullCount() uint64
-
-	// AvgSize returns the estimated average number of bytes in all columns of
-	// the statistic.
-	AvgSize() uint64
 
 	// Histogram returns a slice of histogram buckets, sorted by UpperBound.
 	// It is only used for single-column stats (i.e., when ColumnCount() = 1),
@@ -291,13 +284,6 @@ type UniqueConstraint interface {
 	// cannot make any assumptions about the data. An unvalidated constraint still
 	// needs to be enforced on new mutations.
 	Validated() bool
-
-	// UniquenessGuaranteedByAnotherIndex returns true when WithoutIndex() returns
-	// true and the uniqueness of the constraint is guaranteed by another index.
-	// When true, the optimizer will always consider the constraint to be
-	// satisfied when building functional dependencies for the table. This enables
-	// additional optimizations, such as omission of uniqueness checks.
-	UniquenessGuaranteedByAnotherIndex() bool
 }
 
 // UniqueOrdinal identifies a unique constraint (in the context of a Table).

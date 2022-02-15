@@ -14,179 +14,103 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
-// BuildOptAndHypTableMaps builds a HypotheticalTable for each table in
-// indexCandidates. This HypotheticalTable stores a hypothetical index for each
-// of the table's index candidates. The function returns a map from each table's
-// cat.StableID to its original sql.optTable, as well as a map from each table's
-// cat.StableID to its constructed HypotheticalTable. These tables will be used
-// to update the table query metadata when making index recommendations.
-func BuildOptAndHypTableMaps(
+// BuildHypotheticalTables builds a hypotheticalTable for each table in
+// indexCandidates. This hypotheticalTable stores a hypothetical index for each
+// of the table's index candidates.
+func BuildHypotheticalTables(
 	indexCandidates map[cat.Table][][]cat.IndexColumn,
-) (optTables, hypTables map[cat.StableID]cat.Table) {
-	numTables := len(indexCandidates)
-	hypTables = make(map[cat.StableID]cat.Table, numTables)
-	optTables = make(map[cat.StableID]cat.Table, numTables)
+	tableZones map[cat.Table]*zonepb.ZoneConfig,
+	existingIndexes map[cat.StableID][][]cat.IndexColumn,
+) (oldTables, hypTables map[cat.StableID]cat.Table) {
+	hypTables = make(map[cat.StableID]cat.Table)
+	oldTables = make(map[cat.StableID]cat.Table)
 
 	for t, indexes := range indexCandidates {
-		hypIndexes := make([]hypotheticalIndex, 0, len(indexes))
-		var hypTable HypotheticalTable
-		hypTable.init(t)
+		hypIndexes := make([]cat.Index, 0, len(indexes))
+		hypTable := hypotheticalTable{Table: t, hypotheticalIndexes: hypIndexes}
+		count := t.IndexCount()
 
-		for _, indexCols := range indexes {
-			indexOrd := hypTable.Table.IndexCount() + len(hypIndexes)
-			lastKeyCol := indexCols[len(indexCols)-1]
-			inverted := !colinfo.ColumnTypeIsIndexable(lastKeyCol.DatumType())
-			if inverted {
-				invertedCol := hypTable.addInvertedCol(lastKeyCol.Column)
-				indexCols[len(indexCols)-1] = cat.IndexColumn{Column: invertedCol}
+		for _, index := range indexes {
+			// Do not add the index if it is equivalent to an existing index.
+			if indexOnTableExists(index, existingIndexes[t.ID()]) {
+				continue
 			}
-			var hypIndex hypotheticalIndex
-			hypIndex.init(
-				&hypTable,
-				tree.Name(fmt.Sprintf("_hyp_%d", indexOrd)),
-				indexCols,
-				indexOrd,
-				inverted,
-				t.Zone().(*zonepb.ZoneConfig),
-			)
-
-			// Do not add hypothetical inverted indexes for which there is an existing
-			// index with the same key. Inverted indexes do not have stored columns,
-			// so we should not make a recommendation if the same index already
-			// exists.
-			if !inverted || hypTable.existingRedundantIndex(&hypIndex) == nil {
-				hypIndexes = append(hypIndexes, hypIndex)
+			idx := hypotheticalIndex{
+				tab:          &hypTable,
+				name:         tree.Name(fmt.Sprintf("_hyp_%d", count)),
+				indexOrdinal: count,
+				cols:         index,
+				zone:         tableZones[t],
 			}
+			hypIndexes = append(hypIndexes, &idx)
+			count++
 		}
 
 		hypTable.hypotheticalIndexes = hypIndexes
-		optTables[t.ID()] = t
+		oldTables[t.ID()] = t
 		hypTables[t.ID()] = &hypTable
 	}
 
-	return optTables, hypTables
+	return oldTables, hypTables
 }
 
-// HypotheticalTable is a wrapper around cat.Table, used for creating index
-// recommendations. The hypotheticalIndexes slice stores fake indexes that could
-// potentially speed up queries to this table.
-type HypotheticalTable struct {
-	cat.Table
-	invertedCols         []*cat.Column
-	primaryKeyColsOrdSet util.FastIntSet
-	hypotheticalIndexes  []hypotheticalIndex
-}
-
-var _ cat.Table = &HypotheticalTable{}
-
-func (ht *HypotheticalTable) init(table cat.Table) {
-	ht.Table = table
-
-	// Get PK column ordinals.
-	primaryIndex := ht.Index(cat.PrimaryIndex)
-	numPrimaryKeyCols := primaryIndex.KeyColumnCount()
-	for i := 0; i < numPrimaryKeyCols; i++ {
-		ht.primaryKeyColsOrdSet.Add(primaryIndex.Column(i).Ordinal())
-	}
-}
-
-// ColumnCount is part of the cat.Table interface.
-func (ht *HypotheticalTable) ColumnCount() int {
-	return ht.Table.ColumnCount() + len(ht.invertedCols)
-}
-
-// Column is part of the cat.Table interface.
-func (ht *HypotheticalTable) Column(i int) *cat.Column {
-	originalColCount := ht.Table.ColumnCount()
-	if i < originalColCount {
-		return ht.Table.Column(i)
-	}
-	return ht.invertedCols[i-originalColCount]
-}
-
-// IndexCount is part of the cat.Table interface.
-func (ht *HypotheticalTable) IndexCount() int {
-	// A HypotheticalTable stores the embedded table's existing indexes in
-	// addition to its hypothetical indexes.
-	return ht.Table.IndexCount() + len(ht.hypotheticalIndexes)
-}
-
-// WritableIndexCount is part of the cat.Table interface.
-func (ht *HypotheticalTable) WritableIndexCount() int {
-	return ht.IndexCount()
-}
-
-// DeletableIndexCount is part of the cat.Table interface.
-func (ht *HypotheticalTable) DeletableIndexCount() int {
-	return ht.IndexCount()
-}
-
-// Index is part of the cat.Table interface.
-func (ht *HypotheticalTable) Index(i cat.IndexOrdinal) cat.Index {
-	existingIndexCount := ht.Table.IndexCount()
-	if i < existingIndexCount {
-		return ht.Table.Index(i)
-	}
-	return &ht.hypotheticalIndexes[i-existingIndexCount]
-}
-
-// existingRedundantIndex checks whether an index with the same explicit columns
-// as the index argument is present in the HypotheticalTable's embedded table.
-// If so, it returns the first instance of such an existing index (that is not a
-// partial index). Existing partial indexes and hypothetical standard indexes
-// are not considered redundant. Otherwise, the function returns nil.
-func (ht *HypotheticalTable) existingRedundantIndex(index *hypotheticalIndex) cat.Index {
-	for i, n := 0, ht.Table.IndexCount(); i < n; i++ {
-		indexCols := index.cols
-		existingIndex := ht.Table.Index(i)
-		if existingIndex.ExplicitColumnCount() != len(indexCols) {
+// indexOnTableExists checks whether an index is present in the slice of
+// existingIndexes containing a table's existing indexes.
+func indexOnTableExists(index []cat.IndexColumn, existingIndexes [][]cat.IndexColumn) bool {
+	for i, n := 0, len(existingIndexes); i < n; i++ {
+		existingIndex := existingIndexes[i]
+		if len(existingIndex) != len(index) {
 			continue
 		}
 		indexExists := true
-		for j, m := 0, existingIndex.ExplicitColumnCount(); j < m; j++ {
-			indexCol := existingIndex.Column(j)
-			// If the columns are inverted, compare the source columns. Otherwise,
-			// compare the columns directly.
-			if index.IsInverted() && existingIndex.IsInverted() && j == m-1 {
-				if indexCol.InvertedSourceColumnOrdinal() != indexCols[j].InvertedSourceColumnOrdinal() {
-					indexExists = false
-					break
-				}
-			} else if indexCol != indexCols[j] {
+		for j, m := 0, len(existingIndex); j < m; j++ {
+			if existingIndex[j].ColID() != index[j].ColID() ||
+				existingIndex[j].Descending != index[j].Descending {
 				indexExists = false
 				break
 			}
 		}
-		_, isPartialIndex := existingIndex.Predicate()
-		if indexExists && !isPartialIndex {
-			return existingIndex
+		if indexExists {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
-// addInvertedCol adds an inverted column corresponding to a source column to
-// the HypotheticalTable.
-func (ht *HypotheticalTable) addInvertedCol(invertedSourceCol *cat.Column) *cat.Column {
-	invertedCol := cat.Column{}
+// hypotheticalTable is a wrapper around cat.Table, used for creating index
+// recommendations. The hypotheticalIndexes slice stores fake indexes that could
+// potentially speed up queries to this table.
+type hypotheticalTable struct {
+	cat.Table
+	hypotheticalIndexes []cat.Index
+}
 
-	// All inverted columns have type bytes.
-	typ := types.Bytes
-	invertedCol.InitInverted(
-		ht.ColumnCount(),
-		tree.Name(string(invertedSourceCol.ColName())+"_inverted_key"),
-		typ,
-		false, /* nullable */
-		invertedSourceCol.Ordinal(),
-	)
+var _ cat.Table = &hypotheticalTable{}
 
-	ht.invertedCols = append(ht.invertedCols, &invertedCol)
-	return &invertedCol
+// IndexCount is part of the cat.Table interface.
+func (ht *hypotheticalTable) IndexCount() int {
+	return len(ht.hypotheticalIndexes) + ht.Table.IndexCount()
+}
+
+// WritableIndexCount is part of the cat.Table interface.
+func (ht *hypotheticalTable) WritableIndexCount() int {
+	return ht.IndexCount()
+}
+
+// DeletableIndexCount is part of the cat.Table interface.
+func (ht *hypotheticalTable) DeletableIndexCount() int {
+	return ht.IndexCount()
+}
+
+// Index is part of the cat.Table interface.
+func (ht *hypotheticalTable) Index(i cat.IndexOrdinal) cat.Index {
+	existingIndexCount := ht.Table.IndexCount()
+	if i < existingIndexCount {
+		return ht.Table.Index(i)
+	}
+	return ht.hypotheticalIndexes[i-existingIndexCount]
 }
