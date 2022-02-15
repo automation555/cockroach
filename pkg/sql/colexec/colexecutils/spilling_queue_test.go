@@ -52,11 +52,7 @@ func TestSpillingQueue(t *testing.T) {
 			testReuseCache := rng.Float64() < 0.5
 			if testReuseCache {
 				dequeuedProbabilityBeforeAllEnqueuesAreDone = 0
-				if rng.Float64() < 0.5 {
-					diskQueueCacheMode = colcontainer.DiskQueueCacheModeReuseCache
-				} else {
-					diskQueueCacheMode = colcontainer.DiskQueueCacheModeClearAndReuseCache
-				}
+				diskQueueCacheMode = colcontainer.DiskQueueCacheModeDefault
 			} else if rng.Float64() < 0.5 {
 				dequeuedProbabilityBeforeAllEnqueuesAreDone = 0.5
 			}
@@ -257,7 +253,6 @@ func TestSpillingQueueDidntSpill(t *testing.T) {
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
-	queueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeIntertwinedCalls)
 
 	rng, _ := randutil.NewTestRand()
 	numBatches := int(spillingQueueInitialItemsLen)*(1+rng.Intn(4)) + rng.Intn(int(spillingQueueInitialItemsLen))

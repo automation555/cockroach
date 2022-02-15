@@ -50,11 +50,7 @@ func TestDiskQueue(t *testing.T) {
 				dequeuedProbabilityBeforeAllEnqueuesAreDone := 0.5
 				if testReuseCache {
 					dequeuedProbabilityBeforeAllEnqueuesAreDone = 0
-					if rng.Float64() < 0.5 {
-						diskQueueCacheMode = colcontainer.DiskQueueCacheModeReuseCache
-					} else {
-						diskQueueCacheMode = colcontainer.DiskQueueCacheModeClearAndReuseCache
-					}
+					diskQueueCacheMode = colcontainer.DiskQueueCacheModeDefault
 				}
 				prefix, suffix := "", fmt.Sprintf("/BufferSizeBytes=%s/MaxFileSizeBytes=%s",
 					humanizeutil.IBytes(int64(bufferSizeBytes)),

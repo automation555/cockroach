@@ -305,8 +305,6 @@ type mergeJoinInput struct {
 // implements sort-merge join. It performs a merge on the left and right input
 // sources, based on the equality columns, assuming both inputs are in sorted
 // order.
-//
-// evalCtx will not be mutated.
 func NewMergeJoinOp(
 	unlimitedAllocator *colmem.Allocator,
 	memoryLimit int64,
@@ -889,20 +887,20 @@ func (o *mergeJoinBase) completeRightBufferedGroup() {
 	o.finishRightBufferedGroup()
 }
 
-func (o *mergeJoinBase) Close(ctx context.Context) error {
+func (o *mergeJoinBase) Close() error {
 	if !o.CloserHelper.Close() {
 		return nil
 	}
 	var lastErr error
 	for _, op := range []colexecop.Operator{o.left.source, o.right.source} {
 		if c, ok := op.(colexecop.Closer); ok {
-			if err := c.Close(ctx); err != nil {
+			if err := c.Close(); err != nil {
 				lastErr = err
 			}
 		}
 	}
 	if h := o.bufferedGroup.helper; h != nil {
-		if err := h.Close(ctx); err != nil {
+		if err := h.Close(); err != nil {
 			lastErr = err
 		}
 	}

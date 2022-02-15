@@ -74,16 +74,24 @@ type NewColOperatorArgs struct {
 		// partitions; for sorter it is merging already created partitions into
 		// new one before proceeding to the next partition from the input).
 		NumForcedRepartitions int
+		// UseStreamingMemAccountForBuffering specifies whether to use
+		// StreamingMemAccount when creating buffering operators and should only
+		// be set to 'true' in tests. The idea behind this flag is reducing the
+		// number of memory accounts and monitors we need to close, so we
+		// plumbed it into the planning code so that it doesn't create extra
+		// memory monitoring infrastructure (and so that we could use
+		// testMemAccount defined in main_test.go).
+		UseStreamingMemAccountForBuffering bool
 		// DiskSpillingDisabled specifies whether only in-memory operators
 		// should be created.
 		DiskSpillingDisabled bool
 		// DelegateFDAcquisitions should be observed by users of a
-		// PartitionedDiskQueue. During normal operations, these should acquire
-		// the maximum number of file descriptors they will use from FDSemaphore
-		// up front. Setting this testing knob to true disables that behavior
-		// and lets the PartitionedDiskQueue interact with the semaphore as
-		// partitions are opened/closed, which ensures that the number of open
-		// files never exceeds what is expected.
+		// colcontainer.PartitionedDiskQueue. During normal operations, these
+		// should acquire the maximum number of file descriptors they will use
+		// from FDSemaphore up front. Setting this testing knob to true disables
+		// that behavior and lets the colcontainer.PartitionedDiskQueue interact
+		// with the semaphore as partitions are opened/closed, which ensures
+		// that the number of open files never exceeds what is expected.
 		DelegateFDAcquisitions bool
 	}
 }
@@ -106,7 +114,7 @@ var _ execinfra.Releasable = &NewColOperatorResult{}
 // TestCleanupNoError releases the resources associated with this result and
 // asserts that no error is returned. It should only be used in tests.
 func (r *NewColOperatorResult) TestCleanupNoError(t testing.TB) {
-	require.NoError(t, r.ToClose.Close(context.Background()))
+	require.NoError(t, r.ToClose.Close())
 }
 
 var newColOperatorResultPool = sync.Pool{
