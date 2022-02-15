@@ -66,13 +66,6 @@ type Sink interface {
 	Close() error
 }
 
-// SinkWithTopics extends the Sink interface to include a method that returns
-// the topics that a changefeed will emit to
-type SinkWithTopics interface {
-	Sink
-	Topics() []string
-}
-
 func getSink(
 	ctx context.Context,
 	serverCfg *execinfra.ServerConfig,
@@ -115,11 +108,6 @@ func getSink(
 			return validateOptionsAndMakeSink(changefeedbase.WebhookValidOptions, func() (Sink, error) {
 				return makeWebhookSink(ctx, sinkURL{URL: u}, feedCfg.Opts,
 					defaultWorkerCount(), timeutil.DefaultTimeSource{}, m)
-			})
-		case isPubsubSink(u):
-			// TODO: add metrics to pubsubsink
-			return validateOptionsAndMakeSink(changefeedbase.PubsubValidOptions, func() (Sink, error) {
-				return MakePubsubSink(ctx, u, feedCfg.Opts, feedCfg.Targets)
 			})
 		case isCloudStorageSink(u):
 			return validateOptionsAndMakeSink(changefeedbase.CloudStorageValidOptions, func() (Sink, error) {
@@ -307,7 +295,7 @@ func (b *encDatumRowBuffer) Pop() rowenc.EncDatumRow {
 
 type bufferSink struct {
 	buf     encDatumRowBuffer
-	alloc   tree.DatumAlloc
+	alloc   rowenc.DatumAlloc
 	scratch bufalloc.ByteAllocator
 	closed  bool
 	metrics *sliMetrics
