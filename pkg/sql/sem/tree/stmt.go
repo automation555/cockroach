@@ -171,23 +171,11 @@ var _ CCLOnlyStatement = &Backup{}
 var _ CCLOnlyStatement = &ShowBackup{}
 var _ CCLOnlyStatement = &Restore{}
 var _ CCLOnlyStatement = &CreateChangefeed{}
-var _ CCLOnlyStatement = &AlterChangefeed{}
 var _ CCLOnlyStatement = &Import{}
 var _ CCLOnlyStatement = &Export{}
 var _ CCLOnlyStatement = &ScheduledBackup{}
 var _ CCLOnlyStatement = &StreamIngestion{}
 var _ CCLOnlyStatement = &ReplicationStream{}
-
-// StatementReturnType implements the Statement interface.
-func (*AlterChangefeed) StatementReturnType() StatementReturnType { return Rows }
-
-// StatementType implements the Statement interface.
-func (*AlterChangefeed) StatementType() StatementType { return TypeDML }
-
-// StatementTag returns a short string identifying the type of statement.
-func (*AlterChangefeed) StatementTag() string { return `ALTER CHANGEFEED` }
-
-func (*AlterChangefeed) cclOnlyStatement() {}
 
 // StatementReturnType implements the Statement interface.
 func (*AlterDatabaseOwner) StatementReturnType() StatementReturnType { return DDL }
@@ -1660,8 +1648,6 @@ func (*ValuesClause) StatementType() StatementType { return TypeDML }
 // StatementTag returns a short string identifying the type of statement.
 func (*ValuesClause) StatementTag() string { return "VALUES" }
 
-func (n *AlterChangefeed) String() string                { return AsString(n) }
-func (n *AlterChangefeedCmds) String() string            { return AsString(n) }
 func (n *AlterIndex) String() string                     { return AsString(n) }
 func (n *AlterDatabaseOwner) String() string             { return AsString(n) }
 func (n *AlterDatabaseAddRegion) String() string         { return AsString(n) }
@@ -1675,6 +1661,7 @@ func (n *AlterTable) String() string                     { return AsString(n) }
 func (n *AlterTableCmds) String() string                 { return AsString(n) }
 func (n *AlterTableAddColumn) String() string            { return AsString(n) }
 func (n *AlterTableAddConstraint) String() string        { return AsString(n) }
+func (n *AlterTableAlterColumnAfter) String() string     { return AsString(n) }
 func (n *AlterTableAlterColumnType) String() string      { return AsString(n) }
 func (n *AlterTableDropColumn) String() string           { return AsString(n) }
 func (n *AlterTableDropConstraint) String() string       { return AsString(n) }
