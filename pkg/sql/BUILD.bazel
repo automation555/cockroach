@@ -312,6 +312,7 @@ go_library(
         "//pkg/sql/colflow",
         "//pkg/sql/contention",
         "//pkg/sql/contention/txnidcache",
+        "//pkg/sql/contentionpb",
         "//pkg/sql/covering",
         "//pkg/sql/delegate",
         "//pkg/sql/distsql",
@@ -559,7 +560,6 @@ go_test(
         "//pkg/sql/vtable:pg_catalog.go",
     ],
     embed = [":sql"],
-    shard_count = 16,
     deps = [
         "//pkg/base",
         "//pkg/build/bazel",
