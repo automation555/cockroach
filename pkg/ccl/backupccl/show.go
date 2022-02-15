@@ -22,9 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -35,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -47,9 +46,6 @@ func checkShowBackupURIPrivileges(ctx context.Context, p sql.PlanHookState, uri 
 		return err
 	}
 	if conf.AccessIsWithExplicitAuth() {
-		return nil
-	}
-	if p.ExecCfg().ExternalIODirConfig.EnableNonAdminImplicitAndArbitraryOutbound {
 		return nil
 	}
 	hasAdmin, err := p.HasAdminRole(ctx)
@@ -68,7 +64,6 @@ func checkShowBackupURIPrivileges(ctx context.Context, p sql.PlanHookState, uri 
 type backupInfoReader interface {
 	showBackup(
 		context.Context,
-		*mon.BoundAccount,
 		cloud.ExternalStorage,
 		cloud.ExternalStorage,
 		*jobspb.BackupEncryptionOptions,
@@ -93,21 +88,15 @@ func (m manifestInfoReader) header() colinfo.ResultColumns {
 // and pipes the information to the user's sql console via the results channel.
 func (m manifestInfoReader) showBackup(
 	ctx context.Context,
-	mem *mon.BoundAccount,
 	store cloud.ExternalStorage,
 	incStore cloud.ExternalStorage,
 	enc *jobspb.BackupEncryptionOptions,
 	incPaths []string,
 	resultsCh chan<- tree.Datums,
 ) error {
-	var memSize int64
-	defer func() {
-		mem.Shrink(ctx, memSize)
-	}()
-
 	var err error
 	manifests := make([]BackupManifest, len(incPaths)+1)
-	manifests[0], memSize, err = ReadBackupManifestFromStore(ctx, mem, store, enc)
+	manifests[0], err = ReadBackupManifestFromStore(ctx, store, enc)
 
 	if err != nil {
 		if errors.Is(err, cloud.ErrFileDoesNotExist) {
@@ -125,11 +114,10 @@ func (m manifestInfoReader) showBackup(
 	}
 
 	for i := range incPaths {
-		m, sz, err := readBackupManifest(ctx, mem, incStore, incPaths[i], enc)
+		m, err := readBackupManifest(ctx, incStore, incPaths[i], enc)
 		if err != nil {
 			return err
 		}
-		memSize += sz
 		// Blank the stats to prevent memory blowup.
 		m.DeprecatedStatistics = nil
 		manifests[i+1] = m
@@ -143,7 +131,7 @@ func (m manifestInfoReader) showBackup(
 	// FKs for which we can't resolve the cross-table references. We can't
 	// display them anyway, because we don't have the referenced table names,
 	// etc.
-	err = maybeUpgradeDescriptorsInBackupManifests(manifests, true /* skipFKsWithNoMatchingTable */)
+	err = maybeUpgradeDescriptorsInBackupManifests(ctx, manifests, true /* skipFKsWithNoMatchingTable */)
 	if err != nil {
 		return err
 	}
@@ -324,10 +312,7 @@ func showBackupPlanHook(
 			}
 		}
 
-		mem := p.ExecCfg().RootMemoryMonitor.MakeBoundAccount()
-		defer mem.Close(ctx)
-
-		return infoReader.showBackup(ctx, &mem, store, incStore, encryption, incPaths, resultsCh)
+		return infoReader.showBackup(ctx, store, incStore, encryption, incPaths, resultsCh)
 	}
 
 	return fn, infoReader.header(), nil, false, nil
@@ -391,7 +376,7 @@ func backupShowerDefault(
 				// Map database ID to descriptor name.
 				dbIDToName := make(map[descpb.ID]string)
 				schemaIDToName := make(map[descpb.ID]string)
-				schemaIDToName[keys.PublicSchemaIDForBackup] = catconstants.PublicSchemaName
+				schemaIDToName[keys.PublicSchemaID] = catconstants.PublicSchemaName
 				for i := range manifest.Descriptors {
 					_, db, _, schema := descpb.FromDescriptor(&manifest.Descriptors[i])
 					if db != nil {
@@ -406,10 +391,10 @@ func backupShowerDefault(
 				}
 				descSizes := make(map[descpb.ID]RowCount)
 				for _, file := range manifest.Files {
-					// TODO(dan): This assumes each file in the backup only
-					// contains data from a single table, which is usually but
-					// not always correct. It does not account for a BACKUP that
-					// happened to catch a newly created table that hadn't yet
+					// TODO(dan): This assumes each file in the backup only contains
+					// data from a single table, which is usually but not always
+					// correct. It does not account for interleaved tables or if a
+					// BACKUP happened to catch a newly created table that hadn't yet
 					// been split into its own range.
 					_, tableID, err := encoding.DecodeUvarintAscending(file.Span.Key)
 					if err != nil {
@@ -449,7 +434,7 @@ func backupShowerDefault(
 					dataSizeDatum := tree.DNull
 					rowCountDatum := tree.DNull
 
-					desc := descbuilder.NewBuilder(descriptor).BuildExistingMutable()
+					desc := catalogkv.NewBuilder(descriptor).BuildExistingMutable()
 
 					descriptorName := desc.GetName()
 					switch desc := desc.(type) {
@@ -585,7 +570,7 @@ func nullIfZero(i descpb.ID) tree.Datum {
 func showPrivileges(descriptor *descpb.Descriptor) string {
 	var privStringBuilder strings.Builder
 
-	b := descbuilder.NewBuilder(descriptor)
+	b := catalogkv.NewBuilder(descriptor)
 	if b == nil {
 		return ""
 	}
@@ -617,7 +602,7 @@ func showPrivileges(descriptor *descpb.Descriptor) string {
 			if j != 0 {
 				privStringBuilder.WriteString(", ")
 			}
-			privStringBuilder.WriteString(priv.Kind.String())
+			privStringBuilder.WriteString(priv)
 		}
 		privStringBuilder.WriteString(" ON ")
 		privStringBuilder.WriteString(descpb.GetDescriptorName(descriptor))
@@ -689,8 +674,7 @@ var jsonShower = backupShower{
 	fn: func(manifests []BackupManifest) ([]tree.Datums, error) {
 		rows := make([]tree.Datums, len(manifests))
 		for i, manifest := range manifests {
-			j, err := protoreflect.MessageToJSON(
-				&manifest, protoreflect.FmtFlags{EmitDefaults: true, EmitRedacted: true})
+			j, err := protoreflect.MessageToJSON(&manifest, true)
 			if err != nil {
 				return nil, err
 			}
@@ -741,5 +725,5 @@ func showBackupsInCollectionPlanHook(
 }
 
 func init() {
-	sql.AddPlanHook("show backup", showBackupPlanHook)
+	sql.AddPlanHook(showBackupPlanHook)
 }
