@@ -17,9 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/errors"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -80,21 +79,23 @@ var debugZipTablesPerCluster = []string{
 	"crdb_internal.cluster_settings",
 	"crdb_internal.cluster_transactions",
 
-	"crdb_internal.default_privileges",
-
 	"crdb_internal.jobs",
-	"system.jobs",       // get the raw, restorable jobs records too.
-	"system.descriptor", // descriptors also contain job-like mutation state.
+	// Get the raw, restorable jobs records too.
+	"system.jobs",
+	// As well as the remaining columns (created_by etc).
+	// See comment on customQuery in zip.go about why we also need this.
+	//
+	// TODO(knz): This can be removed (to keep just system.jobs) once
+	// the table retrieval format preserves column structure.
+	"system.jobs_full",
+
+	// Descriptors also contain job-like mutation state.
+	"system.descriptor",
 	"system.namespace",
 	"system.scheduled_jobs",
-	"system.settings", // get the raw settings to determine what's explicitly set.
-	"system.replication_stats",
-	"system.replication_critical_localities",
-	"system.replication_constraint_stats",
 
 	// The synthetic SQL CREATE statements for all tables.
 	// Note the "". to collect across all databases.
-	`"".crdb_internal.create_schema_statements`,
 	`"".crdb_internal.create_statements`,
 	// Ditto, for CREATE TYPE.
 	`"".crdb_internal.create_type_statements`,
@@ -108,34 +109,13 @@ var debugZipTablesPerCluster = []string{
 	"crdb_internal.partitions",
 	"crdb_internal.zones",
 	"crdb_internal.invalid_objects",
-	"crdb_internal.index_usage_statistics",
-	"crdb_internal.table_indexes",
-}
-
-// getNodesList constructs a NodesListResponse using the Nodes API. We need this while building
-// the nodes list for older servers that don't support the new NodesList API.
-func (zc *debugZipContext) getNodesList(ctx context.Context) (*serverpb.NodesListResponse, error) {
-	nodes, err := zc.status.Nodes(ctx, &serverpb.NodesRequest{})
-	if err != nil {
-		return nil, err
-	}
-	nodesList := &serverpb.NodesListResponse{}
-	for _, node := range nodes.Nodes {
-		nodeDetails := serverpb.NodeDetails{
-			NodeID:     int32(node.Desc.NodeID),
-			Address:    node.Desc.Address,
-			SQLAddress: node.Desc.SQLAddress,
-		}
-		nodesList.Nodes = append(nodesList.Nodes, nodeDetails)
-	}
-	return nodesList, nil
 }
 
 // collectClusterData runs the data collection that only needs to
 // occur once for the entire cluster.
 func (zc *debugZipContext) collectClusterData(
 	ctx context.Context, firstNodeDetails *serverpb.DetailsResponse,
-) (nodeList []serverpb.NodeDetails, livenessByNodeID nodeLivenesses, err error) {
+) (nodeList []statuspb.NodeStatus, livenessByNodeID nodeLivenesses, err error) {
 	clusterWideZipRequests := makeClusterWideZipRequests(zc.admin, zc.status)
 
 	for _, r := range clusterWideZipRequests {
@@ -155,15 +135,10 @@ func (zc *debugZipContext) collectClusterData(
 	}
 
 	{
-		var nodes *serverpb.NodesListResponse
+		var nodes *serverpb.NodesResponse
 		s := zc.clusterPrinter.start("requesting nodes")
 		err := zc.runZipFn(ctx, s, func(ctx context.Context) error {
-			nodes, err = zc.status.NodesList(ctx, &serverpb.NodesListRequest{})
-			if code := status.Code(errors.Cause(err)); code == codes.Unimplemented {
-				// Fallback to the old Nodes API; this could occur while connecting to
-				// an older node which does not have the NodesList API implemented.
-				nodes, err = zc.getNodesList(ctx)
-			}
+			nodes, err = zc.status.Nodes(ctx, &serverpb.NodesRequest{})
 			return err
 		})
 		if cErr := zc.z.createJSONOrError(s, debugBase+"/nodes.json", nodes, err); cErr != nil {
@@ -174,12 +149,11 @@ func (zc *debugZipContext) collectClusterData(
 		// still want to inspect the per-node endpoints on the head
 		// node. As per the above, we were able to connect at least to
 		// that.
-		nodeList = []serverpb.NodeDetails{{
-			NodeID:     int32(firstNodeDetails.NodeID),
+		nodeList = []statuspb.NodeStatus{{Desc: roachpb.NodeDescriptor{
+			NodeID:     firstNodeDetails.NodeID,
 			Address:    firstNodeDetails.Address,
 			SQLAddress: firstNodeDetails.SQLAddress,
-		}}
-
+		}}}
 		if nodes != nil {
 			// If the nodes were found, use that instead.
 			nodeList = nodes.Nodes
@@ -200,5 +174,6 @@ func (zc *debugZipContext) collectClusterData(
 			livenessByNodeID = lresponse.Statuses
 		}
 	}
+
 	return nodeList, livenessByNodeID, nil
 }
