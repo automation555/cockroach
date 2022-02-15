@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvaccessor"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
@@ -42,12 +43,14 @@ import (
 // 		upsert [d,e):D
 //      ----
 //
-// They tie into GetSpanConfigRecords and UpdateSpanConfigRecords
+// They tie into GetSpanConfigEntriesFor and UpdateSpanConfigEntries
 // respectively. For kvaccessor-get, each listed span is added to the set of
 // spans being read. For kvaccessor-update, the lines prefixed with "delete"
 // count towards the spans being deleted, and for "upsert" they correspond to
 // the span config entries being upserted. See
 // spanconfigtestutils.Parse{Span,Config,SpanConfigEntry} for more details.
+//
+// TODO(arul): Run these things for secondary tenants as well.
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -69,20 +72,22 @@ func TestDataDriven(t *testing.T) {
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "kvaccessor-get":
-				targets := spanconfigtestutils.ParseKVAccessorGetArguments(t, d.Input)
-				records, err := accessor.GetSpanConfigRecords(ctx, targets)
+				spans, includeSystemSpanConfigs := spanconfigtestutils.ParseKVAccessorGetArguments(t, d.Input)
+				entries, err := accessor.GetSpanConfigEntriesFor(
+					ctx, roachpb.SystemTenantID, spans, includeSystemSpanConfigs,
+				)
 				if err != nil {
 					return fmt.Sprintf("err: %s", err.Error())
 				}
 
 				var output strings.Builder
-				for _, record := range records {
-					output.WriteString(fmt.Sprintf("%s\n", spanconfigtestutils.PrintSpanConfigRecord(record)))
+				for _, entry := range entries {
+					output.WriteString(fmt.Sprintf("%s\n", spanconfigtestutils.PrintSpanConfigRecord(entry)))
 				}
 				return output.String()
 			case "kvaccessor-update":
 				toDelete, toUpsert := spanconfigtestutils.ParseKVAccessorUpdateArguments(t, d.Input)
-				if err := accessor.UpdateSpanConfigRecords(ctx, toDelete, toUpsert); err != nil {
+				if err := accessor.UpdateSpanConfigEntries(ctx, toDelete, toUpsert); err != nil {
 					return fmt.Sprintf("err: %s", err.Error())
 				}
 				return "ok"

@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/migration"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtarget"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
@@ -59,32 +60,34 @@ func seedTenantSpanConfigsMigration(
 			// boundary. Look towards CreateTenantRecord for more details.
 			tenantSpanConfig := d.SpanConfig.Default
 			tenantPrefix := keys.MakeTenantPrefix(tenantID)
-			tenantTarget := spanconfig.MakeTargetFromSpan(roachpb.Span{
+			tenantSpan := roachpb.Span{
 				Key:    tenantPrefix,
 				EndKey: tenantPrefix.PrefixEnd(),
-			})
+			}
 			tenantSeedSpan := roachpb.Span{
 				Key:    tenantPrefix,
 				EndKey: tenantPrefix.Next(),
 			}
 			toUpsert := []spanconfig.Record{
 				{
-					Target: spanconfig.MakeTargetFromSpan(tenantSeedSpan),
+					Target: spanconfigtarget.NewSpanTarget(tenantSeedSpan),
 					Config: tenantSpanConfig,
 				},
 			}
-			scRecords, err := scKVAccessor.GetSpanConfigRecords(ctx, []spanconfig.Target{tenantTarget})
+			scEntries, err := scKVAccessor.GetSpanConfigEntriesFor(
+				ctx, tenantID, []roachpb.Span{tenantSpan}, true, /* includeSystemSpanConfigs */
+			)
 			if err != nil {
 				return err
 			}
-			if len(scRecords) != 0 {
+			if len(scEntries) != 0 {
 				// This tenant already has span config entries. It was either
 				// already migrated (migrations need to be idempotent) or it was
 				// created after PreSeedTenantSpanConfigs was activated. There's
 				// nothing left to do here.
 				continue
 			}
-			if err := scKVAccessor.UpdateSpanConfigRecords(
+			if err := scKVAccessor.UpdateSpanConfigEntries(
 				ctx, nil /* toDelete */, toUpsert,
 			); err != nil {
 				return errors.Wrapf(err, "failed to seed span config for tenant %d", tenantID)

@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -47,18 +48,21 @@ type mutation struct {
 	batchIdx int
 }
 
-// GetSpanConfigRecords is part of the KVAccessor interface.
-func (r *KVAccessorRecorder) GetSpanConfigRecords(
-	ctx context.Context, targets []spanconfig.Target,
+// GetSpanConfigEntriesFor is part of the KVAccessor interface.
+func (r *KVAccessorRecorder) GetSpanConfigEntriesFor(
+	ctx context.Context,
+	tenantID roachpb.TenantID,
+	spans []roachpb.Span,
+	includeSystemSpanConfigs bool,
 ) ([]spanconfig.Record, error) {
-	return r.underlying.GetSpanConfigRecords(ctx, targets)
+	return r.underlying.GetSpanConfigEntriesFor(ctx, tenantID, spans, includeSystemSpanConfigs)
 }
 
-// UpdateSpanConfigRecords is part of the KVAccessor interface.
-func (r *KVAccessorRecorder) UpdateSpanConfigRecords(
+// UpdateSpanConfigEntries is part of the KVAccessor interface.
+func (r *KVAccessorRecorder) UpdateSpanConfigEntries(
 	ctx context.Context, toDelete []spanconfig.Target, toUpsert []spanconfig.Record,
 ) error {
-	if err := r.underlying.UpdateSpanConfigRecords(ctx, toDelete, toUpsert); err != nil {
+	if err := r.underlying.UpdateSpanConfigEntries(ctx, toDelete, toUpsert); err != nil {
 		return err
 	}
 
@@ -98,7 +102,7 @@ func (r *KVAccessorRecorder) Recording(clear bool) string {
 		if mi.batchIdx != mj.batchIdx { // sort by batch/ts order
 			return mi.batchIdx < mj.batchIdx
 		}
-		if !mi.update.Target.Equal(mj.update.Target) { // sort by target order
+		if !mi.update.Target.Encode().Equal(mj.update.Target.Encode()) { // sort by target.
 			return mi.update.Target.Less(mj.update.Target)
 		}
 

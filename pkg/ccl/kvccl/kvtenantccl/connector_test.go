@@ -46,9 +46,8 @@ var rpcRetryOpts = retry.Options{
 var _ roachpb.InternalServer = &mockServer{}
 
 type mockServer struct {
-	rangeLookupFn    func(context.Context, *roachpb.RangeLookupRequest) (*roachpb.RangeLookupResponse, error)
-	gossipSubFn      func(*roachpb.GossipSubscriptionRequest, roachpb.Internal_GossipSubscriptionServer) error
-	tenantSettingsFn func(request *roachpb.TenantSettingsRequest, server roachpb.Internal_TenantSettingsServer) error
+	rangeLookupFn func(context.Context, *roachpb.RangeLookupRequest) (*roachpb.RangeLookupResponse, error)
+	gossipSubFn   func(*roachpb.GossipSubscriptionRequest, roachpb.Internal_GossipSubscriptionServer) error
 }
 
 func (m *mockServer) RangeLookup(
@@ -61,19 +60,6 @@ func (m *mockServer) GossipSubscription(
 	req *roachpb.GossipSubscriptionRequest, stream roachpb.Internal_GossipSubscriptionServer,
 ) error {
 	return m.gossipSubFn(req, stream)
-}
-
-func (m *mockServer) TenantSettings(
-	req *roachpb.TenantSettingsRequest, stream roachpb.Internal_TenantSettingsServer,
-) error {
-	if m.tenantSettingsFn == nil {
-		return stream.Send(&roachpb.TenantSettingsEvent{
-			Precedence:  roachpb.SpecificTenantOverrides,
-			Incremental: false,
-			Overrides:   nil,
-		})
-	}
-	return m.tenantSettingsFn(req, stream)
 }
 
 func (*mockServer) ResetQuorum(
@@ -111,6 +97,12 @@ func (m *mockServer) GetSpanConfigs(
 func (m *mockServer) UpdateSpanConfigs(
 	context.Context, *roachpb.UpdateSpanConfigsRequest,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
+	panic("unimplemented")
+}
+
+func (m *mockServer) TenantSettings(
+	*roachpb.TenantSettingsRequest, roachpb.Internal_TenantSettingsServer,
+) error {
 	panic("unimplemented")
 }
 

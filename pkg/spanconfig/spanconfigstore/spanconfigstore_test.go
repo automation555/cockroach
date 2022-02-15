@@ -17,8 +17,8 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -61,32 +61,32 @@ func TestRandomized(t *testing.T) {
 		return ops[rand.Intn(2)]
 	}
 
-	getRandomUpdate := func() spanconfig.Update {
+	getRandomUpdate := func() spanConfigStoreUpdate {
 		sp, conf, op := genRandomSpan(), getRandomConf(), getRandomOp()
 		switch op {
 		case "set":
-			return spanconfig.Addition(spanconfig.MakeTargetFromSpan(sp), conf)
+			return addition(sp, conf)
 		case "del":
-			return spanconfig.Deletion(spanconfig.MakeTargetFromSpan(sp))
+			return deletion(sp)
 		default:
 		}
 		t.Fatalf("unexpected op: %s", op)
-		return spanconfig.Update{}
+		return spanConfigStoreUpdate{}
 	}
 
-	getRandomUpdates := func() []spanconfig.Update {
+	getRandomUpdates := func() []spanConfigStoreUpdate {
 		numUpdates := 1 + rand.Intn(3)
-		updates := make([]spanconfig.Update, numUpdates)
+		updates := make([]spanConfigStoreUpdate, numUpdates)
 		for {
 			for i := 0; i < numUpdates; i++ {
 				updates[i] = getRandomUpdate()
 			}
 			sort.Slice(updates, func(i, j int) bool {
-				return updates[i].Target.Less(updates[j].Target)
+				return updates[i].span.Key.Compare(updates[j].span.Key) < 0
 			})
 			invalid := false
 			for i := 1; i < numUpdates; i++ {
-				if updates[i].Target.GetSpan().Overlaps(updates[i-1].Target.GetSpan()) {
+				if updates[i].span.Overlaps(updates[i-1].span) {
 					invalid = true
 				}
 			}
@@ -110,12 +110,11 @@ func TestRandomized(t *testing.T) {
 	store := newSpanConfigStore()
 	for i := 0; i < numOps; i++ {
 		updates := getRandomUpdates()
-		_, _, err := store.apply(false /* dryrun */, updates...)
-		require.NoError(t, err)
+		store.apply(false /* dryrun */, updates...)
 		for _, update := range updates {
-			if testSpan.Overlaps(update.Target.GetSpan()) {
-				if update.Addition() {
-					expConfig, expFound = update.Config, true
+			if testSpan.Overlaps(update.span) {
+				if update.isAddition() {
+					expConfig, expFound = update.config, true
 				} else {
 					expConfig, expFound = roachpb.SpanConfig{}, false
 				}
@@ -124,15 +123,17 @@ func TestRandomized(t *testing.T) {
 	}
 
 	if !expFound {
-		_ = store.forEachOverlapping(testSpan,
-			func(entry spanConfigEntry) error {
-				t.Fatalf("found unexpected entry: %s",
-					spanconfigtestutils.PrintSpanConfigRecord(spanconfig.Record{
-						Target: spanconfig.MakeTargetFromSpan(entry.span),
+		_ = store.forEachOverlapping(testSpan, func(entry spanConfigEntry) error {
+			t.Fatalf("found unexpected entry: %s",
+				spanconfigtestutils.PrintSpanConfigRecord(
+					roachpb.SpanConfigEntry{
+						Target: entry.span.SpanConfigTarget(),
 						Config: entry.config,
-					}))
-				return nil
-			},
+					},
+				),
+			)
+			return nil
+		},
 		)
 	} else {
 		var foundEntry spanConfigEntry
@@ -140,10 +141,13 @@ func TestRandomized(t *testing.T) {
 			func(entry spanConfigEntry) error {
 				if !foundEntry.isEmpty() {
 					t.Fatalf("expected single overlapping entry, found second: %s",
-						spanconfigtestutils.PrintSpanConfigRecord(spanconfig.Record{
-							Target: spanconfig.MakeTargetFromSpan(entry.span),
-							Config: entry.config,
-						}))
+						spanconfigtestutils.PrintSpanConfigRecord(
+							roachpb.SpanConfigEntry{
+								Target: entry.span.SpanConfigTarget(),
+								Config: entry.config,
+							},
+						),
+					)
 				}
 				foundEntry = entry
 
@@ -169,34 +173,30 @@ func TestRandomized(t *testing.T) {
 		require.True(t, foundEntry.config.Equal(storeReaderConfig))
 	}
 
-	everythingSpan := spanconfigtestutils.ParseSpan(t, fmt.Sprintf("[%s,%s)",
-		string(alphabet[0]), string(alphabet[len(alphabet)-1])))
-
 	var last spanConfigEntry
-	_ = store.forEachOverlapping(everythingSpan,
-		func(cur spanConfigEntry) error {
-			// All spans are expected to be valid.
-			require.True(t, cur.span.Valid(),
-				"expected to only find valid spans, found %s",
-				spanconfigtestutils.PrintSpan(cur.span),
-			)
+	_ = store.forEachOverlapping(keys.EverythingSpan, func(cur spanConfigEntry) error {
+		// All spans are expected to be valid.
+		require.True(
+			t,
+			cur.span.Valid(),
+			"expected to only find valid spans, found %s", spanconfigtestutils.PrintSpan(cur.span),
+		)
 
-			if last.isEmpty() {
-				last = cur
-				return nil
-			}
-
-			// Span configs are returned in strictly sorted order.
-			require.True(t, last.span.Key.Compare(cur.span.Key) < 0,
-				"expected to find spans in strictly sorted order, found %s then %s",
-				spanconfigtestutils.PrintSpan(last.span), spanconfigtestutils.PrintSpan(cur.span))
-
-			// Span configs must also be non-overlapping.
-			require.Falsef(t, last.span.Overlaps(cur.span),
-				"expected non-overlapping spans, found %s and %s",
-				spanconfigtestutils.PrintSpan(last.span), spanconfigtestutils.PrintSpan(cur.span))
-
+		if last.isEmpty() {
+			last = cur
 			return nil
-		},
-	)
+		}
+
+		// Span configs are returned in strictly sorted order.
+		require.True(t, last.span.Key.Compare(cur.span.Key) < 0,
+			"expected to find spans in strictly sorted order, found %s then %s",
+			spanconfigtestutils.PrintSpan(last.span), spanconfigtestutils.PrintSpan(cur.span))
+
+		// Span configs must also be non-overlapping.
+		require.Falsef(t, last.span.Overlaps(cur.span),
+			"expected non-overlapping spans, found %s and %s",
+			spanconfigtestutils.PrintSpan(last.span), spanconfigtestutils.PrintSpan(cur.span))
+
+		return nil
+	})
 }

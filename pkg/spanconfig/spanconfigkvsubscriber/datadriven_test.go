@@ -81,10 +81,10 @@ import (
 //      ----
 //      ok
 //
-// - update and get tie into GetSpanConfigRecords and UpdateSpanConfigRecords
-//   respectively on the KVAccessor interface, and are a convenient shorthand to
-//   populate the system table that the KVSubscriber subscribes to. The input is
-//   processed in a single batch.
+// - update and get tie into GetSpanConfigEntriesFor and
+//   UpdateSpanConfigEntries respectively on the KVAccessor interface, and are a
+//   convenient shorthand to populate the system table that the KVSubscriber
+//   subscribes to. The input is processed in a single batch.
 // - start starts the subscription process. It can also be used to verify
 //   behavior when re-establishing subscriptions after hard errors.
 // - updates lists the span updates the KVSubscriber receives, in the listed
@@ -97,7 +97,7 @@ import (
 //   kvsubscriber and is useful to test teardown and recovery behavior.
 //
 // Text of the form [a,b) and [a,b):C correspond to spans and span config
-// records; see spanconfigtestutils.Parse{Span,Config,SpanConfigRecord} for more
+// entries; see spanconfigtestutils.Parse{Span,Config,SpanConfigEntry} for more
 // details.
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -165,7 +165,7 @@ func TestDataDriven(t *testing.T) {
 			},
 		)
 
-		kvSubscriber.Subscribe(func(ctx context.Context, span roachpb.Span) {
+		kvSubscriber.Subscribe(func(span roachpb.Span) {
 			mu.Lock()
 			defer mu.Unlock()
 			mu.receivedUpdates = append(mu.receivedUpdates, span)
@@ -175,19 +175,21 @@ func TestDataDriven(t *testing.T) {
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "get":
-				targets := spanconfigtestutils.ParseKVAccessorGetArguments(t, d.Input)
-				records, err := kvAccessor.GetSpanConfigRecords(ctx, targets)
+				spans, _ := spanconfigtestutils.ParseKVAccessorGetArguments(t, d.Input)
+				entries, err := kvAccessor.GetSpanConfigEntriesFor(
+					ctx, roachpb.SystemTenantID, spans, false, /*includeSystemSpanConfigTargets */
+				)
 				require.NoError(t, err)
 
 				var output strings.Builder
-				for _, record := range records {
-					output.WriteString(fmt.Sprintf("%s\n", spanconfigtestutils.PrintSpanConfigRecord(record)))
+				for _, entry := range entries {
+					output.WriteString(fmt.Sprintf("%s\n", spanconfigtestutils.PrintSpanConfigRecord(entry)))
 				}
 				return output.String()
 
 			case "update":
 				toDelete, toUpsert := spanconfigtestutils.ParseKVAccessorUpdateArguments(t, d.Input)
-				require.NoError(t, kvAccessor.UpdateSpanConfigRecords(ctx, toDelete, toUpsert))
+				require.NoError(t, kvAccessor.UpdateSpanConfigEntries(ctx, toDelete, toUpsert))
 				lastUpdateTS = ts.Clock().Now()
 
 			case "start":

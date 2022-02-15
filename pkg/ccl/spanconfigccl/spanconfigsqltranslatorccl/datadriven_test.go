@@ -167,8 +167,11 @@ func TestDataDriven(t *testing.T) {
 
 				var output strings.Builder
 				for _, record := range records {
-					output.WriteString(fmt.Sprintf("%-42s %s\n", record.Target.GetSpan(),
-						spanconfigtestutils.PrintSpanConfigDiffedAgainstDefaults(record.Config)))
+					output.WriteString(fmt.Sprintf(
+						"%-42s %s\n",
+						*record.Target.TargetProto().GetSpan(),
+						spanconfigtestutils.PrintSpanConfigDiffedAgainstDefaults(record.Config)),
+					)
 				}
 				return output.String()
 
@@ -182,8 +185,11 @@ func TestDataDriven(t *testing.T) {
 				})
 				var output strings.Builder
 				for _, record := range records {
-					output.WriteString(fmt.Sprintf("%-42s %s\n", record.Target.GetSpan(),
-						spanconfigtestutils.PrintSpanConfigDiffedAgainstDefaults(record.Config)))
+					output.WriteString(fmt.Sprintf(
+						"%-42s %s\n",
+						*record.Target.TargetProto().GetSpan(),
+						spanconfigtestutils.PrintSpanConfigDiffedAgainstDefaults(record.Config)),
+					)
 				}
 				return output.String()
 
