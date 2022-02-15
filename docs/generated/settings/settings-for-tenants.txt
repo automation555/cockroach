@@ -95,7 +95,7 @@ sql.defaults.experimental_distsql_planning	enumeration	off	default experimental_
 sql.defaults.experimental_enable_unique_without_index_constraints.enabled	boolean	false	default value for experimental_enable_unique_without_index_constraints session setting;disables unique without index constraints by default
 sql.defaults.experimental_hash_sharded_indexes.enabled	boolean	false	default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default
 sql.defaults.experimental_implicit_column_partitioning.enabled	boolean	false	default value for experimental_enable_temp_tables; allows for the use of implicit column partitioning
-sql.defaults.experimental_new_schema_changer.enabled	enumeration	off	default value for experimental_use_new_schema_changer session setting;disables new schema changer by default [off = 0, on = 1, unsafe = 2, unsafe_always = 3]
+sql.defaults.use_declarative_schema_changer	enumeration	off	default value for use_declarative_schema_changer session setting;disables new schema changer by default [off = 0, on = 1, unsafe = 2, unsafe_always = 3]
 sql.defaults.experimental_stream_replication.enabled	boolean	false	default value for experimental_stream_replication session setting;enables the ability to setup a replication stream
 sql.defaults.experimental_temporary_tables.enabled	boolean	false	default value for experimental_enable_temp_tables; allows for use of temporary tables by default
 sql.defaults.foreign_key_cascades_limit	integer	10000	default value for foreign_key_cascades_limit session setting; limits the number of cascading operations that run as part of a single query
@@ -167,8 +167,6 @@ sql.trace.log_statement_execute	boolean	false	set to true to enable logging of e
 sql.trace.session_eventlog.enabled	boolean	false	set to true to enable session tracing. Note that enabling this may have a non-trivial negative performance impact.
 sql.trace.stmt.enable_threshold	duration	0s	duration beyond which all statements are traced (set to 0 to disable). This applies to individual statements within a transaction and is therefore finer-grained than sql.trace.txn.enable_threshold.
 sql.trace.txn.enable_threshold	duration	0s	duration beyond which all transactions are traced (set to 0 to disable). This setting is coarser grained thansql.trace.stmt.enable_threshold because it applies to all statements within a transaction as well as client communication (e.g. retries).
-sql.ttl.default_delete_batch_size	integer	100	default amount of rows to delete in a single query during a TTL job
-sql.ttl.default_select_batch_size	integer	500	default amount of rows to select in a single query during a TTL job
 timeseries.storage.enabled	boolean	true	if set, periodic timeseries data is stored within the cluster; disabling is not recommended unless you are storing the data elsewhere
 timeseries.storage.resolution_10s.ttl	duration	240h0m0s	the maximum age of time series data stored at the 10 second resolution. Data older than this is subject to rollup and deletion.
 timeseries.storage.resolution_30m.ttl	duration	2160h0m0s	the maximum age of time series data stored at the 30 minute resolution. Data older than this is subject to deletion.
