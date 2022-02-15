@@ -64,7 +64,7 @@ include build/defs.mk
 #
 # Note how the actions for this rule are *not* using $(GIT_DIR) which
 # is otherwise defined in defs.mk above. This is because submodules
-# are used in the process of defining the .mk files included by the
+# are used in the process of definining the .mk files included by the
 # Makefile, so it is not yet defined by the time
 # `.submodules-initialized` is needed during a fresh build after a
 # checkout.
@@ -199,10 +199,10 @@ help: ## Print help for targets with comments.
 		"make test PKG=./pkg/sql" "Run all unit tests in the ./pkg/sql package" \
 		"make test PKG=./pkg/sql/parser TESTS=TestParse" "Run the TestParse test in the ./pkg/sql/parser package." \
 		"make bench PKG=./pkg/sql/parser BENCHES=BenchmarkParse" "Run the BenchmarkParse benchmark in the ./pkg/sql/parser package." \
-		"make testlogic" "Run all base, opt exec builder, and CCL logic tests." \
+		"make testlogic" "Run all OSS SQL logic tests." \
 		"make testccllogic" "Run all CCL SQL logic tests." \
 		"make testoptlogic" "Run all opt exec builder SQL logic tests." \
-		"make testbaselogic" "Run all the OSS SQL logic tests." \
+		"make testbaselogic" "Run all the baseSQL SQL logic tests." \
 		"make testlogic FILES='prepare|fk'" "Run the logic tests in the files named prepare and fk (the full path is not required)." \
 		"make testlogic FILES=fk SUBTESTS='20042|20045'" "Run the logic tests within subtests 20042 and 20045 in the file named fk." \
 		"make testlogic TESTCONFIG=local" "Run the logic tests for the cluster configuration 'local'." \
@@ -366,7 +366,7 @@ $(CLUSTER_UI_JS): $(shell find pkg/ui/workspaces/cluster-ui/src -type f | sed 's
 pkg/ui/yarn.installed: pkg/ui/package.json pkg/ui/yarn.lock | bin/.submodules-initialized
 	@# Do not install optional dependencies as far as they are required for UI development only
 	@# and should not be installed for production builds.
-	@# Also some linux distributions (that are used as development env) don't support some of
+	@# Also some of linux distributives (that are used as development env) don't support some of
 	@# optional dependencies (i.e. cypress) so it is important to make these deps optional.
 	$(NODE_RUN) -C pkg/ui yarn install --ignore-optional --offline
 	@# We remove this broken dependency again in pkg/ui/webpack.config.js.
@@ -387,7 +387,6 @@ bin/.bootstrap: $(GITHOOKS) vendor/modules.txt | bin/.submodules-initialized
 		github.com/cockroachdb/gostdlib/x/tools/cmd/goimports \
 		github.com/golang/mock/mockgen \
 		github.com/cockroachdb/stress \
-		github.com/cockroachdb/tools/cmd/stringer \
 		github.com/goware/modvendor \
 		github.com/go-swagger/go-swagger/cmd/swagger \
 		github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway \
@@ -401,6 +400,7 @@ bin/.bootstrap: $(GITHOOKS) vendor/modules.txt | bin/.submodules-initialized
 		golang.org/x/lint/golint \
 		golang.org/x/perf/cmd/benchstat \
 		golang.org/x/tools/cmd/goyacc \
+		golang.org/x/tools/cmd/stringer \
 		golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow \
 		honnef.co/go/tools/cmd/staticcheck \
 		github.com/bufbuild/buf/cmd/buf
@@ -566,7 +566,6 @@ $(BASE_CGO_FLAGS_FILES): Makefile build/defs.mk.sig | bin/.submodules-initialize
 	@echo "regenerating $@"
 	@echo '// GENERATED FILE DO NOT EDIT' > $@
 	@echo >> $@
-	@echo '//go:build $(if $(findstring $(native-tag),$@),$(native-tag),!make)' >> $@
 	@echo '// +build $(if $(findstring $(native-tag),$@),$(native-tag),!make)' >> $@
 	@echo >> $@
 	@echo 'package $(if $($(@D)-package),$($(@D)-package),$(notdir $(@D)))' >> $@
@@ -619,7 +618,7 @@ $(JEMALLOC_DIR)/Makefile: $(C_DEPS_DIR)/jemalloc-rebuild $(JEMALLOC_SRC_DIR)/con
 $(KRB5_SRC_DIR)/src/configure.in: | bin/.submodules-initialized
 
 $(KRB5_SRC_DIR)/src/configure: $(KRB5_SRC_DIR)/src/configure.in
-	cd $(KRB5_SRC_DIR)/src && autoreconf -Wno-obsolete
+	cd $(KRB5_SRC_DIR)/src && autoreconf
 
 $(KRB5_DIR)/Makefile: $(C_DEPS_DIR)/krb5-rebuild $(KRB5_SRC_DIR)/src/configure
 	rm -rf $(KRB5_DIR)
@@ -795,10 +794,6 @@ DOCGEN_TARGETS := \
 	docs/generated/logging.md \
 	docs/generated/eventlog.md
 
-GENERATED_TARGETS = \
-  pkg/roachprod/vm/aws/embedded.go \
-  pkg/security/securitytest/embedded.go
-
 EXECGEN_TARGETS = \
   pkg/col/coldata/vec.eg.go \
   pkg/sql/colconv/datum_to_vec.eg.go \
@@ -895,8 +890,7 @@ OPTGEN_TARGETS = \
 	pkg/sql/opt/rule_name.og.go \
 	pkg/sql/opt/rule_name_string.go \
 	pkg/sql/opt/exec/factory.og.go \
-	pkg/sql/opt/exec/explain/explain_factory.og.go \
-	pkg/sql/opt/exec/explain/plan_gist_factory.og.go \
+	pkg/sql/opt/exec/explain/explain_factory.og.go
 
 # removed-files is a list of files that used to exist in the
 # repository that need to be explicitly cleaned up to prevent build
@@ -917,17 +911,17 @@ ifneq ($(removed-files-to-remove),)
 endif
 
 test-targets := \
-	check test testshort testslow testrace testraceslow testdeadlock testbuild \
+	check test testshort testslow testrace testraceslow testbuild \
 	stress stressrace \
 	roachprod-stress roachprod-stressrace \
 	testlogic testbaselogic testccllogic testoptlogic
 
 go-targets-ccl := \
 	$(COCKROACH) \
-	bin/workload bin/roachprod bin/roachtest \
+	bin/workload \
 	go-install \
 	bench benchshort \
-	check test testshort testslow testrace testraceslow testdeadlock testbuild \
+	check test testshort testslow testrace testraceslow testbuild \
 	stress stressrace \
 	roachprod-stress roachprod-stressrace \
 	generate \
@@ -968,14 +962,14 @@ BUILD_TAGGED_RELEASE =
 ## Override for .buildinfo/tag
 BUILDINFO_TAG :=
 
-$(go-targets): bin/.bootstrap $(BUILDINFO) $(CGO_FLAGS_FILES) $(PROTOBUF_TARGETS) $(LIBPROJ) $(GENERATED_TARGETS) $(CLEANUP_TARGETS)
+$(go-targets): bin/.bootstrap $(BUILDINFO) $(CGO_FLAGS_FILES) $(PROTOBUF_TARGETS) $(LIBPROJ) $(CLEANUP_TARGETS)
 $(go-targets): $(LOG_TARGETS) $(SQLPARSER_TARGETS) $(OPTGEN_TARGETS)
 $(go-targets): override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.tag=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))" \
 	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)" \
 	-X "github.com/cockroachdb/cockroach/pkg/build.cgoTargetTriple=$(TARGET_TRIPLE)" \
 	$(if $(BUILDCHANNEL),-X "github.com/cockroachdb/cockroach/pkg/build.channel=$(BUILDCHANNEL)") \
-	$(if $(BUILD_TAGGED_RELEASE),-X "github.com/cockroachdb/cockroach/pkg/util/log/logcrash.crashReportEnv=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))")
+	$(if $(BUILD_TAGGED_RELEASE),-X "github.com/cockroachdb/cockroach/pkg/util/log.crashReportEnv=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))")
 
 # The build.utcTime format must remain in sync with TimeFormat in
 # pkg/build/info.go. It is not installed in tests or in `buildshort` to avoid
@@ -1050,8 +1044,6 @@ testbuild:
 
 testshort: override TESTFLAGS += -short
 
-testdeadlock: TAGS += deadlock
-
 testrace: ## Run tests with the Go race detector enabled.
 testrace stressrace roachprod-stressrace: override GOFLAGS += -race
 testrace stressrace roachprod-stressrace: export GORACE := halt_on_error=1
@@ -1071,9 +1063,9 @@ bench benchshort: TESTTIMEOUT := $(BENCHTIMEOUT)
 # that longer running benchmarks can skip themselves.
 benchshort: override TESTFLAGS += -benchtime=1ns -short
 
-.PHONY: check test testshort testrace testdeadlock testlogic testbaselogic testccllogic testoptlogic bench benchshort
+.PHONY: check test testshort testrace testlogic testbaselogic testccllogic testoptlogic bench benchshort
 test: ## Run tests.
-check test testshort testrace testdeadlock bench benchshort:
+check test testshort testrace bench benchshort:
 	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
 
 .PHONY: stress stressrace
@@ -1100,6 +1092,8 @@ testlogic: testbaselogic testoptlogic testccllogic
 testbaselogic: ## Run SQL Logic Tests.
 testbaselogic: bin/logictest
 
+testtenantlogic: bin/logictestccl
+
 testccllogic: ## Run SQL CCL Logic Tests.
 testccllogic: bin/logictestccl
 
@@ -1108,7 +1102,8 @@ testoptlogic: bin/logictestopt
 
 logic-test-selector := $(if $(TESTCONFIG),^$(TESTCONFIG)$$)/$(if $(FILES),^$(subst $(space),$$|^,$(FILES))$$)/$(SUBTESTS)
 testbaselogic: TESTS := TestLogic/$(logic-test-selector)
-testccllogic: TESTS := Test(CCL|Tenant)Logic/$(logic-test-selector)
+testtenantlogic: TESTS := TestTenantLogic/$(logic-test-selector)
+testccllogic: TESTS := TestCCLLogic/$(logic-test-selector)
 testoptlogic: TESTS := TestExecBuild/$(logic-test-selector)
 
 # Note: we specify -config here in addition to the filter on TESTS
@@ -1117,8 +1112,8 @@ testoptlogic: TESTS := TestExecBuild/$(logic-test-selector)
 # does not prevent loading and initializing every default config in
 # turn (including setting up the test clusters, etc.). By specifying
 # -config, the extra initialization overhead is averted.
-testbaselogic testccllogic testoptlogic: TESTFLAGS := -test.v $(if $(FILES),-show-sql) $(if $(TESTCONFIG),-config $(TESTCONFIG))
-testbaselogic testccllogic testoptlogic:
+testbaselogic testtenantlogic testccllogic testoptlogic: TESTFLAGS := -test.v $(if $(FILES),-show-sql) $(if $(TESTCONFIG),-config $(TESTCONFIG))
+testbaselogic testtenantlogic testccllogic testoptlogic:
 	cd $($(<F)-package) && $(<F) -test.run "$(TESTS)" -test.timeout $(TESTTIMEOUT) $(TESTFLAGS)
 
 testraceslow: override GOFLAGS += -race
@@ -1290,7 +1285,7 @@ UI_PROTOS_OSS := $(UI_JS_OSS) $(UI_TS_OSS)
 $(GOGOPROTO_PROTO): bin/.submodules-initialized
 $(ERRORS_PROTO): bin/.submodules-initialized
 
-bin/.go_protobuf_sources: $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap bin/protoc-gen-gogoroach c-deps/proto-rebuild
+bin/.go_protobuf_sources: $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap bin/protoc-gen-gogoroach
 	$(FIND_RELEVANT) -type f -name '*.pb.go' -exec rm {} +
 	set -e; for dir in $(sort $(dir $(GO_PROTOS))); do \
 	  buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) -I$(ERRORS_PATH) --gogoroach_out=$(PROTO_MAPPINGS)plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/:./pkg $$dir/*.proto; \
@@ -1298,7 +1293,7 @@ bin/.go_protobuf_sources: $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.b
 	gofmt -s -w $(GO_SOURCES)
 	touch $@
 
-bin/.gw_protobuf_sources: $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap c-deps/proto-rebuild
+bin/.gw_protobuf_sources: $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap
 	$(FIND_RELEVANT) -type f -name '*.pb.gw.go' -exec rm {} +
 		buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(ERRORS_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_SERVER_PROTOS)
 		buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(ERRORS_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_TS_PROTOS)
@@ -1432,13 +1427,13 @@ ui-watch ui-watch-secure: $(UI_CCL_DLLS) pkg/ui/yarn.opt.installed
   # `node-run.sh` wrapper is removed because this command is supposed to be run in dev environment (not in docker of CI)
   # so it is safe to run yarn commands directly to preserve formatting and colors for outputs
 	yarn --cwd pkg/ui/workspaces/cluster-ui build:watch & \
-	yarn --cwd pkg/ui/workspaces/db-console webpack-dev-server --config webpack.app.js --env.dist=ccl --env.WEBPACK_SERVE --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
+	yarn --cwd pkg/ui/workspaces/db-console webpack-dev-server --config webpack.app.js --env.dist=ccl --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
 
 .PHONY: ui-clean
 ui-clean: ## Remove build artifacts.
 	find pkg/ui/distccl/assets pkg/ui/distoss/assets -mindepth 1 -not -name .gitkeep -delete
 	rm -rf pkg/ui/assets.ccl.installed pkg/ui/assets.oss.installed
-	rm -rf pkg/ui/dist_vendor/*
+	rm -rf pkg/ui/dist/*
 	rm -f $(UI_PROTOS_CCL) $(UI_PROTOS_OSS)
 	rm -f pkg/ui/workspaces/db-console/*manifest.json
 	rm -rf pkg/ui/workspaces/cluster-ui/dist
@@ -1447,12 +1442,6 @@ ui-clean: ## Remove build artifacts.
 ui-maintainer-clean: ## Like clean, but also remove installed dependencies
 ui-maintainer-clean: ui-clean
 	rm -rf pkg/ui/node_modules pkg/ui/workspaces/db-console/node_modules pkg/ui/yarn.installed pkg/ui/workspaces/cluster-ui/node_modules
-
-pkg/roachprod/vm/aws/embedded.go: bin/.bootstrap pkg/roachprod/vm/aws/config.json pkg/roachprod/vm/aws/old.json bin/terraformgen
-	(cd pkg/roachprod/vm/aws && $(GO) generate)
-
-pkg/security/securitytest/embedded.go: bin/.bootstrap $(shell find pkg/security/securitytest/test_certs -type f -not -name README.md -not -name regenerate.sh)
-	(cd pkg/security/securitytest && $(GO) generate)
 
 .SECONDARY: pkg/sql/parser/gen/sql.go.tmp
 pkg/sql/parser/gen/sql.go.tmp: pkg/sql/parser/gen/sql-gen.y bin/.bootstrap
@@ -1576,7 +1565,6 @@ docs/generated/redact_safe.md:
 # Order matters!!
 EVENTLOG_PROTOS = \
 	pkg/util/log/eventpb/events.proto \
-	pkg/util/log/eventpb/debug_events.proto \
 	pkg/util/log/eventpb/ddl_events.proto \
 	pkg/util/log/eventpb/misc_sql_events.proto \
 	pkg/util/log/eventpb/privilege_events.proto \
@@ -1628,7 +1616,7 @@ pkg/util/log/log_channels_generated.go: pkg/util/log/gen/main.go pkg/util/log/lo
 .PHONY: execgen
 execgen: ## Regenerate generated code for the vectorized execution engine.
 execgen: $(EXECGEN_TARGETS) bin/execgen
-	for i in $(EXECGEN_TARGETS); do echo EXECGEN $$i && COCKROACH_INTERNAL_DISABLE_METAMORPHIC_TESTING=true ./bin/execgen -fmt=false $$i > $$i; done
+	for i in $(EXECGEN_TARGETS); do echo EXECGEN $$i && ./bin/execgen -fmt=false $$i > $$i; done
 	goimports -w $(EXECGEN_TARGETS)
 
 # Add a catch-all rule for any non-existent execgen generated
@@ -1665,9 +1653,6 @@ pkg/sql/opt/exec/factory.og.go: $(optgen-defs) $(optgen-exec-defs) bin/optgen
 
 pkg/sql/opt/exec/explain/explain_factory.og.go: $(optgen-defs) $(optgen-exec-defs) bin/optgen
 	optgen -out $@ execexplain $(optgen-exec-defs)
-
-pkg/sql/opt/exec/explain/plan_gist_factory.og.go: $(optgen-defs) $(optgen-exec-defs) bin/optgen
-	optgen -out $@ execplangist $(optgen-exec-defs)
 
 .PHONY: clean-c-deps
 clean-c-deps:
@@ -1723,6 +1708,7 @@ bins = \
   bin/cockroach-short \
   bin/cockroach-sql \
   bin/compile-builds \
+  bin/dev \
   bin/docgen \
   bin/execgen \
   bin/fuzz \
@@ -1768,13 +1754,13 @@ optgen-package = ./pkg/sql/opt/optgen/cmd/optgen
 logictest-package = ./pkg/sql/logictest
 logictestccl-package = ./pkg/ccl/logictestccl
 logictestopt-package = ./pkg/sql/opt/exec/execbuilder
-terraformgen-package = ./pkg/roachprod/vm/aws/terraformgen
+terraformgen-package = ./pkg/cmd/roachprod/vm/aws/terraformgen
 logictest-bins := bin/logictest bin/logictestopt bin/logictestccl
 
 # Additional dependencies for binaries that depend on generated code.
 #
 # TODO(benesch): Derive this automatically. This is getting out of hand.
-bin/workload bin/docgen bin/execgen bin/roachtest bin/roachvet $(logictest-bins): $(SQLPARSER_TARGETS) $(LOG_TARGETS) $(PROTOBUF_TARGETS)
+bin/workload bin/docgen bin/execgen bin/roachtest $(logictest-bins): $(SQLPARSER_TARGETS) $(LOG_TARGETS) $(PROTOBUF_TARGETS)
 bin/workload bin/docgen bin/roachtest $(logictest-bins): $(LIBPROJ) $(CGO_FLAGS_FILES)
 bin/roachtest $(logictest-bins): $(C_LIBS_CCL) $(CGO_FLAGS_FILES) $(OPTGEN_TARGETS) | $(C_LIBS_DYNAMIC)
 
@@ -1844,7 +1830,7 @@ endif
 #
 # The additional complexity below handles whitespace and comments.
 #
-# The special comments at the beginning are for GitHub/Go/Reviewable:
+# The special comments at the beginning are for Github/Go/Reviewable:
 # https://github.com/golang/go/issues/13560#issuecomment-277804473
 # https://github.com/Reviewable/Reviewable/wiki/FAQ#how-do-i-tell-reviewable-that-a-file-is-generated-and-should-not-be-reviewed
 # Note how the 'prefix' variable is manually appended. This is required by Homebrew.
