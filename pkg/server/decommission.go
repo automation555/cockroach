@@ -54,7 +54,10 @@ func getPingCheckDecommissionFn(
 // Decommission idempotently sets the decommissioning flag for specified nodes.
 // The error return is a gRPC error.
 func (s *Server) Decommission(
-	ctx context.Context, targetStatus livenesspb.MembershipStatus, nodeIDs []roachpb.NodeID,
+	ctx context.Context,
+	targetStatus livenesspb.MembershipStatus,
+	nodeIDs []roachpb.NodeID,
+	verbose bool,
 ) error {
 	// If we're asked to decommission ourself we may lose access to cluster RPC,
 	// so we decommission ourself last. We copy the slice to avoid mutating the
