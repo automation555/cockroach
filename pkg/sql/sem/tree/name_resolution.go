@@ -226,9 +226,8 @@ type CommonLookupFlags struct {
 	Required bool
 	// RequireMutable specifies whether to return a mutable descriptor.
 	RequireMutable bool
-	// AvoidLeased, if set, avoid the leased (possibly stale) version of the
-	// descriptor. It must be set when callers want consistent reads.
-	AvoidLeased bool
+	// if AvoidCached is set, lookup will avoid the cache (if any).
+	AvoidCached bool
 	// IncludeOffline specifies if offline descriptors should be visible.
 	IncludeOffline bool
 	// IncludeOffline specifies if dropped descriptors should be visible.
@@ -256,10 +255,14 @@ type DatabaseListFlags struct {
 type DesiredObjectKind int
 
 const (
+	_ DesiredObjectKind = iota
 	// TableObject is used when a table-like object is desired from resolution.
-	TableObject DesiredObjectKind = iota
+	TableObject
 	// TypeObject is used when a type-like object is desired from resolution.
 	TypeObject
+	// AnyObject is used when any object is acceptable. This is primary used when
+	// looking for name conflicts.
+	AnyObject
 )
 
 // NewQualifiedObjectName returns an ObjectName of the corresponding kind.
@@ -273,6 +276,10 @@ func NewQualifiedObjectName(catalog, schema, object string, kind DesiredObjectKi
 	case TypeObject:
 		name := MakeQualifiedTypeName(catalog, schema, object)
 		return &name
+	case AnyObject:
+		return &UnspecifiedObjectName{
+			objName: makeQualifiedObjName(Name(catalog), Name(schema), Name(object)),
+		}
 	}
 	return nil
 }

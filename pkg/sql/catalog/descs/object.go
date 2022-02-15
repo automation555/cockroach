@@ -68,7 +68,7 @@ func (tc *Collection) getObjectByName(
 		return prefix, nil, err
 	}
 	if desc.Adding() && desc.IsUncommittedVersion() &&
-		(flags.RequireMutable || flags.CommonLookupFlags.AvoidLeased) {
+		(flags.RequireMutable || flags.CommonLookupFlags.AvoidCached) {
 		// Special case: We always return tables in the adding state if they were
 		// created in the same transaction and a descriptor (effectively) read in
 		// the same transaction is requested. What this basically amounts to is
@@ -95,7 +95,7 @@ func (tc *Collection) getObjectByName(
 		// requested descriptor type, we return either the table descriptor itself,
 		// or the table descriptor's implicit record type.
 		switch flags.DesiredObjectKind {
-		case tree.TableObject, tree.TypeObject:
+		case tree.TableObject, tree.TypeObject, tree.AnyObject:
 		default:
 			return prefix, nil, nil
 		}
@@ -120,7 +120,9 @@ func (tc *Collection) getObjectByName(
 			}
 		}
 	case catalog.TypeDescriptor:
-		if flags.DesiredObjectKind != tree.TypeObject {
+		switch flags.DesiredObjectKind {
+		case tree.TypeObject, tree.AnyObject:
+		default:
 			return prefix, nil, nil
 		}
 	default:
@@ -143,11 +145,11 @@ func (tc *Collection) getObjectByNameIgnoringRequiredAndType(
 	// we should read its parents from the store too to ensure
 	// that subsequent name resolution finds the latest name
 	// in the face of a concurrent rename.
-	avoidLeasedForParent := flags.AvoidLeased || flags.RequireMutable
+	avoidCachedForParent := flags.AvoidCached || flags.RequireMutable
 	// Resolve the database.
 	parentFlags := tree.DatabaseLookupFlags{
 		Required:       flags.Required,
-		AvoidLeased:    avoidLeasedForParent,
+		AvoidCached:    avoidCachedForParent,
 		IncludeDropped: flags.IncludeDropped,
 		IncludeOffline: flags.IncludeOffline,
 	}
@@ -192,7 +194,7 @@ func (tc *Collection) getObjectByNameIgnoringRequiredAndType(
 
 	prefix.Schema = sc
 	found, obj, err := tc.getByName(
-		ctx, txn, db, sc, objectName, flags.AvoidLeased, flags.RequireMutable, flags.AvoidSynthetic,
+		ctx, txn, db, sc, objectName, flags.AvoidCached, flags.RequireMutable, flags.AvoidSynthetic,
 	)
 	if !found || err != nil {
 		return prefix, nil, err

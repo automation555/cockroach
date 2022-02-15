@@ -13,7 +13,6 @@ package resolver
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -222,15 +221,21 @@ func ResolveExistingObject(
 	}
 
 	switch lookupFlags.DesiredObjectKind {
+	case tree.AnyObject:
+		return obj, prefix, nil
 	case tree.TypeObject:
 		typ, isType := obj.(catalog.TypeDescriptor)
 		if !isType {
+			// TODO(ajwerner): This probably should not return an error here if
+			// the required flag is not set.
 			return nil, prefix, sqlerrors.NewUndefinedTypeError(getResolvedTn())
 		}
 		return typ, prefix, nil
 	case tree.TableObject:
 		table, ok := obj.(catalog.TableDescriptor)
 		if !ok {
+			// TODO(ajwerner): This probably should not return an error here if
+			// the required flag is not set.
 			return nil, prefix, sqlerrors.NewUndefinedRelationError(getResolvedTn())
 		}
 		goodType := true
@@ -297,26 +302,20 @@ func ResolveTargetObject(
 // TODO (SQLSchema): The remaining uses of this should be plumbed through
 //  the desc.Collection's ResolveSchemaByID.
 func ResolveSchemaNameByID(
-	ctx context.Context,
-	txn *kv.Txn,
-	codec keys.SQLCodec,
-	db catalog.DatabaseDescriptor,
-	schemaID descpb.ID,
-	version clusterversion.Handle,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, dbID descpb.ID, schemaID descpb.ID,
 ) (string, error) {
 	// Fast-path for public schema and virtual schemas, to avoid hot lookups.
-	staticSchemaMap := catconstants.GetStaticSchemaIDMap(ctx, version)
-	if schemaName, ok := staticSchemaMap[uint32(schemaID)]; ok {
+	if schemaName, ok := catconstants.StaticSchemaIDMap[uint32(schemaID)]; ok {
 		return schemaName, nil
 	}
-	schemas, err := GetForDatabase(ctx, txn, codec, db)
+	schemas, err := GetForDatabase(ctx, txn, codec, dbID)
 	if err != nil {
 		return "", err
 	}
 	if schema, ok := schemas[schemaID]; ok {
 		return schema.Name, nil
 	}
-	return "", errors.Newf("unable to resolve schema id %d for db %d", schemaID, db.GetID())
+	return "", errors.Newf("unable to resolve schema id %d for db %d", schemaID, dbID)
 }
 
 // SchemaEntryForDB entry for an individual schema,
@@ -330,26 +329,25 @@ type SchemaEntryForDB struct {
 // schema ids to SchemaEntryForDB structures for a
 //given database.
 func GetForDatabase(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, db catalog.DatabaseDescriptor,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, dbID descpb.ID,
 ) (map[descpb.ID]SchemaEntryForDB, error) {
-	log.Eventf(ctx, "fetching all schema descriptor IDs for database %q (%d)", db.GetName(), db.GetID())
+	log.Eventf(ctx, "fetching all schema descriptor IDs for %d", dbID)
 
-	nameKey := catalogkeys.MakeSchemaNameKey(codec, db.GetID(), "" /* name */)
+	nameKey := catalogkeys.MakeSchemaNameKey(codec, dbID, "" /* name */)
 	kvs, err := txn.Scan(ctx, nameKey, nameKey.PrefixEnd(), 0 /* maxRows */)
 	if err != nil {
 		return nil, err
 	}
 
+	// Always add public schema ID.
+	// TODO(solon): This can be removed in 20.2, when this is always written.
+	// In 20.1, in a migrating state, it may be not included yet.
 	ret := make(map[descpb.ID]SchemaEntryForDB, len(kvs)+1)
-
-	// This is needed at least for the temp system db during restores.
-	if !db.HasPublicSchemaWithDescriptor() {
-		ret[descpb.ID(keys.PublicSchemaID)] = SchemaEntryForDB{
+	ret[descpb.ID(keys.PublicSchemaID)] =
+		SchemaEntryForDB{
 			Name:      tree.PublicSchema,
 			Timestamp: txn.ReadTimestamp(),
 		}
-	}
-
 	for _, kv := range kvs {
 		id := descpb.ID(kv.ValueInt())
 		if _, ok := ret[id]; ok {

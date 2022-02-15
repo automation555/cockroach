@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	descpb "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
@@ -358,9 +357,6 @@ var systemTableBackupConfiguration = map[string]systemBackupConfiguration{
 	systemschema.SpanConfigurationsTable.GetName(): {
 		shouldIncludeInClusterBackup: optOutOfClusterBackup,
 	},
-	systemschema.TenantSettingsTable.GetName(): {
-		shouldIncludeInClusterBackup: optOutOfClusterBackup,
-	},
 }
 
 // GetSystemTablesToIncludeInClusterBackup returns a set of system table names that
@@ -386,20 +382,20 @@ func GetSystemTableIDsToExcludeFromClusterBackup(
 		if backupConfig.shouldIncludeInClusterBackup == optOutOfClusterBackup {
 			err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
 				tn := tree.MakeTableNameWithSchema("system", tree.PublicSchemaName, tree.Name(systemTableName))
-				found, desc, err := col.GetImmutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlags{})
-				isNotFoundErr := errors.Is(err, catalog.ErrDescriptorNotFound)
-				if err != nil && !isNotFoundErr {
+				found, desc, err := col.GetMutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlags{
+					DesiredObjectKind: tree.TableObject,
+				})
+				if err != nil {
 					return err
 				}
-
 				// Some system tables are not present when running inside a secondary
 				// tenant egs: `systemschema.TenantsTable`. In such situations we are
 				// print a warning and move on.
-				if !found || isNotFoundErr {
-					log.Warningf(ctx, "could not find system table descriptor %q", systemTableName)
+				if !found {
+					log.Warningf(ctx, "could not find system table descriptor %s", systemTableName)
 					return nil
 				}
-				systemTableIDsToExclude[desc.GetID()] = struct{}{}
+				systemTableIDsToExclude[desc.ID] = struct{}{}
 				return nil
 			})
 			if err != nil {
