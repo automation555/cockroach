@@ -11,7 +11,6 @@
 package sql
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -24,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
@@ -37,10 +35,10 @@ type distSQLSpecExecFactory struct {
 	planner *planner
 	dsp     *DistSQLPlanner
 	// planCtx should not be used directly - getPlanCtx() should be used instead.
-	planCtx              *PlanningCtx
-	singleTenant         bool
-	planningMode         distSQLPlanningMode
-	gatewaySQLInstanceID base.SQLInstanceID
+	planCtx       *PlanningCtx
+	singleTenant  bool
+	planningMode  distSQLPlanningMode
+	gatewayNodeID roachpb.NodeID
 }
 
 var _ exec.Factory = &distSQLSpecExecFactory{}
@@ -61,11 +59,11 @@ const (
 
 func newDistSQLSpecExecFactory(p *planner, planningMode distSQLPlanningMode) exec.Factory {
 	e := &distSQLSpecExecFactory{
-		planner:              p,
-		dsp:                  p.extendedEvalCtx.DistSQLPlanner,
-		singleTenant:         p.execCfg.Codec.ForSystemTenant(),
-		planningMode:         planningMode,
-		gatewaySQLInstanceID: p.extendedEvalCtx.DistSQLPlanner.gatewaySQLInstanceID,
+		planner:       p,
+		dsp:           p.extendedEvalCtx.DistSQLPlanner,
+		singleTenant:  p.execCfg.Codec.ForSystemTenant(),
+		planningMode:  planningMode,
+		gatewayNodeID: p.extendedEvalCtx.DistSQLPlanner.gatewayNodeID,
 	}
 	distribute := e.singleTenant && e.planningMode != distSQLLocalOnlyPlanning
 	evalCtx := p.ExtendedEvalContext()
@@ -239,10 +237,16 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 	// what DistSQLPlanner.createTableReaders does.
 	trSpec := physicalplan.NewTableReaderSpec()
 	*trSpec = execinfrapb.TableReaderSpec{
-		Reverse:                         params.Reverse,
-		TableDescriptorModificationTime: tabDesc.GetModificationTime(),
+		Table:     *tabDesc.TableDesc(),
+		Reverse:   params.Reverse,
+		ColumnIDs: columnIDs,
 	}
-	if err := rowenc.InitIndexFetchSpec(&trSpec.FetchSpec, e.planner.ExecCfg().Codec, tabDesc, idx, columnIDs); err != nil {
+	if vc := getInvertedColumn(colCfg.invertedColumnID, cols); vc != nil {
+		trSpec.InvertedColumn = vc.ColumnDesc()
+	}
+
+	trSpec.IndexIdx, err = getIndexIdx(idx, tabDesc)
+	if err != nil {
 		return nil, err
 	}
 	if params.Locking != nil {
@@ -279,6 +283,7 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 			parallelize:       params.Parallelize,
 			estimatedRowCount: uint64(params.EstimatedRowCount),
 			reqOrdering:       ReqOrdering(reqOrdering),
+			cols:              cols,
 		},
 	)
 
@@ -455,9 +460,11 @@ func populateAggFuncSpec(
 	}
 	spec.Func = execinfrapb.AggregatorSpec_Func(funcIdx)
 	spec.Distinct = distinct
-	spec.ColIdx = make([]uint32, len(argCols))
-	for i, col := range argCols {
-		spec.ColIdx[i] = uint32(col)
+	if len(argCols) > 0 {
+		spec.ColIdx = make([]uint32, len(argCols))
+		for i, col := range argCols {
+			spec.ColIdx[i] = uint32(col)
+		}
 	}
 	if filter != tree.NoColumnIdx {
 		filterColIdx := uint32(physPlan.PlanToStreamColMap[filter])
@@ -652,7 +659,6 @@ func (e *distSQLSpecExecFactory) ConstructLookupJoin(
 	remoteLookupExpr tree.TypedExpr,
 	lookupCols exec.TableColumnOrdinalSet,
 	onCond tree.TypedExpr,
-	isFirstJoinInPairedJoiner bool,
 	isSecondJoinInPairedJoiner bool,
 	reqOrdering exec.OutputOrdering,
 	locking *tree.LockingItem,
@@ -1034,6 +1040,14 @@ func (e *distSQLSpecExecFactory) ConstructOpaque(metadata opt.OpaqueMetadata) (e
 	plan, err := constructOpaque(metadata)
 	if err != nil {
 		return nil, err
+	}
+	switch plan.(type) {
+	case *zeroNode:
+		physPlan, err := e.dsp.createPhysPlanForPlanNode(e.getPlanCtx(cannotDistribute), plan)
+		if err != nil {
+			return nil, err
+		}
+		return makePlanMaybePhysical(physPlan, []planNode{plan}), nil
 	}
 	physPlan, err := e.dsp.wrapPlan(e.getPlanCtx(cannotDistribute), plan, e.planningMode != distSQLLocalOnlyPlanning)
 	if err != nil {

@@ -80,14 +80,14 @@ func (so *DummySequenceOperators) IsTypeVisible(
 	return false, false, errors.WithStack(errEvalPlanner)
 }
 
-// HasAnyPrivilege is part of the tree.EvalDatabase interface.
-func (so *DummySequenceOperators) HasAnyPrivilege(
+// HasPrivilege is part of the tree.EvalDatabase interface.
+func (so *DummySequenceOperators) HasPrivilege(
 	ctx context.Context,
 	specifier tree.HasPrivilegeSpecifier,
 	user security.SQLUsername,
-	privs []privilege.Privilege,
-) (tree.HasAnyPrivilegeResult, error) {
-	return tree.HasNoPrivilege, errors.WithStack(errEvalPlanner)
+	priv privilege.Privilege,
+) (bool, error) {
+	return false, errors.WithStack(errEvalPlanner)
 }
 
 // IncrementSequenceByID is part of the tree.SequenceOperators interface.
@@ -216,13 +216,6 @@ func (ep *DummyEvalPlanner) UserHasAdminRole(
 	return false, errors.WithStack(errEvalPlanner)
 }
 
-// CheckCanBecomeUser is part of the EvalPlanner interface.
-func (ep *DummyEvalPlanner) CheckCanBecomeUser(
-	ctx context.Context, becomeUser security.SQLUsername,
-) error {
-	return errors.WithStack(errEvalPlanner)
-}
-
 // MemberOfWithAdminOption is part of the EvalPlanner interface.
 func (ep *DummyEvalPlanner) MemberOfWithAdminOption(
 	ctx context.Context, member security.SQLUsername,
@@ -253,25 +246,6 @@ func (*DummyEvalPlanner) CreateSessionRevivalToken() (*tree.DBytes, error) {
 // ValidateSessionRevivalToken is part of the EvalPlanner interface.
 func (*DummyEvalPlanner) ValidateSessionRevivalToken(token *tree.DBytes) (*tree.DBool, error) {
 	return nil, errors.WithStack(errEvalPlanner)
-}
-
-// RevalidateUniqueConstraintsInCurrentDB is part of the EvalPlanner interface.
-func (*DummyEvalPlanner) RevalidateUniqueConstraintsInCurrentDB(ctx context.Context) error {
-	return errors.WithStack(errEvalPlanner)
-}
-
-// RevalidateUniqueConstraintsInTable is part of the EvalPlanner interface.
-func (*DummyEvalPlanner) RevalidateUniqueConstraintsInTable(
-	ctx context.Context, tableID int,
-) error {
-	return errors.WithStack(errEvalPlanner)
-}
-
-// RevalidateUniqueConstraint is part of the EvalPlanner interface.
-func (*DummyEvalPlanner) RevalidateUniqueConstraint(
-	ctx context.Context, tableID int, constraintName string,
-) error {
-	return errors.WithStack(errEvalPlanner)
 }
 
 // ExecutorConfig is part of the EvalPlanner interface.
@@ -336,14 +310,14 @@ func (ep *DummyEvalPlanner) IsTypeVisible(
 	return false, false, errors.WithStack(errEvalPlanner)
 }
 
-// HasAnyPrivilege is part of the tree.EvalDatabase interface.
-func (ep *DummyEvalPlanner) HasAnyPrivilege(
+// HasPrivilege is part of the tree.EvalDatabase interface.
+func (ep *DummyEvalPlanner) HasPrivilege(
 	ctx context.Context,
 	specifier tree.HasPrivilegeSpecifier,
 	user security.SQLUsername,
-	privs []privilege.Privilege,
-) (tree.HasAnyPrivilegeResult, error) {
-	return tree.HasNoPrivilege, errors.WithStack(errEvalPlanner)
+	priv privilege.Privilege,
+) (bool, error) {
+	return false, errors.WithStack(errEvalPlanner)
 }
 
 // ResolveTableName is part of the tree.EvalDatabase interface.
@@ -397,6 +371,11 @@ func (ep *DummyEvalPlanner) QueryIteratorEx(
 	qargs ...interface{},
 ) (tree.InternalRows, error) {
 	return nil, errors.WithStack(errEvalPlanner)
+}
+
+// ValidateDistSQLPlan is part of the tree.EvalPlanner interface.
+func (ep *DummyEvalPlanner) ValidateDistSQLPlan(ctx context.Context) error {
+	return nil
 }
 
 // DummyPrivilegedAccessor implements the tree.PrivilegedAccessor interface by returning errors.
