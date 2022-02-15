@@ -287,21 +287,12 @@ type cFetcher struct {
 	// kvFetcherMemAcc is a memory account that will be used by the underlying
 	// KV fetcher.
 	kvFetcherMemAcc *mon.BoundAccount
-
-	// maxCapacity if non-zero indicates the target capacity of the output
-	// batch. It is set when at the row finalization we realize that the output
-	// batch has exceeded the memory limit.
-	maxCapacity int
 }
 
 func (cf *cFetcher) resetBatch() {
 	var reallocated bool
 	var minDesiredCapacity int
-	if cf.maxCapacity > 0 {
-		// If we have already exceeded the memory limit for the output batch, we
-		// will only be using the same batch from now on.
-		minDesiredCapacity = cf.maxCapacity
-	} else if cf.machine.limitHint > 0 && (cf.estimatedRowCount == 0 || uint64(cf.machine.limitHint) < cf.estimatedRowCount) {
+	if cf.machine.limitHint > 0 && (cf.estimatedRowCount == 0 || uint64(cf.machine.limitHint) < cf.estimatedRowCount) {
 		// If we have a limit hint, and either
 		//   1) we don't have an estimate, or
 		//   2) we have a soft limit,
@@ -345,9 +336,6 @@ func (cf *cFetcher) resetBatch() {
 func (cf *cFetcher) Init(
 	allocator *colmem.Allocator, kvFetcherMemAcc *mon.BoundAccount, tableArgs *cFetcherTableArgs,
 ) error {
-	if tableArgs.spec.Version != descpb.IndexFetchSpecVersionInitial {
-		return errors.Newf("unsupported IndexFetchSpec version %d", tableArgs.spec.Version)
-	}
 	cf.kvFetcherMemAcc = kvFetcherMemAcc
 	table := newCTableInfo()
 	nCols := tableArgs.ColIdxMap.Len()
@@ -915,23 +903,14 @@ func (cf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 			// column is requested) yet, but it is ok for the purposes of the
 			// memory accounting - oids are fixed length values and, thus, have
 			// already been accounted for when the batch was allocated.
-			cf.accountingHelper.AccountForSet(cf.machine.rowIdx)
+			emitBatch := cf.accountingHelper.AccountForSet(cf.machine.rowIdx)
 			cf.machine.rowIdx++
 			cf.shiftState()
 
-			var emitBatch bool
-			if cf.maxCapacity == 0 && cf.accountingHelper.Allocator.Used() >= cf.memoryLimit {
-				cf.maxCapacity = cf.machine.rowIdx
-			}
-			if cf.machine.rowIdx >= cf.machine.batch.Capacity() ||
-				(cf.maxCapacity > 0 && cf.machine.rowIdx >= cf.maxCapacity) ||
-				(cf.machine.limitHint > 0 && cf.machine.rowIdx >= cf.machine.limitHint) {
-				// We either
-				//   1. have no more room in our batch, so output it immediately
-				// or
-				//   2. we made it to our limit hint, so output our batch early
-				//      to make sure that we don't bother filling in extra data
-				//      if we don't need to.
+			if cf.machine.limitHint > 0 && cf.machine.rowIdx >= cf.machine.limitHint {
+				// If we made it to our limit hint, so output our batch early to
+				// make sure that we don't bother filling in extra data if we
+				// don't need to.
 				emitBatch = true
 				// Update the limit hint to track the expected remaining rows to
 				// be fetched.
