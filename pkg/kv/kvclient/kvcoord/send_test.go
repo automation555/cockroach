@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -91,24 +92,17 @@ func (n Node) UpdateSpanConfigs(
 	panic("unimplemented")
 }
 
-func (n Node) TenantSettings(
-	*roachpb.TenantSettingsRequest, roachpb.Internal_TenantSettingsServer,
-) error {
-	panic("unimplemented")
-}
-
 // TestSendToOneClient verifies that Send correctly sends a request
 // to one server using the heartbeat RPC.
 func TestSendToOneClient(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
+	defer stopper.Stop(context.Background())
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
 	// This test uses the testing function sendBatch() which does not
 	// support setting the node ID on GRPCDialNode(). Disable Node ID
 	// checks to avoid log.Fatal.
@@ -124,7 +118,7 @@ func TestSendToOneClient(t *testing.T) {
 		return ln.Addr(), nil
 	})
 
-	reply, err := sendBatch(ctx, t, nil, []net.Addr{ln.Addr()}, rpcContext, nodeDialer)
+	reply, err := sendBatch(context.Background(), t, nil, []net.Addr{ln.Addr()}, rpcContext, nodeDialer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,12 +175,11 @@ func TestComplexScenarios(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
+	defer stopper.Stop(context.Background())
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
 	// We're going to serve multiple node IDs with that one
 	// context. Disable node ID checks.
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
@@ -220,11 +213,11 @@ func TestComplexScenarios(t *testing.T) {
 		}
 
 		reply, err := sendBatch(
-			ctx,
+			context.Background(),
 			t,
 			func(
 				_ SendOptions,
-				_ *nodedialer.Dialer,
+				_ NodeDialer,
 				replicas ReplicaSlice,
 			) (Transport, error) {
 				return &firstNErrorTransport{
@@ -251,8 +244,8 @@ func TestComplexScenarios(t *testing.T) {
 	}
 }
 
-// TestSplitHealthy tests that the splitHealthy method sorts healthy nodes
-// before unhealthy nodes.
+// TestSplitHealthy tests that the splitHealthy helper function sorts healthy
+// nodes before unhealthy nodes.
 func TestSplitHealthy(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -305,12 +298,8 @@ func TestSplitHealthy(t *testing.T) {
 					health.Set(i, healthUnhealthy)
 				}
 			}
-			gt := grpcTransport{
-				replicas:      replicas,
-				replicaHealth: health,
-			}
-			gt.splitHealthy()
-			if !reflect.DeepEqual(gt.replicas, td.out) {
+			splitHealthy(replicas, health)
+			if !reflect.DeepEqual(replicas, td.out) {
 				t.Errorf("splitHealthy(...) = %+v not %+v", replicas, td.out)
 			}
 		})
@@ -350,7 +339,7 @@ func sendBatch(
 	}
 
 	ds := NewDistSender(DistSenderConfig{
-		AmbientCtx:         log.MakeTestingAmbientCtxWithNewTracer(),
+		AmbientCtx:         log.AmbientContext{Tracer: tracing.NewTracer()},
 		Settings:           cluster.MakeTestingClusterSettings(),
 		NodeDescs:          g,
 		RPCContext:         rpcContext,

@@ -19,14 +19,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
-//go:generate mockgen -package=kvcoord -destination=mocks_generated_test.go . Transport
+//go:generate mockgen -package=kvcoord -destination=mocks_generated.go . Transport
 
 // A SendOptions structure describes the algorithm for sending RPCs to one or
 // more replicas, depending on error conditions and how many successful
@@ -49,7 +48,7 @@ type SendOptions struct {
 // The caller is responsible for ordering the replicas in the slice according to
 // the order in which the should be tried.
 type TransportFactory func(
-	SendOptions, *nodedialer.Dialer, ReplicaSlice,
+	SendOptions, NodeDialer, ReplicaSlice,
 ) (Transport, error)
 
 // Transport objects can send RPCs to one or more replicas of a range.
@@ -91,6 +90,24 @@ type Transport interface {
 	Release()
 }
 
+// NodeDialer narrows nodedialer.Dialer to the set of methods needed for transport operation.
+type NodeDialer interface {
+	// DialInternalClient is a specialization of DialClass for callers that
+	// want a roachpb.InternalClient. This supports an optimization to bypass the
+	// network for the local node. Returns a context.Context which should be used
+	// when making RPC calls on the returned server. (This context is annotated to
+	// mark this request as in-process and bypass ctx.Peer checks).
+	DialInternalClient(
+		ctx context.Context, nodeID roachpb.NodeID, class rpc.ConnectionClass,
+	) (context.Context, roachpb.InternalClient, error)
+
+	// ConnHealth returns nil if we have an open connection of the request
+	// class to the given node that succeeded on its most recent heartbeat.
+	// Returns circuit.ErrBreakerOpen if the breaker is tripped, otherwise
+	// ErrNoConnection if no connection to the node currently exists.
+	ConnHealth(nodeID roachpb.NodeID, class rpc.ConnectionClass) error
+}
+
 // These constants are used for the replica health map below.
 const (
 	healthUnhealthy = iota
@@ -103,7 +120,7 @@ const (
 // During race builds, we wrap this to hold on to and read all obtained
 // requests in a tight loop, exposing data races; see transport_race.go.
 func grpcTransportFactoryImpl(
-	opts SendOptions, nodeDialer *nodedialer.Dialer, rs ReplicaSlice,
+	opts SendOptions, nodeDialer NodeDialer, rs ReplicaSlice,
 ) (Transport, error) {
 	transport := grpcTransportPool.Get().(*grpcTransport)
 	// Grab the saved slice memory from grpcTransport.
@@ -117,8 +134,7 @@ func grpcTransportFactoryImpl(
 
 	// We'll map the index of the replica descriptor in its slice to its health.
 	var health util.FastIntMap
-	for i := range rs {
-		r := &rs[i]
+	for i, r := range rs {
 		replicas[i] = r.ReplicaDescriptor
 		healthy := nodeDialer.ConnHealth(r.NodeID, opts.class) == nil
 		if healthy {
@@ -128,32 +144,27 @@ func grpcTransportFactoryImpl(
 		}
 	}
 
-	*transport = grpcTransport{
-		opts:          opts,
-		nodeDialer:    nodeDialer,
-		class:         opts.class,
-		replicas:      replicas,
-		replicaHealth: health,
-	}
-
 	if !opts.dontConsiderConnHealth {
-		// Put known-healthy replica first, while otherwise respecting the existing
+		// Put known-healthy clients first, while otherwise respecting the existing
 		// ordering of the replicas.
-		transport.splitHealthy()
+		splitHealthy(replicas, health)
 	}
 
+	*transport = grpcTransport{
+		opts:       opts,
+		nodeDialer: nodeDialer,
+		class:      opts.class,
+		replicas:   replicas,
+	}
 	return transport, nil
 }
 
 type grpcTransport struct {
 	opts       SendOptions
-	nodeDialer *nodedialer.Dialer
+	nodeDialer NodeDialer
 	class      rpc.ConnectionClass
 
 	replicas []roachpb.ReplicaDescriptor
-	// replicaHealth maps replica index within the replicas slice to healthHealthy
-	// if healthy, and healthUnhealthy if unhealthy. Used by splitHealthy.
-	replicaHealth util.FastIntMap
 	// nextReplicaIdx represents the index into replicas of the next replica to be
 	// tried.
 	nextReplicaIdx int
@@ -268,30 +279,38 @@ func (gt *grpcTransport) MoveToFront(replica roachpb.ReplicaDescriptor) {
 	}
 }
 
-// splitHealthy splits the grpcTransport's replica slice into healthy replica
-// and unhealthy replica, based on their connection state. Healthy replicas will
-// be rearranged first in the replicas slice, and unhealthy replicas will be
-// rearranged last. Within these two groups, the rearrangement will be stable.
-func (gt *grpcTransport) splitHealthy() {
-	sort.Stable((*byHealth)(gt))
+// splitHealthy splits the provided client slice into healthy clients and
+// unhealthy clients, based on their connection state. Healthy clients will
+// be rearranged first in the slice, and unhealthy clients will be rearranged
+// last. Within these two groups, the rearrangement will be stable. The function
+// will then return the number of healthy clients.
+// The input FastIntMap maps index within the input replicas slice to an integer
+// healthHealthy or healthUnhealthy.
+func splitHealthy(replicas []roachpb.ReplicaDescriptor, health util.FastIntMap) {
+	sort.Stable(&byHealth{replicas: replicas, health: health})
 }
 
-// byHealth sorts a slice of replicas by their health with healthy first.
-type byHealth grpcTransport
+// byHealth sorts a slice of batchClients by their health with healthy first.
+type byHealth struct {
+	replicas []roachpb.ReplicaDescriptor
+	// This map maps replica index within the replicas slice to healthHealthy if
+	// healthy, and healthUnhealthy if unhealthy.
+	health util.FastIntMap
+}
 
 func (h *byHealth) Len() int { return len(h.replicas) }
 func (h *byHealth) Swap(i, j int) {
 	h.replicas[i], h.replicas[j] = h.replicas[j], h.replicas[i]
-	oldI := h.replicaHealth.GetDefault(i)
-	h.replicaHealth.Set(i, h.replicaHealth.GetDefault(j))
-	h.replicaHealth.Set(j, oldI)
+	oldI := h.health.GetDefault(i)
+	h.health.Set(i, h.health.GetDefault(j))
+	h.health.Set(j, oldI)
 }
 func (h *byHealth) Less(i, j int) bool {
-	ih, ok := h.replicaHealth.Get(i)
+	ih, ok := h.health.Get(i)
 	if !ok {
 		panic(fmt.Sprintf("missing health info for %s", h.replicas[i]))
 	}
-	jh, ok := h.replicaHealth.Get(j)
+	jh, ok := h.health.Get(j)
 	if !ok {
 		panic(fmt.Sprintf("missing health info for %s", h.replicas[j]))
 	}
@@ -303,7 +322,7 @@ func (h *byHealth) Less(i, j int) bool {
 // without a full RPC stack.
 func SenderTransportFactory(tracer *tracing.Tracer, sender kv.Sender) TransportFactory {
 	return func(
-		_ SendOptions, _ *nodedialer.Dialer, replicas ReplicaSlice,
+		_ SendOptions, _ NodeDialer, replicas ReplicaSlice,
 	) (Transport, error) {
 		// Always send to the first replica.
 		replica := replicas[0].ReplicaDescriptor

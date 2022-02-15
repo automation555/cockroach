@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -33,7 +32,7 @@ import (
 	"github.com/cockroachdb/logtags"
 )
 
-//go:generate mockgen -destination=mocks_generated_test.go --package=rangefeed . DB
+//go:generate mockgen -package=rangefeed -source rangefeed.go -destination=mocks_generated.go .
 
 // TODO(ajwerner): Expose hooks for metrics.
 // TODO(ajwerner): Expose access to checkpoints and the frontier.
@@ -42,8 +41,8 @@ import (
 // TODO(yevgeniy): Instead of rolling our own logic to parallelize scans, we should
 // use streamer API instead (https://github.com/cockroachdb/cockroach/pull/68430)
 
-// DB is an adapter to the underlying KV store.
-type DB interface {
+// kvDB is an adapter to the underlying KV store.
+type kvDB interface {
 
 	// RangeFeed runs a rangefeed on a given span with the given arguments.
 	// It encapsulates the RangeFeed method on roachpb.Internal.
@@ -71,7 +70,7 @@ type DB interface {
 // Factory is used to construct RangeFeeds.
 type Factory struct {
 	stopper *stop.Stopper
-	client  DB
+	client  kvDB
 	knobs   *TestingKnobs
 }
 
@@ -98,7 +97,7 @@ func NewFactory(
 	return newFactory(stopper, kvDB, knobs), nil
 }
 
-func newFactory(stopper *stop.Stopper, client DB, knobs *TestingKnobs) *Factory {
+func newFactory(stopper *stop.Stopper, client kvDB, knobs *TestingKnobs) *Factory {
 	return &Factory{
 		stopper: stopper,
 		client:  client,
@@ -154,7 +153,7 @@ type OnValue func(ctx context.Context, value *roachpb.RangeFeedValue)
 type RangeFeed struct {
 	config
 	name    string
-	client  DB
+	client  kvDB
 	stopper *stop.Stopper
 	knobs   *TestingKnobs
 
@@ -271,6 +270,7 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 	// TODO(ajwerner): Consider adding event buffering. Doing so would require
 	// draining when the rangefeed fails.
 	eventCh := make(chan *roachpb.RangeFeedEvent)
+	errCh := make(chan error)
 
 	for i := 0; r.Next(); i++ {
 		ts := frontier.Frontier()
@@ -280,16 +280,19 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 
 		start := timeutil.Now()
 
-		rangeFeedTask := func(ctx context.Context) error {
-			return f.client.RangeFeed(ctx, f.spans, ts, f.withDiff, eventCh)
-		}
-		processEventsTask := func(ctx context.Context) error {
-			return f.processEvents(ctx, frontier, eventCh)
+		// Note that the below channel send will not block forever because
+		// processEvents will wait for the worker to send. RunWorker is safe here
+		// because processEvents is guaranteed to consume the error before
+		// returning.
+		if err := f.stopper.RunAsyncTask(ctx, "rangefeed", func(ctx context.Context) {
+			errCh <- f.client.RangeFeed(ctx, f.spans, ts, f.withDiff, eventCh)
+		}); err != nil {
+			log.VEventf(ctx, 1, "exiting rangefeed due to stopper")
+			return
 		}
 
-		err := ctxgroup.GoAndWait(ctx, rangeFeedTask, processEventsTask)
-		if errors.HasType(err, &roachpb.BatchTimestampBeforeGCError{}) ||
-			errors.HasType(err, &roachpb.MVCCHistoryMutationError{}) {
+		err := f.processEvents(ctx, frontier, eventCh, errCh)
+		if errors.HasType(err, &roachpb.BatchTimestampBeforeGCError{}) {
 			if errCallback := f.onUnrecoverableError; errCallback != nil {
 				errCallback(ctx, err)
 			}
@@ -322,9 +325,13 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 	}
 }
 
-// processEvents processes events sent by the rangefeed on the eventCh.
+// processEvents processes events sent by the rangefeed on the eventCh. It waits
+// for the rangefeed to signal that it has exited by sending on errCh.
 func (f *RangeFeed) processEvents(
-	ctx context.Context, frontier *span.Frontier, eventCh <-chan *roachpb.RangeFeedEvent,
+	ctx context.Context,
+	frontier *span.Frontier,
+	eventCh <-chan *roachpb.RangeFeedEvent,
+	errCh <-chan error,
 ) error {
 	for {
 		select {
@@ -343,18 +350,16 @@ func (f *RangeFeed) processEvents(
 				if advanced && f.onFrontierAdvance != nil {
 					f.onFrontierAdvance(ctx, frontier.Frontier())
 				}
-			case ev.SST != nil:
-				if f.onSSTable == nil {
-					return errors.AssertionFailedf(
-						"received unexpected rangefeed SST event with no OnSSTable handler")
-				}
-				f.onSSTable(ctx, ev.SST)
 			case ev.Error != nil:
 				// Intentionally do nothing, we'll get an error returned from the
 				// call to RangeFeed.
 			}
 		case <-ctx.Done():
+			// Ensure that the RangeFeed goroutine stops.
+			<-errCh
 			return ctx.Err()
+		case err := <-errCh:
+			return err
 		}
 	}
 }
