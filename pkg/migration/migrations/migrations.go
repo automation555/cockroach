@@ -81,49 +81,10 @@ var migrations = []migration.Migration{
 		publicSchemaMigration,
 	),
 	migration.NewTenantMigration(
-		"enable span configs infrastructure",
-		toCV(clusterversion.EnsureSpanConfigReconciliation),
+		"add system.single_version_descriptor_lease",
+		toCV(clusterversion.SingleVersionDescriptorLeaseTable),
 		NoPrecondition,
-		ensureSpanConfigReconciliation,
-	),
-	migration.NewSystemMigration(
-		"enable span configs infrastructure",
-		toCV(clusterversion.EnsureSpanConfigSubscription),
-		ensureSpanConfigSubscription,
-	),
-	migration.NewTenantMigration(
-		"track grant options on users and enable granting/revoking with them",
-		toCV(clusterversion.ValidateGrantOption),
-		NoPrecondition,
-		grantOptionMigration,
-	),
-	migration.NewTenantMigration(
-		"delete comments that belong to dropped indexes",
-		toCV(clusterversion.DeleteCommentsWithDroppedIndexes),
-		NoPrecondition,
-		ensureCommentsHaveNonDroppedIndexes,
-	),
-	migration.NewTenantMigration(
-		"convert incompatible database privileges to default privileges",
-		toCV(clusterversion.RemoveIncompatibleDatabasePrivileges),
-		NoPrecondition,
-		runRemoveInvalidDatabasePrivileges,
-	),
-	migration.NewSystemMigration(
-		"populate RangeAppliedState.RaftAppliedIndexTerm for all ranges",
-		toCV(clusterversion.AddRaftAppliedIndexTermMigration),
-		raftAppliedIndexTermMigration,
-	),
-	migration.NewSystemMigration(
-		"purge all replicas not populating RangeAppliedState.RaftAppliedIndexTerm",
-		toCV(clusterversion.PostAddRaftAppliedIndexTermMigration),
-		postRaftAppliedIndexTermMigration,
-	),
-	migration.NewTenantMigration(
-		"add the system.tenant_settings table",
-		toCV(clusterversion.TenantSettingsTable),
-		NoPrecondition,
-		tenantSettingsTableMigration,
+		addSingleVersionDescriptorLeaseTable,
 	),
 }
 

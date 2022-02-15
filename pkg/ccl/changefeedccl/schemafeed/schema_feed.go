@@ -15,13 +15,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -96,6 +97,16 @@ func New(
 	m.mu.previousTableVersion = make(map[descpb.ID]catalog.TableDescriptor)
 	m.mu.highWater = initialHighwater
 	m.mu.typeDeps = typeDependencyTracker{deps: make(map[descpb.ID][]descpb.ID)}
+
+	if cfg.Settings.Version.IsActive(ctx, clusterversion.SingleVersionDescriptorLeaseTable) {
+		lm := newLeasedSchemaFeed(
+			cfg.SingleVersion,
+			targets,
+			initialHighwater,
+			m,
+		)
+		return lm
+	}
 	return m
 }
 
@@ -613,7 +624,7 @@ func (tf *schemaFeed) fetchDescriptorVersions(
 	tf.mu.Lock()
 	defer tf.mu.Unlock()
 
-	var descriptors []catalog.Descriptor
+	var descs []catalog.Descriptor
 	for _, file := range res.(*roachpb.ExportResponse).Files {
 		if err := func() error {
 			it, err := storage.NewMemSSTIterator(file.SST, false /* verify */)
@@ -661,16 +672,16 @@ func (tf *schemaFeed) fetchDescriptorVersions(
 					return err
 				}
 
-				b := descbuilder.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
+				b := catalogkv.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
 				if b != nil && (b.DescriptorType() == catalog.Table || b.DescriptorType() == catalog.Type) {
-					descriptors = append(descriptors, b.BuildImmutable())
+					descs = append(descs, b.BuildImmutable())
 				}
 			}
 		}(); err != nil {
 			return nil, err
 		}
 	}
-	return descriptors, nil
+	return descs, nil
 }
 
 type doNothingSchemaFeed struct{}
