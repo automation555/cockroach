@@ -14,8 +14,6 @@ import (
 	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
@@ -83,7 +81,7 @@ func isAllowedPartialIndexColType(columnTableDef *tree.ColumnTableDef) bool {
 	}
 }
 
-var cmpOps = []treecmp.ComparisonOperatorSymbol{treecmp.EQ, treecmp.NE, treecmp.LT, treecmp.LE, treecmp.GE, treecmp.GT}
+var cmpOps = []tree.ComparisonOperatorSymbol{tree.EQ, tree.NE, tree.LT, tree.LE, tree.GE, tree.GT}
 
 // randBoolColumnExpr returns a random boolean expression with the given column.
 func randBoolColumnExpr(
@@ -103,7 +101,7 @@ func randBoolColumnExpr(
 	// Otherwise, return a comparison expression with a random comparison
 	// operator, the column as the left side, and an interesting datum as the
 	// right side.
-	op := treecmp.MakeComparisonOperator(cmpOps[rng.Intn(len(cmpOps))])
+	op := tree.MakeComparisonOperator(cmpOps[rng.Intn(len(cmpOps))])
 	datum := randInterestingDatum(rng, t)
 	return &tree.ComparisonExpr{Operator: op, Left: varExpr, Right: datum}
 }
@@ -124,12 +122,12 @@ func randAndOrExpr(rng *rand.Rand, left, right tree.Expr) tree.Expr {
 	}
 }
 
-// randExpr produces a random expression that refers to columns in
+// randColumnExpr produces a random expression that refers to columns in
 // normalColDefs. It can be used to generate random computed columns and
 // expression indexes. The return type is the type of the expression. The
 // returned nullability is NotNull if all columns referenced in the expression
 // have a NotNull nullability.
-func randExpr(
+func randColumnExpr(
 	rng *rand.Rand, normalColDefs []*tree.ColumnTableDef, nullOk bool,
 ) (tree.Expr, *types.T, tree.Nullability) {
 	nullability := tree.NotNull
@@ -170,7 +168,7 @@ func randExpr(
 			expr = tree.NewUnresolvedName(string(cols[0].Name))
 			for _, x := range cols[1:] {
 				expr = &tree.BinaryExpr{
-					Operator: treebin.MakeBinaryOperator(treebin.Plus),
+					Operator: tree.MakeBinaryOperator(tree.Plus),
 					Left:     expr,
 					Right:    tree.NewUnresolvedName(string(x.Name)),
 				}
@@ -193,35 +191,97 @@ func randExpr(
 	nullability = x.Nullable.Nullability
 	nullOk = nullOk && nullability != tree.NotNull
 
-	var expr tree.Expr
-	var typ *types.T
-	switch xTyp.Family() {
+	expr, typ := randExpr(rng, tree.NewUnresolvedName(string(x.Name)), xTyp, true, /* canChangeType */
+		true /* needsImmutable */, nullOk)
+	return expr, typ, nullability
+}
+
+// randExpr generates a random expression that includes the input expr that has
+// the given type exprType. If canChangeType is true, we may cast the input expr
+// to a different type. nullOk controls whether generating NULL is allowed.
+// If needsImmutable is true, we won't generate any scalar expressions that
+// are not immutable (always returning the same value given the same inputs).
+func randExpr(
+	rng *rand.Rand,
+	expr tree.Expr,
+	exprType *types.T,
+	canChangeType bool,
+	needsImmutable bool,
+	nullOk bool,
+) (tree.Expr, *types.T) {
+	typ := exprType
+	switch exprType.Family() {
 	case types.IntFamily, types.FloatFamily, types.DecimalFamily:
-		typ = xTyp
 		expr = &tree.BinaryExpr{
-			Operator: treebin.MakeBinaryOperator(treebin.Plus),
-			Left:     tree.NewUnresolvedName(string(x.Name)),
-			Right:    RandDatum(rng, xTyp, nullOk),
+			Operator: tree.MakeBinaryOperator(tree.Plus),
+			Left:     expr,
+			Right:    RandDatum(rng, exprType, nullOk),
 		}
 
 	case types.StringFamily:
-		typ = types.String
 		expr = &tree.FuncExpr{
 			Func:  tree.WrapFunction("lower"),
-			Exprs: tree.Exprs{tree.NewUnresolvedName(string(x.Name))},
+			Exprs: tree.Exprs{expr},
+		}
+
+	case types.IntervalFamily:
+		if !needsImmutable && rng.Intn(3) == 0 {
+			// We don't have builtin expressions that just return intervals, so
+			// return the result of adding the input expression to now()-now(), to
+			// make sure that we're at least forcing the engine to evaluate something
+			// non-constant.
+			expr = &tree.BinaryExpr{
+				Operator: tree.MakeBinaryOperator(tree.Plus),
+				Left:     expr,
+				Right: &tree.BinaryExpr{
+					Operator: tree.MakeBinaryOperator(tree.Minus),
+					Left: &tree.FuncExpr{
+						Func: tree.WrapFunction("now"),
+					},
+					Right: &tree.FuncExpr{
+						Func: tree.WrapFunction("now"),
+					},
+				},
+			}
+		}
+
+	case types.TimestampFamily, types.DateFamily, types.TimestampTZFamily:
+		if !needsImmutable {
+			// input expr + now() - now(), a random expression that is slightly
+			// more complex that still involves the input expr. There's no great
+			// reason why this expression should be used rather than any other -
+			// it's just an example of something that requires expression evaluation.
+			expr = &tree.CastExpr{
+				Expr: &tree.BinaryExpr{
+					Operator: tree.MakeBinaryOperator(tree.Plus),
+					Left:     expr,
+					Right: &tree.BinaryExpr{
+						Operator: tree.MakeBinaryOperator(tree.Minus),
+						Left: &tree.FuncExpr{
+							Func: tree.WrapFunction("now"),
+						},
+						Right: &tree.FuncExpr{
+							Func: tree.WrapFunction("now"),
+						},
+					},
+				},
+				Type: exprType,
+			}
 		}
 
 	default:
-		volatility, ok := tree.LookupCastVolatility(xTyp, types.String, nil /* sessionData */)
-		if ok && volatility <= tree.VolatilityImmutable &&
-			!typeToStringCastHasIncorrectVolatility(xTyp) {
+		if !canChangeType {
+			return expr, exprType
+		}
+		volatility, ok := tree.LookupCastVolatility(exprType, types.String, nil /* sessionData */)
+		typ = types.String
+		if ok && volatility <= tree.VolatilityImmutable {
 			// We can cast to string; use lower(x::string)
-			typ = types.String
 			expr = &tree.FuncExpr{
 				Func: tree.WrapFunction("lower"),
 				Exprs: tree.Exprs{
 					&tree.CastExpr{
-						Expr: tree.NewUnresolvedName(string(x.Name)),
+						Expr: expr,
 						Type: types.String,
 					},
 				},
@@ -229,12 +289,11 @@ func randExpr(
 		} else {
 			// We cannot cast this type to string in a computed column expression.
 			// Use CASE WHEN x IS NULL THEN 'foo' ELSE 'bar'.
-			typ = types.String
 			expr = &tree.CaseExpr{
 				Whens: []*tree.When{
 					{
 						Cond: &tree.IsNullExpr{
-							Expr: tree.NewUnresolvedName(string(x.Name)),
+							Expr: expr,
 						},
 						Val: RandDatum(rng, types.String, nullOk),
 					},
@@ -243,28 +302,5 @@ func randExpr(
 			}
 		}
 	}
-
-	return expr, typ, nullability
-}
-
-// typeToStringCastHasIncorrectVolatility returns true for a given type if the
-// cast from it to STRING types has been given an incorrect volatility. For
-// example, REGCLASS->STRING casts are immutable when they should be stable (see
-// #74286 and #74553 for more details).
-//
-// Creating computed column expressions with such a cast can cause logical
-// correctness bugs and internal errors. The volatilities cannot be fixed
-// without causing backward incompatibility, so this function is used to prevent
-// sqlsmith and TLP from repetitively finding these known volatility bugs.
-func typeToStringCastHasIncorrectVolatility(t *types.T) bool {
-	switch t.Family() {
-	case types.DateFamily, types.EnumFamily, types.TimestampFamily,
-		types.IntervalFamily, types.TupleFamily:
-		return true
-	case types.OidFamily:
-		return t == types.RegClass || t == types.RegNamespace || t == types.RegProc ||
-			t == types.RegProcedure || t == types.RegRole || t == types.RegType
-	default:
-		return false
-	}
+	return expr, typ
 }

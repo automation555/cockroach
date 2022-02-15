@@ -122,14 +122,6 @@ func RandCreateTableWithColumnIndexNumberGenerator(
 		defs = append(defs, columnDef)
 	}
 
-	// Make defs for computed columns.
-	normalColDefs := columnDefs
-	for i := nNormalColumns; i < nColumns; i++ {
-		columnDef := randComputedColumnTableDef(rng, normalColDefs, tableIdx, colIdx(i))
-		columnDefs = append(columnDefs, columnDef)
-		defs = append(defs, columnDef)
-	}
-
 	// Make a random primary key with high likelihood.
 	if rng.Intn(8) != 0 {
 		indexDef, ok := randIndexTableDefFromCols(rng, columnDefs, false /* allowExpressions */)
@@ -150,6 +142,14 @@ func RandCreateTableWithColumnIndexNumberGenerator(
 				}
 			}
 		}
+	}
+
+	// Make defs for computed columns.
+	normalColDefs := columnDefs
+	for i := nNormalColumns; i < nColumns; i++ {
+		columnDef := randComputedColumnTableDef(rng, normalColDefs, tableIdx, colIdx(i))
+		columnDefs = append(columnDefs, columnDef)
+		defs = append(defs, columnDef)
 	}
 
 	// Make indexes.
@@ -249,13 +249,31 @@ func GenerateRandInterestingTable(db *gosql.DB, dbName, tableName string) error 
 // randColumnTableDef produces a random ColumnTableDef for a non-computed
 // column, with a random type and nullability.
 func randColumnTableDef(rand *rand.Rand, tableIdx int, colIdx int) *tree.ColumnTableDef {
+	typ := RandColumnType(rand)
 	columnDef := &tree.ColumnTableDef{
 		// We make a unique name for all columns by prefixing them with the table
 		// index to make it easier to reference columns from different tables.
 		Name: tree.Name(fmt.Sprintf("col%d_%d", tableIdx, colIdx)),
-		Type: RandColumnType(rand),
+		Type: typ,
 	}
 	columnDef.Nullable.Nullability = tree.Nullability(rand.Intn(int(tree.SilentNull) + 1))
+	var nullOk bool
+	if columnDef.Nullable.Nullability != tree.NotNull {
+		nullOk = true
+	}
+	if rand.Intn(2) == 0 {
+		datum := RandDatum(rand, typ, nullOk)
+		expr, _ := randExpr(rand, datum, typ, false /* canChangeType */, false /* needsImmutable */, nullOk)
+		// Add a random DEFAULT expr.
+		columnDef.DefaultExpr.Expr = expr
+	}
+
+	if rand.Intn(4) == 0 {
+		datum := RandDatum(rand, typ, nullOk)
+		expr, _ := randExpr(rand, datum, typ, false /* canChangeType */, false /* needsImmutable */, nullOk)
+		// Add a random ON UPDATE expr.
+		columnDef.OnUpdateExpr.Expr = expr
+	}
 	return columnDef
 }
 
@@ -269,7 +287,14 @@ func randComputedColumnTableDef(
 	newDef.Computed.Computed = true
 	newDef.Computed.Virtual = (rng.Intn(2) == 0)
 
-	expr, typ, nullability := randExpr(rng, normalColDefs, true /* nullOk */)
+	// Clear any default or ON UPDATE expr, since we're going to switch the type
+	// of the definition.
+	newDef.DefaultExpr.Expr = nil
+	newDef.DefaultExpr.ConstraintName = ""
+	newDef.OnUpdateExpr.Expr = nil
+	newDef.OnUpdateExpr.ConstraintName = ""
+
+	expr, typ, nullability := randColumnExpr(rng, normalColDefs, true /* nullOk */)
 	newDef.Computed.Expr = expr
 	newDef.Type = typ
 	newDef.Nullable.Nullability = nullability
@@ -305,7 +330,7 @@ func randIndexTableDefFromCols(
 			// computed columns, so only make expressions with non-computed
 			// columns. Do not allow NULL in expressions to avoid expressions
 			// that have an ambiguous type.
-			expr, semType, _ = randExpr(rng, nonComputedColumnTableDefs(columnTableDefs), false /* nullOk */)
+			expr, semType, _ = randColumnExpr(rng, nonComputedColumnTableDefs(columnTableDefs), false /* nullOk */)
 			elem.Expr = expr
 			elem.Column = ""
 		}
@@ -395,7 +420,7 @@ func TestingMakePrimaryIndexKeyForTenant(
 		colIDToRowIndex.Set(index.GetKeyColumnID(i), i)
 	}
 
-	keyPrefix := rowenc.MakeIndexKeyPrefix(codec, desc.GetID(), index.GetID())
+	keyPrefix := rowenc.MakeIndexKeyPrefix(codec, desc, index.GetID())
 	key, _, err := rowenc.EncodeIndexKey(desc, index, colIDToRowIndex, datums, keyPrefix)
 	if err != nil {
 		return nil, err
