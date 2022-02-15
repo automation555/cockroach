@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq" // register postgres driver
@@ -358,9 +357,7 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	}
 	register(&r)
 	cr := newClusterRegistry()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	runner := newTestRunner(cr, stopper, r.buildVersion)
+	runner := newTestRunner(cr, r.buildVersion)
 
 	filter := registry.NewTestFilter(cfg.args)
 	clusterType := roachprodCluster
@@ -415,7 +412,7 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	err = runner.Run(
 		ctx, tests, cfg.count, cfg.parallelism, opt,
 		testOpts{versionsBinaryOverride: cfg.versionsBinaryOverride},
-		lopt)
+		lopt, nil /* clusterAllocator */)
 
 	// Make sure we attempt to clean up. We run with a non-canceled ctx; the
 	// ctx above might be canceled in case a signal was received. If that's

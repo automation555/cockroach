@@ -818,6 +818,15 @@ func createFlagsOverride(flags *pflag.FlagSet, opts *vm.CreateOpts) {
 	}
 }
 
+// clusterMock creates a cluster to be used for (self) testing.
+func (f *clusterFactory) clusterMock(cfg clusterConfig) *clusterImpl {
+	return &clusterImpl{
+		name:       f.genName(cfg),
+		expiration: timeutil.Now().Add(24 * time.Hour),
+		r:          f.r,
+	}
+}
+
 // newCluster creates a new roachprod cluster.
 //
 // setStatus is called with status messages indicating the stage of cluster
@@ -836,12 +845,8 @@ func (f *clusterFactory) newCluster(
 	}
 
 	if cfg.spec.NodeCount == 0 {
-		// For tests. Return the minimum that makes them happy.
-		c := &clusterImpl{
-			name:       f.genName(cfg),
-			expiration: timeutil.Now().Add(24 * time.Hour),
-			r:          f.r,
-		}
+		// For tests, use a mock cluster.
+		c := f.clusterMock(cfg)
 		if err := f.r.registerCluster(c); err != nil {
 			return nil, err
 		}
@@ -1296,21 +1301,35 @@ func (c *clusterImpl) FetchDebugZip(ctx context.Context, t test.Test) error {
 	})
 }
 
-// checkNoDeadNode reports an error (via `t.Error`) if nodes that have a populated
-// data dir are found to be not running. It prints both to t.L() and the test
-// output.
-func (c *clusterImpl) assertNoDeadNode(ctx context.Context, t test.Test) {
+// FailOnDeadNodes fails the test if nodes that have a populated data dir are
+// found to be not running. It prints both to t.L() and the test output.
+func (c *clusterImpl) FailOnDeadNodes(ctx context.Context, t test.Test) {
 	if c.spec.NodeCount == 0 {
 		// No nodes can happen during unit tests and implies nothing to do.
 		return
 	}
 
-	_, err := roachprod.Monitor(ctx, t.L(), c.name, install.MonitorOpts{OneShot: true, IgnoreEmptyNodes: true})
-	// If there's an error, it means either that the monitor command failed
-	// completely, or that it found a dead node worth complaining about.
-	if err != nil {
-		t.Errorf("dead node detection: %s", err)
-	}
+	// Don't hang forever.
+	_ = contextutil.RunWithTimeout(ctx, "detect dead nodes", time.Minute, func(ctx context.Context) error {
+		messages, err := roachprod.Monitor(ctx, t.L(), c.name, install.MonitorOpts{OneShot: true, IgnoreEmptyNodes: true})
+		// If there's an error, it means either that the monitor command failed
+		// completely, or that it found a dead node worth complaining about.
+		if err != nil {
+			if ctx.Err() != nil {
+				// Don't fail if we timed out.
+				return nil
+			}
+			// TODO(tbg): remove this type assertion.
+			t.(*testImpl).printfAndFail(0 /* skip */, "dead node detection: %s", err)
+		}
+		for msg := range messages {
+			if msg.Err != nil {
+				msg.Msg += "error: " + msg.Err.Error()
+				return errors.Newf("%d: %s", msg.Node, msg.Msg)
+			}
+		}
+		return nil
+	})
 }
 
 // CheckReplicaDivergenceOnDB runs a fast consistency check of the whole keyspace
@@ -1362,7 +1381,7 @@ WHERE t.status NOT IN ('RANGE_CONSISTENT', 'RANGE_INDETERMINATE')`)
 // crdb_internal.check_consistency(true, '', '') indicates that any ranges'
 // replicas are inconsistent with each other. It uses the first node that
 // is up to run the query.
-func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t test.Test) {
+func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t *testImpl) {
 	if c.spec.NodeCount < 1 {
 		return // unit tests
 	}
@@ -1398,7 +1417,11 @@ func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t test.Test) 
 			return c.CheckReplicaDivergenceOnDB(ctx, t.L(), db)
 		},
 	); err != nil {
-		t.Errorf("consistency check failed: %v", err)
+		// NB: we don't call t.Fatal() here because this method is
+		// for use by the test harness beyond the point at which
+		// it can interpret `t.Fatal`.
+		//
+		t.printAndFail(0, err)
 	}
 }
 
@@ -1655,7 +1678,7 @@ func (c *clusterImpl) PutE(
 
 	c.status("uploading file")
 	defer c.status("")
-	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, true /* useTreeDist */), "cluster.PutE")
+	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, false /* useTreeDist */), "cluster.PutE")
 }
 
 // PutLibraries inserts all available library files into all nodes on the cluster
@@ -1913,9 +1936,6 @@ func (c *clusterImpl) StopE(
 ) error {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.StopE")
-	}
-	if c.spec.NodeCount == 0 {
-		return nil // unit tests
 	}
 	c.setStatusForClusterOpt("stopping", stopOpts.RoachtestOpts.Worker, nodes...)
 	defer c.clearStatusForClusterOpt(stopOpts.RoachtestOpts.Worker)
@@ -2366,28 +2386,6 @@ func (c *clusterImpl) ConnE(ctx context.Context, l *logger.Logger, node int) (*g
 		return nil, err
 	}
 	db, err := gosql.Open("postgres", urls[0])
-	if err != nil {
-		return nil, err
-	}
-	return db, nil
-}
-
-// ConnEAsUser returns a SQL connection to the specified node as a specific user
-func (c *clusterImpl) ConnEAsUser(
-	ctx context.Context, l *logger.Logger, node int, user string,
-) (*gosql.DB, error) {
-	urls, err := c.ExternalPGUrl(ctx, l, c.Node(node))
-	if err != nil {
-		return nil, err
-	}
-
-	u, err := url.Parse(urls[0])
-	if err != nil {
-		return nil, err
-	}
-	u.User = url.User(user)
-	dataSourceName := u.String()
-	db, err := gosql.Open("postgres", dataSourceName)
 	if err != nil {
 		return nil, err
 	}
