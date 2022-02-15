@@ -35,7 +35,7 @@ eexpect "brief introduction"
 eexpect root@
 # Ensure db is movr.
 eexpect "movr>"
-send_eof
+interrupt
 eexpect eof
 end_test
 
@@ -68,7 +68,7 @@ eexpect ":26257"
 eexpect "sslmode=disable"
 eexpect "defaultdb>"
 
-send_eof
+interrupt
 eexpect eof
 
 # With command-line override.
@@ -88,7 +88,7 @@ eexpect "(sql/unix)"
 eexpect "root:unused@"
 eexpect "defaultdb>"
 
-send_eof
+interrupt
 eexpect eof
 
 end_test
@@ -125,7 +125,7 @@ eexpect ":26257"
 eexpect "sslmode=require"
 eexpect "defaultdb>"
 
-send_eof
+interrupt
 eexpect eof
 
 # With command-line override.
@@ -146,7 +146,7 @@ eexpect "(sql/unix)"
 eexpect "demo:"
 eexpect "defaultdb>"
 
-send_eof
+interrupt
 eexpect eof
 
 end_test
@@ -213,7 +213,7 @@ eexpect "http://"
 eexpect ":8005"
 eexpect "defaultdb>"
 
-send_eof
+interrupt
 eexpect eof
 
 spawn $argv demo --no-example-database --nodes 3 --sql-port 23000
@@ -249,7 +249,7 @@ eexpect "(sql)"
 eexpect ":23002"
 eexpect "defaultdb>"
 
-send_eof
+interrupt
 eexpect eof
 
 
@@ -264,7 +264,7 @@ eexpect "defaultdb>"
 # Check the URL is valid. If the connection fails, the system command will fail too.
 system "$argv sql --url `cat test.url` -e 'select 1'"
 
-send_eof
+interrupt
 eexpect eof
 
 # Ditto, insecure
@@ -275,7 +275,7 @@ eexpect "defaultdb>"
 # Check the URL is valid. If the connection fails, the system command will fail too.
 system "$argv sql --url `cat test.url` -e 'select 1'"
 
-send_eof
+interrupt
 eexpect eof
 
 

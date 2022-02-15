@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/internal/codeowners"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	_ "github.com/cockroachdb/cockroach/pkg/testutils/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/errors"
@@ -1168,7 +1167,6 @@ func TestLint(t *testing.T) {
 			":!*.pb.go",
 			":!*.pb.gw.go",
 			":!kv/kvclient/kvcoord/lock_spans_over_budget_error.go",
-			":!roachpb/replica_unavailable_error.go",
 			":!sql/pgwire/pgerror/constraint_name.go",
 			":!sql/pgwire/pgerror/severity.go",
 			":!sql/pgwire/pgerror/with_candidate_code.go",
@@ -1577,7 +1575,7 @@ func TestLint(t *testing.T) {
 		if bazel.BuiltWithBazel() {
 			skip.IgnoreLint(t, "the errcheck tests are run during the bazel build")
 		}
-		excludesPath, err := filepath.Abs(testutils.TestDataPath(t, "errcheck_excludes.txt"))
+		excludesPath, err := filepath.Abs(filepath.Join("testdata", "errcheck_excludes.txt"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2033,6 +2031,42 @@ func TestLint(t *testing.T) {
 		}
 	})
 
+	t.Run("TestFormatImpl", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			// We prohibit usage of NodeFormatter.FormatImpl outside of the expected
+			// usages by FmtCtx.
+			`\.(FormatImpl)\(`,
+			"--",
+			"sql/sem/tree/",
+			":!sql/sem/tree/format.go",
+			":!sql/sem/tree/hide_constants.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use ctx.Format(n)", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	// RoachVet is expensive memory-wise and thus should not run with t.Parallel().
 	// RoachVet includes all of the passes of `go vet` plus first-party additions.
 	// See pkg/cmd/roachvet.
@@ -2114,9 +2148,6 @@ func TestLint(t *testing.T) {
 			`pkg/testutils/.*\.go`,
 			`pkg/workload/.*\.go`,
 		}, "|") + `)`
-		unkeyedLiteralExceptions := `pkg/.*_test\.go:.*(` + strings.Join([]string{
-			`pkg/testutils/sstutil\.KV`,
-		}, "|") + `)`
 		filters := []stream.Filter{
 			// Ignore generated files.
 			stream.GrepNot(`pkg/.*\.pb\.go:`),
@@ -2174,10 +2205,6 @@ func TestLint(t *testing.T) {
 			// pooling, etc, then test code needs to adhere as well.
 			stream.GrepNot(nakedGoroutineExceptions + `:.*Use of go keyword not allowed`),
 			stream.GrepNot(nakedGoroutineExceptions + `:.*Illegal call to Group\.Go\(\)`),
-			// We allow unkeyed struct literals for certain internal test types.
-			// Ideally, go vet should not complain about this for types declared in
-			// the same module: https://github.com/golang/go/issues/43864
-			stream.GrepNot(unkeyedLiteralExceptions + `.*composite literal uses unkeyed fields`),
 		}
 
 		const vetTool = "roachvet"
@@ -2192,7 +2219,6 @@ func TestLint(t *testing.T) {
 	})
 
 	t.Run("CODEOWNERS", func(t *testing.T) {
-		skip.UnderBazel(t, "doesn't work under bazel")
 		co, err := codeowners.DefaultLoadCodeOwners()
 		require.NoError(t, err)
 		const verbose = false
