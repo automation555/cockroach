@@ -17,12 +17,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -43,8 +41,7 @@ var validTableDesc = &descpb.Descriptor{
 			Columns: []descpb.ColumnDescriptor{
 				{Name: "col", ID: 1, Type: types.Int},
 			},
-			NextColumnID:     2,
-			NextConstraintID: 2,
+			NextColumnID: 2,
 			Families: []descpb.ColumnFamilyDescriptor{
 				{ID: 0, Name: "f", ColumnNames: []string{"col"}, ColumnIDs: []descpb.ColumnID{1}, DefaultColumnID: 1},
 			},
@@ -58,11 +55,11 @@ var validTableDesc = &descpb.Descriptor{
 				KeyColumnIDs:        []descpb.ColumnID{1},
 				Version:             descpb.PrimaryIndexWithStoredColumnsVersion,
 				EncodingType:        descpb.PrimaryIndexEncoding,
-				ConstraintID:        1,
 			},
 			NextIndexID: 2,
-			Privileges: catpb.NewCustomSuperuserPrivilegeDescriptor(
-				privilege.ReadWriteData, security.NodeUserName()),
+			//Privileges: descpb.NewCustomSuperuserPrivilegeDescriptor(
+			//	privilege.ReadWriteData, security.NodeUserName()),
+			Privileges:     descpb.NewBasePrivilegeDescriptor(security.NodeUserName()),
 			FormatVersion:  descpb.InterleavedFormatVersion,
 			NextMutationID: 1,
 		},
@@ -170,9 +167,6 @@ func TestExamineDescriptors(t *testing.T) {
 			},
 			expected: `Examining 1 descriptors and 0 namespace entries...
   ParentID   0, ParentSchemaID 29: relation "" (2): different id in descriptor table: 1
-  ParentID   0, ParentSchemaID 29: relation "" (2): empty table name
-  ParentID   0, ParentSchemaID 29: relation "" (2): invalid parent ID 0
-  ParentID   0, ParentSchemaID 29: relation "" (2): table must contain at least 1 column
 `,
 		},
 		{ // 4
@@ -251,7 +245,7 @@ func TestExamineDescriptors(t *testing.T) {
 				{NameInfo: descpb.NameInfo{ParentID: 2, Name: "schema"}, ID: 51},
 			},
 			expected: `Examining 1 descriptors and 1 namespace entries...
-  ParentID   2, ParentSchemaID  0: schema "schema" (51): referenced database ID 2: referenced descriptor not found
+  ParentID   2, ParentSchemaID  0: schema "schema" (51): referenced database ID 2: descriptor not found
 `,
 		},
 		{ // 9
@@ -291,8 +285,8 @@ func TestExamineDescriptors(t *testing.T) {
 				{NameInfo: descpb.NameInfo{Name: "db"}, ID: 3},
 			},
 			expected: `Examining 2 descriptors and 2 namespace entries...
-  ParentID   3, ParentSchemaID  2: type "type" (51): referenced schema ID 2: referenced descriptor not found
-  ParentID   3, ParentSchemaID  2: type "type" (51): arrayTypeID 0 does not exist for "ENUM": referenced type ID 0: referenced descriptor not found
+  ParentID   3, ParentSchemaID  2: type "type" (51): referenced schema ID 2: descriptor not found
+  ParentID   3, ParentSchemaID  2: type "type" (51): arrayTypeID 0 does not exist for "ENUM": referenced type ID 0: descriptor not found
 `,
 		},
 		{ // 11
@@ -320,7 +314,7 @@ func TestExamineDescriptors(t *testing.T) {
 				{NameInfo: descpb.NameInfo{ParentID: 51, ParentSchemaID: keys.PublicSchemaID, Name: "type"}, ID: 52},
 			},
 			expected: `Examining 2 descriptors and 2 namespace entries...
-  ParentID  51, ParentSchemaID 29: type "type" (52): arrayTypeID 0 does not exist for "ENUM": referenced type ID 0: referenced descriptor not found
+  ParentID  51, ParentSchemaID 29: type "type" (52): arrayTypeID 0 does not exist for "ENUM": referenced type ID 0: descriptor not found
 `,
 		},
 		{ // 12
@@ -414,6 +408,7 @@ func TestExamineDescriptors(t *testing.T) {
 			expected: "Examining 1 descriptors and 3 namespace entries...\n",
 		},
 		{ // 17
+			valid: false,
 			descTable: doctor.DescriptorTable{
 				{
 					ID: 1,
@@ -549,21 +544,15 @@ func TestExamineDescriptors(t *testing.T) {
 	for i, test := range tests {
 		var buf bytes.Buffer
 		valid, err := doctor.ExamineDescriptors(
-			context.Background(),
-			clusterversion.TestingClusterVersion,
-			test.descTable,
-			test.namespaceTable,
-			test.jobsTable,
-			false,
-			&buf)
+			context.Background(), test.descTable, test.namespaceTable, test.jobsTable, false, &buf)
 		msg := fmt.Sprintf("Test %d failed!", i+1)
 		if test.errStr != "" {
 			require.Containsf(t, err.Error(), test.errStr, msg)
 		} else {
 			require.NoErrorf(t, err, msg)
 		}
-		require.Equalf(t, test.expected, buf.String(), msg)
 		require.Equalf(t, test.valid, valid, msg)
+		require.Equalf(t, test.expected, buf.String(), msg)
 	}
 }
 
