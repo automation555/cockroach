@@ -68,17 +68,18 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 				m.MergeTimestamp.Synthetic = nil // never populated below Raft
 			}
 			m.TxnDidNotUpdateMeta = nil // never populated below Raft
+			m.WrittenTimestamp = nil    // never populated below Raft
 			return m
 		},
 		emptySum:     7551962144604783939,
-		populatedSum: 6170112718709472849,
+		populatedSum: 4745626903798922387,
 	},
 	reflect.TypeOf(&enginepb.RangeAppliedState{}): {
 		populatedConstructor: func(r *rand.Rand) protoutil.Message {
 			return enginepb.NewPopulatedRangeAppliedState(r, false)
 		},
 		emptySum:     615555020845646359,
-		populatedSum: 12125419916111069931,
+		populatedSum: 17354515720541950025,
 	},
 	reflect.TypeOf(&raftpb.HardState{}): {
 		populatedConstructor: func(r *rand.Rand) protoutil.Message {
@@ -132,13 +133,6 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 		},
 		emptySum:     14695981039346656037,
 		populatedSum: 1187861800212570275,
-	},
-	reflect.TypeOf(&roachpb.RaftReplicaID{}): {
-		populatedConstructor: func(r *rand.Rand) protoutil.Message {
-			return roachpb.NewPopulatedRaftReplicaID(r, false)
-		},
-		emptySum:     598336668751268149,
-		populatedSum: 9313101058286450988,
 	},
 }
 

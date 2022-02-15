@@ -23,22 +23,7 @@ import (
 
 // ErrBufferClosed is returned by Readers when no more values will be
 // returned from the buffer.
-type ErrBufferClosed struct {
-	reason error
-}
-
-// Error() implements the error interface
-func (e ErrBufferClosed) Error() string {
-	return "buffer closed"
-}
-
-func (e ErrBufferClosed) Unwrap() error {
-	return e.reason
-}
-
-// ErrNormalRestartReason is a sentinel error to indicate the
-// ErrBufferClosed's reason is a pending restart
-var ErrNormalRestartReason = errors.New("writer can restart")
+var ErrBufferClosed = errors.New("buffer closed")
 
 // Buffer is an interface for communicating kvfeed entries between processors.
 type Buffer interface {
@@ -58,8 +43,8 @@ type Writer interface {
 	Add(ctx context.Context, event Event) error
 	// Drain waits until all events buffered by this writer has been consumed.
 	Drain(ctx context.Context) error
-	// CloseWithReason closes this writer. reason may be added as a detail to ErrBufferClosed.
-	CloseWithReason(ctx context.Context, reason error) error
+	// Close closes this writer.
+	Close(ctx context.Context) error
 }
 
 // Type indicates the type of the event.
@@ -94,7 +79,7 @@ type Event struct {
 	flush              bool
 	resolved           *jobspb.ResolvedSpan
 	backfillTimestamp  hlc.Timestamp
-	bufferAddTimestamp time.Time
+	bufferGetTimestamp time.Time
 	approxSize         int
 	alloc              Alloc
 }
@@ -146,9 +131,9 @@ func (b *Event) BackfillTimestamp() hlc.Timestamp {
 	return b.backfillTimestamp
 }
 
-// BufferAddTimestamp is the time this event came into  the buffer.
-func (b *Event) BufferAddTimestamp() time.Time {
-	return b.bufferAddTimestamp
+// BufferGetTimestamp is the time this event came out of the buffer.
+func (b *Event) BufferGetTimestamp() time.Time {
+	return b.bufferGetTimestamp
 }
 
 // Timestamp returns the timestamp of the write if this is a KV event.
@@ -202,6 +187,11 @@ func (b *Event) DetachAlloc() Alloc {
 func MakeResolvedEvent(
 	span roachpb.Span, ts hlc.Timestamp, boundaryType jobspb.ResolvedSpan_BoundaryType,
 ) Event {
+	// Strip synthetic bit from CDC events. It can confuse consumers.
+	// TODO DURING PR: this is needed to fix a few tests, but hints at a larger
+	// question of whether we like that the synthetic timestamp flag can escape
+	// outside the system.
+	ts.Synthetic = false
 	return Event{
 		resolved: &jobspb.ResolvedSpan{
 			Span:         span,
@@ -216,6 +206,11 @@ func MakeResolvedEvent(
 func MakeKVEvent(
 	kv roachpb.KeyValue, prevVal roachpb.Value, backfillTimestamp hlc.Timestamp,
 ) Event {
+	// Strip synthetic bit from CDC events. It can confuse consumers.
+	// TODO DURING PR: this is needed to fix a few tests, but hints at a larger
+	// question of whether we like that the synthetic timestamp flag can escape
+	// outside the system.
+	kv.Value.Timestamp.Synthetic = false
 	return Event{
 		kv:                kv,
 		prevVal:           prevVal,

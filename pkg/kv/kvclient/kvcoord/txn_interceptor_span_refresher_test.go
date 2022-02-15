@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -28,9 +29,11 @@ import (
 
 func makeMockTxnSpanRefresher() (txnSpanRefresher, *mockLockedSender) {
 	mockSender := &mockLockedSender{}
+	manual := hlc.NewManualClock(123)
 	return txnSpanRefresher{
 		st:                            cluster.MakeTestingClusterSettings(),
 		knobs:                         new(ClientTestingKnobs),
+		clock:                         hlc.NewClock(manual.UnixNano, time.Nanosecond),
 		wrapped:                       mockSender,
 		canAutoRetry:                  true,
 		refreshSuccess:                metric.NewCounter(metaRefreshSuccess),
@@ -386,10 +389,12 @@ func TestTxnSpanRefresherPreemptiveRefresh(t *testing.T) {
 	txn := makeTxnProto()
 	keyA, keyB := roachpb.Key("a"), roachpb.Key("b")
 
-	// Push the txn so that it needs a refresh.
-	txn.WriteTimestamp = txn.WriteTimestamp.Add(1, 0)
+	// Push the txn so that it needs a refresh. Mark the timestamp as synthetic,
+	// which will be stripped before a refresh because the timestamp trails the
+	// local clock.
+	txn.WriteTimestamp = txn.WriteTimestamp.Add(1, 0).WithSynthetic(true)
 	origReadTs := txn.ReadTimestamp
-	pushedWriteTs := txn.WriteTimestamp
+	pushedWriteTs := txn.WriteTimestamp.WithSynthetic(false)
 
 	// Send an EndTxn request that will need a refresh to succeed. Because
 	// no refresh spans have been recorded, the preemptive refresh should be
@@ -478,8 +483,7 @@ func TestTxnSpanRefresherPreemptiveRefresh(t *testing.T) {
 		require.Equal(t, scanArgs.Span(), refReq.Span())
 		require.Equal(t, origReadTs, refReq.RefreshFrom)
 
-		return nil, roachpb.NewError(roachpb.NewRefreshFailedError(
-			roachpb.RefreshFailedError_REASON_COMMITTED_VALUE, roachpb.Key("a"), hlc.Timestamp{WallTime: 1}))
+		return nil, roachpb.NewErrorf("encountered recently written key")
 	}
 	unexpected := func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		require.Fail(t, "unexpected")
@@ -490,9 +494,7 @@ func TestTxnSpanRefresherPreemptiveRefresh(t *testing.T) {
 	br, pErr = tsr.SendLocked(ctx, ba)
 	require.Nil(t, br)
 	require.NotNil(t, pErr)
-	require.Regexp(t,
-		"TransactionRetryError: retry txn \\(RETRY_SERIALIZABLE - failed preemptive refresh "+
-			"due to a conflict: committed value on key \"a\"\\)", pErr)
+	require.Regexp(t, `TransactionRetryError: retry txn \(RETRY_SERIALIZABLE - failed preemptive refresh\)`, pErr)
 	require.Equal(t, int64(2), tsr.refreshSuccess.Count())
 	require.Equal(t, int64(1), tsr.refreshFail.Count())
 	require.Equal(t, int64(0), tsr.refreshAutoRetries.Count())

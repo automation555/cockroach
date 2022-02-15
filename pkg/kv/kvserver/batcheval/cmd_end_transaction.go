@@ -16,8 +16,8 @@ import (
 	"fmt"
 	"math"
 	"sync/atomic"
-	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -42,7 +42,7 @@ func init() {
 // declareKeysWriteTransaction is the shared portion of
 // declareKeys{End,Heartbeat}Transaction.
 func declareKeysWriteTransaction(
-	_ ImmutableRangeState, header *roachpb.Header, req roachpb.Request, latchSpans *spanset.SpanSet,
+	_ ImmutableRangeState, header roachpb.Header, req roachpb.Request, latchSpans *spanset.SpanSet,
 ) {
 	if header.Txn != nil {
 		header.Txn.AssertInitialized(context.TODO())
@@ -54,10 +54,9 @@ func declareKeysWriteTransaction(
 
 func declareKeysEndTxn(
 	rs ImmutableRangeState,
-	header *roachpb.Header,
+	header roachpb.Header,
 	req roachpb.Request,
 	latchSpans, _ *spanset.SpanSet,
-	_ time.Duration,
 ) {
 	et := req.(*roachpb.EndTxnRequest)
 	declareKeysWriteTransaction(rs, header, req, latchSpans)
@@ -276,23 +275,10 @@ func EndTxn(
 			return result.FromEndTxn(reply.Txn, true /* alwaysReturn */, args.Poison),
 				roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_ABORTED_RECORD_FOUND)
 
-		case roachpb.PENDING:
+		case roachpb.PENDING, roachpb.STAGING:
 			if h.Txn.Epoch < reply.Txn.Epoch {
 				return result.Result{}, errors.AssertionFailedf(
 					"programming error: epoch regression: %d", h.Txn.Epoch)
-			}
-
-		case roachpb.STAGING:
-			if h.Txn.Epoch < reply.Txn.Epoch {
-				return result.Result{}, errors.AssertionFailedf(
-					"programming error: epoch regression: %d", h.Txn.Epoch)
-			}
-			if h.Txn.Epoch > reply.Txn.Epoch {
-				// If the EndTxn carries a newer epoch than a STAGING txn record, we do
-				// not consider the transaction to be performing a parallel commit and
-				// potentially already implicitly committed because we know that the
-				// transaction restarted since entering the STAGING state.
-				reply.Txn.Status = roachpb.PENDING
 			}
 
 		default:
@@ -333,40 +319,6 @@ func EndTxn(
 		// Else, the transaction can be explicitly committed.
 		reply.Txn.Status = roachpb.COMMITTED
 	} else {
-		// If the transaction is STAGING, we can only move it to ABORTED if it is
-		// *not* already implicitly committed. On the commit path, the transaction
-		// coordinator is deliberate to only ever issue an EndTxn(commit) once the
-		// transaction has reached an implicit commit state. However, on the
-		// rollback path, the transaction coordinator does not make the opposite
-		// guarantee that it will never issue an EndTxn(abort) once the transaction
-		// has reached (or if it still could reach) an implicit commit state.
-		//
-		// As a result, on the rollback path, we don't trust the transaction's
-		// coordinator to be an authoritative source of truth about whether the
-		// transaction is implicitly committed. In other words, we don't consider
-		// this EndTxn(abort) to be a claim that the transaction is not implicitly
-		// committed. The transaction's coordinator may have just given up on the
-		// transaction before it heard the outcome of a commit attempt. So in this
-		// case, we return an IndeterminateCommitError to trigger the transaction
-		// recovery protocol and transition the transaction record to a finalized
-		// state (COMMITTED or ABORTED).
-		//
-		// Interestingly, because intents are not currently resolved until after an
-		// implicitly committed transaction has been moved to an explicit commit
-		// state (i.e. its record has moved from STAGING to COMMITTED), no other
-		// transaction could see the effect of an implicitly committed transaction
-		// that was erroneously rolled back. This means that such a mistake does not
-		// actually compromise atomicity. Regardless, such a transition is confusing
-		// and can cause errors in transaction recovery code. We would also like to
-		// begin resolving intents earlier, while a transaction is still implicitly
-		// committed. Doing so is only possible if we can guarantee that under no
-		// circumstances can an implicitly committed transaction be rolled back.
-		if reply.Txn.Status == roachpb.STAGING {
-			err := roachpb.NewIndeterminateCommitError(*reply.Txn)
-			log.VEventf(ctx, 1, "%v", err)
-			return result.Result{}, err
-		}
-
 		reply.Txn.Status = roachpb.ABORTED
 	}
 
@@ -436,11 +388,10 @@ func EndTxn(
 	return txnResult, nil
 }
 
-// IsEndTxnExceedingDeadline returns true if the transaction's provisional
-// commit timestamp exceeded its deadline. If so, the transaction should not be
-// allowed to commit.
-func IsEndTxnExceedingDeadline(commitTS hlc.Timestamp, deadline *hlc.Timestamp) bool {
-	return deadline != nil && !deadline.IsEmpty() && deadline.LessEq(commitTS)
+// IsEndTxnExceedingDeadline returns true if the transaction exceeded its
+// deadline.
+func IsEndTxnExceedingDeadline(t hlc.Timestamp, args *roachpb.EndTxnRequest) bool {
+	return args.Deadline != nil && args.Deadline.LessEq(t)
 }
 
 // IsEndTxnTriggeringRetryError returns true if the EndTxnRequest cannot be
@@ -465,7 +416,7 @@ func IsEndTxnTriggeringRetryError(
 	}
 
 	// A transaction must obey its deadline, if set.
-	if !retry && IsEndTxnExceedingDeadline(txn.WriteTimestamp, args.Deadline) {
+	if !retry && IsEndTxnExceedingDeadline(txn.WriteTimestamp, args) {
 		exceededBy := txn.WriteTimestamp.GoTime().Sub(args.Deadline.GoTime())
 		extraMsg = fmt.Sprintf(
 			"txn timestamp pushed too much; deadline exceeded by %s (%s > %s)",
@@ -500,13 +451,21 @@ func resolveLocalLocks(
 		desc = &mergeTrigger.LeftDesc
 	}
 
-	var resolveAllowance int64 = lockResolutionBatchSize
+	// Any intent resolved here is resolved synchronously with the txn commit.
+	const asyncResolution = false
+	resolveAllowance := int64(lockResolutionBatchSize)
 	if args.InternalCommitTrigger != nil {
 		// If this is a system transaction (such as a split or merge), don't enforce the resolve allowance.
 		// These transactions rely on having their locks resolved synchronously.
 		resolveAllowance = math.MaxInt64
 	}
-
+	onlySeparatedIntents := false
+	st := evalCtx.ClusterSettings()
+	// Some tests have st == nil.
+	if st != nil {
+		onlySeparatedIntents = st.Version.ActiveVersionOrEmpty(ctx).IsActive(
+			clusterversion.PostSeparatedIntentsMigration)
+	}
 	for _, span := range args.LockSpans {
 		if err := func() error {
 			if resolveAllowance == 0 {
@@ -529,7 +488,7 @@ func resolveLocalLocks(
 				//
 				// Note that the underlying pebbleIterator will still be reused
 				// since readWriter is a pebbleBatch in the typical case.
-				ok, err := storage.MVCCResolveWriteIntent(ctx, readWriter, ms, update)
+				ok, err := storage.MVCCResolveWriteIntent(ctx, readWriter, ms, update, asyncResolution)
 				if err != nil {
 					return err
 				}
@@ -547,7 +506,7 @@ func resolveLocalLocks(
 			if inSpan != nil {
 				update.Span = *inSpan
 				num, resumeSpan, err := storage.MVCCResolveWriteIntentRange(
-					ctx, readWriter, ms, update, resolveAllowance)
+					ctx, readWriter, ms, update, resolveAllowance, asyncResolution, onlySeparatedIntents)
 				if err != nil {
 					return err
 				}
@@ -1060,23 +1019,9 @@ func splitTriggerHelper(
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to load replica version")
 		}
-		// The RHS should populate RaftAppliedIndexTerm if the LHS is doing so.
-		// Alternatively, we could be more aggressive and also look at the cluster
-		// version, but this is simpler -- if the keyspace occupied by the
-		// original unsplit range has not been migrated yet, by an ongoing
-		// migration, both LHS and RHS will be migrated later.
-		rangeAppliedState, err := sl.LoadRangeAppliedState(ctx, batch)
-		if err != nil {
-			return enginepb.MVCCStats{}, result.Result{},
-				errors.Wrap(err, "unable to load range applied state")
-		}
-		writeRaftAppliedIndexTerm := false
-		if rangeAppliedState.RaftAppliedIndexTerm > 0 {
-			writeRaftAppliedIndexTerm = true
-		}
 		*h.AbsPostSplitRight(), err = stateloader.WriteInitialReplicaState(
 			ctx, batch, *h.AbsPostSplitRight(), split.RightDesc, rightLease,
-			*gcThreshold, replicaVersion, writeRaftAppliedIndexTerm,
+			*gcThreshold, replicaVersion,
 		)
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to write initial Replica state")

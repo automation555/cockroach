@@ -126,7 +126,7 @@ func generateMVCCScan(
 	maxKeys := int64(m.floatGenerator.parse(args[3]) * 32)
 	targetBytes := int64(m.floatGenerator.parse(args[4]) * (1 << 20))
 	targetBytesAvoidExcess := m.boolGenerator.parse(args[5])
-	allowEmpty := m.boolGenerator.parse(args[6])
+	targetBytesAllowEmpty := m.boolGenerator.parse(args[6])
 	return &mvccScanOp{
 		m:                      m,
 		key:                    key.Key,
@@ -138,7 +138,7 @@ func generateMVCCScan(
 		maxKeys:                maxKeys,
 		targetBytes:            targetBytes,
 		targetBytesAvoidExcess: targetBytesAvoidExcess,
-		allowEmpty:             allowEmpty,
+		targetBytesAllowEmpty:  targetBytesAllowEmpty,
 	}
 }
 
@@ -271,11 +271,6 @@ type mvccDeleteRangeOp struct {
 func (m mvccDeleteRangeOp) run(ctx context.Context) string {
 	txn := m.m.getTxn(m.txn)
 	writer := m.m.getReadWriter(m.writer)
-	if m.key.Compare(m.endKey) >= 0 {
-		// Empty range. No-op.
-		return "no-op due to no non-conflicting key range"
-	}
-
 	txn.Sequence++
 
 	keys, _, _, err := storage.MVCCDeleteRange(ctx, writer, nil, m.key, m.endKey, 0, txn.WriteTimestamp, txn, true)
@@ -300,6 +295,7 @@ func (m mvccDeleteRangeOp) run(ctx context.Context) string {
 
 type mvccClearTimeRangeOp struct {
 	m         *metaTestRunner
+	writer    readWriterID
 	key       roachpb.Key
 	endKey    roachpb.Key
 	startTime hlc.Timestamp
@@ -307,16 +303,14 @@ type mvccClearTimeRangeOp struct {
 }
 
 func (m mvccClearTimeRangeOp) run(ctx context.Context) string {
-	if m.key.Compare(m.endKey) >= 0 {
-		// Empty range. No-op.
-		return "no-op due to no non-conflicting key range"
-	}
-	span, err := storage.MVCCClearTimeRange(ctx, m.m.engine, &enginepb.MVCCStats{}, m.key, m.endKey,
-		m.startTime, m.endTime, math.MaxInt64, math.MaxInt64, true /* useTBI */)
+	writer := m.m.getReadWriter(m.writer)
+	useTBI := m.writer == "engine"
+	span, err := storage.MVCCClearTimeRange(ctx, writer, &enginepb.MVCCStats{}, m.key, m.endKey,
+		m.startTime, m.endTime, math.MaxInt64, math.MaxInt64, useTBI)
 	if err != nil {
 		return fmt.Sprintf("error: %s", err)
 	}
-	return fmt.Sprintf("ok, deleted span = %s - %s, resumeSpan = %v", m.key, m.endKey, span)
+	return fmt.Sprintf("ok, span = %v", span)
 }
 
 type mvccDeleteOp struct {
@@ -368,7 +362,7 @@ type mvccScanOp struct {
 	maxKeys                int64
 	targetBytes            int64
 	targetBytesAvoidExcess bool
-	allowEmpty             bool
+	targetBytesAllowEmpty  bool
 }
 
 func (m mvccScanOp) run(ctx context.Context) string {
@@ -390,7 +384,7 @@ func (m mvccScanOp) run(ctx context.Context) string {
 		MaxKeys:                m.maxKeys,
 		TargetBytes:            m.targetBytes,
 		TargetBytesAvoidExcess: m.targetBytesAvoidExcess,
-		AllowEmpty:             m.allowEmpty,
+		TargetBytesAllowEmpty:  m.targetBytesAllowEmpty,
 	})
 	if err != nil {
 		return fmt.Sprintf("error: %s", err)
@@ -438,7 +432,7 @@ func (t txnCommitOp) run(ctx context.Context) string {
 	for _, span := range txn.LockSpans {
 		intent := roachpb.MakeLockUpdate(txn, span)
 		intent.Status = roachpb.COMMITTED
-		_, err := storage.MVCCResolveWriteIntent(context.TODO(), t.m.engine, nil, intent)
+		_, err := storage.MVCCResolveWriteIntent(context.TODO(), t.m.engine, nil, intent, false)
 		if err != nil {
 			panic(err)
 		}
@@ -461,7 +455,7 @@ func (t txnAbortOp) run(ctx context.Context) string {
 	for _, span := range txn.LockSpans {
 		intent := roachpb.MakeLockUpdate(txn, span)
 		intent.Status = roachpb.ABORTED
-		_, err := storage.MVCCResolveWriteIntent(context.TODO(), t.m.engine, nil, intent)
+		_, err := storage.MVCCResolveWriteIntent(context.TODO(), t.m.engine, nil, intent, false /* asyncResolution */)
 		if err != nil {
 			panic(err)
 		}
@@ -684,15 +678,11 @@ type clearRangeOp struct {
 func (c clearRangeOp) run(ctx context.Context) string {
 	// ClearRange calls in Cockroach usually happen with boundaries demarcated
 	// using unversioned keys, so mimic the same behavior here.
-	if c.key.Compare(c.endKey) >= 0 {
-		// Empty range. No-op.
-		return "no-op due to no non-conflicting key range"
-	}
 	err := c.m.engine.ClearMVCCRangeAndIntents(c.key, c.endKey)
 	if err != nil {
 		return fmt.Sprintf("error: %s", err.Error())
 	}
-	return fmt.Sprintf("deleted range = %s - %s", c.key, c.endKey)
+	return "ok"
 }
 
 type compactOp struct {
@@ -897,9 +887,11 @@ var opGenerators = []opGenerator{
 			if endKey.Compare(key) < 0 {
 				key, endKey = endKey, key
 			}
-			truncatedSpan := m.txnGenerator.truncateSpanForConflicts(writer, txn, key, endKey)
-			key = truncatedSpan.Key
-			endKey = truncatedSpan.EndKey
+			// forEachConflict is guaranteed to iterate
+			m.txnGenerator.forEachConflict(writer, txn, key, endKey, func(conflict roachpb.Span) bool {
+				endKey = conflict.Key
+				return false
+			})
 
 			// Track this write in the txn generator. This ensures the batch will be
 			// committed before the transaction is committed
@@ -926,34 +918,32 @@ var opGenerators = []opGenerator{
 	{
 		name: "mvcc_clear_time_range",
 		generate: func(ctx context.Context, m *metaTestRunner, args ...string) mvccOp {
-			key := m.keyGenerator.parse(args[0]).Key
-			endKey := m.keyGenerator.parse(args[1]).Key
-			startTime := m.pastTSGenerator.parse(args[2])
+			writer := readWriterID(args[0])
+			key := m.keyGenerator.parse(args[1]).Key
+			endKey := m.keyGenerator.parse(args[2]).Key
+			startTime := m.pastTSGenerator.parse(args[3])
 			endTime := m.pastTSGenerator.parse(args[3])
 
 			if endKey.Compare(key) < 0 {
 				key, endKey = endKey, key
 			}
-			truncatedSpan := m.txnGenerator.truncateSpanForConflicts("engine", "", key, endKey)
-			key = truncatedSpan.Key
-			endKey = truncatedSpan.EndKey
 			if endTime.Less(startTime) {
 				startTime, endTime = endTime, startTime
 			}
-			// This is to avoid a panic where startTime == endTime == hlc.Timestamp{}
-			// and where startTime gets next()'d in the time-bound iterator creation
-			// but endTime doesn't, making it seem like a start timestamp is set
-			// but an end timestamp is not.
-			endTime = endTime.Next()
 			return &mvccClearTimeRangeOp{
 				m:         m,
+				writer:    writer,
 				key:       key,
 				endKey:    endKey,
 				startTime: startTime,
 				endTime:   endTime,
 			}
 		},
+		dependentOps: func(m *metaTestRunner, args ...string) []opReference {
+			return closeItersOnBatch(m, readWriterID(args[0]))
+		},
 		operands: []operandType{
+			operandReadWriter,
 			operandMVCCKey,
 			operandMVCCKey,
 			operandPastTS,
@@ -1341,10 +1331,6 @@ var opGenerators = []opGenerator{
 				// standardize behavior.
 				endKey = endKey.Next()
 			}
-
-			truncatedSpan := m.txnGenerator.truncateSpanForConflicts("engine", "", key, endKey)
-			key = truncatedSpan.Key
-			endKey = truncatedSpan.EndKey
 
 			return &clearRangeOp{
 				m:      m,

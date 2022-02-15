@@ -1,3 +1,6 @@
+# In this mixed cluster test, where v21.2 is writing separated intents, the
+# value of txnDidNotUpdateMeta will always be false.
+
 ## Write the base (default) value.
 
 run ok
@@ -28,13 +31,13 @@ with t=A
 txn: "A" meta={id=00000000 key=/Min pri=0.00000000 epo=0 ts=2.000000000,0 min=0,0 seq=0} lock=true stat=PENDING rts=2.000000000,0 wto=false gul=0,0
 >> put v=first k=a t=A
 called PutIntent("a", _, NoExistingIntent, TDNUM(true), 00000000-0000-0000-0000-000000000002)
-meta: "a"/0,0 -> txn={id=00000000 key=/Min pri=0.00000000 epo=0 ts=2.000000000,0 min=0,0 seq=0} ts=2.000000000,0 del=false klen=12 vlen=10 txnDidNotUpdateMeta=true
+meta: "a"/0,0 -> txn={id=00000000 key=/Min pri=0.00000000 epo=0 ts=2.000000000,0 min=0,0 seq=0} ts=2.000000000,0 del=false klen=12 vlen=10 txnDidNotUpdateMeta=false
 data: "a"/2.000000000,0 -> /BYTES/first
 data: "a"/1.000000000,0 -> /BYTES/default
 >> txn_step k=a t=A
 txn: "A" meta={id=00000000 key=/Min pri=0.00000000 epo=0 ts=2.000000000,0 min=0,0 seq=1} lock=true stat=PENDING rts=2.000000000,0 wto=false gul=0,0
 >> put v=second k=a t=A
-called PutIntent("a", _, ExistingIntentSeparated, TDNUM(true), 00000000-0000-0000-0000-000000000002)
+called PutIntent("a", _, ExistingIntentSeparated, TDNUM(false), 00000000-0000-0000-0000-000000000002)
 meta: "a"/0,0 -> txn={id=00000000 key=/Min pri=0.00000000 epo=0 ts=2.000000000,0 min=0,0 seq=1} ts=2.000000000,0 del=false klen=12 vlen=11 ih={{0 /BYTES/first}} txnDidNotUpdateMeta=false
 data: "a"/2.000000000,0 -> /BYTES/second
 data: "a"/1.000000000,0 -> /BYTES/default

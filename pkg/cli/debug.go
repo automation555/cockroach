@@ -31,7 +31,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
-	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/syncbench"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -46,7 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -94,10 +93,10 @@ Create a ballast file to fill the store directory up to a given amount
 	RunE: runDebugBallast,
 }
 
-// PopulateStorageConfigHook is a callback set by CCL code.
-// It populates any needed fields in the StorageConfig.
+// PopulateRocksDBConfigHook is a callback set by CCL code.
+// It populates any needed fields in the RocksDBConfig.
 // It must do nothing in OSS code.
-var PopulateStorageConfigHook func(*base.StorageConfig) error
+var PopulateRocksDBConfigHook func(*base.StorageConfig) error
 
 func parsePositiveInt(arg string) (int64, error) {
 	i, err := strconv.ParseInt(arg, 10, 64)
@@ -146,7 +145,7 @@ func (opts OpenEngineOptions) configOptions() []storage.ConfigOption {
 	return cfgOpts
 }
 
-// OpenExistingStore opens the Pebble engine rooted at 'dir'.
+// OpenExistingStore opens the rocksdb engine rooted at 'dir'.
 // If 'readOnly' is true, opens the store in read-only mode.
 func OpenExistingStore(dir string, stopper *stop.Stopper, readOnly bool) (storage.Engine, error) {
 	return OpenEngine(dir, stopper, OpenEngineOptions{ReadOnly: readOnly, MustExist: true})
@@ -164,7 +163,7 @@ func OpenEngine(dir string, stopper *stop.Stopper, opts OpenEngineOptions) (stor
 		storage.MaxOpenFiles(int(maxOpenFiles)),
 		storage.CacheSize(server.DefaultCacheSize),
 		storage.Settings(serverCfg.Settings),
-		storage.Hook(PopulateStorageConfigHook),
+		storage.Hook(PopulateRocksDBConfigHook),
 		storage.CombineOptions(opts.configOptions()...))
 	if err != nil {
 		return nil, err
@@ -251,7 +250,7 @@ func runDebugKeys(cmd *cobra.Command, args []string) error {
 		if err := protoutil.Unmarshal(bytes, &desc); err != nil {
 			return err
 		}
-		b := descbuilder.NewBuilder(&desc)
+		b := catalogkv.NewBuilder(&desc)
 		if b == nil || b.DescriptorType() != catalog.Table {
 			return errors.Newf("expected a table descriptor")
 		}
@@ -642,8 +641,8 @@ func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 	end := keys.RaftLogPrefix(rangeID).PrefixEnd()
 	fmt.Printf("Printing keys %s -> %s (RocksDB keys: %#x - %#x )\n",
 		start, end,
-		string(storage.EncodeMVCCKey(storage.MakeMVCCMetadataKey(start))),
-		string(storage.EncodeMVCCKey(storage.MakeMVCCMetadataKey(end))))
+		string(storage.EncodeKey(storage.MakeMVCCMetadataKey(start))),
+		string(storage.EncodeKey(storage.MakeMVCCMetadataKey(end))))
 
 	// NB: raft log does not have intents.
 	return db.MVCCIterate(start, end, storage.MVCCKeyIterKind, func(kv storage.MVCCKeyValue) error {
@@ -1300,7 +1299,7 @@ func removeDeadReplicas(
 				Txn:    intent.Txn,
 				Status: roachpb.ABORTED,
 			}
-			if _, err := storage.MVCCResolveWriteIntent(ctx, batch, &ms, update); err != nil {
+			if _, err := storage.MVCCResolveWriteIntent(ctx, batch, &ms, update, false /* asyncResolution */); err != nil {
 				return nil, err
 			}
 			// With the intent resolved, we can try again.
@@ -1502,10 +1501,10 @@ func runDebugIntentCount(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// DebugCommandsRequiringEncryption lists debug commands that access Pebble through the engine
+// DebugCmdsForRocksDB lists debug commands that access rocksdb through the engine
 // and need encryption flags (injected by CCL code).
-// Note: do NOT include commands that just call Pebble code without setting up an engine.
-var DebugCommandsRequiringEncryption = []*cobra.Command{
+// Note: do NOT include commands that just call rocksdb code without setting up an engine.
+var DebugCmdsForRocksDB = []*cobra.Command{
 	debugCheckStoreCmd,
 	debugCompactCmd,
 	debugGCCmd,
@@ -1515,21 +1514,10 @@ var DebugCommandsRequiringEncryption = []*cobra.Command{
 	debugRangeDataCmd,
 	debugRangeDescriptorsCmd,
 	debugUnsafeRemoveDeadReplicasCmd,
-	debugRecoverCollectInfoCmd,
-	debugRecoverExecuteCmd,
 }
 
-// Debug commands. All commands in this list to be added to root debug command.
-var debugCmds = []*cobra.Command{
-	debugCheckStoreCmd,
-	debugCompactCmd,
-	debugGCCmd,
-	debugIntentCount,
-	debugKeysCmd,
-	debugRaftLogCmd,
-	debugRangeDataCmd,
-	debugRangeDescriptorsCmd,
-	debugUnsafeRemoveDeadReplicasCmd,
+// All other debug commands go here.
+var debugCmds = append(DebugCmdsForRocksDB,
 	debugBallastCmd,
 	debugCheckLogConfigCmd,
 	debugDecodeKeyCmd,
@@ -1544,9 +1532,7 @@ var debugCmds = []*cobra.Command{
 	debugMergeLogsCmd,
 	debugListFilesCmd,
 	debugResetQuorumCmd,
-	debugSendKVBatchCmd,
-	debugRecoverCmd,
-}
+)
 
 // DebugCmd is the root of all debug commands. Exported to allow modification by CCL code.
 var DebugCmd = &cobra.Command{
@@ -1611,7 +1597,7 @@ func init() {
 		return lockValueFormatter{value: value}
 	}
 
-	// To be able to read Cockroach-written Pebble manifests/SSTables, comparator
+	// To be able to read Cockroach-written RocksDB manifests/SSTables, comparator
 	// and merger functions must be specified to pebble that match the ones used
 	// to write those files.
 	pebbleTool := tool.New(tool.Mergers(storage.MVCCMerger),
@@ -1643,25 +1629,6 @@ func init() {
 	f = debugUnsafeRemoveDeadReplicasCmd.Flags()
 	f.IntSliceVar(&removeDeadReplicasOpts.deadStoreIDs, "dead-store-ids", nil,
 		"list of dead store IDs")
-
-	f = debugRecoverCollectInfoCmd.Flags()
-	f.VarP(&debugRecoverCollectInfoOpts.Stores, cliflags.RecoverStore.Name, cliflags.RecoverStore.Shorthand, cliflags.RecoverStore.Usage())
-
-	f = debugRecoverPlanCmd.Flags()
-	f.StringVarP(&debugRecoverPlanOpts.outputFileName, "plan", "o", "",
-		"filename to write plan to")
-	f.IntSliceVar(&debugRecoverPlanOpts.deadStoreIDs, "dead-store-ids", nil,
-		"list of dead store IDs")
-	f.VarP(&debugRecoverPlanOpts.confirmAction, cliflags.ConfirmActions.Name, cliflags.ConfirmActions.Shorthand,
-		cliflags.ConfirmActions.Usage())
-	f.BoolVar(&debugRecoverPlanOpts.force, "force", false,
-		"force creation of plan even when problems were encountered; applying this plan may "+
-			"result in additional problems and should be done only with care and as a last resort")
-
-	f = debugRecoverExecuteCmd.Flags()
-	f.VarP(&debugRecoverExecuteOpts.Stores, cliflags.RecoverStore.Name, cliflags.RecoverStore.Shorthand, cliflags.RecoverStore.Usage())
-	f.VarP(&debugRecoverExecuteOpts.confirmAction, cliflags.ConfirmActions.Name, cliflags.ConfirmActions.Shorthand,
-		cliflags.ConfirmActions.Usage())
 
 	f = debugMergeLogsCmd.Flags()
 	f.Var(flagutil.Time(&debugMergeLogsOpts.from), "from",
@@ -1700,14 +1667,6 @@ func init() {
 	f.Var(&debugTimeSeriesDumpOpts.format, "format", "output format (text, csv, tsv, raw)")
 	f.Var(&debugTimeSeriesDumpOpts.from, "from", "oldest timestamp to include (inclusive)")
 	f.Var(&debugTimeSeriesDumpOpts.to, "to", "newest timestamp to include (inclusive)")
-
-	f = debugSendKVBatchCmd.Flags()
-	f.StringVar(&debugSendKVBatchContext.traceFormat, "trace", debugSendKVBatchContext.traceFormat,
-		"which format to use for the trace output (off, text, jaeger)")
-	f.BoolVar(&debugSendKVBatchContext.keepCollectedSpans, "keep-collected-spans", debugSendKVBatchContext.keepCollectedSpans,
-		"whether to keep the CollectedSpans field on the response, to learn about how traces work")
-	f.StringVar(&debugSendKVBatchContext.traceFile, "trace-output", debugSendKVBatchContext.traceFile,
-		"the output file to use for the trace. If left empty, output to stderr.")
 }
 
 func initPebbleCmds(cmd *cobra.Command) {
@@ -1731,8 +1690,8 @@ func pebbleCryptoInitializer() error {
 		Dir:      serverCfg.Stores.Specs[0].Path,
 	}
 
-	if PopulateStorageConfigHook != nil {
-		if err := PopulateStorageConfigHook(&storageConfig); err != nil {
+	if PopulateRocksDBConfigHook != nil {
+		if err := PopulateRocksDBConfigHook(&storageConfig); err != nil {
 			return err
 		}
 	}

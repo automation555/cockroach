@@ -13,20 +13,16 @@ package storage
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -52,16 +48,16 @@ import (
 // txn_advance    t=<name> ts=<int>[,<int>]
 // txn_status     t=<name> status=<txnstatus>
 //
-// resolve_intent t=<name> k=<key> [status=<txnstatus>]
+// resolve_intent t=<name> k=<key> [status=<txnstatus>] [asyncResolution]
 // check_intent   k=<key> [none]
 //
 // cput      [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> v=<string> [raw] [cond=<string>]
 // del       [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key>
 // del_range [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [end=<key>] [max=<max>] [returnKeys]
-// get       [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [inconsistent] [tombstones] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]]
+// get       [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [inconsistent] [tombstones] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]]
 // increment [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [inc=<val>]
 // put       [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> v=<string> [raw]
-// scan      [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [end=<key>] [inconsistent] [tombstones] [reverse] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [globalUncertaintyLimit=<int>[,<int>]] [max=<max>] [targetbytes=<target>] [avoidExcess] [allowEmpty]
+// scan      [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] k=<key> [end=<key>] [inconsistent] [tombstones] [reverse] [failOnMoreRecent] [localUncertaintyLimit=<int>[,<int>]] [max=<max>] [targetbytes=<target>] [avoidExcess] [allowEmpty]
 //
 // merge     [ts=<int>[,<int>]] k=<key> v=<string> [raw]
 //
@@ -74,7 +70,6 @@ import (
 // - `+foo` means `Key(foo).Next()`
 // - `-foo` means `Key(foo).PrefixEnd()`
 // - `%foo` means `append(LocalRangePrefix, "foo")`
-// - `/foo/7` means SQL row with key foo, optional column family 7 (system tenant, table/index 1).
 //
 // Additionally, the pseudo-command `with` enables sharing
 // a group of arguments between multiple commands, for example:
@@ -97,13 +92,46 @@ func TestMVCCHistories(t *testing.T) {
 	// Everything reads/writes under the same prefix.
 	span := roachpb.Span{Key: keys.LocalMax, EndKey: roachpb.KeyMax}
 
-	datadriven.Walk(t, testutils.TestDataPath(t, "mvcc_histories"), func(t *testing.T, path string) {
+	datadriven.Walk(t, "testdata/mvcc_histories", func(t *testing.T, path string) {
+		// Default to random behavior wrt cluster version and separated
+		// intents.
+		enabledSeparated := rand.Intn(2) == 0
+		overridden := false
+		if strings.Contains(path, "_disallow_separated") {
+			enabledSeparated = false
+			overridden = true
+		}
+		if strings.Contains(path, "_enable_separated") {
+			enabledSeparated = true
+			overridden = true
+		}
+		if !overridden {
+			log.Infof(context.Background(),
+				"randomly setting enableSeparated: %t", enabledSeparated)
+		}
 		// We start from a clean slate in every test file.
 		engine, err := Open(ctx, InMemory(), CacheSize(1<<20 /* 1 MiB */),
+			SetSeparatedIntents(!enabledSeparated),
 			func(cfg *engineConfig) error {
-				// Latest cluster version, since these tests are not ones where we
-				// are examining differences related to separated intents.
-				cfg.Settings = cluster.MakeTestingClusterSettings()
+				if !overridden {
+					// Latest cluster version, since these tests are not ones where we
+					// are examining differences related to separated intents.
+					cfg.Settings = cluster.MakeTestingClusterSettings()
+				} else {
+					if !enabledSeparated {
+						// 21.1, which has the old code that is unaware about the changes
+						// we have made for OverrideTxnDidNotUpdateMetaToFalse. By using
+						// the latest cluster version, we effectively undo these changes.
+						cfg.Settings = cluster.MakeTestingClusterSettings()
+					} else if strings.Contains(path, "mixed_cluster") {
+						v21_1 := clusterversion.ByKey(clusterversion.V21_1)
+						cfg.Settings =
+							cluster.MakeTestingClusterSettingsWithVersions(v21_1, v21_1, true)
+					} else {
+						// Latest cluster version.
+						cfg.Settings = cluster.MakeTestingClusterSettings()
+					}
+				}
 				return nil
 			})
 		if err != nil {
@@ -517,19 +545,24 @@ type intentPrintingReadWriter struct {
 }
 
 func (rw intentPrintingReadWriter) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
-) error {
-	rw.buf.Printf("called PutIntent(%v, _, %v)\n",
-		key, txnUUID)
-	return rw.ReadWriter.PutIntent(ctx, key, value, txnUUID)
+	ctx context.Context,
+	key roachpb.Key,
+	value []byte,
+	state PrecedingIntentState,
+	txnDidNotUpdateMeta bool,
+	txnUUID uuid.UUID,
+) (int, error) {
+	rw.buf.Printf("called PutIntent(%v, _, %v, TDNUM(%t), %v)\n",
+		key, state, txnDidNotUpdateMeta, txnUUID)
+	return rw.ReadWriter.PutIntent(ctx, key, value, state, txnDidNotUpdateMeta, txnUUID)
 }
 
 func (rw intentPrintingReadWriter) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) error {
-	rw.buf.Printf("called ClearIntent(%v, TDNUM(%t), %v)\n",
-		key, txnDidNotUpdateMeta, txnUUID)
-	return rw.ReadWriter.ClearIntent(key, txnDidNotUpdateMeta, txnUUID)
+	key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+) (int, error) {
+	rw.buf.Printf("called ClearIntent(%v, %v, TDNUM(%t), %v)\n",
+		key, state, txnDidNotUpdateMeta, txnUUID)
+	return rw.ReadWriter.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID)
 }
 
 func (e *evalCtx) tryWrapForIntentPrinting(rw ReadWriter) ReadWriter {
@@ -543,15 +576,20 @@ func cmdResolveIntent(e *evalCtx) error {
 	txn := e.getTxn(mandatory)
 	key := e.getKey()
 	status := e.getTxnStatus()
-	return e.resolveIntent(e.tryWrapForIntentPrinting(e.engine), key, txn, status)
+	asyncResolution := e.hasArg("asyncResolution")
+	return e.resolveIntent(e.tryWrapForIntentPrinting(e.engine), key, txn, status, asyncResolution)
 }
 
 func (e *evalCtx) resolveIntent(
-	rw ReadWriter, key roachpb.Key, txn *roachpb.Transaction, resolveStatus roachpb.TransactionStatus,
+	rw ReadWriter,
+	key roachpb.Key,
+	txn *roachpb.Transaction,
+	resolveStatus roachpb.TransactionStatus,
+	asyncResolution bool,
 ) error {
 	intent := roachpb.MakeLockUpdate(txn, roachpb.Span{Key: key})
 	intent.Status = resolveStatus
-	_, err := MVCCResolveWriteIntent(e.ctx, rw, nil, intent)
+	_, err := MVCCResolveWriteIntent(e.ctx, rw, nil, intent, asyncResolution)
 	return err
 }
 
@@ -607,7 +645,7 @@ func cmdCPut(e *evalCtx) error {
 			return err
 		}
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus)
+			return e.resolveIntent(rw, key, txn, resolveStatus, false /* asyncResolution */)
 		}
 		return nil
 	})
@@ -623,7 +661,7 @@ func cmdDelete(e *evalCtx) error {
 			return err
 		}
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus)
+			return e.resolveIntent(rw, key, txn, resolveStatus, false /* asyncResolution */)
 		}
 		return nil
 	})
@@ -654,7 +692,7 @@ func cmdDeleteRange(e *evalCtx) error {
 		}
 
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus)
+			return e.resolveIntent(rw, key, txn, resolveStatus, false /* asyncResolution */)
 		}
 		return nil
 	})
@@ -675,15 +713,8 @@ func cmdGet(e *evalCtx) error {
 	if e.hasArg("failOnMoreRecent") {
 		opts.FailOnMoreRecent = true
 	}
-	opts.Uncertainty = uncertainty.Interval{
-		GlobalLimit: e.getTsWithName(nil, "globalUncertaintyLimit"),
-		LocalLimit:  hlc.ClockTimestamp(e.getTsWithName(nil, "localUncertaintyLimit")),
-	}
-	if opts.Txn != nil {
-		if !opts.Uncertainty.GlobalLimit.IsEmpty() {
-			e.Fatalf("globalUncertaintyLimit arg incompatible with txn")
-		}
-		opts.Uncertainty.GlobalLimit = txn.GlobalUncertaintyLimit
+	if e.hasArg("localUncertaintyLimit") {
+		opts.LocalUncertaintyLimit = e.getTsWithName(nil, "localUncertaintyLimit")
 	}
 	val, intent, err := MVCCGet(e.ctx, e.engine, key, ts, opts)
 	// NB: the error is returned below. This ensures the test can
@@ -721,7 +752,7 @@ func cmdIncrement(e *evalCtx) error {
 		}
 		e.results.buf.Printf("inc: current value = %d\n", curVal)
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus)
+			return e.resolveIntent(rw, key, txn, resolveStatus, false /* asyncResolution */)
 		}
 		return nil
 	})
@@ -757,7 +788,7 @@ func cmdPut(e *evalCtx) error {
 			return err
 		}
 		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus)
+			return e.resolveIntent(rw, key, txn, resolveStatus, false /* asyncResolution */)
 		}
 		return nil
 	})
@@ -781,15 +812,8 @@ func cmdScan(e *evalCtx) error {
 	if e.hasArg("failOnMoreRecent") {
 		opts.FailOnMoreRecent = true
 	}
-	opts.Uncertainty = uncertainty.Interval{
-		GlobalLimit: e.getTsWithName(nil, "globalUncertaintyLimit"),
-		LocalLimit:  hlc.ClockTimestamp(e.getTsWithName(nil, "localUncertaintyLimit")),
-	}
-	if opts.Txn != nil {
-		if !opts.Uncertainty.GlobalLimit.IsEmpty() {
-			e.Fatalf("globalUncertaintyLimit arg incompatible with txn")
-		}
-		opts.Uncertainty.GlobalLimit = txn.GlobalUncertaintyLimit
+	if e.hasArg("localUncertaintyLimit") {
+		opts.LocalUncertaintyLimit = e.getTsWithName(nil, "localUncertaintyLimit")
 	}
 	if e.hasArg("max") {
 		var n int
@@ -805,10 +829,7 @@ func cmdScan(e *evalCtx) error {
 		opts.TargetBytesAvoidExcess = true
 	}
 	if e.hasArg("allowEmpty") {
-		opts.AllowEmpty = true
-	}
-	if e.hasArg("wholeRows") {
-		opts.WholeRowsOfSize = 10 // arbitrary, must be greater than largest column family in tests
+		opts.TargetBytesAllowEmpty = true
 	}
 	res, err := MVCCScan(e.ctx, e.engine, key, endKey, ts, opts)
 	// NB: the error is returned below. This ensures the test can
@@ -1043,44 +1064,15 @@ func (e *evalCtx) lookupTxn(txnName string) (*roachpb.Transaction, error) {
 }
 
 func toKey(s string) roachpb.Key {
-	if len(s) == 0 {
-		return roachpb.Key(s)
-	}
-	switch s[0] {
-	case '+':
+	switch {
+	case len(s) > 0 && s[0] == '+':
 		return roachpb.Key(s[1:]).Next()
-	case '=':
+	case len(s) > 0 && s[0] == '=':
 		return roachpb.Key(s[1:])
-	case '-':
+	case len(s) > 0 && s[0] == '-':
 		return roachpb.Key(s[1:]).PrefixEnd()
-	case '%':
+	case len(s) > 0 && s[0] == '%':
 		return append(keys.LocalRangePrefix, s[1:]...)
-	case '/':
-		var pk string
-		var columnFamilyID uint64
-		var err error
-		parts := strings.Split(s[1:], "/")
-		switch len(parts) {
-		case 2:
-			if columnFamilyID, err = strconv.ParseUint(parts[1], 10, 32); err != nil {
-				panic(fmt.Sprintf("invalid column family ID %s in row key %s: %s", parts[1], s, err))
-			}
-			fallthrough
-		case 1:
-			pk = parts[0]
-		default:
-			panic(fmt.Sprintf("expected at most one / separator in row key %s", s))
-		}
-
-		var colMap catalog.TableColMap
-		colMap.Set(0, 0)
-		key := keys.SystemSQLCodec.IndexPrefix(1, 1)
-		key, _, err = rowenc.EncodeColumns([]descpb.ColumnID{0}, nil /* directions */, colMap, []tree.Datum{tree.NewDString(pk)}, key)
-		if err != nil {
-			panic(err)
-		}
-		key = keys.MakeFamilyKey(key, uint32(columnFamilyID))
-		return key
 	default:
 		return roachpb.Key(s)
 	}

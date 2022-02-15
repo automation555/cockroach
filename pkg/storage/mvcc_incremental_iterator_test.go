@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"math/rand"
 	"path/filepath"
 	"testing"
 
@@ -28,10 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -196,7 +193,6 @@ func assertExportedErrs(
 		ExportAllRevisions: revisions,
 		TargetSize:         big,
 		MaxSize:            big,
-		MaxIntents:         uint64(MaxIntentsPerWriteIntentError.Default()),
 		StopMidKey:         false,
 		UseTBI:             useTBI,
 	}, sstFile)
@@ -895,12 +891,12 @@ func TestMVCCIncrementalIterator(t *testing.T) {
 
 			intent1 := roachpb.MakeLockUpdate(&txn1, roachpb.Span{Key: testKey1})
 			intent1.Status = roachpb.COMMITTED
-			if _, err := MVCCResolveWriteIntent(ctx, e, nil, intent1); err != nil {
+			if _, err := MVCCResolveWriteIntent(ctx, e, nil, intent1, false); err != nil {
 				t.Fatal(err)
 			}
 			intent2 := roachpb.MakeLockUpdate(&txn2, roachpb.Span{Key: testKey2})
 			intent2.Status = roachpb.ABORTED
-			if _, err := MVCCResolveWriteIntent(ctx, e, nil, intent2); err != nil {
+			if _, err := MVCCResolveWriteIntent(ctx, e, nil, intent2, false); err != nil {
 				t.Fatal(err)
 			}
 			t.Run("intents-resolved", assertEqualKVs(e, localMax, keyMax, tsMin, tsMax, latest, kvs(kv1_4_4, kv2_2_2)))
@@ -964,12 +960,12 @@ func TestMVCCIncrementalIterator(t *testing.T) {
 
 			intent1 := roachpb.MakeLockUpdate(&txn1, roachpb.Span{Key: testKey1})
 			intent1.Status = roachpb.COMMITTED
-			if _, err := MVCCResolveWriteIntent(ctx, e, nil, intent1); err != nil {
+			if _, err := MVCCResolveWriteIntent(ctx, e, nil, intent1, false); err != nil {
 				t.Fatal(err)
 			}
 			intent2 := roachpb.MakeLockUpdate(&txn2, roachpb.Span{Key: testKey2})
 			intent2.Status = roachpb.ABORTED
-			if _, err := MVCCResolveWriteIntent(ctx, e, nil, intent2); err != nil {
+			if _, err := MVCCResolveWriteIntent(ctx, e, nil, intent2, false); err != nil {
 				t.Fatal(err)
 			}
 			t.Run("intents-resolved", assertEqualKVs(e, localMax, keyMax, tsMin, tsMax, all, kvs(kv1_4_4, kv1Deleted3, kv1_2_2, kv1_1_1, kv2_2_2)))
@@ -1151,9 +1147,9 @@ func TestMVCCIncrementalIteratorIntentDeletion(t *testing.T) {
 	require.NoError(t, MVCCPut(ctx, db, nil, kC, txnC1.ReadTimestamp, vC1, txnC1))
 	require.NoError(t, db.Flush())
 	require.NoError(t, db.Compact())
-	_, err := MVCCResolveWriteIntent(ctx, db, nil, intent(txnA1))
+	_, err := MVCCResolveWriteIntent(ctx, db, nil, intent(txnA1), false)
 	require.NoError(t, err)
-	_, err = MVCCResolveWriteIntent(ctx, db, nil, intent(txnB1))
+	_, err = MVCCResolveWriteIntent(ctx, db, nil, intent(txnB1), false)
 	require.NoError(t, err)
 	require.NoError(t, MVCCPut(ctx, db, nil, kA, ts2, vA2, nil))
 	require.NoError(t, MVCCPut(ctx, db, nil, kA, txnA3.WriteTimestamp, vA3, txnA3))
@@ -1429,36 +1425,17 @@ func runIncrementalBenchmark(
 }
 
 func BenchmarkMVCCIncrementalIterator(b *testing.B) {
-	defer log.Scope(b).Close(b)
 	numVersions := 100
 	numKeys := 1000
-	// Mean of 50 versions * 1000 bytes results in more than one block per
-	// versioned key, so there is some chance of
-	// EnableTimeBoundIteratorOptimization=true being useful.
-	valueBytes := 1000
+	valueBytes := 64
 
-	setupMVCCPebbleWithBlockProperties := func(b testing.TB, dir string) Engine {
-		peb, err := Open(
-			context.Background(),
-			Filesystem(dir),
-			CacheSize(testCacheSize),
-			func(cfg *engineConfig) error {
-				cfg.Opts.FormatMajorVersion = pebble.FormatBlockPropertyCollector
-				return nil
-			})
-
-		if err != nil {
-			b.Fatalf("could not create new pebble instance at %s: %+v", dir, err)
-		}
-		return peb
-	}
 	for _, useTBI := range []bool{true, false} {
 		b.Run(fmt.Sprintf("useTBI=%v", useTBI), func(b *testing.B) {
 			for _, tsExcludePercent := range []float64{0, 0.95} {
 				wallTime := int64((5 * (float64(numVersions)*tsExcludePercent + 1)))
 				ts := hlc.Timestamp{WallTime: wallTime}
 				b.Run(fmt.Sprintf("ts=%d", ts.WallTime), func(b *testing.B) {
-					runIncrementalBenchmark(b, setupMVCCPebbleWithBlockProperties, useTBI, ts, benchDataOptions{
+					runIncrementalBenchmark(b, setupMVCCPebble, useTBI, ts, benchDataOptions{
 						numVersions: numVersions,
 						numKeys:     numKeys,
 						valueBytes:  valueBytes,
@@ -1466,102 +1443,5 @@ func BenchmarkMVCCIncrementalIterator(b *testing.B) {
 				})
 			}
 		})
-	}
-}
-
-// BenchmarkMVCCIncrementalIteratorForOldData is a benchmark for the case of
-// finding old data when most data is in L6. This uses the MVCC timestamp to
-// define age, for convenience, though it could be a different field in the
-// key if one wrote a BlockPropertyCollector that could parse the key to find
-// the field (for instance the crdb_internal_ttl_expiration used in
-// https://github.com/cockroachdb/cockroach/pull/70241).
-func BenchmarkMVCCIncrementalIteratorForOldData(b *testing.B) {
-	defer log.Scope(b).Close(b)
-
-	numKeys := 10000
-	// 1 in 400 keys is being looked for. Roughly corresponds to a TTL of
-	// slightly longer than 1 year, where each day, we run a pass to expire 1
-	// day of keys. The old keys are uniformly distributed in the key space,
-	// which is the worst case for block property filters.
-	keyAgeInterval := 400
-	setupMVCCPebbleWithBlockProperties := func(b *testing.B) Engine {
-		eng, err := Open(
-			context.Background(),
-			InMemory(),
-			// Use a small cache size. Scanning large tables with mostly cold data
-			// will mostly miss the cache (especially since the block cache is meant
-			// to be scan resistant).
-			CacheSize(1<<10),
-			func(cfg *engineConfig) error {
-				cfg.Opts.FormatMajorVersion = pebble.FormatBlockPropertyCollector
-				return nil
-			})
-		if err != nil {
-			b.Fatal(err)
-		}
-		return eng
-	}
-
-	baseTimestamp := int64(1000)
-	setupData := func(b *testing.B, eng Engine, valueSize int) {
-		// Generate the same data every time.
-		rng := rand.New(rand.NewSource(1449168817))
-		batch := eng.NewBatch()
-		for i := 0; i < numKeys; i++ {
-			if (i+1)%100 == 0 {
-				if err := batch.Commit(false /* sync */); err != nil {
-					b.Fatal(err)
-				}
-				batch.Close()
-				batch = eng.NewBatch()
-			}
-			key := encoding.EncodeUvarintAscending([]byte("key-"), uint64(i))
-			value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, valueSize))
-			value.InitChecksum(key)
-			ts := hlc.Timestamp{WallTime: baseTimestamp + 100*int64(i%keyAgeInterval)}
-			if err := MVCCPut(
-				context.Background(), batch, nil /* ms */, key, ts, value, nil); err != nil {
-				b.Fatal(err)
-			}
-		}
-		if err := eng.Flush(); err != nil {
-			b.Fatal(err)
-		}
-		if err := eng.Compact(); err != nil {
-			b.Fatal(err)
-		}
-	}
-
-	for _, valueSize := range []int{100, 500, 1000, 2000} {
-		eng := setupMVCCPebbleWithBlockProperties(b)
-		setupData(b, eng, valueSize)
-		b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
-			for _, useTBI := range []bool{true, false} {
-				b.Run(fmt.Sprintf("useTBI=%t", useTBI), func(b *testing.B) {
-					startKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(0)))
-					endKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(numKeys)))
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						it := NewMVCCIncrementalIterator(eng, MVCCIncrementalIterOptions{
-							EnableTimeBoundIteratorOptimization: useTBI,
-							EndKey:                              endKey,
-							StartTime:                           hlc.Timestamp{},
-							EndTime:                             hlc.Timestamp{WallTime: baseTimestamp},
-						})
-						it.SeekGE(MVCCKey{Key: startKey})
-						for {
-							if ok, err := it.Valid(); err != nil {
-								b.Fatalf("failed incremental iteration: %+v", err)
-							} else if !ok {
-								break
-							}
-							it.Next()
-						}
-						it.Close()
-					}
-				})
-			}
-		})
-		eng.Close()
 	}
 }
