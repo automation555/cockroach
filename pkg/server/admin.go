@@ -868,25 +868,6 @@ func (s *adminServer) tableDetailsHelper(
 		resp.CreateTableStatement = createStmt
 	}
 
-	// Marshal SHOW STATISTICS result.
-	row, cols, err = s.server.sqlServer.internalExecutor.QueryRowExWithCols(
-		ctx, "admin-show-statistics", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: userName},
-		fmt.Sprintf("SELECT max(created) AS created FROM [SHOW STATISTICS FOR TABLE %s]", escQualTable),
-	)
-	if err != nil {
-		return nil, err
-	}
-	if row != nil {
-		scanner := makeResultScanner(cols)
-		const createdCol = "created"
-		var createdTs *time.Time
-		if err := scanner.Scan(row, createdCol, &createdTs); err != nil {
-			return nil, err
-		}
-		resp.StatsLastCreatedAt = createdTs
-	}
-
 	// Marshal SHOW ZONE CONFIGURATION result.
 	row, cols, err = s.server.sqlServer.internalExecutor.QueryRowExWithCols(
 		ctx, "admin-show-zone-config", nil, /* txn */
@@ -1830,7 +1811,7 @@ func (s *adminServer) checkReadinessForHealthCheck(ctx context.Context) error {
 		return status.Errorf(codes.Unavailable, "node is shutting down")
 	}
 
-	if !s.server.sqlServer.acceptingClients.Get() {
+	if !s.server.sqlServer.isReady.Get() {
 		return status.Errorf(codes.Unavailable, "node is not accepting SQL clients")
 	}
 
