@@ -71,7 +71,7 @@ func TestCleanupTxnIntentsOnGCAsync(t *testing.T) {
 	// Txn1 is in the pending state but is expired.
 	txn1 := newTransaction("txn1", key, 1, clock)
 	txn1.ReadTimestamp.WallTime -= int64(100 * time.Second)
-	txn1.LastHeartbeat = txn1.ReadTimestamp
+	txn1.LastHeartbeat = txn1.ReadTimestamp.UnsafeToClockTimestamp().ToTimestamp()
 	// Txn2 is in the staging state and is not old enough to have expired so the
 	// code ought to send nothing.
 	txn2 := newTransaction("txn2", key, 1, clock)
@@ -795,7 +795,7 @@ func newIntentResolverWithSendFuncs(
 			f := sf.popLocked()
 			return f(ba)
 		})
-	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), txnSenderFactory, c.Clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientContext(), txnSenderFactory, c.Clock, stopper)
 	c.DB = db
 	c.MaxGCBatchWait = time.Nanosecond
 	return New(c)

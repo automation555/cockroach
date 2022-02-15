@@ -23,14 +23,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -111,9 +109,9 @@ func (ltc *LocalTestCluster) Stopper() *stop.Stopper {
 func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFactory InitFactoryFn) {
 	manualClock := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manualClock.UnixNano, 50*time.Millisecond)
-	cfg := kvserver.TestStoreConfig(clock)
-	tr := cfg.AmbientCtx.Tracer
-	ltc.stopper = stop.NewStopper(stop.WithTracer(tr))
+	cfg := kvserver.TestStoreConfigWithRandomizedClusterSeparatedIntentsMigration(clock)
+	ltc.stopper = stop.NewStopper()
+	tr := ltc.stopper.Tracer()
 	ltc.Manual = manualClock
 	ltc.Clock = clock
 	ambient := cfg.AmbientCtx
@@ -156,7 +154,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 
 	ltc.Stores = kvserver.NewStores(ambient, ltc.Clock)
 
-	factory := initFactory(ctx, cfg.Settings, nodeDesc, ltc.stopper.Tracer(), ltc.Clock, ltc.Latency, ltc.Stores, ltc.stopper, ltc.Gossip)
+	factory := initFactory(ctx, cfg.Settings, nodeDesc, tr, ltc.Clock, ltc.Latency, ltc.Stores, ltc.stopper, ltc.Gossip)
 
 	var nodeIDContainer base.NodeIDContainer
 	nodeIDContainer.Set(context.Background(), nodeID)
@@ -167,7 +165,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		NodeID:       base.NewSQLIDContainerForNode(&nodeIDContainer),
 	}
 	ltc.DB = kv.NewDBWithContext(cfg.AmbientCtx, factory, ltc.Clock, *ltc.dbContext)
-	transport := kvserver.NewDummyRaftTransport(cfg.Settings, cfg.AmbientCtx.Tracer)
+	transport := kvserver.NewDummyRaftTransport(cfg.Settings, tr)
 	// By default, disable the replica scanner and split queue, which
 	// confuse tests using LocalTestCluster.
 	if ltc.StoreTestingKnobs == nil {
@@ -182,6 +180,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	active, renewal := cfg.NodeLivenessDurations()
 	cfg.NodeLiveness = liveness.NewNodeLiveness(liveness.NodeLivenessOptions{
 		AmbientCtx:              cfg.AmbientCtx,
+		Tracer:                  ltc.stopper.Tracer(),
 		Clock:                   cfg.Clock,
 		DB:                      cfg.DB,
 		Gossip:                  cfg.Gossip,
@@ -211,20 +210,6 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	); err != nil {
 		t.Fatalf("unable to start local test cluster: %s", err)
 	}
-
-	rangeFeedFactory, err := rangefeed.NewFactory(ltc.stopper, ltc.DB, cfg.Settings, nil /* knobs */)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.SpanConfigSubscriber = spanconfigkvsubscriber.New(
-		clock,
-		rangeFeedFactory,
-		keys.SpanConfigurationsTableID,
-		1<<20, /* 1 MB */
-		cfg.DefaultSpanConfig,
-		nil,
-	)
-
 	ltc.Store = kvserver.NewStore(ctx, cfg, ltc.Eng, nodeDesc)
 
 	var initialValues []roachpb.KeyValue

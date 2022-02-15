@@ -224,7 +224,7 @@ func (ih *instrumentationHelper) Setup(
 			// If we need to collect stats, create a child span with structured
 			// recording. Stats will be added as structured metadata and processed in
 			// Finish.
-			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement",
+			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.Tracer(), "traced statement",
 				tracing.WithRecording(tracing.RecordingStructured))
 			ih.shouldFinishSpan = true
 			return newCtx, true
@@ -235,7 +235,7 @@ func (ih *instrumentationHelper) Setup(
 	ih.collectExecStats = true
 	ih.traceMetadata = make(execNodeTraceMetadata)
 	ih.evalCtx = p.EvalContext()
-	newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement", tracing.WithRecording(tracing.RecordingVerbose))
+	newCtx, ih.sp = tracing.StartVerboseTrace(ctx, cfg.Tracer(), "traced statement")
 	ih.shouldFinishSpan = true
 	return newCtx, true
 }
@@ -260,9 +260,9 @@ func (ih *instrumentationHelper) Finish(
 	// Note that in case of implicit transactions, the trace contains the auto-commit too.
 	var trace tracing.Recording
 	if ih.shouldFinishSpan {
-		trace = ih.sp.FinishAndGetConfiguredRecording()
+		trace = ih.sp.FinishAndGetRecording(ih.sp.RecordingType())
 	} else {
-		trace = ih.sp.GetConfiguredRecording()
+		trace = ih.sp.GetRecording(ih.sp.RecordingType())
 	}
 
 	if ih.withStatementTrace != nil {
@@ -296,7 +296,6 @@ func (ih *instrumentationHelper) Finish(
 			ImplicitTxn: ih.implicitTxn,
 			Database:    p.SessionData().Database,
 			Failed:      retErr != nil,
-			PlanHash:    ih.planGist.Hash(),
 		}
 		// We populate transaction fingerprint ID if this is an implicit transaction.
 		// See executor_statement_metrics.go:recordStatementSummary() for further

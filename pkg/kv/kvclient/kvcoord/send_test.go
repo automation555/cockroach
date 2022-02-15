@@ -91,12 +91,6 @@ func (n Node) UpdateSpanConfigs(
 	panic("unimplemented")
 }
 
-func (n Node) TenantSettings(
-	*roachpb.TenantSettingsRequest, roachpb.Internal_TenantSettingsServer,
-) error {
-	panic("unimplemented")
-}
-
 // TestSendToOneClient verifies that Send correctly sends a request
 // to one server using the heartbeat RPC.
 func TestSendToOneClient(t *testing.T) {
@@ -251,8 +245,8 @@ func TestComplexScenarios(t *testing.T) {
 	}
 }
 
-// TestSplitHealthy tests that the splitHealthy method sorts healthy nodes
-// before unhealthy nodes.
+// TestSplitHealthy tests that the splitHealthy helper function sorts healthy
+// nodes before unhealthy nodes.
 func TestSplitHealthy(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -305,12 +299,8 @@ func TestSplitHealthy(t *testing.T) {
 					health.Set(i, healthUnhealthy)
 				}
 			}
-			gt := grpcTransport{
-				replicas:      replicas,
-				replicaHealth: health,
-			}
-			gt.splitHealthy()
-			if !reflect.DeepEqual(gt.replicas, td.out) {
+			splitHealthy(replicas, health)
+			if !reflect.DeepEqual(replicas, td.out) {
 				t.Errorf("splitHealthy(...) = %+v not %+v", replicas, td.out)
 			}
 		})
@@ -350,7 +340,7 @@ func sendBatch(
 	}
 
 	ds := NewDistSender(DistSenderConfig{
-		AmbientCtx:         log.MakeTestingAmbientCtxWithNewTracer(),
+		AmbientCtx:         log.MakeTestingAmbientContext(),
 		Settings:           cluster.MakeTestingClusterSettings(),
 		NodeDescs:          g,
 		RPCContext:         rpcContext,

@@ -20,7 +20,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -74,7 +73,7 @@ var targetRaftOutgoingBatchSize = settings.RegisterByteSizeSetting(
 // RaftMessageResponseStream is the subset of the
 // MultiRaft_RaftMessageServer interface that is needed for sending responses.
 type RaftMessageResponseStream interface {
-	Send(*kvserverpb.RaftMessageResponse) error
+	Send(*RaftMessageResponse) error
 }
 
 // lockedRaftMessageResponseStream is an implementation of
@@ -86,13 +85,13 @@ type lockedRaftMessageResponseStream struct {
 	sendMu  syncutil.Mutex
 }
 
-func (s *lockedRaftMessageResponseStream) Send(resp *kvserverpb.RaftMessageResponse) error {
+func (s *lockedRaftMessageResponseStream) Send(resp *RaftMessageResponse) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	return s.wrapped.Send(resp)
 }
 
-func (s *lockedRaftMessageResponseStream) Recv() (*kvserverpb.RaftMessageRequestBatch, error) {
+func (s *lockedRaftMessageResponseStream) Recv() (*RaftMessageRequestBatch, error) {
 	// No need for lock. gRPC.Stream.RecvMsg is safe for concurrent use.
 	return s.wrapped.Recv()
 }
@@ -100,8 +99,8 @@ func (s *lockedRaftMessageResponseStream) Recv() (*kvserverpb.RaftMessageRequest
 // SnapshotResponseStream is the subset of the
 // MultiRaft_RaftSnapshotServer interface that is needed for sending responses.
 type SnapshotResponseStream interface {
-	Send(*kvserverpb.SnapshotResponse) error
-	Recv() (*kvserverpb.SnapshotRequest, error)
+	Send(*SnapshotResponse) error
+	Recv() (*SnapshotRequest, error)
 }
 
 // RaftMessageHandler is the interface that must be implemented by
@@ -111,17 +110,17 @@ type RaftMessageHandler interface {
 	// always processed asynchronously and the response is sent over respStream.
 	// If an error is encountered during asynchronous processing, it will be
 	// streamed back to the sender of the message as a RaftMessageResponse.
-	HandleRaftRequest(ctx context.Context, req *kvserverpb.RaftMessageRequest,
+	HandleRaftRequest(ctx context.Context, req *RaftMessageRequest,
 		respStream RaftMessageResponseStream) *roachpb.Error
 
 	// HandleRaftResponse is called for each raft response. Note that
 	// not all messages receive a response. An error is returned if and only if
 	// the underlying Raft connection should be closed.
-	HandleRaftResponse(context.Context, *kvserverpb.RaftMessageResponse) error
+	HandleRaftResponse(context.Context, *RaftMessageResponse) error
 
 	// HandleSnapshot is called for each new incoming snapshot stream, after
 	// parsing the initial SnapshotRequest_Header on the stream.
-	HandleSnapshot(ctx context.Context, header *kvserverpb.SnapshotRequest_Header, respStream SnapshotResponseStream) error
+	HandleSnapshot(ctx context.Context, header *SnapshotRequest_Header, respStream SnapshotResponseStream) error
 }
 
 type raftTransportStats struct {
@@ -171,7 +170,7 @@ func NewDummyRaftTransport(st *cluster.Settings, tracer *tracing.Tracer) *RaftTr
 	resolver := func(roachpb.NodeID) (net.Addr, error) {
 		return nil, errors.New("dummy resolver")
 	}
-	return NewRaftTransport(log.MakeTestingAmbientContext(tracer), st,
+	return NewRaftTransport(log.MakeTestingAmbientContext(), st,
 		nodedialer.New(nil, resolver), nil, nil)
 }
 
@@ -223,7 +222,7 @@ func NewRaftTransport(
 						return true
 					}
 					setQueueLength := func(k int64, v unsafe.Pointer) bool {
-						ch := *(*chan *kvserverpb.RaftMessageRequest)(v)
+						ch := *(*chan *RaftMessageRequest)(v)
 						if s, ok := statsMap[roachpb.NodeID(k)]; ok {
 							s.queue += len(ch)
 						}
@@ -280,7 +279,7 @@ func NewRaftTransport(
 func (t *RaftTransport) queuedMessageCount() int64 {
 	var n int64
 	addLength := func(k int64, v unsafe.Pointer) bool {
-		ch := *(*chan *kvserverpb.RaftMessageRequest)(v)
+		ch := *(*chan *RaftMessageRequest)(v)
 		n += int64(len(ch))
 		return true
 	}
@@ -299,7 +298,7 @@ func (t *RaftTransport) getHandler(storeID roachpb.StoreID) (RaftMessageHandler,
 
 // handleRaftRequest proxies a request to the listening server interface.
 func (t *RaftTransport) handleRaftRequest(
-	ctx context.Context, req *kvserverpb.RaftMessageRequest, respStream RaftMessageResponseStream,
+	ctx context.Context, req *RaftMessageRequest, respStream RaftMessageResponseStream,
 ) *roachpb.Error {
 	handler, ok := t.getHandler(req.ToReplica.StoreID)
 	if !ok {
@@ -313,10 +312,8 @@ func (t *RaftTransport) handleRaftRequest(
 
 // newRaftMessageResponse constructs a RaftMessageResponse from the
 // given request and error.
-func newRaftMessageResponse(
-	req *kvserverpb.RaftMessageRequest, pErr *roachpb.Error,
-) *kvserverpb.RaftMessageResponse {
-	resp := &kvserverpb.RaftMessageResponse{
+func newRaftMessageResponse(req *RaftMessageRequest, pErr *roachpb.Error) *RaftMessageResponse {
+	resp := &RaftMessageResponse{
 		RangeID: req.RangeID,
 		// From and To are reversed in the response.
 		ToReplica:   req.FromReplica,
@@ -423,8 +420,8 @@ func (t *RaftTransport) RaftSnapshot(stream MultiRaft_RaftSnapshotServer) error 
 					return err
 				}
 				if req.Header == nil {
-					return stream.Send(&kvserverpb.SnapshotResponse{
-						Status:  kvserverpb.SnapshotResponse_ERROR,
+					return stream.Send(&SnapshotResponse{
+						Status:  SnapshotResponse_ERROR,
 						Message: "client error: no header in first snapshot request message"})
 				}
 				rmr := req.Header.RaftMessageRequest
@@ -464,7 +461,7 @@ func (t *RaftTransport) Stop(storeID roachpb.StoreID) {
 // to be sent.
 func (t *RaftTransport) processQueue(
 	nodeID roachpb.NodeID,
-	ch chan *kvserverpb.RaftMessageRequest,
+	ch chan *RaftMessageRequest,
 	stats *raftTransportStats,
 	stream MultiRaft_RaftMessageBatchClient,
 	class rpc.ConnectionClass,
@@ -500,7 +497,7 @@ func (t *RaftTransport) processQueue(
 
 	var raftIdleTimer timeutil.Timer
 	defer raftIdleTimer.Stop()
-	batch := &kvserverpb.RaftMessageRequestBatch{}
+	batch := &RaftMessageRequestBatch{}
 	for {
 		raftIdleTimer.Reset(raftIdleTimeout)
 		select {
@@ -514,14 +511,14 @@ func (t *RaftTransport) processQueue(
 		case req := <-ch:
 			budget := targetRaftOutgoingBatchSize.Get(&t.st.SV) - int64(req.Size())
 			batch.Requests = append(batch.Requests, *req)
-			releaseRaftMessageRequest(req)
+			req.release()
 			// Pull off as many queued requests as possible, within reason.
 			for budget > 0 {
 				select {
 				case req = <-ch:
 					budget -= int64(req.Size())
 					batch.Requests = append(batch.Requests, *req)
-					releaseRaftMessageRequest(req)
+					req.release()
 				default:
 					budget = -1
 				}
@@ -535,7 +532,7 @@ func (t *RaftTransport) processQueue(
 			// Reuse the Requests slice, but zero out the contents to avoid delaying
 			// GC of memory referenced from within.
 			for i := range batch.Requests {
-				batch.Requests[i] = kvserverpb.RaftMessageRequest{}
+				batch.Requests[i] = RaftMessageRequest{}
 			}
 			batch.Requests = batch.Requests[:0]
 
@@ -548,14 +545,14 @@ func (t *RaftTransport) processQueue(
 // indicating whether the queue already exists (true) or was created (false).
 func (t *RaftTransport) getQueue(
 	nodeID roachpb.NodeID, class rpc.ConnectionClass,
-) (chan *kvserverpb.RaftMessageRequest, bool) {
+) (chan *RaftMessageRequest, bool) {
 	queuesMap := &t.queues[class]
 	value, ok := queuesMap.Load(int64(nodeID))
 	if !ok {
-		ch := make(chan *kvserverpb.RaftMessageRequest, raftSendBufferSize)
+		ch := make(chan *RaftMessageRequest, raftSendBufferSize)
 		value, ok = queuesMap.LoadOrStore(int64(nodeID), unsafe.Pointer(&ch))
 	}
-	return *(*chan *kvserverpb.RaftMessageRequest)(value), ok
+	return *(*chan *RaftMessageRequest)(value), ok
 }
 
 // SendAsync sends a message to the recipient specified in the request. It
@@ -563,9 +560,7 @@ func (t *RaftTransport) getQueue(
 // positive but will never be a false negative; if sent is true the message may
 // or may not actually be sent but if it's false the message definitely was not
 // sent. It is not safe to continue using the reference to the provided request.
-func (t *RaftTransport) SendAsync(
-	req *kvserverpb.RaftMessageRequest, class rpc.ConnectionClass,
-) (sent bool) {
+func (t *RaftTransport) SendAsync(req *RaftMessageRequest, class rpc.ConnectionClass) (sent bool) {
 	toNodeID := req.ToReplica.NodeID
 	stats := t.getStats(toNodeID, class)
 	defer func() {
@@ -604,7 +599,7 @@ func (t *RaftTransport) SendAsync(
 		}
 		return true
 	default:
-		releaseRaftMessageRequest(req)
+		req.release()
 		return false
 	}
 }
@@ -624,7 +619,7 @@ func (t *RaftTransport) startProcessNewQueue(
 	class rpc.ConnectionClass,
 	stats *raftTransportStats,
 ) (started bool) {
-	cleanup := func(ch chan *kvserverpb.RaftMessageRequest) {
+	cleanup := func(ch chan *RaftMessageRequest) {
 		// Account for the remainder of `ch` which was never sent.
 		// NB: we deleted the queue above, so within a short amount
 		// of time nobody should be writing into the channel any
@@ -683,7 +678,7 @@ func (t *RaftTransport) startProcessNewQueue(
 func (t *RaftTransport) SendSnapshot(
 	ctx context.Context,
 	storePool *StorePool,
-	header kvserverpb.SnapshotRequest_Header,
+	header SnapshotRequest_Header,
 	snap *OutgoingSnapshot,
 	newBatch func() storage.Batch,
 	sent func(),

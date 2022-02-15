@@ -24,9 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -71,12 +69,11 @@ func TestTableReader(t *testing.T) {
 		19,
 		sqlutils.ToRowFn(aFn, bFn, sumFn, sqlutils.RowEnglishFn))
 
-	td := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
-	cols := td.PublicColumns()
+	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	makeIndexSpan := func(start, end int) roachpb.Span {
 		var span roachpb.Span
-		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, td.GetID(), td.PublicNonPrimaryIndexes()[0].GetID()))
+		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, td, td.PublicNonPrimaryIndexes()[0].GetID()))
 		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
 		span.EndKey = append(span.EndKey, prefix...)
 		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
@@ -90,27 +87,35 @@ func TestTableReader(t *testing.T) {
 	}{
 		{
 			spec: execinfrapb.TableReaderSpec{
-				FetchSpec: makeFetchSpec(t, td, td.GetPrimaryIndex(), cols[0].GetID(), cols[1].GetID()),
-				Spans:     []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
+				Spans: []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
+			},
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1},
 			},
 			expected: "[[0 1] [0 2] [0 3] [0 4] [0 5] [0 6] [0 7] [0 8] [0 9] [1 0] [1 1] [1 2] [1 3] [1 4] [1 5] [1 6] [1 7] [1 8] [1 9]]",
 		},
 		{
 			spec: execinfrapb.TableReaderSpec{
-				FetchSpec: makeFetchSpec(t, td, td.GetPrimaryIndex(), cols[3].GetID()),
-				Spans:     []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
+				Spans: []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
 			},
 			post: execinfrapb.PostProcessSpec{
-				Limit: 4,
+				Projection:    true,
+				OutputColumns: []uint32{3}, // s
+				Limit:         4,
 			},
 			expected: "[['one'] ['two'] ['three'] ['four']]",
 		},
 		{
 			spec: execinfrapb.TableReaderSpec{
-				FetchSpec: makeFetchSpec(t, td, td.ActiveIndexes()[1], cols[0].GetID(), cols[1].GetID()),
+				IndexIdx:  1,
 				Reverse:   true,
 				Spans:     []roachpb.Span{makeIndexSpan(4, 6)},
 				LimitHint: 1,
+			},
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1},
 			},
 			expected: "[[1 5] [0 5] [1 4] [0 4]]",
 		},
@@ -124,6 +129,7 @@ func TestTableReader(t *testing.T) {
 				// them.
 				ts.Spans = make([]roachpb.Span, len(c.spec.Spans))
 				copy(ts.Spans, c.spec.Spans)
+				ts.Table = *td.TableDesc()
 
 				st := s.ClusterSettings()
 				evalCtx := tree.MakeTestingEvalContext(st)
@@ -133,7 +139,7 @@ func TestTableReader(t *testing.T) {
 					Cfg: &execinfra.ServerConfig{
 						Settings: st,
 						RangeCache: rangecache.NewRangeCache(s.ClusterSettings(), nil,
-							func() int64 { return 2 << 10 }, s.Stopper(), s.TracerI().(*tracing.Tracer)),
+							func() int64 { return 2 << 10 }, s.Stopper()),
 					},
 					Txn:    kv.NewTxn(ctx, s.DB(), s.NodeID()),
 					NodeID: evalCtx.NodeID,
@@ -213,7 +219,7 @@ ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[
 	}
 
 	kvDB := tc.Server(0).DB()
-	td := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	st := tc.Server(0).ClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
@@ -232,12 +238,15 @@ ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[
 		Txn:    kv.NewTxn(ctx, tc.Server(0).DB(), tc.Server(0).NodeID()),
 		NodeID: evalCtx.NodeID,
 	}
-	post := execinfrapb.PostProcessSpec{}
+	post := execinfrapb.PostProcessSpec{
+		Projection:    true,
+		OutputColumns: []uint32{0},
+	}
 
 	testutils.RunTrueAndFalse(t, "row-source", func(t *testing.T, rowSource bool) {
 		spec := execinfrapb.TableReaderSpec{
-			FetchSpec: makeFetchSpec(t, td, td.GetPrimaryIndex(), td.PublicColumns()[0].GetID()),
-			Spans:     []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
+			Spans: []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
+			Table: *td.TableDesc(),
 		}
 		var out execinfra.RowReceiver
 		var buf *distsqlutils.RowBuffer
@@ -315,11 +324,11 @@ func TestTableReaderDrain(t *testing.T) {
 		3, /* numRows */
 		sqlutils.ToRowFn(sqlutils.RowIdxFn))
 
-	td := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	// Run the flow in a verbose trace so that we can test for tracing info.
 	tracer := s.TracerI().(*tracing.Tracer)
-	ctx, sp := tracer.StartSpanCtx(context.Background(), "test flow ctx", tracing.WithRecording(tracing.RecordingVerbose))
+	ctx, sp := tracing.StartVerboseTrace(context.Background(), tracer, "test flow ctx")
 	defer sp.Finish()
 	st := s.ClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
@@ -327,7 +336,7 @@ func TestTableReaderDrain(t *testing.T) {
 
 	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
 	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
-	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState)
+	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), &leafInputState)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg: &execinfra.ServerConfig{
@@ -338,10 +347,13 @@ func TestTableReaderDrain(t *testing.T) {
 		NodeID: evalCtx.NodeID,
 	}
 	spec := execinfrapb.TableReaderSpec{
-		Spans:     []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
-		FetchSpec: makeFetchSpec(t, td, td.GetPrimaryIndex(), td.PublicColumns()[0].GetID()),
+		Spans: []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
+		Table: *td.TableDesc(),
 	}
-	post := execinfrapb.PostProcessSpec{}
+	post := execinfrapb.PostProcessSpec{
+		Projection:    true,
+		OutputColumns: []uint32{0},
+	}
 
 	testReaderProcessorDrain(ctx, t, func(out execinfra.RowReceiver) (execinfra.Processor, error) {
 		return newTableReader(&flowCtx, 0 /* processorID */, &spec, &post, out)
@@ -370,7 +382,7 @@ func TestLimitScans(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	st := s.ClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
@@ -380,14 +392,14 @@ func TestLimitScans(t *testing.T) {
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 			RangeCache: rangecache.NewRangeCache(s.ClusterSettings(), nil,
-				func() int64 { return 2 << 10 }, s.Stopper(), s.TracerI().(*tracing.Tracer)),
+				func() int64 { return 2 << 10 }, s.Stopper()),
 		},
 		Txn:    kv.NewTxn(ctx, kvDB, s.NodeID()),
 		NodeID: evalCtx.NodeID,
 	}
 	spec := execinfrapb.TableReaderSpec{
-		FetchSpec: makeFetchSpec(t, tableDesc, tableDesc.GetPrimaryIndex()),
-		Spans:     []roachpb.Span{tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)},
+		Table: *tableDesc.TableDesc(),
+		Spans: []roachpb.Span{tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)},
 	}
 	// We're going to ask for 3 rows, all contained in the first range.
 	const limit = 3
@@ -434,7 +446,7 @@ func TestLimitScans(t *testing.T) {
 	// scans from the same key as the DistSender retries scans when it detects
 	// splits.
 	re := regexp.MustCompile(fmt.Sprintf(`querying next range at /Table/%d/1(\S.*)?`, tableDesc.GetID()))
-	spans := sp.GetConfiguredRecording()
+	spans := sp.GetRecording(tracing.RecordingVerbose)
 	ranges := make(map[string]struct{})
 	for _, span := range spans {
 		if span.Operation == tableReaderProcName {
@@ -488,13 +500,13 @@ func BenchmarkTableReader(b *testing.B) {
 			numRows,
 			sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(42)),
 		)
-		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
+		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
 		flowCtx := execinfra.FlowCtx{
 			EvalCtx: &evalCtx,
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 				RangeCache: rangecache.NewRangeCache(s.ClusterSettings(), nil,
-					func() int64 { return 2 << 10 }, s.Stopper(), s.TracerI().(*tracing.Tracer)),
+					func() int64 { return 2 << 10 }, s.Stopper()),
 			},
 			Txn:    kv.NewTxn(ctx, s.DB(), s.NodeID()),
 			NodeID: evalCtx.NodeID,
@@ -503,10 +515,7 @@ func BenchmarkTableReader(b *testing.B) {
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
 			span := tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
 			spec := execinfrapb.TableReaderSpec{
-				FetchSpec: makeFetchSpec(
-					b, tableDesc, tableDesc.GetPrimaryIndex(),
-					tableDesc.PublicColumns()[0].GetID(), tableDesc.PublicColumns()[1].GetID(),
-				),
+				Table: *tableDesc.TableDesc(),
 				// Spans will be set below.
 			}
 			post := execinfrapb.PostProcessSpec{}
@@ -541,14 +550,4 @@ func BenchmarkTableReader(b *testing.B) {
 			}
 		})
 	}
-}
-
-func makeFetchSpec(
-	t testing.TB, table catalog.TableDescriptor, index catalog.Index, colIDs ...descpb.ColumnID,
-) descpb.IndexFetchSpec {
-	var spec descpb.IndexFetchSpec
-	if err := rowenc.InitIndexFetchSpec(&spec, keys.SystemSQLCodec, table, index, colIDs); err != nil {
-		t.Fatal(err)
-	}
-	return spec
 }

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -39,9 +40,6 @@ import (
 )
 
 // RangefeedEnabled is a cluster setting that enables rangefeed requests.
-// Certain ranges have span configs that specifically enable rangefeeds (system
-// ranges and ranges covering tables in the system database); this setting
-// covers everything else.
 var RangefeedEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"kv.rangefeed.enabled",
@@ -153,7 +151,7 @@ func (r *Replica) rangeFeedWithRangeID(
 	args *roachpb.RangeFeedRequest,
 	stream roachpb.Internal_RangeFeedServer,
 ) *roachpb.Error {
-	if !r.isRangefeedEnabled() && !RangefeedEnabled.Get(&r.store.cfg.Settings.SV) {
+	if !r.isSystemRange() && !RangefeedEnabled.Get(&r.store.cfg.Settings.SV) {
 		return roachpb.NewErrorf("rangefeeds require the kv.rangefeed.enabled setting. See %s",
 			docs.URL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 	}
@@ -455,18 +453,6 @@ func (r *Replica) disconnectRangefeedWithErr(p *rangefeed.Processor, pErr *roach
 	r.unsetRangefeedProcessor(p)
 }
 
-// disconnectRangefeedSpanWithErr broadcasts the provided error to all rangefeed
-// registrations that overlap the given span. Tears down the rangefeed Processor
-// if it has no remaining registrations.
-func (r *Replica) disconnectRangefeedSpanWithErr(span roachpb.Span, pErr *roachpb.Error) {
-	p := r.getRangefeedProcessor()
-	if p == nil {
-		return
-	}
-	p.DisconnectSpanWithErr(span, pErr)
-	r.maybeDisconnectEmptyRangefeed(p)
-}
-
 // disconnectRangefeedWithReason broadcasts the provided rangefeed retry reason
 // to all rangefeed registrations and tears down the active rangefeed Processor.
 // No-op if a rangefeed is not active.
@@ -630,28 +616,6 @@ func (r *Replica) handleLogicalOpLogRaftMuLocked(
 	}
 }
 
-// handleSSTableRaftMuLocked emits an ingested SSTable from AddSSTable via the
-// rangefeed. These can be expected to have timestamps at the write timestamp
-// (i.e. submitted with WriteAtRequestTimestamp) since we assert elsewhere that
-// MVCCHistoryMutation commands disconnect rangefeeds.
-//
-// NB: We currently don't have memory budgeting for rangefeeds, instead using a
-// large buffered channel, so this can easily OOM the node. This is "fine" for
-// now, since we do not currently expect AddSSTable across spans with
-// rangefeeds, but must be added before we start publishing SSTables in earnest.
-// See: https://github.com/cockroachdb/cockroach/issues/73616
-func (r *Replica) handleSSTableRaftMuLocked(
-	ctx context.Context, sst []byte, sstSpan roachpb.Span, writeTS hlc.Timestamp,
-) {
-	p, _ := r.getRangefeedProcessorAndFilter()
-	if p == nil {
-		return
-	}
-	if !p.ConsumeSSTable(sst, sstSpan, writeTS) {
-		r.unsetRangefeedProcessor(p)
-	}
-}
-
 // handleClosedTimestampUpdate takes the a closed timestamp for the replica
 // and informs the rangefeed, if one is running. No-op if a
 // rangefeed is not active.
@@ -696,7 +660,7 @@ func (r *Replica) handleClosedTimestampUpdateRaftMuLocked(
 		// Ignore the result of DoChan since, to keep this all async, it always
 		// returns nil and any errors are logged by the closure passed to the
 		// `DoChan` call.
-		taskCtx, sp := tracing.EnsureForkSpan(ctx, r.AmbientContext.Tracer, key)
+		taskCtx, sp := tracing.EnsureForkSpan(ctx, r.store.stopper.Tracer(), key)
 		_, leader := m.RangeFeedSlowClosedTimestampNudge.DoChan(key, func() (interface{}, error) {
 			defer sp.Finish()
 			// Also ignore the result of RunTask, since it only returns errors when
@@ -764,8 +728,10 @@ func (r *Replica) ensureClosedTimestampStarted(ctx context.Context) *roachpb.Err
 			})
 		if err != nil {
 			if errors.HasType(err, (*contextutil.TimeoutError)(nil)) {
-				err = &roachpb.RangeFeedRetryError{
-					Reason: roachpb.RangeFeedRetryError_REASON_NO_LEASEHOLDER,
+				if r.store.cfg.Settings.Version.IsActive(ctx, clusterversion.NewRetryableRangefeedErrors) {
+					err = &roachpb.RangeFeedRetryError{
+						Reason: roachpb.RangeFeedRetryError_REASON_NO_LEASEHOLDER,
+					}
 				}
 			}
 			return roachpb.NewError(err)

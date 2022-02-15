@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"math"
 	"net"
 	"net/url"
 	"os"
@@ -86,7 +85,7 @@ import (
 //
 // See #64329 for details.
 var debugTSImportFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_FILE", "")
-var debugTSImportMappingFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_MAPPING_FILE", "")
+var debugTSImportMappingFile = envutil.EnvOrDefaultString("COCKROACH_DEBUG_TS_IMPORT_MAPPING_FILE", debugTSImportFile+".yaml")
 
 // startCmd starts a node by initializing the stores and joining
 // the cluster.
@@ -378,6 +377,22 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, drainSignals...)
 
+	// SIGQUIT is handled differently: for SIGQUIT we spawn a goroutine
+	// and we always handle it, no matter at which point during
+	// execution we are. This makes it possible to use SIGQUIT to
+	// inspect a running process and determine what it is currently
+	// doing, even if it gets stuck somewhere.
+	if quitSignal != nil {
+		quitSignalCh := make(chan os.Signal, 1)
+		signal.Notify(quitSignalCh, quitSignal)
+		go func() {
+			for {
+				<-quitSignalCh
+				log.DumpStacks(context.Background())
+			}
+		}()
+	}
+
 	// Check for stores with full disks and exit with an informative exit
 	// code. This needs to happen early during start, before we perform any
 	// writes to the filesystem including log rotation. We need to guarantee
@@ -406,8 +421,9 @@ func runStart(cmd *cobra.Command, args []string, startSingleNode bool) (returnEr
 	// infrastructure below.  This span concludes when the startup
 	// goroutine started below has completed.  TODO(andrei): we don't
 	// close the span on the early returns below.
+	ctx = ambientCtx.AnnotateCtx(ctx)
 	var startupSpan *tracing.Span
-	ctx, startupSpan = ambientCtx.AnnotateCtxWithSpan(ctx, "server start")
+	ctx, startupSpan = serverCfg.Tracer.EnsureChildSpan(ctx, "server start")
 
 	// Set up the logging and profiling output.
 	//
@@ -576,7 +592,14 @@ If problems persist, please see %s.`
 	// Run the rest of the startup process in a goroutine separate from
 	// the main goroutine to avoid preventing proper handling of signals
 	// if we get stuck on something during initialization (#10138).
-	var serverStatusMu serverStatus
+	var serverStatusMu struct {
+		syncutil.Mutex
+		// Used to synchronize server startup with server shutdown if something
+		// interrupts the process during initialization (it isn't safe to try to
+		// drain a server that doesn't exist or is in the middle of starting up,
+		// or to start a server after draining has begun).
+		started, draining bool
+	}
 	var s *server.Server
 	errChan := make(chan error, 1)
 	go func() {
@@ -668,41 +691,6 @@ If problems persist, please see %s.`
 		}
 	}()
 
-	return waitForShutdown(
-		// NB: we delay the access to s, as it is assigned
-		// asynchronously in a goroutine above.
-		func() serverShutdownInterface { return s },
-		stopper, errChan, signalCh,
-		&serverStatusMu)
-}
-
-type serverStatus struct {
-	syncutil.Mutex
-	// Used to synchronize server startup with server shutdown if something
-	// interrupts the process during initialization (it isn't safe to try to
-	// drain a server that doesn't exist or is in the middle of starting up,
-	// or to start a server after draining has begun).
-	started, draining bool
-}
-
-// serverShutdownInterface is the subset of the APIs on a server
-// object that's sufficient to run a server shutdown.
-type serverShutdownInterface interface {
-	AnnotateCtx(context.Context) context.Context
-	Drain(ctx context.Context, verbose bool) (uint64, redact.RedactableString, error)
-}
-
-// waitForShutdown lets the server run asynchronously and waits for
-// shutdown, either due to the server spontaneously shutting down
-// (signaled by stopper), or due to a server error (signaled on
-// errChan), by receiving a signal (signaled by signalCh).
-func waitForShutdown(
-	getS func() serverShutdownInterface,
-	stopper *stop.Stopper,
-	errChan chan error,
-	signalCh chan os.Signal,
-	serverStatusMu *serverStatus,
-) (returnErr error) {
 	// The remainder of the main function executes concurrently with the
 	// start up goroutine started above.
 	//
@@ -712,9 +700,10 @@ func waitForShutdown(
 	// decommission`, or a signal.
 
 	// We'll want to log any shutdown activity against a separate span.
-	// We cannot use s.AnnotateCtx here because the server might not have
+	// We cannot use s.AnnotateCtx here because s might not have
 	// been assigned yet (the goroutine above runs asynchronously).
-	shutdownCtx, shutdownSpan := serverCfg.AmbientCtx.AnnotateCtxWithSpan(context.Background(), "server shutdown")
+	shutdownCtx := ambientCtx.AnnotateCtx(context.Background())
+	shutdownCtx, shutdownSpan := serverCfg.Tracer.EnsureChildSpan(shutdownCtx, "server shutdown")
 	defer shutdownSpan.Finish()
 
 	stopWithoutDrain := make(chan struct{}) // closed if interrupted very early
@@ -778,22 +767,16 @@ func waitForShutdown(
 			}
 			// Don't use shutdownCtx because this is in a goroutine that may
 			// still be running after shutdownCtx's span has been finished.
-			drainCtx := logtags.AddTag(getS().AnnotateCtx(context.Background()), "server drain process", nil)
+			drainCtx := s.AnnotateCtx(context.Background())
+			drainCtx = logtags.AddTag(drainCtx, "server drain process", nil)
 
 			// Perform a graceful drain. We keep retrying forever, in
 			// case there are many range leases or some unavailability
 			// preventing progress. If the operator wants to expedite
 			// the shutdown, they will need to make it ungraceful
 			// via a 2nd signal.
-			var (
-				remaining     = uint64(math.MaxUint64)
-				prevRemaining = uint64(math.MaxUint64)
-				verbose       = false
-			)
-
-			for ; ; prevRemaining = remaining {
-				var err error
-				remaining, _, err = getS().Drain(drainCtx, verbose)
+			for {
+				remaining, _, err := s.Drain(drainCtx)
 				if err != nil {
 					log.Ops.Errorf(drainCtx, "graceful drain failed: %v", err)
 					break
@@ -802,14 +785,6 @@ func waitForShutdown(
 					// No more work to do.
 					break
 				}
-
-				// If range lease transfer stalls or the number of
-				// remaining leases somehow increases, verbosity is set
-				// to help with troubleshooting.
-				if remaining >= prevRemaining {
-					verbose = true
-				}
-
 				// Avoid a busy wait with high CPU usage if the server replies
 				// with an incomplete drain too quickly.
 				time.Sleep(200 * time.Millisecond)
@@ -1248,11 +1223,7 @@ func getClientGRPCConn(
 	// cluster, so there's no need to enforce that its max offset is the same
 	// as that of nodes in the cluster.
 	clock := hlc.NewClock(hlc.UnixNano, 0)
-	tracer := cfg.Tracer
-	if tracer == nil {
-		tracer = tracing.NewTracer()
-	}
-	stopper := stop.NewStopper(stop.WithTracer(tracer))
+	stopper := stop.NewStopper()
 	rpcContext := rpc.NewContext(ctx,
 		rpc.ContextOptions{
 			TenantID: roachpb.SystemTenantID,
@@ -1260,8 +1231,6 @@ func getClientGRPCConn(
 			Clock:    clock,
 			Stopper:  stopper,
 			Settings: cfg.Settings,
-
-			ClientOnly: true,
 		})
 	if cfg.TestingKnobs.Server != nil {
 		rpcContext.Knobs = cfg.TestingKnobs.Server.(*server.TestingKnobs).ContextTestingKnobs

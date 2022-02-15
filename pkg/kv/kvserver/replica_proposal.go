@@ -18,14 +18,13 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -68,10 +67,6 @@ type ProposalData struct {
 	// proposedAtTicks is the (logical) time at which this command was
 	// last (re-)proposed.
 	proposedAtTicks int
-
-	// createdAtTicks is the (logical) time at which this command was
-	// *first* proposed.
-	createdAtTicks int
 
 	// command is serialized and proposed to raft. In the event of
 	// reproposals its MaxLeaseIndex field is mutated.
@@ -237,9 +232,7 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.Co
 	}
 
 	// Compute SHA asynchronously and store it in a map by UUID.
-	// Don't use the proposal's context for this, as it likely to be canceled very
-	// soon.
-	if err := stopper.RunAsyncTask(r.AnnotateCtx(context.Background()), "storage.Replica: computing checksum", func(ctx context.Context) {
+	if err := stopper.RunAsyncTask(ctx, "storage.Replica: computing checksum", func(ctx context.Context) {
 		func() {
 			defer snap.Close()
 			var snapshot *roachpb.RaftSnapshotData
@@ -257,7 +250,7 @@ func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.Co
 
 		var shouldFatal bool
 		for _, rDesc := range cc.Terminate {
-			if rDesc.StoreID == r.store.StoreID() && rDesc.ReplicaID == r.replicaID {
+			if rDesc.StoreID == r.store.StoreID() && rDesc.ReplicaID == r.mu.replicaID {
 				shouldFatal = true
 			}
 		}
@@ -381,7 +374,7 @@ func (r *Replica) leasePostApplyLocked(
 		}
 	}
 
-	iAmTheLeaseHolder := newLease.Replica.ReplicaID == r.replicaID
+	iAmTheLeaseHolder := newLease.Replica.ReplicaID == r.mu.replicaID
 	// NB: in the case in which a node restarts, minLeaseProposedTS forces it to
 	// get a new lease and we make sure it gets a new sequence number, thus
 	// causing the right half of the disjunction to fire so that we update the
@@ -407,12 +400,6 @@ func (r *Replica) leasePostApplyLocked(
 			log.Fatalf(ctx, "failed checking for in-progress merge while installing new lease %s: %s",
 				newLease, err)
 		}
-
-		// Forward the node clock to the start time of the new lease. This ensures
-		// that the leaseholder's clock always leads its lease's start time. For an
-		// explanation about why this is needed, see "Cooperative lease transfers"
-		// in pkg/util/hlc/doc.go.
-		r.Clock().Update(newLease.Start)
 
 		// If this replica is a new holder of the lease, update the timestamp
 		// cache. Note that clock offset scenarios are handled via a stasis
@@ -513,7 +500,7 @@ func (r *Replica) leasePostApplyLocked(
 	if iAmTheLeaseHolder {
 		// NB: run these in an async task to keep them out of the critical section
 		// (r.mu is held here).
-		_ = r.store.stopper.RunAsyncTask(r.AnnotateCtx(context.Background()), "lease-triggers", func(ctx context.Context) {
+		_ = r.store.stopper.RunAsyncTask(ctx, "lease-triggers", func(ctx context.Context) {
 			// Re-acquire the raftMu, as we are now in an async task.
 			r.raftMu.Lock()
 			defer r.raftMu.Unlock()
@@ -592,12 +579,8 @@ func addSSTablePreApply(
 
 	copied := false
 	if eng.InMem() {
-		// Ingest a copy of the SST. Otherwise, Pebble will claim and mutate the
-		// sst.Data byte slice, which will also be used later by e.g. rangefeeds.
-		data := make([]byte, len(sst.Data))
-		copy(data, sst.Data)
 		path = fmt.Sprintf("%x", checksum)
-		if err := eng.WriteFile(path, data); err != nil {
+		if err := eng.WriteFile(path, sst.Data); err != nil {
 			log.Fatalf(ctx, "unable to write sideloaded SSTable at term %d, index %d: %s", term, index, err)
 		}
 	} else {
@@ -780,7 +763,7 @@ func (r *Replica) evaluateProposal(
 	idKey kvserverbase.CmdIDKey,
 	ba *roachpb.BatchRequest,
 	ui uncertainty.Interval,
-	g *concurrency.Guard,
+	latchSpans *spanset.SpanSet,
 ) (*result.Result, bool, *roachpb.Error) {
 	if ba.Timestamp.IsEmpty() {
 		return nil, false, roachpb.NewErrorf("can't propose Raft command with zero timestamp")
@@ -796,7 +779,7 @@ func (r *Replica) evaluateProposal(
 	//
 	// TODO(tschottdorf): absorb all returned values in `res` below this point
 	// in the call stack as well.
-	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, ui, g)
+	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, ui, latchSpans)
 
 	// Note: reusing the proposer's batch when applying the command on the
 	// proposer was explored as an optimization but resulted in no performance
@@ -861,17 +844,11 @@ func (r *Replica) evaluateProposal(
 		if ba.AppliesTimestampCache() {
 			res.Replicated.WriteTimestamp = ba.WriteTimestamp()
 		} else {
-			if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.DontProposeWriteTimestampForLeaseTransfers) {
-				// For misc requests, use WriteTimestamp to propagate a clock signal. This
-				// is particularly important for lease transfers, as it assures that the
-				// follower getting the lease will have a clock above the start time of
-				// its lease.
-				//
-				// This is no longer needed in v22.1 because nodes running v22.1 and
-				// above will update their clock directly from the new lease's start
-				// time.
-				res.Replicated.WriteTimestamp = r.store.Clock().Now()
-			}
+			// For misc requests, use WriteTimestamp to propagate a clock signal. This
+			// is particularly important for lease transfers, as it assures that the
+			// follower getting the lease will have a clock above the start time of
+			// its lease.
+			res.Replicated.WriteTimestamp = r.store.Clock().Now()
 		}
 		res.Replicated.Delta = ms.ToStatsDelta()
 
@@ -888,15 +865,18 @@ func (r *Replica) evaluateProposal(
 // evaluating it. The returned ProposalData is partially valid even
 // on a non-nil *roachpb.Error and should be proposed through Raft
 // if ProposalData.command is non-nil.
+//
+// TODO(nvanbenschoten): combine idKey, ba, and latchSpans into a
+// `serializedRequest` struct.
 func (r *Replica) requestToProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
 	ba *roachpb.BatchRequest,
 	st kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
-	g *concurrency.Guard,
+	latchSpans *spanset.SpanSet,
 ) (*ProposalData, *roachpb.Error) {
-	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, ui, g)
+	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, ui, latchSpans)
 
 	// Fill out the results even if pErr != nil; we'll return the error below.
 	proposal := &ProposalData{
@@ -926,9 +906,6 @@ func (r *Replica) getTraceData(ctx context.Context) map[string]string {
 	if sp == nil {
 		return nil
 	}
-	// TODO(andrei): We should propagate trace info even for non-verbose spans.
-	// We'd probably want to use a cheaper mechanism than `InjectMetaInto`,
-	// though.
 	if !sp.IsVerbose() {
 		return nil
 	}
@@ -936,6 +913,6 @@ func (r *Replica) getTraceData(ctx context.Context) map[string]string {
 	traceCarrier := tracing.MapCarrier{
 		Map: make(map[string]string),
 	}
-	r.AmbientContext.Tracer.InjectMetaInto(sp.Meta(), traceCarrier)
+	r.store.stopper.Tracer().InjectMetaInto(sp.Meta(), traceCarrier)
 	return traceCarrier.Map
 }

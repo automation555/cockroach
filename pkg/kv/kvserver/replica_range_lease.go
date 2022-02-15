@@ -61,7 +61,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/etcd/raft/v3"
+	raft "go.etcd.io/etcd/raft/v3"
 )
 
 var leaseStatusLogLimiter = func() *log.EveryN {
@@ -319,7 +319,7 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 	// cancel function that must be called; calling just cancel is insufficient.
 	ctx := p.repl.AnnotateCtx(context.Background())
 	const opName = "request range lease"
-	tr := p.repl.AmbientContext.Tracer
+	tr := p.repl.store.stopper.Tracer()
 	tagsOpt := tracing.WithLogTags(logtags.FromContext(parentCtx))
 	var sp *tracing.Span
 	if parentSp := tracing.SpanFromContext(parentCtx); parentSp != nil {
@@ -436,11 +436,6 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 			// Send the RequestLeaseRequest or TransferLeaseRequest and wait for the new
 			// lease to be applied.
 			if pErr == nil {
-				// The Replica circuit breakers together with round-tripping a ProbeRequest
-				// here before asking for the lease could provide an alternative, simpler
-				// solution to the the below issue:
-				//
-				// https://github.com/cockroachdb/cockroach/issues/37906
 				ba := roachpb.BatchRequest{}
 				ba.Timestamp = p.repl.store.Clock().Now()
 				ba.RangeID = p.repl.RangeID
@@ -913,9 +908,8 @@ func newNotLeaseHolderError(
 	l roachpb.Lease, proposerStoreID roachpb.StoreID, rangeDesc *roachpb.RangeDescriptor, msg string,
 ) *roachpb.NotLeaseHolderError {
 	err := &roachpb.NotLeaseHolderError{
-		RangeID:              rangeDesc.RangeID,
-		DescriptorGeneration: rangeDesc.Generation,
-		CustomMsg:            msg,
+		RangeID:   rangeDesc.RangeID,
+		CustomMsg: msg,
 	}
 	if proposerStoreID != 0 {
 		err.Replica, _ = rangeDesc.GetReplicaDescriptor(proposerStoreID)
@@ -1236,17 +1230,14 @@ func (r *Replica) redirectOnOrAcquireLeaseForRequest(
 					}
 
 					if pErr != nil {
-						goErr := pErr.GoError()
-						switch {
-						case errors.HasType(goErr, (*roachpb.AmbiguousResultError)(nil)):
+						switch tErr := pErr.GetDetail().(type) {
+						case *roachpb.AmbiguousResultError:
 							// This can happen if the RequestLease command we sent has been
 							// applied locally through a snapshot: the RequestLeaseRequest
 							// cannot be reproposed so we get this ambiguity.
 							// We'll just loop around.
 							return nil
-						case errors.HasType(goErr, (*roachpb.LeaseRejectedError)(nil)):
-							var tErr *roachpb.LeaseRejectedError
-							errors.As(goErr, &tErr)
+						case *roachpb.LeaseRejectedError:
 							if tErr.Existing.OwnedBy(r.store.StoreID()) {
 								// The RequestLease command we sent was rejected because another
 								// lease was applied in the meantime, but we own that other
@@ -1278,8 +1269,8 @@ func (r *Replica) redirectOnOrAcquireLeaseForRequest(
 					return nil
 				case <-slowTimer.C:
 					slowTimer.Read = true
-					log.Warningf(ctx, "have been waiting %s attempting to acquire lease (%d attempts)",
-						base.SlowRequestThreshold, attempt)
+					log.Warningf(ctx, "have been waiting %s attempting to acquire lease",
+						base.SlowRequestThreshold)
 					r.store.metrics.SlowLeaseRequests.Inc(1)
 					defer func() {
 						r.store.metrics.SlowLeaseRequests.Dec(1)

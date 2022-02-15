@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -265,6 +266,11 @@ type DB struct {
 	SQLKVResponseAdmissionQ *admission.WorkQueue
 }
 
+// Tracer retrieves the Tracer instance for this DB handle.
+func (db *DB) Tracer() *tracing.Tracer {
+	return db.ctx.Stopper.Tracer()
+}
+
 // NonTransactionalSender returns a Sender that can be used for sending
 // non-transactional requests. The Sender is capable of transparently wrapping
 // non-transactional requests that span ranges in transactions.
@@ -296,8 +302,8 @@ func NewDB(
 func NewDBWithContext(
 	actx log.AmbientContext, factory TxnSenderFactory, clock *hlc.Clock, ctx DBContext,
 ) *DB {
-	if actx.Tracer == nil {
-		panic("no tracer set in AmbientCtx")
+	if ctx.Stopper.Tracer() == nil {
+		panic("no tracer set in stopper")
 	}
 	db := &DB{
 		AmbientContext: actx,
@@ -572,26 +578,20 @@ func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
 //
 // The keys can be either byte slices or a strings.
 func (db *DB) AdminSplit(
-	ctx context.Context,
-	splitKey interface{},
-	expirationTime hlc.Timestamp,
-	predicateKeys ...roachpb.Key,
+	ctx context.Context, splitKey interface{}, expirationTime hlc.Timestamp,
 ) error {
 	b := &Batch{}
-	b.adminSplit(splitKey, expirationTime, predicateKeys)
+	b.adminSplit(splitKey, expirationTime)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
 // SplitAndScatter is a helper that wraps AdminSplit + AdminScatter.
 func (db *DB) SplitAndScatter(
-	ctx context.Context, key roachpb.Key, expirationTime hlc.Timestamp, predicateKeys ...roachpb.Key,
+	ctx context.Context, key roachpb.Key, expirationTime hlc.Timestamp,
 ) error {
-	b := &Batch{}
-	b.adminSplit(key, expirationTime, predicateKeys)
-	if err := getOneErr(db.Run(ctx, b), b); err != nil {
+	if err := db.AdminSplit(ctx, key, expirationTime); err != nil {
 		return err
 	}
-
 	scatterReq := &roachpb.AdminScatterRequest{
 		RequestHeader:   roachpb.RequestHeaderFromSpan(roachpb.Span{Key: key, EndKey: key.Next()}),
 		RandomizeLeases: true,
@@ -661,19 +661,17 @@ func (db *DB) AdminChangeReplicas(
 // AdminRelocateRange relocates the replicas for a range onto the specified
 // list of stores.
 func (db *DB) AdminRelocateRange(
-	ctx context.Context,
-	key interface{},
-	voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
-	transferLeaseToFirstVoter bool,
+	ctx context.Context, key interface{}, voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
 ) error {
 	b := &Batch{}
-	b.adminRelocateRange(key, voterTargets, nonVoterTargets, transferLeaseToFirstVoter)
+	b.adminRelocateRange(key, voterTargets, nonVoterTargets)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// AddSSTable links a file into the Pebble log-structured merge-tree.
+// AddSSTable links a file into the RocksDB log-structured merge-tree. Existing
+// data in the range is cleared.
 //
-// The disallowConflicts, disallowShadowingBelow parameters
+// The disallowConflicts, disallowShadowingBelow, and writeAtBatchTs parameters
 // require the MVCCAddSSTable version gate, as they are new in 22.1.
 func (db *DB) AddSSTable(
 	ctx context.Context,
@@ -685,38 +683,12 @@ func (db *DB) AddSSTable(
 	stats *enginepb.MVCCStats,
 	ingestAsWrites bool,
 	batchTs hlc.Timestamp,
+	writeAtBatchTs bool,
 ) error {
 	b := &Batch{Header: roachpb.Header{Timestamp: batchTs}}
 	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowing, disallowShadowingBelow,
-		stats, ingestAsWrites, false /* writeAtBatchTS */, hlc.Timestamp{} /* sstTimestamp */)
+		stats, ingestAsWrites, writeAtBatchTs)
 	return getOneErr(db.Run(ctx, b), b)
-}
-
-// AddSSTableAtBatchTimestamp links a file into the Pebble log-structured
-// merge-tree. All keys in the SST must have batchTs as their timestamp, but the
-// batch timestamp at which the sst is actually ingested -- and that those keys
-// end up with after it is ingested -- may be updated if the request is pushed.
-//
-// Should only be called after checking the MVCCAddSSTable version gate.
-func (db *DB) AddSSTableAtBatchTimestamp(
-	ctx context.Context,
-	begin, end interface{},
-	data []byte,
-	disallowConflicts bool,
-	disallowShadowing bool,
-	disallowShadowingBelow hlc.Timestamp,
-	stats *enginepb.MVCCStats,
-	ingestAsWrites bool,
-	batchTs hlc.Timestamp,
-) (hlc.Timestamp, error) {
-	b := &Batch{Header: roachpb.Header{Timestamp: batchTs}}
-	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowing, disallowShadowingBelow,
-		stats, ingestAsWrites, true /* writeAtBatchTS */, batchTs)
-	err := getOneErr(db.Run(ctx, b), b)
-	if err != nil {
-		return hlc.Timestamp{}, err
-	}
-	return b.response.Timestamp, nil
 }
 
 // Migrate is used instruct all ranges overlapping with the provided keyspace to

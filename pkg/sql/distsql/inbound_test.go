@@ -39,10 +39,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// staticAddressResolver maps execinfra.StaticSQLInstanceID to the given address.
+// staticAddressResolver maps execinfra.StaticNodeID to the given address.
 func staticAddressResolver(addr net.Addr) nodedialer.AddressResolver {
 	return func(nodeID roachpb.NodeID) (net.Addr, error) {
-		if nodeID == roachpb.NodeID(execinfra.StaticSQLInstanceID) {
+		if nodeID == execinfra.StaticNodeID {
 			return addr, nil
 		}
 		return nil, errors.Errorf("node %d not found", nodeID)
@@ -67,7 +67,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 			Metrics:  &mt,
 			NodeID:   base.TestingIDContainer,
 		},
-		flowinfra.NewFlowScheduler(log.MakeTestingAmbientCtxWithNewTracer(), stopper, st),
+		flowinfra.NewFlowScheduler(log.MakeTestingAmbientContext(), stopper, st),
 	)
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
@@ -88,19 +88,17 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	// The outbox uses this stopper to run a goroutine.
 	outboxStopper := stop.NewStopper()
 	defer outboxStopper.Stop(ctx)
-	nodeDialer := nodedialer.New(rpcContext, staticAddressResolver(ln.Addr()))
 	flowCtx := execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
-			Settings:      st,
-			NodeDialer:    nodeDialer,
-			PodNodeDialer: nodeDialer,
-			Stopper:       outboxStopper,
+			Settings:   st,
+			NodeDialer: nodedialer.New(rpcContext, staticAddressResolver(ln.Addr())),
+			Stopper:    outboxStopper,
 		},
 		NodeID: base.TestingIDContainer,
 	}
 
 	streamID := execinfrapb.StreamID(1)
-	outbox := flowinfra.NewOutbox(&flowCtx, execinfra.StaticSQLInstanceID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+	outbox := flowinfra.NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 	outbox.Init(types.OneIntCol)
 
 	// WaitGroup for the outbox and inbound stream. If the WaitGroup is done, no
