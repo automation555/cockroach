@@ -49,7 +49,6 @@ type CreateDatabase struct {
 	Regions         NameList
 	SurvivalGoal    SurvivalGoal
 	Placement       DataPlacement
-	Owner           RoleSpec
 }
 
 // Format implements the NodeFormatter interface.
@@ -115,11 +114,6 @@ func (node *CreateDatabase) Format(ctx *FmtCtx) {
 	if node.Placement != DataPlacementUnspecified {
 		ctx.WriteString(" ")
 		ctx.FormatNode(&node.Placement)
-	}
-
-	if node.Owner.Name != "" {
-		ctx.WriteString(" OWNER = ")
-		ctx.FormatNode(&node.Owner)
 	}
 }
 
@@ -223,18 +217,16 @@ type CreateIndex struct {
 	StorageParams    StorageParams
 	Predicate        Expr
 	Concurrently     bool
+	Invisible        bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *CreateIndex) Format(ctx *FmtCtx) {
-	// Please also update indexForDisplay function in
-	// pkg/sql/catalog/catformat/index.go if there's any update to index
-	// definition components.
 	ctx.WriteString("CREATE ")
 	if node.Unique {
 		ctx.WriteString("UNIQUE ")
 	}
-	if node.Inverted {
+	if node.Inverted && !ctx.HasFlags(FmtPGCatalog) {
 		ctx.WriteString("INVERTED ")
 	}
 	ctx.WriteString("INDEX ")
@@ -250,7 +242,14 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 	}
 	ctx.WriteString("ON ")
 	ctx.FormatNode(&node.Table)
-
+	if ctx.HasFlags(FmtPGCatalog) {
+		ctx.WriteString(" USING")
+		if node.Inverted {
+			ctx.WriteString(" gin")
+		} else {
+			ctx.WriteString(" btree")
+		}
+	}
 	ctx.WriteString(" (")
 	ctx.FormatNode(&node.Columns)
 	ctx.WriteByte(')')
@@ -271,8 +270,14 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 		ctx.WriteString(")")
 	}
 	if node.Predicate != nil {
-		ctx.WriteString(" WHERE ")
-		ctx.FormatNode(node.Predicate)
+		if ctx.HasFlags(FmtPGCatalog) {
+			ctx.WriteString(" WHERE (")
+			ctx.FormatNode(node.Predicate)
+			ctx.WriteString(")")
+		} else {
+			ctx.WriteString(" WHERE ")
+			ctx.FormatNode(node.Predicate)
+		}
 	}
 }
 
@@ -421,10 +426,9 @@ type ColumnTableDef struct {
 		ConstraintName Name
 	}
 	PrimaryKey struct {
-		IsPrimaryKey  bool
-		Sharded       bool
-		ShardBuckets  Expr
-		StorageParams StorageParams
+		IsPrimaryKey bool
+		Sharded      bool
+		ShardBuckets Expr
 	}
 	Unique struct {
 		IsUnique       bool
@@ -546,11 +550,9 @@ func NewColumnTableDef(
 			d.OnUpdateExpr.Expr = t.Expr
 			d.OnUpdateExpr.ConstraintName = c.Name
 		case *GeneratedAlwaysAsIdentity, *GeneratedByDefAsIdentity:
-			if typ, ok := typRef.(*types.T); !ok || typ.InternalType.Family != types.IntFamily {
-				return nil, pgerror.Newf(
-					pgcode.InvalidParameterValue,
-					"identity column type must be an INT",
-				)
+			if typRef.(*types.T).InternalType.Family != types.IntFamily {
+				return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+					"identity column type must be INT, INT2, or INT4")
 			}
 			if d.GeneratedIdentity.IsGeneratedAsIdentity {
 				return nil, pgerror.Newf(pgcode.Syntax,
@@ -601,14 +603,12 @@ func NewColumnTableDef(
 			d.Nullable.ConstraintName = c.Name
 		case PrimaryKeyConstraint:
 			d.PrimaryKey.IsPrimaryKey = true
-			d.PrimaryKey.StorageParams = c.Qualification.(PrimaryKeyConstraint).StorageParams
 			d.Unique.ConstraintName = c.Name
 		case ShardedPrimaryKeyConstraint:
 			d.PrimaryKey.IsPrimaryKey = true
 			constraint := c.Qualification.(ShardedPrimaryKeyConstraint)
 			d.PrimaryKey.Sharded = true
 			d.PrimaryKey.ShardBuckets = constraint.ShardBuckets
-			d.PrimaryKey.StorageParams = constraint.StorageParams
 			d.Unique.ConstraintName = c.Name
 		case UniqueConstraint:
 			d.Unique.IsUnique = true
@@ -714,26 +714,9 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 		}
 		if node.PrimaryKey.IsPrimaryKey {
 			ctx.WriteString(" PRIMARY KEY")
-
-			// Always prefer to output hash sharding bucket count as a storage param.
-			pkStorageParams := node.PrimaryKey.StorageParams
 			if node.PrimaryKey.Sharded {
-				ctx.WriteString(" USING HASH")
-				bcStorageParam := node.PrimaryKey.StorageParams.GetVal(`bucket_count`)
-				if _, ok := node.PrimaryKey.ShardBuckets.(DefaultVal); !ok && bcStorageParam == nil {
-					pkStorageParams = append(
-						pkStorageParams,
-						StorageParam{
-							Key:   `bucket_count`,
-							Value: node.PrimaryKey.ShardBuckets,
-						},
-					)
-				}
-			}
-			if len(pkStorageParams) > 0 {
-				ctx.WriteString(" WITH (")
-				ctx.FormatNode(&pkStorageParams)
-				ctx.WriteString(")")
+				ctx.WriteString(" USING HASH WITH BUCKET_COUNT=")
+				ctx.FormatNode(node.PrimaryKey.ShardBuckets)
 			}
 		} else if node.Unique.IsUnique {
 			ctx.WriteString(" UNIQUE")
@@ -904,16 +887,13 @@ type NullConstraint struct{}
 type HiddenConstraint struct{}
 
 // PrimaryKeyConstraint represents PRIMARY KEY on a column.
-type PrimaryKeyConstraint struct {
-	StorageParams StorageParams
-}
+type PrimaryKeyConstraint struct{}
 
 // ShardedPrimaryKeyConstraint represents `PRIMARY KEY .. USING HASH..`
 // on a column.
 type ShardedPrimaryKeyConstraint struct {
-	Sharded       bool
-	ShardBuckets  Expr
-	StorageParams StorageParams
+	Sharded      bool
+	ShardBuckets Expr
 }
 
 // UniqueConstraint represents UNIQUE on a column.
@@ -1005,10 +985,6 @@ type ConstraintTableDef interface {
 
 	// SetName replaces the name of the definition in-place. Used in the parser.
 	SetName(name Name)
-
-	// SetIfNotExists sets this definition as coming from an
-	// ADD CONSTRAINT IF NOT EXISTS statement. Used in the parser.
-	SetIfNotExists()
 }
 
 func (*UniqueConstraintTableDef) constraintTableDef()     {}
@@ -1021,7 +997,6 @@ type UniqueConstraintTableDef struct {
 	IndexTableDef
 	PrimaryKey   bool
 	WithoutIndex bool
-	IfNotExists  bool
 }
 
 // SetName implements the TableDef interface.
@@ -1029,18 +1004,10 @@ func (node *UniqueConstraintTableDef) SetName(name Name) {
 	node.Name = name
 }
 
-// SetIfNotExists implements the ConstraintTableDef interface.
-func (node *UniqueConstraintTableDef) SetIfNotExists() {
-	node.IfNotExists = true
-}
-
 // Format implements the NodeFormatter interface.
 func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.Name != "" {
 		ctx.WriteString("CONSTRAINT ")
-		if node.IfNotExists {
-			ctx.WriteString("IF NOT EXISTS ")
-		}
 		ctx.FormatNode(&node.Name)
 		ctx.WriteByte(' ')
 	}
@@ -1141,22 +1108,18 @@ func (c CompositeKeyMatchMethod) String() string {
 
 // ForeignKeyConstraintTableDef represents a FOREIGN KEY constraint in the AST.
 type ForeignKeyConstraintTableDef struct {
-	Name        Name
-	Table       TableName
-	FromCols    NameList
-	ToCols      NameList
-	Actions     ReferenceActions
-	Match       CompositeKeyMatchMethod
-	IfNotExists bool
+	Name     Name
+	Table    TableName
+	FromCols NameList
+	ToCols   NameList
+	Actions  ReferenceActions
+	Match    CompositeKeyMatchMethod
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ForeignKeyConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.Name != "" {
 		ctx.WriteString("CONSTRAINT ")
-		if node.IfNotExists {
-			ctx.WriteString("IF NOT EXISTS ")
-		}
 		ctx.FormatNode(&node.Name)
 		ctx.WriteByte(' ')
 	}
@@ -1185,18 +1148,12 @@ func (node *ForeignKeyConstraintTableDef) SetName(name Name) {
 	node.Name = name
 }
 
-// SetIfNotExists implements the ConstraintTableDef interface.
-func (node *ForeignKeyConstraintTableDef) SetIfNotExists() {
-	node.IfNotExists = true
-}
-
 // CheckConstraintTableDef represents a check constraint within a CREATE
 // TABLE statement.
 type CheckConstraintTableDef struct {
-	Name        Name
-	Expr        Expr
-	Hidden      bool
-	IfNotExists bool
+	Name   Name
+	Expr   Expr
+	Hidden bool
 }
 
 // SetName implements the ConstraintTableDef interface.
@@ -1204,18 +1161,10 @@ func (node *CheckConstraintTableDef) SetName(name Name) {
 	node.Name = name
 }
 
-// SetIfNotExists implements the ConstraintTableDef interface.
-func (node *CheckConstraintTableDef) SetIfNotExists() {
-	node.IfNotExists = true
-}
-
 // Format implements the NodeFormatter interface.
 func (node *CheckConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.Name != "" {
 		ctx.WriteString("CONSTRAINT ")
-		if node.IfNotExists {
-			ctx.WriteString("IF NOT EXISTS ")
-		}
 		ctx.FormatNode(&node.Name)
 		ctx.WriteByte(' ')
 	}
@@ -1251,10 +1200,6 @@ type ShardedIndexDef struct {
 
 // Format implements the NodeFormatter interface.
 func (node *ShardedIndexDef) Format(ctx *FmtCtx) {
-	if _, ok := node.ShardBuckets.(DefaultVal); ok {
-		ctx.WriteString(" USING HASH")
-		return
-	}
 	ctx.WriteString(" USING HASH WITH BUCKET_COUNT = ")
 	ctx.FormatNode(node.ShardBuckets)
 }
@@ -1433,18 +1378,6 @@ func (o *StorageParams) Format(ctx *FmtCtx) {
 	}
 }
 
-// GetVal returns corresponding value if a key exists, otherwise nil is
-// returned.
-func (o *StorageParams) GetVal(key string) Expr {
-	k := Name(key)
-	for _, param := range *o {
-		if param.Key == k {
-			return param.Value
-		}
-	}
-	return nil
-}
-
 // CreateTableOnCommitSetting represents the CREATE TABLE ... ON COMMIT <action>
 // parameters.
 type CreateTableOnCommitSetting uint32
@@ -1528,11 +1461,8 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 		if node.PartitionByTable != nil {
 			ctx.FormatNode(node.PartitionByTable)
 		}
-		if node.StorageParams != nil {
-			ctx.WriteString(` WITH (`)
-			ctx.FormatNode(&node.StorageParams)
-			ctx.WriteByte(')')
-		}
+		// No storage parameters are implemented, so we never list the storage
+		// parameters in the output format.
 		if node.Locality != nil {
 			ctx.WriteString(" ")
 			ctx.FormatNode(node.Locality)
@@ -1659,10 +1589,6 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 		option := &(*node)[i]
 		ctx.WriteByte(' ')
 		switch option.Name {
-		case SeqOptAs:
-			ctx.WriteString(option.Name)
-			ctx.WriteByte(' ')
-			ctx.WriteString(option.AsIntegerType.SQLString())
 		case SeqOptCycle, SeqOptNoCycle:
 			ctx.WriteString(option.Name)
 		case SeqOptCache:
@@ -1736,9 +1662,6 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 // SequenceOption represents an option on a CREATE SEQUENCE statement.
 type SequenceOption struct {
 	Name string
-
-	// AsIntegerType specifies default min and max values of a sequence.
-	AsIntegerType *types.T
 
 	IntVal *int64
 
