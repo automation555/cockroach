@@ -402,7 +402,7 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 		// If no columns are specified, attempt to default to PK, ignoring implicit
 		// columns.
 		idx := targetTable.Index(cat.PrimaryIndex)
-		numImplicitCols := idx.ImplicitPartitioningColumnCount()
+		numImplicitCols := idx.ImplicitColumnCount()
 		referencedColNames = make(
 			tree.NameList,
 			0,
@@ -689,7 +689,7 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 }
 
 func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
-	return tt.addIndexWithVersion(def, typ, descpb.PrimaryIndexWithStoredColumnsVersion)
+	return tt.addIndexWithVersion(def, typ, descpb.LatestNonPrimaryIndexDescriptorVersion)
 }
 
 func (tt *Table) addIndexWithVersion(

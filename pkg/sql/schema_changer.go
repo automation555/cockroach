@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -410,59 +411,6 @@ func (sc *SchemaChanger) maybeMakeAddTablePublic(
 	})
 }
 
-// ignoreRevertedDropIndex finds all add index mutations that are the
-// result of a rollback and changes their direction to DROP.
-//
-// Prior to 22.1 we would attempt to revert failed DROP INDEX
-// mutations. However, not all dependent objects were reverted and it
-// required an expensive, full index rebuild.
-//
-// In 22.1+, we no longer revert failed DROP INDEX mutations, but we
-// need to account for mutations created on earlier versions.
-//
-// In a mixed-version state, if this code runs once, then the mutation
-// will have been converted to a DROP and the index will be dropped
-// regardless of which node resumes the job after this function
-// returns. If the job is resumed only on an older node, then the
-// reverted schema change will continue as it would have previously.
-//
-// TODO(ssd): Once we install a version gate and migration that drains
-// in-flight schema changes and disallows any old-style index
-// backfills, we can remove this extra transaction since we will know
-// that any reverted DROP INDEX mutations will either have already
-// been processed or will fail (since after the new gate, we will fail
-// any ADD INDEX mutations generated on old code).
-func (sc *SchemaChanger) ignoreRevertedDropIndex(
-	ctx context.Context, table catalog.TableDescriptor,
-) error {
-	if !table.IsPhysicalTable() {
-		return nil
-	}
-	return sc.txn(ctx, func(ctx context.Context, txn *kv.Txn, descsCol *descs.Collection) error {
-		mut, err := descsCol.GetMutableTableVersionByID(ctx, table.GetID(), txn)
-		if err != nil {
-			return err
-		}
-		mutationsModified := false
-		for _, m := range mut.AllMutations() {
-			if m.MutationID() != sc.mutationID {
-				break
-			}
-
-			if !m.IsRollback() || !m.Adding() || m.AsIndex() == nil {
-				continue
-			}
-			log.Warningf(ctx, "ignoring rollback of index drop; index %q will be dropped", m.AsIndex().GetName())
-			mut.Mutations[m.MutationOrdinal()].Direction = descpb.DescriptorMutation_DROP
-			mutationsModified = true
-		}
-		if mutationsModified {
-			return descsCol.WriteDesc(ctx, true /* kvTrace */, mut, txn)
-		}
-		return nil
-	})
-}
-
 // drainNamesForDescriptor will drain remove the draining names from the
 // descriptor with the specified ID. If it is a schema, it will also remove the
 // names from the parent database.
@@ -719,10 +667,6 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 				return err
 			}
 		}
-	}
-
-	if err := sc.ignoreRevertedDropIndex(ctx, tableDesc); err != nil {
-		return err
 	}
 
 	if err := sc.maybeBackfillCreateTableAs(ctx, tableDesc); err != nil {
@@ -1959,11 +1903,6 @@ func (sc *SchemaChanger) reverseMutation(
 		}
 
 	case descpb.DescriptorMutation_DROP:
-		// DROP INDEX is not reverted.
-		if mutation.GetIndex() != nil {
-			return mutation, columns
-		}
-
 		mutation.Direction = descpb.DescriptorMutation_ADD
 		if notStarted && mutation.State != descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY {
 			panic(errors.AssertionFailedf("mutation in bad state: %+v", mutation))
@@ -2718,12 +2657,56 @@ func (sc *SchemaChanger) preSplitHashShardedIndexRanges(ctx context.Context) err
 
 			if idx := m.AsIndex(); m.Adding() && m.DeleteOnly() && idx != nil {
 				if idx.IsSharded() {
+					// Iterate through all partitioning lists to get all possible list
+					// partitioning key prefix. Hash sharded index only allows implicit
+					// partitioning, and implicit partitioning does not support
+					// subpartition. So it's safe not to consider subpartitions. Range
+					// partition is not considered here as well, because it's hard to
+					// predict the sampling points within each range to make the pre-split
+					// on shard boundaries helpful.
+					var partitionKeyPrefixes []roachpb.Key
+					partitioning := idx.GetPartitioning()
+					partitioning.ForEachList(
+						func(name string, values [][]byte, subPartitioning catalog.Partitioning) error {
+							for _, tupleBytes := range values {
+								_, key, err := rowenc.DecodePartitionTuple(
+									&tree.DatumAlloc{},
+									sc.execCfg.Codec,
+									tableDesc,
+									idx,
+									partitioning,
+									tupleBytes,
+									tree.Datums{},
+								)
+								if err != nil {
+									return nil
+								}
+								partitionKeyPrefixes = append(partitionKeyPrefixes, key)
+							}
+							return nil
+						},
+					)
+
 					splitAtShards := calculateSplitAtShards(maxHashShardedIndexRangePreSplit.Get(&sc.settings.SV), idx.GetSharded().ShardBuckets)
-					for _, shard := range splitAtShards {
-						keyPrefix := sc.execCfg.Codec.IndexPrefix(uint32(tableDesc.GetID()), uint32(idx.GetID()))
-						splitKey := encoding.EncodeVarintAscending(keyPrefix, shard)
-						if err := sc.db.SplitAndScatter(ctx, splitKey, hour); err != nil {
-							return err
+					if len(partitionKeyPrefixes) == 0 {
+						// If there is no partitioning on the index, only pre-split on
+						// selected shard boundaries.
+						for _, shard := range splitAtShards {
+							keyPrefix := sc.execCfg.Codec.IndexPrefix(uint32(tableDesc.GetID()), uint32(idx.GetID()))
+							splitKey := encoding.EncodeVarintAscending(keyPrefix, shard)
+							if err := sc.db.SplitAndScatter(ctx, splitKey, hour); err != nil {
+								return err
+							}
+						}
+					} else {
+						// If there are partitioning prefixes, pre-split each of them.
+						for _, partPrefix := range partitionKeyPrefixes {
+							for _, shard := range splitAtShards {
+								splitKey := encoding.EncodeVarintAscending(partPrefix, shard)
+								if err := sc.db.SplitAndScatter(ctx, splitKey, hour); err != nil {
+									return err
+								}
+							}
 						}
 					}
 				}
