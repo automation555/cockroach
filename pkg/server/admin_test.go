@@ -317,21 +317,13 @@ func TestAdminAPIDatabases(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
-	ac := ts.AmbientCtx()
+	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
 
 	const testdb = "test"
 	query := "CREATE DATABASE " + testdb
 	if _, err := db.Exec(query); err != nil {
-		t.Fatal(err)
-	}
-	// Test needs to revoke CONNECT on the public database to properly exercise
-	// fine-grained permissions logic.
-	if _, err := db.Exec(fmt.Sprintf("REVOKE CONNECT ON DATABASE %s FROM public", testdb)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec("REVOKE CONNECT ON DATABASE defaultdb FROM public"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -359,7 +351,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 		isAdmin     bool
 	}{
 		{[]string{"defaultdb", "postgres", "system", testdb}, true},
-		{[]string{"postgres", testdb}, false},
+		{[]string{testdb}, false},
 	} {
 		t.Run(fmt.Sprintf("isAdmin:%t", tc.isAdmin), func(t *testing.T) {
 			// Test databases endpoint.
@@ -639,12 +631,12 @@ func TestAdminAPITableDetails(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	for _, tc := range []struct {
-		name, dbName, tblName, pkName string
+		name, dbName, tblName string
 	}{
-		{name: "lower", dbName: "test", tblName: "tbl", pkName: "tbl_pkey"},
-		{name: "lower", dbName: "test", tblName: `testschema.tbl`, pkName: "tbl_pkey"},
-		{name: "lower with space", dbName: "test test", tblName: `"tbl tbl"`, pkName: "tbl tbl_pkey"},
-		{name: "upper", dbName: "TEST", tblName: `"TBL"`, pkName: "TBL_pkey"}, // Regression test for issue #14056
+		{name: "lower", dbName: "test", tblName: "tbl"},
+		{name: "lower", dbName: "test", tblName: `testschema.tbl`},
+		{name: "lower with space", dbName: "test test", tblName: `"tbl tbl"`},
+		{name: "upper", dbName: "TEST", tblName: `"TBL"`}, // Regression test for issue #14056
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
@@ -655,7 +647,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 			tblName := tc.tblName
 			schemaName := "testschema"
 
-			ac := ts.AmbientCtx()
+			ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 			ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 			defer span.Finish()
 
@@ -673,7 +665,6 @@ func TestAdminAPITableDetails(t *testing.T) {
 				"CREATE USER app",
 				fmt.Sprintf("GRANT SELECT ON %s.%s TO readonly", escDBName, tblName),
 				fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, tblName),
-				fmt.Sprintf("CREATE STATISTICS test_stats FROM %s.%s", escDBName, tblName),
 			}
 			pgURL, cleanupGoDB := sqlutils.PGUrl(
 				t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(security.RootUser))
@@ -742,11 +733,11 @@ func TestAdminAPITableDetails(t *testing.T) {
 
 			// Verify indexes.
 			expIndexes := []serverpb.TableDetailsResponse_Index{
-				{Name: tc.pkName, Column: "string_default", Direction: "N/A", Unique: true, Seq: 5, Storing: true},
-				{Name: tc.pkName, Column: "default2", Direction: "N/A", Unique: true, Seq: 4, Storing: true},
-				{Name: tc.pkName, Column: "nulls_not_allowed", Direction: "N/A", Unique: true, Seq: 3, Storing: true},
-				{Name: tc.pkName, Column: "nulls_allowed", Direction: "N/A", Unique: true, Seq: 2, Storing: true},
-				{Name: tc.pkName, Column: "rowid", Direction: "ASC", Unique: true, Seq: 1},
+				{Name: "primary", Column: "string_default", Direction: "N/A", Unique: true, Seq: 5, Storing: true},
+				{Name: "primary", Column: "default2", Direction: "N/A", Unique: true, Seq: 4, Storing: true},
+				{Name: "primary", Column: "nulls_not_allowed", Direction: "N/A", Unique: true, Seq: 3, Storing: true},
+				{Name: "primary", Column: "nulls_allowed", Direction: "N/A", Unique: true, Seq: 2, Storing: true},
+				{Name: "primary", Column: "rowid", Direction: "ASC", Unique: true, Seq: 1},
 				{Name: "descidx", Column: "rowid", Direction: "ASC", Unique: false, Seq: 2, Implicit: true},
 				{Name: "descidx", Column: "default2", Direction: "DESC", Unique: false, Seq: 1},
 			}
@@ -780,22 +771,6 @@ func TestAdminAPITableDetails(t *testing.T) {
 				}
 			}
 
-			// Verify statistics last updated.
-			{
-
-				showStatisticsForTableQuery := fmt.Sprintf("SELECT max(created) AS created FROM [SHOW STATISTICS FOR TABLE %s.%s]", escDBName, tblName)
-
-				row := db.QueryRow(showStatisticsForTableQuery)
-				var createdTs time.Time
-				if err := row.Scan(&createdTs); err != nil {
-					t.Fatal(err)
-				}
-
-				if a, e := resp.StatsLastCreatedAt, createdTs; reflect.DeepEqual(a, e) {
-					t.Fatalf("mismatched statistics creation timestamp; expected %s, got %s", e, a)
-				}
-			}
-
 			// Verify Descriptor ID.
 			tableID, err := ts.admin.queryTableID(ctx, security.RootUserName(), tc.dbName, tc.tblName)
 			if err != nil {
@@ -818,7 +793,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	ts := s.(*TestServer)
 
 	// Create database and table.
-	ac := ts.AmbientCtx()
+	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
 	setupQueries := []string{
@@ -1091,10 +1066,10 @@ func TestAdminAPISettings(t *testing.T) {
 	// Any bool that defaults to true will work here.
 	const settingKey = "sql.metrics.statement_details.enabled"
 	st := s.ClusterSettings()
-	allKeys := settings.Keys(settings.ForSystemTenant)
+	allKeys := settings.Keys()
 
 	checkSetting := func(t *testing.T, k string, v serverpb.SettingsResponse_Value) {
-		ref, ok := settings.Lookup(k, settings.LookupForReporting, settings.ForSystemTenant)
+		ref, ok := settings.Lookup(k, settings.LookupForReporting)
 		if !ok {
 			t.Fatalf("%s: not found after initial lookup", k)
 		}
@@ -1477,30 +1452,18 @@ func TestAdminAPIJobs(t *testing.T) {
 	existingRunningIDs := getSystemJobIDs(t, sqlDB, jobs.StatusRunning)
 	existingIDs := append(existingSucceededIDs, existingRunningIDs...)
 
-	runningOnlyIds := []int64{1, 2, 4}
-	revertingOnlyIds := []int64{7, 8, 9}
-	retryRunningIds := []int64{6}
-	retryRevertingIds := []int64{10}
-
 	testJobs := []struct {
 		id       int64
 		status   jobs.Status
 		details  jobspb.Details
 		progress jobspb.ProgressDetails
 		username security.SQLUsername
-		numRuns  int64
-		lastRun  time.Time
 	}{
-		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}, security.RootUserName(), 1, time.Time{}},
-		{2, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 1, timeutil.Now().Add(10 * time.Minute)},
-		{3, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 1, time.Time{}},
-		{4, jobs.StatusRunning, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 2, time.Time{}},
-		{5, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, authenticatedUserNameNoAdmin(), 1, time.Time{}},
-		{6, jobs.StatusRunning, jobspb.ImportDetails{}, jobspb.ImportProgress{}, security.RootUserName(), 2, timeutil.Now().Add(10 * time.Minute)},
-		{7, jobs.StatusReverting, jobspb.ImportDetails{}, jobspb.ImportProgress{}, security.RootUserName(), 1, time.Time{}},
-		{8, jobs.StatusReverting, jobspb.ImportDetails{}, jobspb.ImportProgress{}, security.RootUserName(), 1, timeutil.Now().Add(10 * time.Minute)},
-		{9, jobs.StatusReverting, jobspb.ImportDetails{}, jobspb.ImportProgress{}, security.RootUserName(), 2, time.Time{}},
-		{10, jobs.StatusReverting, jobspb.ImportDetails{}, jobspb.ImportProgress{}, security.RootUserName(), 2, timeutil.Now().Add(10 * time.Minute)},
+		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}, security.RootUserName()},
+		{2, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName()},
+		{3, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName()},
+		{4, jobs.StatusRunning, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName()},
+		{5, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, authenticatedUserNameNoAdmin()},
 	}
 	for _, job := range testJobs {
 		payload := jobspb.Payload{UsernameProto: job.username.EncodeProto(), Details: jobspb.WrapPayloadDetails(job.details)}
@@ -1527,8 +1490,8 @@ func TestAdminAPIJobs(t *testing.T) {
 			t.Fatal(err)
 		}
 		sqlDB.Exec(t,
-			`INSERT INTO system.jobs (id, status, payload, progress, num_runs, last_run) VALUES ($1, $2, $3, $4, $5, $6)`,
-			job.id, job.status, payloadBytes, progressBytes, job.numRuns, job.lastRun,
+			`INSERT INTO system.jobs (id, status, payload, progress) VALUES ($1, $2, $3, $4)`,
+			job.id, job.status, payloadBytes, progressBytes,
 		)
 	}
 
@@ -1541,33 +1504,23 @@ func TestAdminAPIJobs(t *testing.T) {
 	}{
 		{
 			"jobs",
-			append([]int64{10, 9, 8, 7, 6, 5, 4, 3, 2, 1}, existingIDs...),
+			append([]int64{5, 4, 3, 2, 1}, existingIDs...),
 			[]int64{5},
 		},
 		{
 			"jobs?limit=1",
-			[]int64{10},
 			[]int64{5},
+			[]int64{5},
+		},
+		{
+			"jobs?status=running",
+			append([]int64{4, 2, 1}, existingRunningIDs...),
+			[]int64{},
 		},
 		{
 			"jobs?status=succeeded",
 			append([]int64{5, 3}, existingSucceededIDs...),
 			[]int64{5},
-		},
-		{
-			"jobs?status=running",
-			append(append(append([]int64{}, runningOnlyIds...), retryRunningIds...), existingRunningIDs...),
-			[]int64{},
-		},
-		{
-			"jobs?status=reverting",
-			append(append([]int64{}, revertingOnlyIds...), retryRevertingIds...),
-			[]int64{},
-		},
-		{
-			"jobs?status=retrying",
-			append(append([]int64{}, retryRunningIds...), retryRevertingIds...),
-			[]int64{},
 		},
 		{
 			"jobs?status=pending",
@@ -1617,163 +1570,11 @@ func TestAdminAPIJobs(t *testing.T) {
 				expected = testCase.expectedIDsViaNonAdmin
 			}
 
-			sort.Slice(expected, func(i, j int) bool {
-				return expected[i] < expected[j]
-			})
-
-			sort.Slice(resIDs, func(i, j int) bool {
-				return resIDs[i] < resIDs[j]
-			})
 			if e, a := expected, resIDs; !reflect.DeepEqual(e, a) {
 				t.Errorf("%d: expected job IDs %v, but got %v", i, e, a)
 			}
-
 		}
 	})
-}
-
-func TestAdminAPIJobsDetails(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
-	sqlDB := sqlutils.MakeSQLRunner(conn)
-
-	runningOnlyIds := []int64{1, 3, 5}
-	revertingOnlyIds := []int64{2, 4, 6}
-	retryRunningIds := []int64{7}
-	retryRevertingIds := []int64{8}
-
-	now := timeutil.Now()
-
-	encodedError := func(err error) *errors.EncodedError {
-		ee := errors.EncodeError(context.Background(), err)
-		return &ee
-	}
-	testJobs := []struct {
-		id           int64
-		status       jobs.Status
-		details      jobspb.Details
-		progress     jobspb.ProgressDetails
-		username     security.SQLUsername
-		numRuns      int64
-		lastRun      time.Time
-		executionLog []*jobspb.RetriableExecutionFailure
-	}{
-		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}, security.RootUserName(), 1, time.Time{}, nil},
-		{2, jobs.StatusReverting, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 1, time.Time{}, nil},
-		{3, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 1, now.Add(10 * time.Minute), nil},
-		{4, jobs.StatusReverting, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 1, now.Add(10 * time.Minute), nil},
-		{5, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 2, time.Time{}, nil},
-		{6, jobs.StatusReverting, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 2, time.Time{}, nil},
-		{7, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 2, now.Add(10 * time.Minute), nil},
-		{8, jobs.StatusReverting, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 2, now.Add(10 * time.Minute), []*jobspb.RetriableExecutionFailure{
-			{
-				Status:               string(jobs.StatusRunning),
-				ExecutionStartMicros: now.Add(-time.Minute).UnixMicro(),
-				ExecutionEndMicros:   now.Add(-30 * time.Second).UnixMicro(),
-				InstanceID:           1,
-				Error:                encodedError(errors.New("foo")),
-			},
-			{
-				Status:               string(jobs.StatusReverting),
-				ExecutionStartMicros: now.Add(-29 * time.Minute).UnixMicro(),
-				ExecutionEndMicros:   now.Add(-time.Second).UnixMicro(),
-				InstanceID:           1,
-				TruncatedError:       "bar",
-			},
-		}},
-	}
-	for _, job := range testJobs {
-		payload := jobspb.Payload{
-			UsernameProto:                job.username.EncodeProto(),
-			Details:                      jobspb.WrapPayloadDetails(job.details),
-			RetriableExecutionFailureLog: job.executionLog,
-		}
-		payloadBytes, err := protoutil.Marshal(&payload)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		progress := jobspb.Progress{Details: jobspb.WrapProgressDetails(job.progress)}
-		// Populate progress.Progress field with a specific progress type based on
-		// the job type.
-		if _, ok := job.progress.(jobspb.ChangefeedProgress); ok {
-			progress.Progress = &jobspb.Progress_HighWater{
-				HighWater: &hlc.Timestamp{},
-			}
-		} else {
-			progress.Progress = &jobspb.Progress_FractionCompleted{
-				FractionCompleted: 1.0,
-			}
-		}
-
-		progressBytes, err := protoutil.Marshal(&progress)
-		if err != nil {
-			t.Fatal(err)
-		}
-		sqlDB.Exec(t,
-			`INSERT INTO system.jobs (id, status, payload, progress, num_runs, last_run) VALUES ($1, $2, $3, $4, $5, $6)`,
-			job.id, job.status, payloadBytes, progressBytes, job.numRuns, job.lastRun,
-		)
-	}
-
-	var res serverpb.JobsResponse
-	if err := getAdminJSONProto(s, "jobs", &res); err != nil {
-		t.Fatal(err)
-	}
-
-	// test that the select statement correctly converts expected jobs to retry-____ statuses
-	expectedStatuses := []struct {
-		status string
-		ids    []int64
-	}{
-		{"running", runningOnlyIds},
-		{"reverting", revertingOnlyIds},
-		{"retry-running", retryRunningIds},
-		{"retry-reverting", retryRevertingIds},
-	}
-	for _, expected := range expectedStatuses {
-		var jobsWithStatus []serverpb.JobResponse
-		for _, job := range res.Jobs {
-			for _, expectedID := range expected.ids {
-				if job.ID == expectedID {
-					jobsWithStatus = append(jobsWithStatus, job)
-				}
-			}
-		}
-
-		require.Len(t, jobsWithStatus, len(expected.ids))
-		for _, job := range jobsWithStatus {
-			assert.Equal(t, expected.status, job.Status)
-		}
-	}
-
-	// Trim down our result set to the jobs we injected.
-	resJobs := append([]serverpb.JobResponse(nil), res.Jobs...)
-	sort.Slice(resJobs, func(i, j int) bool {
-		return resJobs[i].ID < resJobs[j].ID
-	})
-	resJobs = resJobs[:len(testJobs)]
-
-	for i, job := range resJobs {
-		require.Equal(t, testJobs[i].id, job.ID)
-		require.Equal(t, len(testJobs[i].executionLog), len(job.ExecutionFailures))
-		for j, f := range job.ExecutionFailures {
-			tf := testJobs[i].executionLog[j]
-			require.Equal(t, tf.Status, f.Status)
-			require.Equal(t, tf.ExecutionStartMicros, f.Start.UnixMicro())
-			require.Equal(t, tf.ExecutionEndMicros, f.End.UnixMicro())
-			var expErr string
-			if tf.Error != nil {
-				expErr = errors.DecodeError(context.Background(), *tf.Error).Error()
-			} else {
-				expErr = tf.TruncatedError
-			}
-			require.Equal(t, expErr, f.Error)
-		}
-	}
 }
 
 func TestAdminAPILocations(t *testing.T) {
@@ -1833,8 +1634,8 @@ func TestAdminAPIQueryPlan(t *testing.T) {
 		query string
 		exp   []string
 	}{
-		{"SELECT sum(id) FROM api_test.t1", []string{"nodeNames\":[\"1\"]", "Columns: id"}},
-		{"SELECT sum(1) FROM api_test.t1 JOIN api_test.t2 on t1.id = t2.id", []string{"nodeNames\":[\"1\"]", "Columns: id"}},
+		{"SELECT sum(id) FROM api_test.t1", []string{"nodeNames\":[\"1\"]", "Out: @1"}},
+		{"SELECT sum(1) FROM api_test.t1 JOIN api_test.t2 on t1.id = t2.id", []string{"nodeNames\":[\"1\"]", "Out: @1"}},
 	}
 	for i, testCase := range testCases {
 		var res serverpb.QueryPlanResponse
@@ -2164,7 +1965,7 @@ func TestEnqueueRange(t *testing.T) {
 		expectedNonErrors int
 	}{
 		// Success cases
-		{0, "mvccGC", realRangeID, allReplicas, leaseholder},
+		{0, "gc", realRangeID, allReplicas, leaseholder},
 		{0, "split", realRangeID, allReplicas, leaseholder},
 		{0, "replicaGC", realRangeID, allReplicas, allReplicas},
 		{0, "RaFtLoG", realRangeID, allReplicas, allReplicas},
@@ -2174,10 +1975,6 @@ func TestEnqueueRange(t *testing.T) {
 		{1, "raftlog", realRangeID, leaseholder, leaseholder},
 		{2, "raftlog", realRangeID, leaseholder, 1},
 		{3, "raftlog", realRangeID, leaseholder, 1},
-		// Compatibility cases.
-		// TODO(nvanbenschoten): remove this in v23.1.
-		{0, "gc", realRangeID, allReplicas, leaseholder},
-		{0, "GC", realRangeID, allReplicas, leaseholder},
 		// Error cases
 		{0, "gv", realRangeID, allReplicas, none},
 		{0, "GC", fakeRangeID, allReplicas, none},
@@ -2211,9 +2008,9 @@ func TestEnqueueRange(t *testing.T) {
 
 	// Finally, test a few more basic error cases.
 	reqs := []*serverpb.EnqueueRangeRequest{
-		{NodeID: -1, Queue: "mvccGC"},
+		{NodeID: -1, Queue: "gc"},
 		{Queue: ""},
-		{RangeID: -1, Queue: "mvccGC"},
+		{RangeID: -1, Queue: "gc"},
 	}
 	for _, req := range reqs {
 		t.Run(fmt.Sprint(req), func(t *testing.T) {
@@ -2379,7 +2176,6 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 	}, 10*time.Second, 100*time.Millisecond, "timed out waiting for server to lose cluster access")
 
 	// Set up an admin client.
-	//lint:ignore SA1019 grpc.WithInsecure is deprecated
 	conn, err := grpc.Dial(decomSrv.ServingRPCAddr(), grpc.WithInsecure())
 	require.NoError(t, err)
 	defer func() {
@@ -2412,14 +2208,14 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			_, err := c.DataDistribution(ctx, &serverpb.DataDistributionRequest{})
 			return err
 		}},
-		{"Decommission", codes.Internal, func(c serverpb.AdminClient) error {
+		{"Decommission", codes.Unknown, func(c serverpb.AdminClient) error {
 			_, err := c.Decommission(ctx, &serverpb.DecommissionRequest{
 				NodeIDs:          []roachpb.NodeID{srv.NodeID(), decomSrv.NodeID()},
 				TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONED,
 			})
 			return err
 		}},
-		{"DecommissionStatus", codes.Internal, func(c serverpb.AdminClient) error {
+		{"DecommissionStatus", codes.Unknown, func(c serverpb.AdminClient) error {
 			_, err := c.DecommissionStatus(ctx, &serverpb.DecommissionStatusRequest{
 				NodeIDs: []roachpb.NodeID{srv.NodeID(), decomSrv.NodeID()},
 			})
@@ -2508,6 +2304,190 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 				require.Equal(t, tc.expectCode, s.Code())
 				return true
 			}, 10*time.Second, 100*time.Millisecond, "timed out waiting for gRPC error, got %s", err)
+		})
+	}
+}
+
+func TestNodeLivenessLivenessStatus(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	now := timeutil.Now()
+	threshold := 5 * time.Minute
+
+	for _, tc := range []struct {
+		liveness livenesspb.Liveness
+		expected livenesspb.NodeLivenessStatus
+	}{
+		// Valid status.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(5 * time.Minute).UnixNano(),
+				},
+				Draining: false,
+			},
+			expected: livenesspb.NodeLivenessStatus_LIVE,
+		},
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					// Expires just slightly in the future.
+					WallTime: now.UnixNano() + 1,
+				},
+				Draining: false,
+			},
+			expected: livenesspb.NodeLivenessStatus_LIVE,
+		},
+		// Expired status.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					// Just expired.
+					WallTime: now.UnixNano(),
+				},
+				Draining: false,
+			},
+			expected: livenesspb.NodeLivenessStatus_UNAVAILABLE,
+		},
+		// Expired status.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.UnixNano(),
+				},
+				Draining: false,
+			},
+			expected: livenesspb.NodeLivenessStatus_UNAVAILABLE,
+		},
+		// Max bound of expired.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(-threshold).UnixNano() + 1,
+				},
+				Draining: false,
+			},
+			expected: livenesspb.NodeLivenessStatus_UNAVAILABLE,
+		},
+		// Dead status.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(-threshold).UnixNano(),
+				},
+				Draining: false,
+			},
+			expected: livenesspb.NodeLivenessStatus_DEAD,
+		},
+		// Decommissioning.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(time.Second).UnixNano(),
+				},
+				Membership: livenesspb.MembershipStatus_DECOMMISSIONING,
+				Draining:   false,
+			},
+			expected: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+		},
+		// Decommissioning + expired.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(-threshold).UnixNano(),
+				},
+				Membership: livenesspb.MembershipStatus_DECOMMISSIONING,
+				Draining:   false,
+			},
+			expected: livenesspb.NodeLivenessStatus_DECOMMISSIONED,
+		},
+		// Decommissioned + live.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(time.Second).UnixNano(),
+				},
+				Membership: livenesspb.MembershipStatus_DECOMMISSIONED,
+				Draining:   false,
+			},
+			// Despite having marked the node as fully decommissioned, through
+			// this NodeLivenessStatus API we still surface the node as
+			// "Decommissioning". See #50707 for more details.
+			expected: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+		},
+		// Decommissioned + expired.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(-threshold).UnixNano(),
+				},
+				Membership: livenesspb.MembershipStatus_DECOMMISSIONED,
+				Draining:   false,
+			},
+			expected: livenesspb.NodeLivenessStatus_DECOMMISSIONED,
+		},
+		// Draining
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(5 * time.Minute).UnixNano(),
+				},
+				Draining: true,
+			},
+			expected: livenesspb.NodeLivenessStatus_DRAINING,
+		},
+		// Decommissioning that is unavailable.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.UnixNano(),
+				},
+				Draining:   false,
+				Membership: livenesspb.MembershipStatus_DECOMMISSIONING,
+			},
+			expected: livenesspb.NodeLivenessStatus_UNAVAILABLE,
+		},
+		// Draining that is unavailable.
+		{
+			liveness: livenesspb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.UnixNano(),
+				},
+				Draining: true,
+			},
+			expected: livenesspb.NodeLivenessStatus_UNAVAILABLE,
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			if a, e := livenessStatus(tc.liveness, now, threshold), tc.expected; a != e {
+				t.Errorf("liveness status was %s, wanted %s", a.String(), e.String())
+			}
 		})
 	}
 }

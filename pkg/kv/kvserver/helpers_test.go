@@ -21,13 +21,13 @@ import (
 	"math/rand"
 	"testing"
 	"time"
+	"unsafe"
 
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -35,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	circuit2 "github.com/cockroachdb/cockroach/pkg/util/circuit"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
@@ -179,9 +178,9 @@ func manualQueue(s *Store, q queueImpl, repl *Replica) error {
 	return err
 }
 
-// ManualMVCCGC processes the specified replica using the store's MVCC GC queue.
-func (s *Store) ManualMVCCGC(repl *Replica) error {
-	return manualQueue(s, s.mvccGCQueue, repl)
+// ManualGC processes the specified replica using the store's GC queue.
+func (s *Store) ManualGC(repl *Replica) error {
+	return manualQueue(s, s.gcQueue, repl)
 }
 
 // ManualReplicaGC processes the specified replica using the store's replica
@@ -215,22 +214,11 @@ func NewTestStorePool(cfg StoreConfig) *StorePool {
 		func() int {
 			return 1
 		},
-		func(roachpb.NodeID, time.Time, time.Duration) livenesspb.NodeLivenessStatus {
-			return livenesspb.NodeLivenessStatus_LIVE
+		func(roachpb.NodeID, time.Time, time.Duration) (NodeStatus, NodeMembershipStatus) {
+			return NodeStatusLive, NodeMembershipStatusActive
 		},
 		/* deterministic */ false,
 	)
-}
-
-func (r *Replica) Breaker() *circuit2.Breaker {
-	return r.breaker.wrapped
-}
-
-func (r *Replica) VisitBreakerContexts(fn func(ctx context.Context)) {
-	r.breaker.cancels.Visit(func(ctx context.Context, _ func()) (remove bool) {
-		fn(ctx)
-		return false // keep
-	})
 }
 
 func (r *Replica) AssertState(ctx context.Context, reader storage.Reader) {
@@ -474,10 +462,10 @@ func (r *Replica) GetQueueLastProcessed(ctx context.Context, queue string) (hlc.
 	return r.getQueueLastProcessed(ctx, queue)
 }
 
-func (r *Replica) MaybeUnquiesceAndWakeLeader() bool {
+func (r *Replica) UnquiesceAndWakeLeader() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.maybeUnquiesceAndWakeLeaderLocked()
+	r.unquiesceAndWakeLeaderLocked()
 }
 
 func (r *Replica) ReadProtectedTimestamps(ctx context.Context) {
@@ -526,7 +514,7 @@ func WriteRandomDataToRange(
 }
 
 func WatchForDisappearingReplicas(t testing.TB, store *Store) {
-	m := make(map[roachpb.RangeID]struct{})
+	m := make(map[int64]struct{})
 	for {
 		select {
 		case <-store.Stopper().ShouldQuiesce():
@@ -534,12 +522,13 @@ func WatchForDisappearingReplicas(t testing.TB, store *Store) {
 		default:
 		}
 
-		store.mu.replicasByRangeID.Range(func(repl *Replica) {
-			m[repl.RangeID] = struct{}{}
+		store.mu.replicas.Range(func(k int64, v unsafe.Pointer) bool {
+			m[k] = struct{}{}
+			return true
 		})
 
 		for k := range m {
-			if _, ok := store.mu.replicasByRangeID.Load(k); !ok {
+			if _, ok := store.mu.replicas.Load(k); !ok {
 				t.Fatalf("r%d disappeared from Store.mu.replicas map", k)
 			}
 		}

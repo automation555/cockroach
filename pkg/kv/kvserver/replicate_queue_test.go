@@ -33,8 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/spanconfig"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -78,9 +76,9 @@ func TestReplicateQueueRebalance(t *testing.T) {
 
 	const newRanges = 10
 	trackedRanges := map[roachpb.RangeID]struct{}{}
-	for i := uint32(0); i < newRanges; i++ {
-		tableID := bootstrap.TestingUserDescID(i)
-		splitKey := keys.SystemSQLCodec.TablePrefix(tableID)
+	for i := 0; i < newRanges; i++ {
+		tableID := keys.MinUserDescID + i
+		splitKey := keys.SystemSQLCodec.TablePrefix(uint32(tableID))
 		// Retry the splits on descriptor errors which are likely as the replicate
 		// queue is already hard at work.
 		testutils.SucceedsSoon(t, func() error {
@@ -119,11 +117,7 @@ func TestReplicateQueueRebalance(t *testing.T) {
 		return counts
 	}
 
-	initialRanges, err := server.ExpectedInitialRangeCount(
-		keys.SystemSQLCodec,
-		zonepb.DefaultZoneConfigRef(),
-		zonepb.DefaultSystemZoneConfigRef(),
-	)
+	initialRanges, err := server.ExpectedInitialRangeCount(tc.Servers[0].DB(), zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,81 +239,79 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 	skip.UnderRace(t, "takes >1min under race")
 
 	ctx := context.Background()
-	// The goal of this test is to ensure that down replication occurs
-	// correctly using the replicate queue, and to ensure that's the case,
-	// the test cluster needs to be kept in auto replication mode.
-	tc := testcluster.StartTestCluster(t, 3,
+	const replicaCount = 3
+
+	// The goal of this test is to ensure that down replication occurs correctly
+	// using the replicate queue, and to ensure that's the case, the test
+	// cluster needs to be kept in auto replication mode.
+	tc := testcluster.StartTestCluster(t, replicaCount+2,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationAuto,
 			ServerArgs: base.TestServerArgs{
 				ScanMinIdleTime: 10 * time.Millisecond,
 				ScanMaxIdleTime: 10 * time.Millisecond,
-				Knobs: base.TestingKnobs{
-					SpanConfig: &spanconfig.TestingKnobs{
-						ConfigureScratchRange: true,
-					},
-				},
 			},
 		},
 	)
 	defer tc.Stopper().Stop(ctx)
 
+	// Disable the replication queues so that the range we're about to create
+	// doesn't get down-replicated too soon.
+	tc.ToggleReplicateQueues(false)
+
 	testKey := tc.ScratchRange(t)
-	testutils.SucceedsSoon(t, func() error {
-		desc := tc.LookupRangeOrFatal(t, testKey)
-		if got := len(desc.Replicas().Descriptors()); got != 3 {
-			return errors.Newf("expected 3 replicas for scratch range, found %d", got)
-		}
-		return nil
-	})
-
-	_, err := tc.ServerConn(0).Exec(
-		`ALTER RANGE DEFAULT CONFIGURE ZONE USING num_replicas = 1`,
-	)
-	require.NoError(t, err)
-
-	for _, s := range tc.Servers {
-		require.NoError(t, s.Stores().VisitStores(func(s *kvserver.Store) error {
-			require.NoError(t, s.ForceReplicationScanAndProcess())
-			return nil
-		}))
-	}
+	desc := tc.LookupRangeOrFatal(t, testKey)
+	// At the end of StartTestCluster(), all ranges have 5 replicas since they're
+	// all "system ranges". When the ScratchRange() splits its range, it also
+	// starts up with 5 replicas. Since it's not a system range, its default zone
+	// config asks for 3x replication, and the replication queue will
+	// down-replicate it.
+	require.Len(t, desc.Replicas().Descriptors(), 5)
+	// Re-enable the replication queue.
+	tc.ToggleReplicateQueues(true)
 
 	// Now wait until the replicas have been down-replicated back to the
 	// desired number.
 	testutils.SucceedsSoon(t, func() error {
-		desc := tc.LookupRangeOrFatal(t, testKey)
-		if got := len(desc.Replicas().Descriptors()); got != 1 {
-			return errors.Errorf("expected 1 replica, found %d", got)
+		descriptor, err := tc.LookupRange(testKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(descriptor.InternalReplicas) != replicaCount {
+			return errors.Errorf("replica count, want %d, current %d", replicaCount, len(desc.InternalReplicas))
 		}
 		return nil
 	})
 
-	desc := tc.LookupRangeOrFatal(t, testKey)
 	infos, err := filterRangeLog(
 		tc.Conns[0], desc.RangeID, kvserverpb.RangeLogEventType_remove_voter, kvserverpb.ReasonRangeOverReplicated,
 	)
-	require.NoError(t, err)
-	require.Truef(t, len(infos) >= 1, "found no down replication due to over-replication in the range logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) < 1 {
+		t.Fatalf("found no downreplication due to over-replication in the range logs")
+	}
 }
 
 func scanAndGetNumNonVoters(
-	t *testing.T, tc *testcluster.TestCluster, scratchKey roachpb.Key,
+	ctx context.Context,
+	t *testing.T,
+	tc *testcluster.TestCluster,
+	store *kvserver.Store,
+	scratchKey roachpb.Key,
 ) (numNonVoters int) {
-	for _, s := range tc.Servers {
-		// Nudge internal queues to up/down-replicate our scratch range.
-		require.NoError(t, s.Stores().VisitStores(func(s *kvserver.Store) error {
-			require.NoError(t, s.ForceSplitScanAndProcess())
-			require.NoError(t, s.ForceReplicationScanAndProcess())
-			require.NoError(t, s.ForceRaftSnapshotQueueProcess())
-			return nil
-		}))
+	// Nudge the replicateQueue to up/down-replicate our scratch range.
+	if err := store.ForceReplicationScanAndProcess(); err != nil {
+		t.Fatal(err)
 	}
 	scratchRange := tc.LookupRangeOrFatal(t, scratchKey)
 	row := tc.ServerConn(0).QueryRow(
-		`SELECT coalesce(max(array_length(non_voting_replicas, 1)),0) FROM crdb_internal.ranges_no_leases WHERE range_id=$1`,
+		`SELECT array_length(non_voting_replicas, 1) FROM crdb_internal.ranges_no_leases WHERE range_id=$1`,
 		scratchRange.GetRangeID())
-	require.NoError(t, row.Scan(&numNonVoters))
+	err := row.Scan(&numNonVoters)
+	log.Warningf(ctx, "error while retrieving the number of non-voters: %s", err)
+
 	return numNonVoters
 }
 
@@ -331,17 +323,9 @@ func TestReplicateQueueUpAndDownReplicateNonVoters(t *testing.T) {
 	skip.UnderRace(t)
 	defer log.Scope(t).Close(t)
 
+	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationAuto,
-			ServerArgs: base.TestServerArgs{
-				Knobs: base.TestingKnobs{
-					SpanConfig: &spanconfig.TestingKnobs{
-						ConfigureScratchRange: true,
-					},
-				},
-			},
-		},
+		base.TestClusterArgs{ReplicationMode: base.ReplicationAuto},
 	)
 	defer tc.Stopper().Stop(context.Background())
 
@@ -361,10 +345,13 @@ func TestReplicateQueueUpAndDownReplicateNonVoters(t *testing.T) {
 	// Add two new servers and expect that 2 non-voters are added to the range.
 	tc.AddAndStartServer(t, base.TestServerArgs{})
 	tc.AddAndStartServer(t, base.TestServerArgs{})
+	store, err := tc.Server(0).GetStores().(*kvserver.Stores).GetStore(
+		tc.Server(0).GetFirstStoreID())
+	require.NoError(t, err)
 
 	var expectedNonVoterCount = 2
 	testutils.SucceedsSoon(t, func() error {
-		if found := scanAndGetNumNonVoters(t, tc, scratchKey); found != expectedNonVoterCount {
+		if found := scanAndGetNumNonVoters(ctx, t, tc, store, scratchKey); found != expectedNonVoterCount {
 			return errors.Errorf("expected upreplication to %d non-voters; found %d",
 				expectedNonVoterCount, found)
 		}
@@ -377,7 +364,7 @@ func TestReplicateQueueUpAndDownReplicateNonVoters(t *testing.T) {
 	require.NoError(t, err)
 	expectedNonVoterCount = 0
 	testutils.SucceedsSoon(t, func() error {
-		if found := scanAndGetNumNonVoters(t, tc, scratchKey); found != expectedNonVoterCount {
+		if found := scanAndGetNumNonVoters(ctx, t, tc, store, scratchKey); found != expectedNonVoterCount {
 			return errors.Errorf("expected downreplication to %d non-voters; found %d",
 				expectedNonVoterCount, found)
 		}
@@ -422,16 +409,7 @@ func TestReplicateQueueDecommissioningNonVoters(t *testing.T) {
 	// Setup a scratch range on a test cluster with 2 non-voters and 1 voter.
 	setupFn := func(t *testing.T) (*testcluster.TestCluster, roachpb.RangeDescriptor) {
 		tc := testcluster.StartTestCluster(t, 5,
-			base.TestClusterArgs{
-				ReplicationMode: base.ReplicationAuto,
-				ServerArgs: base.TestServerArgs{
-					Knobs: base.TestingKnobs{
-						SpanConfig: &spanconfig.TestingKnobs{
-							ConfigureScratchRange: true,
-						},
-					},
-				},
-			},
+			base.TestClusterArgs{ReplicationMode: base.ReplicationAuto},
 		)
 
 		scratchKey := tc.ScratchRange(t)
@@ -546,18 +524,15 @@ func TestReplicateQueueDeadNonVoters(t *testing.T) {
 				ReplicationMode: base.ReplicationAuto,
 				ServerArgs: base.TestServerArgs{
 					Knobs: base.TestingKnobs{
-						SpanConfig: &spanconfig.TestingKnobs{
-							ConfigureScratchRange: true,
-						},
 						NodeLiveness: kvserver.NodeLivenessTestingKnobs{
 							StorePoolNodeLivenessFn: func(
 								id roachpb.NodeID, now time.Time, duration time.Duration,
-							) livenesspb.NodeLivenessStatus {
+							) (kvserver.NodeStatus, kvserver.NodeMembershipStatus) {
 								val := livenessTrap.Load()
 								if val == nil {
-									return livenesspb.NodeLivenessStatus_LIVE
+									return kvserver.NodeStatusLive, kvserver.NodeMembershipStatusActive
 								}
-								return val.(func(nodeID roachpb.NodeID) livenesspb.NodeLivenessStatus)(id)
+								return val.(func(nodeID roachpb.NodeID) kvserver.NodeStatus)(id), kvserver.NodeMembershipStatusActive
 							},
 						},
 					},
@@ -583,13 +558,13 @@ func TestReplicateQueueDeadNonVoters(t *testing.T) {
 	}
 
 	markDead := func(nodeIDs []roachpb.NodeID) {
-		livenessTrap.Store(func(id roachpb.NodeID) livenesspb.NodeLivenessStatus {
+		livenessTrap.Store(func(id roachpb.NodeID) kvserver.NodeStatus {
 			for _, dead := range nodeIDs {
 				if dead == id {
-					return livenesspb.NodeLivenessStatus_DEAD
+					return kvserver.NodeStatusDead
 				}
 			}
-			return livenesspb.NodeLivenessStatus_LIVE
+			return kvserver.NodeStatusLive
 		})
 	}
 
@@ -696,11 +671,6 @@ func TestReplicateQueueSwapVotersWithNonVoters(t *testing.T) {
 					{
 						Key: "rack", Value: strconv.Itoa(i),
 					},
-				},
-			},
-			Knobs: base.TestingKnobs{
-				SpanConfig: &spanconfig.TestingKnobs{
-					ConfigureScratchRange: true,
 				},
 			},
 		}
@@ -842,11 +812,6 @@ func TestReplicateQueueShouldQueueNonVoter(t *testing.T) {
 					},
 				},
 			},
-			Knobs: base.TestingKnobs{
-				SpanConfig: &spanconfig.TestingKnobs{
-					ConfigureScratchRange: true,
-				},
-			},
 		}
 	}
 
@@ -952,7 +917,7 @@ func queryRangeLog(
 			}
 			var info kvserverpb.RangeLogEvent_Info
 			if err := json.Unmarshal([]byte(infoStr), &info); err != nil {
-				return errors.Wrapf(err, "error unmarshaling info string %q", infoStr)
+				return errors.Errorf("error unmarshaling info string %q: %s", infoStr, err)
 			}
 			events = append(events, info)
 		}
@@ -1010,7 +975,6 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	skip.UnderStress(t, 38565)
 	skip.UnderRaceWithIssue(t, 38565)
 	skip.UnderShort(t, 38565)
-	skip.UnderDeadlockWithIssue(t, 38565)
 	ctx := context.Background()
 
 	// Create a cluster with really small ranges.
@@ -1127,7 +1091,7 @@ const (
 
 func (h delayingRaftMessageHandler) HandleRaftRequest(
 	ctx context.Context,
-	req *kvserverpb.RaftMessageRequest,
+	req *kvserver.RaftMessageRequest,
 	respStream kvserver.RaftMessageResponseStream,
 ) *roachpb.Error {
 	if h.rangeID != req.RangeID {
