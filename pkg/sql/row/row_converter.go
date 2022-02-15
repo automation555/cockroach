@@ -16,10 +16,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -148,9 +149,18 @@ func GenerateInsertRow(
 
 	// Verify the column constraints.
 	//
-	// During mutations (INSERT, UPDATE, UPSERT), this is checked by
-	// sql.enforceLocalColumnConstraints. These checks are required for IMPORT
-	// statements.
+	// We would really like to use enforceLocalColumnConstraints() here,
+	// but this is not possible because of some brain damage in the
+	// Insert() constructor, which causes insertCols to contain
+	// duplicate columns descriptors: computed columns are listed twice,
+	// one will receive a NULL value and one will receive a comptued
+	// value during execution. It "works out in the end" because the
+	// latter (non-NULL) value overwrites the earlier, but
+	// enforceLocalColumnConstraints() does not know how to reason about
+	// this.
+	//
+	// In the end it does not matter much, this code is going away in
+	// favor of the (simpler, correct) code in the CBO.
 
 	// Check to see if NULL is being inserted into any non-nullable column.
 	for _, col := range tableDesc.WritableColumns() {
@@ -204,14 +214,16 @@ type DatumRowConverter struct {
 	TargetColOrds util.FastIntSet
 
 	// The rest of these are derived from tableDesc, just cached here.
-	ri                    Inserter
-	EvalCtx               *tree.EvalContext
-	cols                  []catalog.Column
-	VisibleCols           []catalog.Column
-	VisibleColTypes       []*types.T
-	computedExprs         []tree.TypedExpr
-	defaultCache          []tree.TypedExpr
-	computedIVarContainer schemaexpr.RowIndexedVarContainer
+	ri                        Inserter
+	EvalCtx                   *tree.EvalContext
+	cols                      []catalog.Column
+	VisibleCols               []catalog.Column
+	VisibleColTypes           []*types.T
+	computedExprs             []tree.TypedExpr
+	partialIndexExprs         map[descpb.IndexID]tree.TypedExpr
+	defaultCache              []tree.TypedExpr
+	computedIVarContainer     schemaexpr.RowIndexedVarContainer
+	partialIndexIVarContainer schemaexpr.RowIndexedVarContainer
 
 	// FractionFn is used to set the progress header in KVBatches.
 	CompletedRowFn func() int64
@@ -255,10 +267,6 @@ func (c *DatumRowConverter) getSequenceAnnotation(
 
 	var seqNameToMetadata map[string]*SequenceMetadata
 	var seqIDToMetadata map[descpb.ID]*SequenceMetadata
-	// TODO(postamar): give the tree.EvalContext a useful interface
-	// instead of cobbling a descs.Collection in this way.
-	cf := descs.NewBareBonesCollectionFactory(evalCtx.Settings, evalCtx.Codec)
-	descsCol := cf.MakeCollection(evalCtx.Context, descs.NewTemporarySchemaProvider(evalCtx.SessionDataStack))
 	err := evalCtx.DB.Txn(evalCtx.Context, func(ctx context.Context, txn *kv.Txn) error {
 		seqNameToMetadata = make(map[string]*SequenceMetadata)
 		seqIDToMetadata = make(map[descpb.ID]*SequenceMetadata)
@@ -266,16 +274,22 @@ func (c *DatumRowConverter) getSequenceAnnotation(
 			return err
 		}
 		for seqID := range sequenceIDs {
-			seqDesc, err := descsCol.Direct().MustGetTableDescByID(ctx, txn, seqID)
+			seqDesc, err := catalogkv.MustGetTableDescByID(ctx, txn, evalCtx.Codec, seqID)
 			if err != nil {
 				return err
 			}
-			if seqDesc.GetSequenceOpts() == nil {
-				return errors.Errorf("relation %q (%d) is not a sequence", seqDesc.GetName(), seqDesc.GetID())
+
+			seqOpts := seqDesc.GetSequenceOpts()
+			if seqOpts == nil {
+				return errors.Newf("descriptor %s is not a sequence", seqDesc.GetName())
 			}
-			seqMetadata := &SequenceMetadata{seqDesc: seqDesc}
+
+			seqMetadata := &SequenceMetadata{
+				id:      seqID,
+				seqDesc: seqDesc,
+			}
 			seqNameToMetadata[seqDesc.GetName()] = seqMetadata
-			seqIDToMetadata[seqID] = seqMetadata
+			seqIDToMetadata[seqDesc.GetID()] = seqMetadata
 		}
 		return nil
 	})
@@ -339,7 +353,7 @@ func NewDatumRowConverter(
 		evalCtx.Codec,
 		tableDesc,
 		cols,
-		&tree.DatumAlloc{},
+		&rowenc.DatumAlloc{},
 		&evalCtx.Settings.SV,
 		evalCtx.SessionData().Internal,
 		metrics,
@@ -439,7 +453,21 @@ func NewDatumRowConverter(
 		c.EvalCtx,
 		&semaCtxCopy)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error evaluating computed expression for IMPORT INTO")
+		return nil, errors.Wrapf(err, "error type checking and building computed expression for IMPORT INTO")
+	}
+
+	// Here, partialIndexExprs will be nil if there are no partial indexes, or a
+	// map of predicate expressions for each partial index in the input list of
+	// indexes.
+	c.partialIndexExprs, _, err = schemaexpr.MakePartialIndexExprs(ctx, c.tableDesc.PartialIndexes(),
+		c.tableDesc.PublicColumns(), c.tableDesc, c.EvalCtx, &semaCtxCopy)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error type checking and building partial index expression for IMPORT INTO")
+	}
+
+	c.partialIndexIVarContainer = schemaexpr.RowIndexedVarContainer{
+		Mapping: ri.InsertColIDtoRowIndex,
+		Cols:    tableDesc.PublicColumns(),
 	}
 
 	c.computedIVarContainer = schemaexpr.RowIndexedVarContainer{
@@ -485,9 +513,31 @@ func (c *DatumRowConverter) Row(ctx context.Context, sourceID int32, rowIndex in
 	if err != nil {
 		return errors.Wrap(err, "generate insert row")
 	}
-	// TODO(mgartner): Add partial index IDs to ignoreIndexes that we should
-	// not delete entries from.
+
+	// Initialize the PartialIndexUpdateHelper with evaluated predicates for
+	// partial indexes.
 	var pm PartialIndexUpdateHelper
+	{
+		c.partialIndexIVarContainer.CurSourceRow = insertRow
+		c.EvalCtx.PushIVarContainer(&c.partialIndexIVarContainer)
+		partialIndexPutVals := make(tree.Datums, len(c.tableDesc.PartialIndexes()))
+		if len(partialIndexPutVals) > 0 {
+			for i, idx := range c.tableDesc.PartialIndexes() {
+				texpr := c.partialIndexExprs[idx.GetID()]
+				val, err := texpr.Eval(c.EvalCtx)
+				if err != nil {
+					return errors.Wrap(err, "evaluate partial index expression")
+				}
+				partialIndexPutVals[i] = val
+			}
+		}
+		err = pm.Init(partialIndexPutVals, nil /* partialIndexDelVals */, c.tableDesc)
+		if err != nil {
+			return errors.Wrap(err, "error init'ing PartialIndexUpdateHelper")
+		}
+		c.EvalCtx.PopIVarContainer()
+	}
+
 	if err := c.ri.InsertRow(
 		ctx,
 		KVInserter(func(kv roachpb.KeyValue) {

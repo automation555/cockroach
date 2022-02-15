@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -841,29 +840,6 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 	assert.Zero(t, importSummary.Rows)
 }
 
-func TestImportWithPartialIndexesErrs(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	s, db, _ := serverutils.StartServer(t,
-		base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				DistSQL: &execinfra.TestingKnobs{
-					BulkAdderFlushesEveryBatch: true,
-				},
-			},
-		})
-	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
-
-	sqlDB := sqlutils.MakeSQLRunner(db)
-	sqlDB.Exec(t, `CREATE DATABASE d`)
-	sqlDB.Exec(t, "CREATE TABLE t (id INT, data STRING, INDEX (data) WHERE id > 0)")
-	defer sqlDB.Exec(t, `DROP TABLE t`)
-
-	sqlDB.ExpectErr(t, "cannot import into table with partial indexes", `IMPORT INTO t (id, data) CSV DATA ('https://foo.bar')`)
-}
-
 func (ses *generatedStorage) externalStorageFactory() cloud.ExternalStorageFactory {
 	return func(_ context.Context, es roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
 		uri, err := url.Parse(es.HttpPath.BaseUri)
@@ -907,7 +883,7 @@ func newTestSpec(
 	switch format.Format {
 	case roachpb.IOFileFormat_CSV:
 		descr = descForTable(ctx, t,
-			"CREATE TABLE simple (i INT PRIMARY KEY, s text )", 100, 150, 200, NoFKs)
+			"CREATE TABLE simple (i INT PRIMARY KEY, s text )", 100, 200, NoFKs)
 	case
 		roachpb.IOFileFormat_Mysqldump,
 		roachpb.IOFileFormat_MysqlOutfile,
@@ -915,7 +891,7 @@ func newTestSpec(
 		roachpb.IOFileFormat_PgCopy,
 		roachpb.IOFileFormat_Avro:
 		descr = descForTable(ctx, t,
-			"CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea default null)", 100, 150, 200, NoFKs)
+			"CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea default null)", 100, 200, NoFKs)
 	default:
 		t.Fatalf("Unsupported input format: %v", format)
 	}
@@ -1000,7 +976,7 @@ func avroFormat(t *testing.T, format roachpb.AvroOptions_Format) roachpb.IOFileF
 
 	if format != roachpb.AvroOptions_OCF {
 		// Need to load schema for record specific inputs.
-		bytes, err := ioutil.ReadFile(testutils.TestDataPath(t, "avro", "simple-schema.json"))
+		bytes, err := ioutil.ReadFile("testdata/avro/simple-schema.json")
 		require.NoError(t, err)
 		avro.SchemaJSON = string(bytes)
 		avro.RecordSeparator = '\n'

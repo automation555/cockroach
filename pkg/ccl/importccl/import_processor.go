@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -32,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -49,7 +47,6 @@ const readImportDataProcessorName = "readImportDataProcessor"
 
 var importPKAdderBufferSize = func() *settings.ByteSizeSetting {
 	s := settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
 		"kv.bulk_ingest.pk_buffer_size",
 		"the initial size of the BulkAdder buffer handling primary index imports",
 		32<<20,
@@ -59,7 +56,6 @@ var importPKAdderBufferSize = func() *settings.ByteSizeSetting {
 
 var importPKAdderMaxBufferSize = func() *settings.ByteSizeSetting {
 	s := settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
 		"kv.bulk_ingest.max_pk_buffer_size",
 		"the maximum size of the BulkAdder buffer handling primary index imports",
 		128<<20,
@@ -69,7 +65,6 @@ var importPKAdderMaxBufferSize = func() *settings.ByteSizeSetting {
 
 var importIndexAdderBufferSize = func() *settings.ByteSizeSetting {
 	s := settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
 		"kv.bulk_ingest.index_buffer_size",
 		"the initial size of the BulkAdder buffer handling secondary index imports",
 		32<<20,
@@ -79,7 +74,6 @@ var importIndexAdderBufferSize = func() *settings.ByteSizeSetting {
 
 var importIndexAdderMaxBufferSize = func() *settings.ByteSizeSetting {
 	s := settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
 		"kv.bulk_ingest.max_index_buffer_size",
 		"the maximum size of the BulkAdder buffer handling secondary index imports",
 		512<<20,
@@ -89,20 +83,12 @@ var importIndexAdderMaxBufferSize = func() *settings.ByteSizeSetting {
 
 var importBufferIncrementSize = func() *settings.ByteSizeSetting {
 	s := settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
 		"kv.bulk_ingest.buffer_increment",
 		"the size by which the BulkAdder attempts to grow its buffer before flushing",
 		32<<20,
 	)
 	return s
 }()
-
-var importAtNow = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	"bulkio.import_at_current_time.enabled",
-	"write imported data at the current timestamp, when each batch is flushed",
-	true,
-)
 
 // ImportBufferConfigSizes determines the minimum, maximum and step size for the
 // BulkAdder buffer used in import.
@@ -254,12 +240,6 @@ func makeInputConverter(
 	}
 
 	if singleTable != nil {
-		if idx := catalog.FindDeletableNonPrimaryIndex(singleTable, func(idx catalog.Index) bool {
-			return idx.IsPartial()
-		}); idx != nil {
-			return nil, unimplemented.NewWithIssue(50225, "cannot import into table with partial indexes")
-		}
-
 		// If we're using a format like CSV where data columns are not "named", and
 		// therefore cannot be mapped to schema columns, then require the user to
 		// use IMPORT INTO.
@@ -328,14 +308,6 @@ func ingestKvs(
 	defer span.Finish()
 
 	writeTS := hlc.Timestamp{WallTime: spec.WalltimeNanos}
-	writeAtRequestTime := true
-	if !importAtNow.Get(&flowCtx.Cfg.Settings.SV) {
-		log.Warningf(ctx, "ingesting import data with raw timestamps due to cluster setting")
-		writeAtRequestTime = false
-	} else if !flowCtx.Cfg.Settings.Version.IsActive(ctx, clusterversion.MVCCAddSSTable) {
-		log.Warningf(ctx, "ingesting import data with raw timestamps due to cluster version")
-		writeAtRequestTime = false
-	}
 
 	flushSize := func() int64 { return storageccl.MaxIngestBatchSize(flowCtx.Cfg.Settings) }
 
@@ -351,15 +323,13 @@ func ingestKvs(
 	minBufferSize, maxBufferSize, stepSize := importBufferConfigSizes(flowCtx.Cfg.Settings,
 		true /* isPKAdder */)
 	pkIndexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
-		Name:                     "pkAdder",
-		DisallowShadowingBelow:   writeTS,
-		SkipDuplicates:           true,
-		MinBufferSize:            minBufferSize,
-		MaxBufferSize:            maxBufferSize,
-		StepBufferSize:           stepSize,
-		SSTSize:                  flushSize,
-		InitialSplitsIfUnordered: int(spec.InitialSplits),
-		WriteAtRequestTime:       writeAtRequestTime,
+		Name:              "pkAdder",
+		DisallowShadowing: true,
+		SkipDuplicates:    true,
+		MinBufferSize:     minBufferSize,
+		MaxBufferSize:     maxBufferSize,
+		StepBufferSize:    stepSize,
+		SSTSize:           flushSize,
 	})
 	if err != nil {
 		return nil, err
@@ -369,15 +339,13 @@ func ingestKvs(
 	minBufferSize, maxBufferSize, stepSize = importBufferConfigSizes(flowCtx.Cfg.Settings,
 		false /* isPKAdder */)
 	indexAdder, err := flowCtx.Cfg.BulkAdder(ctx, flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{
-		Name:                     "indexAdder",
-		DisallowShadowingBelow:   writeTS,
-		SkipDuplicates:           true,
-		MinBufferSize:            minBufferSize,
-		MaxBufferSize:            maxBufferSize,
-		StepBufferSize:           stepSize,
-		SSTSize:                  flushSize,
-		InitialSplitsIfUnordered: int(spec.InitialSplits),
-		WriteAtRequestTime:       writeAtRequestTime,
+		Name:              "indexAdder",
+		DisallowShadowing: true,
+		SkipDuplicates:    true,
+		MinBufferSize:     minBufferSize,
+		MaxBufferSize:     maxBufferSize,
+		StepBufferSize:    stepSize,
+		SSTSize:           flushSize,
 	})
 	if err != nil {
 		return nil, err
