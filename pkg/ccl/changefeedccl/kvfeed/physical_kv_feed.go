@@ -34,7 +34,7 @@ type physicalConfig struct {
 
 type rangefeedFactory func(
 	ctx context.Context,
-	spans []roachpb.Span,
+	span roachpb.Span,
 	startFrom hlc.Timestamp,
 	withDiff bool,
 	eventC chan<- *roachpb.RangeFeedEvent,
@@ -53,17 +53,9 @@ func (p rangefeedFactory) Run(ctx context.Context, sink kvevent.Writer, cfg phys
 	// we throw it in a buffer here to pick up the slack between RangeFeed and
 	// the sink.
 	//
-	// TODO(dan): Right now, there are two buffers in the changefeed flow when
-	// using RangeFeeds, one here and the usual one between the KVFeed and the
-	// rest of the changefeed (the latter of which is implemented with an
-	// unbuffered channel, and so doesn't actually buffer). Ideally, we'd have
-	// one, but the structure of the KVFeed code right now makes this hard.
-	// Specifically, when a schema change happens, we need a barrier where we
-	// flush out every change before the schema change timestamp before we start
-	// emitting any changes from after the schema change. The KVFeed's
-	// `SchemaFeed` is responsible for detecting and enforcing these , but the
-	// after-KVFeed buffer doesn't have access to any of this state. A cleanup is
-	// in order.
+	// TODO(yevgeniy): Evaluate if having a barrier (i.e. the need to check schema feed prior
+	// to adding events) causes too many catchup scans.
+	//
 	feed := rangefeed{
 		memBuf: sink,
 		cfg:    cfg,
@@ -71,9 +63,12 @@ func (p rangefeedFactory) Run(ctx context.Context, sink kvevent.Writer, cfg phys
 	}
 	g := ctxgroup.WithContext(ctx)
 	g.GoCtx(feed.addEventsToBuffer)
-	g.GoCtx(func(ctx context.Context) error {
-		return p(ctx, cfg.Spans, cfg.Timestamp, cfg.WithDiff, feed.eventC)
-	})
+	for _, span := range cfg.Spans {
+		span := span
+		g.GoCtx(func(ctx context.Context) error {
+			return p(ctx, span, cfg.Timestamp, cfg.WithDiff, feed.eventC)
+		})
+	}
 	return g.Wait()
 }
 
@@ -85,11 +80,6 @@ func (p *rangefeed) addEventsToBuffer(ctx context.Context) error {
 			switch t := e.GetValue().(type) {
 			case *roachpb.RangeFeedValue:
 				kv := roachpb.KeyValue{Key: t.Key, Value: t.Value}
-				if p.cfg.Knobs.OnRangeFeedValue != nil {
-					if err := p.cfg.Knobs.OnRangeFeedValue(kv); err != nil {
-						return err
-					}
-				}
 				var prevVal roachpb.Value
 				if p.cfg.WithDiff {
 					prevVal = t.PrevValue
@@ -113,11 +103,6 @@ func (p *rangefeed) addEventsToBuffer(ctx context.Context) error {
 				); err != nil {
 					return err
 				}
-			case *roachpb.RangeFeedSSTable:
-				// For now, we just error on SST ingestion, since we currently don't
-				// expect SST ingestion into spans with active changefeeds.
-				return errors.Errorf("unexpected SST ingestion: %v", t)
-
 			default:
 				return errors.Errorf("unexpected RangeFeedEvent variant %v", t)
 			}
