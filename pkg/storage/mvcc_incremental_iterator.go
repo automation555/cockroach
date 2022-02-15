@@ -485,6 +485,21 @@ func (i *MVCCIncrementalIterator) UnsafeKey() MVCCKey {
 	return i.iter.UnsafeKey()
 }
 
+// HasPointAndRange implements SimpleMVCCIterator.
+func (i *MVCCIncrementalIterator) HasPointAndRange() (bool, bool) {
+	panic("not implemented")
+}
+
+// RangeBounds implements SimpleMVCCIterator.
+func (i *MVCCIncrementalIterator) RangeBounds() (roachpb.Key, roachpb.Key) {
+	panic("not implemented")
+}
+
+// RangeKeys implements SimpleMVCCIterator.
+func (i *MVCCIncrementalIterator) RangeKeys() []MVCCRangeKeyValue {
+	panic("not implemented")
+}
+
 // UnsafeValue returns the same value as Value, but the memory is invalidated on
 // the next call to {Next,Reset,Close}.
 func (i *MVCCIncrementalIterator) UnsafeValue() []byte {
@@ -498,6 +513,33 @@ func (i *MVCCIncrementalIterator) UnsafeValue() []byte {
 func (i *MVCCIncrementalIterator) NextIgnoringTime() {
 	for {
 		i.iter.Next()
+		if !i.checkValidAndSaveErr() {
+			return
+		}
+
+		if err := i.initMetaAndCheckForIntentOrInlineError(); err != nil {
+			return
+		}
+
+		// We have encountered an intent but it does not lie in the timestamp span
+		// (startTime, endTime] so we do not throw an error, and attempt to move to
+		// the next valid KV.
+		if i.meta.Txn != nil && i.intentPolicy != MVCCIncrementalIterIntentPolicyEmit {
+			continue
+		}
+
+		// We have a valid KV or an intent to emit.
+		return
+	}
+}
+
+// NextKeyIgnoringTime returns the next distinct key that would be encountered
+// in a non-incremental iteration by moving the underlying non-TBI iterator
+// forward. This method throws an error if it encounters an intent in the time
+// range (startTime, endTime] or sees an inline value.
+func (i *MVCCIncrementalIterator) NextKeyIgnoringTime() {
+	for {
+		i.iter.NextKey()
 		if !i.checkValidAndSaveErr() {
 			return
 		}
