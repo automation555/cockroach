@@ -267,9 +267,9 @@ const (
 	// on lease transfer Raft proposals. New leaseholders now forward their clock
 	// directly to the new lease start time.
 	DontProposeWriteTimestampForLeaseTransfers
-	// TenantSettingsTable adds the system table for tracking tenant usage.
-	TenantSettingsTable
-
+	// IncrementalBackupSubdir enables backing up new incremental backups to a
+	// dedicated subdirectory, to make it easier to apply a different ttl.
+	IncrementalBackupSubdir
 	// *************************************************
 	// Step (1): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -426,10 +426,9 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 60},
 	},
 	{
-		Key:     TenantSettingsTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 62},
+		Key:     IncrementalBackupSubdir,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 0},
 	},
-
 	// *************************************************
 	// Step (2): Add new versions here.
 	// Do not add new versions to a patch release.
