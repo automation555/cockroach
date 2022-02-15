@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -29,6 +30,7 @@ import (
 func (r *Replica) maybeAcquireProposalQuota(
 	ctx context.Context, quota uint64,
 ) (*quotapool.IntAlloc, error) {
+	var tm *metric.Timing // TODO(tbg): dummy
 	r.mu.RLock()
 	quotaPool := r.mu.proposalQuota
 	desc := *r.mu.state.Desc
@@ -53,6 +55,8 @@ func (r *Replica) maybeAcquireProposalQuota(
 		return nil, nil
 	}
 
+	tm.Event(ctx, "waiting on proposal quota")
+
 	// Trace if we're running low on available proposal quota; it might explain
 	// why we're taking so long.
 	if log.HasSpanOrEvent(ctx) {
@@ -61,6 +65,7 @@ func (r *Replica) maybeAcquireProposalQuota(
 		}
 	}
 	alloc, err := quotaPool.Acquire(ctx, quota)
+	tm.Event(ctx, "proposal quota acquired")
 	// Let quotapool errors due to being closed pass through.
 	if errors.HasType(err, (*quotapool.ErrClosed)(nil)) {
 		err = nil
@@ -87,7 +92,7 @@ func (r *Replica) updateProposalQuotaRaftMuLocked(
 
 	status := r.mu.internalRaftGroup.BasicStatus()
 	if r.mu.leaderID != lastLeaderID {
-		if r.replicaID == r.mu.leaderID {
+		if r.mu.replicaID == r.mu.leaderID {
 			// We're becoming the leader.
 			// Initialize the proposalQuotaBaseIndex at the applied index.
 			// After the proposal quota is enabled all entries applied by this replica
@@ -125,7 +130,7 @@ func (r *Replica) updateProposalQuotaRaftMuLocked(
 		}
 		return
 	} else if r.mu.proposalQuota == nil {
-		if r.replicaID == r.mu.leaderID {
+		if r.mu.replicaID == r.mu.leaderID {
 			log.Fatal(ctx, "leader has uninitialized proposalQuota pool")
 		}
 		// We're a follower.
