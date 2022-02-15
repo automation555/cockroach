@@ -206,15 +206,7 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 	ctx, ca.cancel = context.WithCancel(ctx)
 	ca.Ctx = ctx
 
-	initialHighWater, needsInitialScan := getKVFeedInitialParameters(ca.spec)
-
-	frontierHighWater := initialHighWater
-	if needsInitialScan {
-		// The frontier highwater marks the latest timestamp we don't need to emit
-		// spans for, and therefore should be 0 if an initial scan is needed
-		frontierHighWater = hlc.Timestamp{}
-	}
-	spans, err := ca.setupSpansAndFrontier(frontierHighWater)
+	spans, err := ca.setupSpansAndFrontier()
 
 	if err != nil {
 		ca.MoveToDraining(err)
@@ -271,7 +263,18 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 
 	ca.sink = &errorWrapperSink{wrapped: ca.sink}
 
-	ca.eventProducer, err = ca.startKVFeed(ctx, spans, initialHighWater, needsInitialScan, ca.sliMetrics)
+	// If the initial scan was disabled the highwater would've already been forwarded
+	needsInitialScan := ca.frontier.Frontier().IsEmpty()
+
+	// The "HighWater" of the KVFeed is the timestamp it will begin streaming
+	// change events from.  When there's an inital scan, we want the scan to cover
+	// data up to the StatementTime and change events to begin from that point.
+	kvFeedHighWater := ca.frontier.Frontier()
+	if needsInitialScan {
+		kvFeedHighWater = ca.spec.Feed.StatementTime
+	}
+
+	ca.eventProducer, err = ca.startKVFeed(ctx, spans, kvFeedHighWater, needsInitialScan, ca.sliMetrics)
 	if err != nil {
 		// Early abort in the case that there is an error creating the sink.
 		ca.MoveToDraining(err)
@@ -283,7 +286,7 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 		ca.eventConsumer = newNativeKVConsumer(ca.sink)
 	} else {
 		ca.eventConsumer = newKVEventToRowConsumer(
-			ctx, ca.flowCtx.Cfg, ca.frontier.SpanFrontier(), initialHighWater,
+			ctx, ca.flowCtx.Cfg, ca.frontier.SpanFrontier(), kvFeedHighWater,
 			ca.sink, ca.encoder, ca.spec.Feed, ca.knobs)
 	}
 }
@@ -401,16 +404,18 @@ func getKVFeedInitialParameters(
 }
 
 // setupSpans is called on start to extract the spans for this changefeed as a
-// slice and creates a span frontier with the initial resolved timestampsc. This
+// slice and creates a span frontier with the initial resolved timestamps. This
 // SpanFrontier only tracks the spans being watched on this node. There is a
 // different SpanFrontier elsewhere for the entire changefeed. This object is
 // used to filter out some previously emitted rows, and by the cloudStorageSink
 // to name its output files in lexicographically monotonic fashion.
-func (ca *changeAggregator) setupSpansAndFrontier(
-	initialHighWater hlc.Timestamp,
-) (spans []roachpb.Span, err error) {
+func (ca *changeAggregator) setupSpansAndFrontier() (spans []roachpb.Span, err error) {
+	var initialHighWater hlc.Timestamp
 	spans = make([]roachpb.Span, 0, len(ca.spec.Watches))
 	for _, watch := range ca.spec.Watches {
+		if initialHighWater.IsEmpty() || watch.InitialResolved.Less(initialHighWater) {
+			initialHighWater = watch.InitialResolved
+		}
 		spans = append(spans, watch.Span)
 	}
 
@@ -419,17 +424,20 @@ func (ca *changeAggregator) setupSpansAndFrontier(
 		return nil, err
 	}
 
+	checkpointedSpanTs := ca.spec.Checkpoint.Timestamp
+
+	// Checkpoint records from 21.2 were used only for backfills and did not store
+	// the timestamp, since in a backfill it must either be the StatementTime for
+	// an initial backfill, or right after the high-water for schema backfills.
+	if checkpointedSpanTs.IsEmpty() {
+		if initialHighWater.IsEmpty() {
+			checkpointedSpanTs = ca.spec.Feed.StatementTime
+		} else {
+			checkpointedSpanTs = initialHighWater.Next()
+		}
+	}
 	// Checkpointed spans are spans that were above the highwater mark, and we
 	// must preserve that information in the frontier for future checkpointing.
-	// If we don't have a highwater yet (during initial scan) they must at least
-	// be from StatementTime, and given an initial highwater they must all by
-	// definition have been at or after initialHighWater.Next()
-	var checkpointedSpanTs hlc.Timestamp
-	if initialHighWater.IsEmpty() {
-		checkpointedSpanTs = ca.spec.Feed.StatementTime
-	} else {
-		checkpointedSpanTs = initialHighWater.Next()
-	}
 	for _, checkpointedSpan := range ca.spec.Checkpoint.Spans {
 		if _, err := ca.frontier.Forward(checkpointedSpan, checkpointedSpanTs); err != nil {
 			return nil, err
@@ -547,14 +555,15 @@ func (ca *changeAggregator) noteResolvedSpan(resolved *jobspb.ResolvedSpan) erro
 	forceFlush := resolved.BoundaryType != jobspb.ResolvedSpan_NONE
 
 	checkpointFrontier := advanced &&
-		(forceFlush || timeutil.Since(ca.lastFlush) > ca.flushFrequency)
+		(forceFlush || ca.lastFlush.Add(ca.flushFrequency).Before(timeutil.Now()))
 
-	// If backfilling we must also consider the Backfill Checkpointing frequency
-	checkpointBackfill := ca.spec.JobID != 0 && /* enterprise changefeed */
-		resolved.Timestamp.Equal(ca.frontier.BackfillTS()) &&
-		canCheckpointBackfill(&ca.flowCtx.Cfg.Settings.SV, ca.lastFlush)
+	// At a lower frequency we checkpoint specific spans in the job progress
+	// either in backfills or if the highwater mark is excessively lagging behind
+	checkpointSpans := ca.spec.JobID != 0 && /* enterprise changefeed */
+		(resolved.Timestamp.Equal(ca.frontier.BackfillTS()) || ca.frontier.hasLaggingSpans(&ca.flowCtx.Cfg.Settings.SV)) &&
+		canCheckpointSpans(&ca.flowCtx.Cfg.Settings.SV, ca.lastFlush)
 
-	if checkpointFrontier || checkpointBackfill {
+	if checkpointFrontier || checkpointSpans {
 		defer func() {
 			ca.lastFlush = timeutil.Now()
 		}()
@@ -742,7 +751,6 @@ func (c *kvEventToRowConsumer) eventToRow(
 		return r, err
 	}
 
-	r.tableDesc = desc
 	rf, err := c.rfCache.RowFetcherForTableDesc(desc)
 	if err != nil {
 		return r, err
@@ -757,7 +765,7 @@ func (c *kvEventToRowConsumer) eventToRow(
 		return r, err
 	}
 
-	r.datums, err = rf.NextRow(ctx)
+	r.datums, r.tableDesc, _, err = rf.NextRow(ctx)
 	if err != nil {
 		return r, err
 	}
@@ -771,10 +779,8 @@ func (c *kvEventToRowConsumer) eventToRow(
 
 	// Assert that we don't get a second row from the row.Fetcher. We
 	// fed it a single KV, so that would be surprising.
-	nextRow := encodeRow{
-		tableDesc: desc,
-	}
-	nextRow.datums, err = rf.NextRow(ctx)
+	var nextRow encodeRow
+	nextRow.datums, nextRow.tableDesc, _, err = rf.NextRow(ctx)
 	if err != nil {
 		return r, err
 	}
@@ -786,7 +792,6 @@ func (c *kvEventToRowConsumer) eventToRow(
 	_, withDiff := c.details.Opts[changefeedbase.OptDiff]
 	if withDiff {
 		prevRF := rf
-		r.prevTableDesc = r.tableDesc
 		if prevSchemaTimestamp != schemaTimestamp {
 			// If the previous value is being interpreted under a different
 			// version of the schema, fetch the correct table descriptor and
@@ -796,7 +801,6 @@ func (c *kvEventToRowConsumer) eventToRow(
 				return r, err
 			}
 
-			r.prevTableDesc = prevDesc
 			prevRF, err = c.rfCache.RowFetcherForTableDesc(prevDesc)
 			if err != nil {
 				return r, err
@@ -811,7 +815,7 @@ func (c *kvEventToRowConsumer) eventToRow(
 		if err := prevRF.StartScanFrom(ctx, &c.kvFetcher, false /* traceKV */); err != nil {
 			return r, err
 		}
-		r.prevDatums, err = prevRF.NextRow(ctx)
+		r.prevDatums, r.prevTableDesc, _, err = prevRF.NextRow(ctx)
 		if err != nil {
 			return r, err
 		}
@@ -823,10 +827,8 @@ func (c *kvEventToRowConsumer) eventToRow(
 
 		// Assert that we don't get a second row from the row.Fetcher. We
 		// fed it a single KV, so that would be surprising.
-		nextRow := encodeRow{
-			prevTableDesc: r.prevTableDesc,
-		}
-		nextRow.prevDatums, err = prevRF.NextRow(ctx)
+		var nextRow encodeRow
+		nextRow.prevDatums, nextRow.prevTableDesc, _, err = prevRF.NextRow(ctx)
 		if err != nil {
 			return r, err
 		}
@@ -891,7 +893,7 @@ type changeFrontier struct {
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.ChangeFrontierSpec
 	memAcc  mon.BoundAccount
-	a       tree.DatumAlloc
+	a       rowenc.DatumAlloc
 
 	// input returns rows from one or more changeAggregator processors
 	input execinfra.RowSource
@@ -928,8 +930,7 @@ type changeFrontier struct {
 	// `passthroughBuf` being sent, so that one needs to be emptied first.
 	resolvedBuf *encDatumRowBuffer
 	// metrics are monitoring counters shared between all changefeeds.
-	metrics    *Metrics
-	sliMetrics *sliMetrics
+	metrics *Metrics
 	// metricsID is used as the unique id of this changefeed in the
 	// metrics.MaxBehindNanos map.
 	metricsID int
@@ -969,7 +970,7 @@ func newJobState(
 	}
 }
 
-func canCheckpointBackfill(sv *settings.Values, lastCheckpoint time.Time) bool {
+func canCheckpointSpans(sv *settings.Values, lastCheckpoint time.Time) bool {
 	freq := changefeedbase.FrontierCheckpointFrequency.Get(sv)
 	if freq == 0 {
 		return false
@@ -977,8 +978,8 @@ func canCheckpointBackfill(sv *settings.Values, lastCheckpoint time.Time) bool {
 	return timeutil.Since(lastCheckpoint) > freq
 }
 
-func (j *jobState) canCheckpointBackfill() bool {
-	return canCheckpointBackfill(&j.settings.SV, j.lastProgressUpdate)
+func (j *jobState) canCheckpointSpans() bool {
+	return canCheckpointSpans(&j.settings.SV, j.lastProgressUpdate)
 }
 
 // canCheckpointHighWatermark returns true if we should update job high water mark (i.e. progress).
@@ -1116,7 +1117,6 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 		cf.MoveToDraining(err)
 		return
 	}
-	cf.sliMetrics = sli
 	cf.sink, err = getSink(ctx, cf.flowCtx.Cfg, cf.spec.Feed, nilOracle,
 		cf.spec.User(), cf.spec.JobID, sli)
 
@@ -1175,7 +1175,7 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 	cf.metrics.mu.Lock()
 	cf.metricsID = cf.metrics.mu.id
 	cf.metrics.mu.id++
-	sli.RunningCount.Inc(1)
+	cf.metrics.Running.Inc(1)
 	cf.metrics.mu.Unlock()
 	// TODO(dan): It's very important that we de-register from the metric because
 	// if we orphan an entry in there, our monitoring will lie (say the changefeed
@@ -1212,7 +1212,7 @@ func (cf *changeFrontier) closeMetrics() {
 	// considered by the gauge.
 	cf.metrics.mu.Lock()
 	if cf.metricsID > 0 {
-		cf.sliMetrics.RunningCount.Dec(1)
+		cf.metrics.Running.Dec(1)
 	}
 	delete(cf.metrics.mu.resolved, cf.metricsID)
 	cf.metricsID = -1
@@ -1360,20 +1360,25 @@ func (cf *changeFrontier) maybeCheckpointJob(
 	// as we receive spans from the scan request at the Backfill Timestamp
 	inBackfill := !frontierChanged && resolvedSpan.Timestamp.Equal(cf.frontier.BackfillTS())
 
-	// During a backfill we store a checkpoint of completed scans at a throttled rate in the job record
-	updateCheckpoint := inBackfill && cf.js.canCheckpointBackfill()
-
-	var checkpoint jobspb.ChangefeedProgress_Checkpoint
-	if updateCheckpoint {
-		maxBytes := changefeedbase.FrontierCheckpointMaxBytes.Get(&cf.flowCtx.Cfg.Settings.SV)
-		checkpoint.Spans = cf.frontier.getCheckpointSpans(maxBytes)
-	}
-
 	// If we're not in a backfill, highwater progress and an empty checkpoint will
 	// be saved. This is throttled however we always persist progress to a schema
 	// boundary.
 	updateHighWater :=
 		!inBackfill && (cf.frontier.schemaChangeBoundaryReached() || cf.js.canCheckpointHighWatermark(frontierChanged))
+
+	// During backfills or when some problematic spans stop advancing, the
+	// highwater mark remains fixed while other spans may significantly outpace
+	// it, therefore to avoid losing that progress on changefeed resumption we
+	// also store as many of those leading spans as we can in the job progress
+	updateCheckpoint :=
+		(inBackfill || cf.frontier.hasLaggingSpans(&cf.js.settings.SV)) && cf.js.canCheckpointSpans()
+
+	// If the highwater has moved an empty checkpoint will be saved
+	var checkpoint jobspb.ChangefeedProgress_Checkpoint
+	if updateCheckpoint {
+		maxBytes := changefeedbase.FrontierCheckpointMaxBytes.Get(&cf.flowCtx.Cfg.Settings.SV)
+		checkpoint.Spans, checkpoint.Timestamp = cf.frontier.getCheckpointSpans(maxBytes)
+	}
 
 	if updateCheckpoint || updateHighWater {
 		manageProtected := updateHighWater
@@ -1701,21 +1706,40 @@ func (f *schemaChangeFrontier) SpanFrontier() *span.Frontier {
 }
 
 // getCheckpointSpans returns as many spans that should be checkpointed (are
-// above the highwater mark) as can fit in maxBytes.
-func (f *schemaChangeFrontier) getCheckpointSpans(maxBytes int64) (checkpoint []roachpb.Span) {
-	var used int64
+// above the highwater mark) as can fit in maxBytes, along with the earliest
+// timestamp of the checkpointed spans.  A SpanGroup is used to merge adjacent
+// spans above the high-water mark.
+func (f *schemaChangeFrontier) getCheckpointSpans(
+	maxBytes int64,
+) (spans []roachpb.Span, timestamp hlc.Timestamp) {
 	frontier := f.frontierTimestamp()
+
+	// Collect leading spans into a SpanGroup to merge adjacent spans and store
+	// the lowest timestamp found
+	var checkpointSpanGroup roachpb.SpanGroup
+	checkpointFrontier := hlc.Timestamp{}
 	f.Entries(func(s roachpb.Span, ts hlc.Timestamp) span.OpResult {
 		if frontier.Less(ts) {
-			used += int64(len(s.Key)) + int64(len(s.EndKey))
-			if used > maxBytes {
-				return span.StopMatch
+			checkpointSpanGroup.Add(s)
+			if checkpointFrontier.IsEmpty() || ts.Less(checkpointFrontier) {
+				checkpointFrontier = ts
 			}
-			checkpoint = append(checkpoint, s)
 		}
 		return span.ContinueMatch
 	})
-	return checkpoint
+
+	// Ensure we only return up to maxBytes spans
+	var checkpointSpans []roachpb.Span
+	var used int64
+	for _, span := range checkpointSpanGroup.Slice() {
+		used += int64(len(span.Key)) + int64(len(span.EndKey))
+		if used > maxBytes {
+			break
+		}
+		checkpointSpans = append(checkpointSpans, span)
+	}
+
+	return checkpointSpans, checkpointFrontier
 }
 
 // BackfillTS returns the timestamp of the incoming spans for an ongoing
@@ -1750,4 +1774,14 @@ func (f *schemaChangeFrontier) schemaChangeBoundaryReached() (r bool) {
 	return f.boundaryTime.Equal(f.Frontier()) &&
 		f.latestTs.Equal(f.boundaryTime) &&
 		f.boundaryType != jobspb.ResolvedSpan_NONE
+}
+
+// hasLaggingSpans returns true when the time between the earliest and latest
+// resolved spans has exceeded the configured HighwaterLagCheckpointThreshold
+func (f *schemaChangeFrontier) hasLaggingSpans(sv *settings.Values) bool {
+	lagThreshold := changefeedbase.FrontierHighwaterLagCheckpointThreshold.Get(sv)
+	if lagThreshold == 0 {
+		return false
+	}
+	return f.latestTs.GoTime().Sub(f.Frontier().GoTime()) > lagThreshold
 }
