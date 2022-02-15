@@ -209,71 +209,6 @@ RegionsResponse describes the available regions.
 
 
 
-## NodesList
-
-
-
-NodesList returns all available nodes with their addresses.
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-NodesListRequest requests list of all nodes.
-The nodes are KV nodes when the cluster is a single
-tenant cluster or the host cluster in case of multi-tenant
-clusters.
-The nodes are SQL instances in case of multi-tenant
-clusters.
-
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-NodesListResponse contains a list of all nodes with their addresses.
-The nodes are KV nodes when the cluster is a single
-tenant cluster or the host cluster in case of multi-tenant
-clusters.
-The nodes are SQL instances in case of multi-tenant
-clusters.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| nodes | [NodeDetails](#cockroach.server.serverpb.NodesListResponse-cockroach.server.serverpb.NodeDetails) | repeated | nodes contains a list of NodeDetails. Each individual node within the list is a SQL node in case of a tenant server and KV nodes in case of a KV server. | [reserved](#support-status) |
-
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesListResponse-cockroach.server.serverpb.NodeDetails"></a>
-#### NodeDetails
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [int32](#cockroach.server.serverpb.NodesListResponse-int32) |  | node_id is a unique identifier for the node. This corresponds to SQL instance ID for a tenant server and KV node id for for a KV server. | [reserved](#support-status) |
-| address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodesListResponse-cockroach.util.UnresolvedAddr) |  | address is the RPC address for a KV node. This will be set to null for a tenant server node. | [reserved](#support-status) |
-| sql_address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodesListResponse-cockroach.util.UnresolvedAddr) |  | sql_address is the SQL address for a node. | [reserved](#support-status) |
-
-
-
-
-
-
 ## Nodes
 
 `GET /_status/nodes`
@@ -581,523 +516,6 @@ StoreStatus records the most recent values of metrics for a store.
 | incoming | [int64](#cockroach.server.status.statuspb.NodeStatus-int64) |  | in bytes | [reserved](#support-status) |
 | outgoing | [int64](#cockroach.server.status.statuspb.NodeStatus-int64) |  | in bytes | [reserved](#support-status) |
 | latency | [int64](#cockroach.server.status.statuspb.NodeStatus-int64) |  | in nanoseconds | [reserved](#support-status) |
-
-
-
-
-
-
-## NodesUI
-
-`GET /_status/nodes_ui`
-
-
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-NodesRequest requests a copy of the node information as known to gossip
-and the KV layer.
-
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-NodesResponse describe the nodes in the cluster.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| nodes | [NodeResponse](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse) | repeated | nodes carries the status payloads for all nodes in the cluster. | [alpha](#support-status) |
-| liveness_by_node_id | [NodesResponseExternal.LivenessByNodeIdEntry](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodesResponseExternal.LivenessByNodeIdEntry) | repeated | liveness_by_node_id maps each node ID to a liveness status. | [reserved](#support-status) |
-
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse"></a>
-#### NodeResponse
-
-NodeStatus records the most recent values of metrics for a node.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| desc | [NodeDescriptor](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeDescriptor) |  | desc is the node descriptor. | [reserved](#support-status) |
-| build_info | [cockroach.build.Info](#cockroach.server.serverpb.NodesResponseExternal-cockroach.build.Info) |  | build_info describes the `cockroach` executable file. | [alpha](#support-status) |
-| started_at | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  | started_at is the unix timestamp at which the node process was last started. | [alpha](#support-status) |
-| updated_at | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  | updated_at is the unix timestamp at which the node status record was last updated. | [alpha](#support-status) |
-| metrics | [NodeResponse.MetricsEntry](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse.MetricsEntry) | repeated | metrics contains the last sampled values for the node metrics. | [reserved](#support-status) |
-| store_statuses | [StoreStatus](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.StoreStatus) | repeated | store_statuses provides the store status payloads for all the stores on that node. | [reserved](#support-status) |
-| args | [string](#cockroach.server.serverpb.NodesResponseExternal-string) | repeated | args is the list of command-line arguments used to last start the node. args should only be visible by the Admin role. | [reserved](#support-status) |
-| env | [string](#cockroach.server.serverpb.NodesResponseExternal-string) | repeated | env is the list of environment variables that influenced the node's configuration. env should only be visible by the Admin role. | [reserved](#support-status) |
-| latencies | [NodeResponse.LatenciesEntry](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse.LatenciesEntry) | repeated | latencies is a map of nodeIDs to nanoseconds which is the latency between this node and the other node.<br><br>NOTE: this is deprecated and is only set if the min supported       cluster version is >= VersionRPCNetworkStats. | [reserved](#support-status) |
-| activity | [NodeResponse.ActivityEntry](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse.ActivityEntry) | repeated | activity is a map of nodeIDs to network statistics from this node to other nodes. | [reserved](#support-status) |
-| total_system_memory | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  | total_system_memory is the total RAM available to the system (or, if detected, the memory available to the cgroup this process is in) in bytes. | [alpha](#support-status) |
-| num_cpus | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  | num_cpus is the number of logical CPUs as reported by the operating system on the host where the `cockroach` process is running. Note that this does not report the number of CPUs actually used by `cockroach`; this parameter is controlled separately. | [alpha](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeDescriptor"></a>
-#### NodeDescriptor
-
-NodeDescriptor holds details on node physical/network topology.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  |  | [reserved](#support-status) |
-| address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodesResponseExternal-cockroach.util.UnresolvedAddr) |  | address should only be visible by the Admin role. | [reserved](#support-status) |
-| attrs | [cockroach.roachpb.Attributes](#cockroach.server.serverpb.NodesResponseExternal-cockroach.roachpb.Attributes) |  | attrs should only be visible by the Admin role. | [reserved](#support-status) |
-| locality | [Locality](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.Locality) |  |  | [reserved](#support-status) |
-| ServerVersion | [Version](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.Version) |  |  | [reserved](#support-status) |
-| build_tag | [string](#cockroach.server.serverpb.NodesResponseExternal-string) |  |  | [reserved](#support-status) |
-| started_at | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  |  | [reserved](#support-status) |
-| locality_address | [cockroach.roachpb.LocalityAddress](#cockroach.server.serverpb.NodesResponseExternal-cockroach.roachpb.LocalityAddress) | repeated | locality_address should only be visible by the Admin role. | [reserved](#support-status) |
-| cluster_name | [string](#cockroach.server.serverpb.NodesResponseExternal-string) |  |  | [reserved](#support-status) |
-| sql_address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodesResponseExternal-cockroach.util.UnresolvedAddr) |  | The SQL address. If empty, indicates that the base address field is also used to accept SQL connections. sql_address should only be visible by the Admin role. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.Locality"></a>
-#### Locality
-
-Locality is an ordered set of key value Tiers that describe a node's
-location. The tier keys should be the same across all nodes.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| tiers | [Tier](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.Tier) | repeated |  | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.Tier"></a>
-#### Tier
-
-Tier represents one level of the locality hierarchy.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [string](#cockroach.server.serverpb.NodesResponseExternal-string) |  | Key is the name of tier and should match all other nodes. | [reserved](#support-status) |
-| value | [string](#cockroach.server.serverpb.NodesResponseExternal-string) |  | Value is node specific value corresponding to the key. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.Version"></a>
-#### Version
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| major_val | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  | The names "major" and "minor" are reserved in C in some platforms (e.g. FreeBSD). | [reserved](#support-status) |
-| minor_val | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  |  | [reserved](#support-status) |
-| patch | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  | Note that patch is a placeholder and will always be zero. | [reserved](#support-status) |
-| internal | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  | The internal version is used to introduce migrations during the development cycle. They are subversions that are never the end versions of a release, i.e. users of stable, public release will only use binaries with the internal version set to 0. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse.MetricsEntry"></a>
-#### NodeResponse.MetricsEntry
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [string](#cockroach.server.serverpb.NodesResponseExternal-string) |  |  |  |
-| value | [double](#cockroach.server.serverpb.NodesResponseExternal-double) |  |  |  |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.StoreStatus"></a>
-#### StoreStatus
-
-StoreStatus records the most recent values of metrics for a store.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| desc | [StoreDescriptor](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.StoreDescriptor) |  | desc is the store descriptor. | [reserved](#support-status) |
-| metrics | [StoreStatus.MetricsEntry](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.StoreStatus.MetricsEntry) | repeated | metrics contains the last sampled values for the node metrics. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.StoreDescriptor"></a>
-#### StoreDescriptor
-
-StoreDescriptor holds store information including store attributes, node
-descriptor and store capacity.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| store_id | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  |  | [reserved](#support-status) |
-| attrs | [cockroach.roachpb.Attributes](#cockroach.server.serverpb.NodesResponseExternal-cockroach.roachpb.Attributes) |  |  | [reserved](#support-status) |
-| node | [NodeDescriptor](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeDescriptor) |  |  | [reserved](#support-status) |
-| capacity | [cockroach.roachpb.StoreCapacity](#cockroach.server.serverpb.NodesResponseExternal-cockroach.roachpb.StoreCapacity) |  |  | [reserved](#support-status) |
-| properties | [cockroach.roachpb.StoreProperties](#cockroach.server.serverpb.NodesResponseExternal-cockroach.roachpb.StoreProperties) |  |  | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeDescriptor"></a>
-#### NodeDescriptor
-
-NodeDescriptor holds details on node physical/network topology.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  |  | [reserved](#support-status) |
-| address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodesResponseExternal-cockroach.util.UnresolvedAddr) |  | address should only be visible by the Admin role. | [reserved](#support-status) |
-| attrs | [cockroach.roachpb.Attributes](#cockroach.server.serverpb.NodesResponseExternal-cockroach.roachpb.Attributes) |  | attrs should only be visible by the Admin role. | [reserved](#support-status) |
-| locality | [Locality](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.Locality) |  |  | [reserved](#support-status) |
-| ServerVersion | [Version](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.Version) |  |  | [reserved](#support-status) |
-| build_tag | [string](#cockroach.server.serverpb.NodesResponseExternal-string) |  |  | [reserved](#support-status) |
-| started_at | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  |  | [reserved](#support-status) |
-| locality_address | [cockroach.roachpb.LocalityAddress](#cockroach.server.serverpb.NodesResponseExternal-cockroach.roachpb.LocalityAddress) | repeated | locality_address should only be visible by the Admin role. | [reserved](#support-status) |
-| cluster_name | [string](#cockroach.server.serverpb.NodesResponseExternal-string) |  |  | [reserved](#support-status) |
-| sql_address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodesResponseExternal-cockroach.util.UnresolvedAddr) |  | The SQL address. If empty, indicates that the base address field is also used to accept SQL connections. sql_address should only be visible by the Admin role. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.StoreStatus.MetricsEntry"></a>
-#### StoreStatus.MetricsEntry
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [string](#cockroach.server.serverpb.NodesResponseExternal-string) |  |  |  |
-| value | [double](#cockroach.server.serverpb.NodesResponseExternal-double) |  |  |  |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse.LatenciesEntry"></a>
-#### NodeResponse.LatenciesEntry
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  |  |  |
-| value | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  |  |  |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse.ActivityEntry"></a>
-#### NodeResponse.ActivityEntry
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  |  |  |
-| value | [NodeResponse.NetworkActivity](#cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse.NetworkActivity) |  |  |  |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodeResponse.NetworkActivity"></a>
-#### NodeResponse.NetworkActivity
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| incoming | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  | in bytes | [reserved](#support-status) |
-| outgoing | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  | in bytes | [reserved](#support-status) |
-| latency | [int64](#cockroach.server.serverpb.NodesResponseExternal-int64) |  | in nanoseconds | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodesResponseExternal-cockroach.server.serverpb.NodesResponseExternal.LivenessByNodeIdEntry"></a>
-#### NodesResponseExternal.LivenessByNodeIdEntry
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [int32](#cockroach.server.serverpb.NodesResponseExternal-int32) |  |  |  |
-| value | [cockroach.kv.kvserver.liveness.livenesspb.NodeLivenessStatus](#cockroach.server.serverpb.NodesResponseExternal-cockroach.kv.kvserver.liveness.livenesspb.NodeLivenessStatus) |  |  |  |
-
-
-
-
-
-
-## NodeUI
-
-`GET /_status/nodes_ui/{node_id}`
-
-
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [string](#cockroach.server.serverpb.NodeRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. | [reserved](#support-status) |
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-NodeStatus records the most recent values of metrics for a node.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| desc | [NodeDescriptor](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeDescriptor) |  | desc is the node descriptor. | [reserved](#support-status) |
-| build_info | [cockroach.build.Info](#cockroach.server.serverpb.NodeResponse-cockroach.build.Info) |  | build_info describes the `cockroach` executable file. | [alpha](#support-status) |
-| started_at | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  | started_at is the unix timestamp at which the node process was last started. | [alpha](#support-status) |
-| updated_at | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  | updated_at is the unix timestamp at which the node status record was last updated. | [alpha](#support-status) |
-| metrics | [NodeResponse.MetricsEntry](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeResponse.MetricsEntry) | repeated | metrics contains the last sampled values for the node metrics. | [reserved](#support-status) |
-| store_statuses | [StoreStatus](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.StoreStatus) | repeated | store_statuses provides the store status payloads for all the stores on that node. | [reserved](#support-status) |
-| args | [string](#cockroach.server.serverpb.NodeResponse-string) | repeated | args is the list of command-line arguments used to last start the node. args should only be visible by the Admin role. | [reserved](#support-status) |
-| env | [string](#cockroach.server.serverpb.NodeResponse-string) | repeated | env is the list of environment variables that influenced the node's configuration. env should only be visible by the Admin role. | [reserved](#support-status) |
-| latencies | [NodeResponse.LatenciesEntry](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeResponse.LatenciesEntry) | repeated | latencies is a map of nodeIDs to nanoseconds which is the latency between this node and the other node.<br><br>NOTE: this is deprecated and is only set if the min supported       cluster version is >= VersionRPCNetworkStats. | [reserved](#support-status) |
-| activity | [NodeResponse.ActivityEntry](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeResponse.ActivityEntry) | repeated | activity is a map of nodeIDs to network statistics from this node to other nodes. | [reserved](#support-status) |
-| total_system_memory | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  | total_system_memory is the total RAM available to the system (or, if detected, the memory available to the cgroup this process is in) in bytes. | [alpha](#support-status) |
-| num_cpus | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  | num_cpus is the number of logical CPUs as reported by the operating system on the host where the `cockroach` process is running. Note that this does not report the number of CPUs actually used by `cockroach`; this parameter is controlled separately. | [alpha](#support-status) |
-
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeDescriptor"></a>
-#### NodeDescriptor
-
-NodeDescriptor holds details on node physical/network topology.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  |  | [reserved](#support-status) |
-| address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodeResponse-cockroach.util.UnresolvedAddr) |  | address should only be visible by the Admin role. | [reserved](#support-status) |
-| attrs | [cockroach.roachpb.Attributes](#cockroach.server.serverpb.NodeResponse-cockroach.roachpb.Attributes) |  | attrs should only be visible by the Admin role. | [reserved](#support-status) |
-| locality | [Locality](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.Locality) |  |  | [reserved](#support-status) |
-| ServerVersion | [Version](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.Version) |  |  | [reserved](#support-status) |
-| build_tag | [string](#cockroach.server.serverpb.NodeResponse-string) |  |  | [reserved](#support-status) |
-| started_at | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  |  | [reserved](#support-status) |
-| locality_address | [cockroach.roachpb.LocalityAddress](#cockroach.server.serverpb.NodeResponse-cockroach.roachpb.LocalityAddress) | repeated | locality_address should only be visible by the Admin role. | [reserved](#support-status) |
-| cluster_name | [string](#cockroach.server.serverpb.NodeResponse-string) |  |  | [reserved](#support-status) |
-| sql_address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodeResponse-cockroach.util.UnresolvedAddr) |  | The SQL address. If empty, indicates that the base address field is also used to accept SQL connections. sql_address should only be visible by the Admin role. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.Locality"></a>
-#### Locality
-
-Locality is an ordered set of key value Tiers that describe a node's
-location. The tier keys should be the same across all nodes.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| tiers | [Tier](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.Tier) | repeated |  | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.Tier"></a>
-#### Tier
-
-Tier represents one level of the locality hierarchy.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [string](#cockroach.server.serverpb.NodeResponse-string) |  | Key is the name of tier and should match all other nodes. | [reserved](#support-status) |
-| value | [string](#cockroach.server.serverpb.NodeResponse-string) |  | Value is node specific value corresponding to the key. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.Version"></a>
-#### Version
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| major_val | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  | The names "major" and "minor" are reserved in C in some platforms (e.g. FreeBSD). | [reserved](#support-status) |
-| minor_val | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  |  | [reserved](#support-status) |
-| patch | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  | Note that patch is a placeholder and will always be zero. | [reserved](#support-status) |
-| internal | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  | The internal version is used to introduce migrations during the development cycle. They are subversions that are never the end versions of a release, i.e. users of stable, public release will only use binaries with the internal version set to 0. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeResponse.MetricsEntry"></a>
-#### NodeResponse.MetricsEntry
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [string](#cockroach.server.serverpb.NodeResponse-string) |  |  |  |
-| value | [double](#cockroach.server.serverpb.NodeResponse-double) |  |  |  |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.StoreStatus"></a>
-#### StoreStatus
-
-StoreStatus records the most recent values of metrics for a store.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| desc | [StoreDescriptor](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.StoreDescriptor) |  | desc is the store descriptor. | [reserved](#support-status) |
-| metrics | [StoreStatus.MetricsEntry](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.StoreStatus.MetricsEntry) | repeated | metrics contains the last sampled values for the node metrics. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.StoreDescriptor"></a>
-#### StoreDescriptor
-
-StoreDescriptor holds store information including store attributes, node
-descriptor and store capacity.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| store_id | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  |  | [reserved](#support-status) |
-| attrs | [cockroach.roachpb.Attributes](#cockroach.server.serverpb.NodeResponse-cockroach.roachpb.Attributes) |  |  | [reserved](#support-status) |
-| node | [NodeDescriptor](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeDescriptor) |  |  | [reserved](#support-status) |
-| capacity | [cockroach.roachpb.StoreCapacity](#cockroach.server.serverpb.NodeResponse-cockroach.roachpb.StoreCapacity) |  |  | [reserved](#support-status) |
-| properties | [cockroach.roachpb.StoreProperties](#cockroach.server.serverpb.NodeResponse-cockroach.roachpb.StoreProperties) |  |  | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeDescriptor"></a>
-#### NodeDescriptor
-
-NodeDescriptor holds details on node physical/network topology.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  |  | [reserved](#support-status) |
-| address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodeResponse-cockroach.util.UnresolvedAddr) |  | address should only be visible by the Admin role. | [reserved](#support-status) |
-| attrs | [cockroach.roachpb.Attributes](#cockroach.server.serverpb.NodeResponse-cockroach.roachpb.Attributes) |  | attrs should only be visible by the Admin role. | [reserved](#support-status) |
-| locality | [Locality](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.Locality) |  |  | [reserved](#support-status) |
-| ServerVersion | [Version](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.Version) |  |  | [reserved](#support-status) |
-| build_tag | [string](#cockroach.server.serverpb.NodeResponse-string) |  |  | [reserved](#support-status) |
-| started_at | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  |  | [reserved](#support-status) |
-| locality_address | [cockroach.roachpb.LocalityAddress](#cockroach.server.serverpb.NodeResponse-cockroach.roachpb.LocalityAddress) | repeated | locality_address should only be visible by the Admin role. | [reserved](#support-status) |
-| cluster_name | [string](#cockroach.server.serverpb.NodeResponse-string) |  |  | [reserved](#support-status) |
-| sql_address | [cockroach.util.UnresolvedAddr](#cockroach.server.serverpb.NodeResponse-cockroach.util.UnresolvedAddr) |  | The SQL address. If empty, indicates that the base address field is also used to accept SQL connections. sql_address should only be visible by the Admin role. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.StoreStatus.MetricsEntry"></a>
-#### StoreStatus.MetricsEntry
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [string](#cockroach.server.serverpb.NodeResponse-string) |  |  |  |
-| value | [double](#cockroach.server.serverpb.NodeResponse-double) |  |  |  |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeResponse.LatenciesEntry"></a>
-#### NodeResponse.LatenciesEntry
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  |  |  |
-| value | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  |  |  |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeResponse.ActivityEntry"></a>
-#### NodeResponse.ActivityEntry
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| key | [int32](#cockroach.server.serverpb.NodeResponse-int32) |  |  |  |
-| value | [NodeResponse.NetworkActivity](#cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeResponse.NetworkActivity) |  |  |  |
-
-
-
-
-
-<a name="cockroach.server.serverpb.NodeResponse-cockroach.server.serverpb.NodeResponse.NetworkActivity"></a>
-#### NodeResponse.NetworkActivity
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| incoming | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  | in bytes | [reserved](#support-status) |
-| outgoing | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  | in bytes | [reserved](#support-status) |
-| latency | [int64](#cockroach.server.serverpb.NodeResponse-int64) |  | in nanoseconds | [reserved](#support-status) |
 
 
 
@@ -1833,7 +1251,6 @@ Response object for ListSessions and ListLocalSessions.
 | ----- | ---- | ----- | ----------- | -------------- |
 | sessions | [Session](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.Session) | repeated | A list of sessions on this node or cluster. | [reserved](#support-status) |
 | errors | [ListSessionsError](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ListSessionsError) | repeated | Any errors that occurred during fan-out calls to other nodes. | [reserved](#support-status) |
-| internal_app_name_prefix | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | If set and non-empty, indicates the prefix to application_name used for statements/queries issued internally by CockroachDB. | [reserved](#support-status) |
 
 
 
@@ -1879,7 +1296,6 @@ ActiveQuery represents a query in flight on some Session.
 | phase | [ActiveQuery.Phase](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ActiveQuery.Phase) |  | phase stores the current phase of execution for this query. | [reserved](#support-status) |
 | progress | [float](#cockroach.server.serverpb.ListSessionsResponse-float) |  | progress is an estimate of the fraction of this query that has been processed. | [reserved](#support-status) |
 | sql_no_constants | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The SQL statement fingerprint, compatible with StatementStatisticsKey. | [reserved](#support-status) |
-| sql_summary | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | A summarized version of the sql query. | [reserved](#support-status) |
 
 
 
@@ -1963,7 +1379,6 @@ Response object for ListSessions and ListLocalSessions.
 | ----- | ---- | ----- | ----------- | -------------- |
 | sessions | [Session](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.Session) | repeated | A list of sessions on this node or cluster. | [reserved](#support-status) |
 | errors | [ListSessionsError](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ListSessionsError) | repeated | Any errors that occurred during fan-out calls to other nodes. | [reserved](#support-status) |
-| internal_app_name_prefix | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | If set and non-empty, indicates the prefix to application_name used for statements/queries issued internally by CockroachDB. | [reserved](#support-status) |
 
 
 
@@ -2009,7 +1424,6 @@ ActiveQuery represents a query in flight on some Session.
 | phase | [ActiveQuery.Phase](#cockroach.server.serverpb.ListSessionsResponse-cockroach.server.serverpb.ActiveQuery.Phase) |  | phase stores the current phase of execution for this query. | [reserved](#support-status) |
 | progress | [float](#cockroach.server.serverpb.ListSessionsResponse-float) |  | progress is an estimate of the fraction of this query that has been processed. | [reserved](#support-status) |
 | sql_no_constants | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The SQL statement fingerprint, compatible with StatementStatisticsKey. | [reserved](#support-status) |
-| sql_summary | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | A summarized version of the sql query. | [reserved](#support-status) |
 
 
 
@@ -2102,101 +1516,6 @@ Response returned by target query's gateway node.
 
 
 
-## CancelLocalQuery
-
-`POST /_status/cancel_local_query`
-
-CancelLocalQuery cancels a SQL query running on this node given its ID.
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-Request object for issuing a query cancel request.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | ID of gateway node for the query to be canceled.<br><br>TODO(itsbilal): use [(gogoproto.customname) = "NodeID"] below. Need to figure out how to teach grpc-gateway about custom names.<br><br>node_id is a string so that "local" can be used to specify that no forwarding is necessary. | [reserved](#support-status) |
-| query_id | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | ID of query to be canceled (converted to string). | [reserved](#support-status) |
-| username | [string](#cockroach.server.serverpb.CancelQueryRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelQueryRequest. The caller is responsible for case-folding and NFC normalization. | [reserved](#support-status) |
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-Response returned by target query's gateway node.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| canceled | [bool](#cockroach.server.serverpb.CancelQueryResponse-bool) |  | Whether the cancellation request succeeded and the query was canceled. | [reserved](#support-status) |
-| error | [string](#cockroach.server.serverpb.CancelQueryResponse-string) |  | Error message (accompanied with canceled = false). | [reserved](#support-status) |
-
-
-
-
-
-
-
-## CancelQueryByKey
-
-
-
-CancelQueryByKey cancels a SQL query given its pgwire BackendKeyData.
-It is invoked through the pgwire protocol, so it's not exposed as an
-HTTP endpoint.
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-Request object for issuing a pgwire query cancel request.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| sql_instance_id | [int32](#cockroach.server.serverpb.CancelQueryByKeyRequest-int32) |  | The SQLInstanceID of the gateway node for the query to be canceled. | [reserved](#support-status) |
-| cancel_query_key | [uint64](#cockroach.server.serverpb.CancelQueryByKeyRequest-uint64) |  | The key that was generated during session initialization as part of the pgwire protocol. | [reserved](#support-status) |
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-Response returned by target query's gateway node for a pgwire cancel request.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| canceled | [bool](#cockroach.server.serverpb.CancelQueryByKeyResponse-bool) |  | Whether the cancellation request succeeded and the query was canceled. | [reserved](#support-status) |
-| error | [string](#cockroach.server.serverpb.CancelQueryByKeyResponse-string) |  | Error message (accompanied with canceled = false). | [reserved](#support-status) |
-
-
-
-
-
-
-
 ## ListContentionEvents
 
 `GET /_status/contention_events`
@@ -2259,9 +1578,7 @@ Response object for ListContentionEvents and ListLocalContentionEvents.
 #### ListActivityError
 
 An error wrapper object for ListContentionEventsResponse and
-ListDistSQLFlowsResponse. Similar to the Statements endpoint, when
-implemented on a tenant, the `node_id` field refers to the instanceIDs that
-identify individual tenant pods.
+ListDistSQLFlowsResponse.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
@@ -2334,9 +1651,7 @@ Response object for ListContentionEvents and ListLocalContentionEvents.
 #### ListActivityError
 
 An error wrapper object for ListContentionEventsResponse and
-ListDistSQLFlowsResponse. Similar to the Statements endpoint, when
-implemented on a tenant, the `node_id` field refers to the instanceIDs that
-identify individual tenant pods.
+ListDistSQLFlowsResponse.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
@@ -2419,7 +1734,6 @@ Info contains an information about a single DistSQL remote flow.
 | node_id | [int32](#cockroach.server.serverpb.ListDistSQLFlowsResponse-int32) |  | NodeID is the node on which this remote flow is either running or queued. | [reserved](#support-status) |
 | timestamp | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListDistSQLFlowsResponse-google.protobuf.Timestamp) |  | Timestamp must be in the UTC timezone. | [reserved](#support-status) |
 | status | [DistSQLRemoteFlows.Status](#cockroach.server.serverpb.ListDistSQLFlowsResponse-cockroach.server.serverpb.DistSQLRemoteFlows.Status) |  | Status is the current status of this remote flow. | [reserved](#support-status) |
-| stmt | [string](#cockroach.server.serverpb.ListDistSQLFlowsResponse-string) |  | Stmt is the SQL statement for which this flow is executing. | [reserved](#support-status) |
 
 
 
@@ -2429,9 +1743,7 @@ Info contains an information about a single DistSQL remote flow.
 #### ListActivityError
 
 An error wrapper object for ListContentionEventsResponse and
-ListDistSQLFlowsResponse. Similar to the Statements endpoint, when
-implemented on a tenant, the `node_id` field refers to the instanceIDs that
-identify individual tenant pods.
+ListDistSQLFlowsResponse.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
@@ -2513,7 +1825,6 @@ Info contains an information about a single DistSQL remote flow.
 | node_id | [int32](#cockroach.server.serverpb.ListDistSQLFlowsResponse-int32) |  | NodeID is the node on which this remote flow is either running or queued. | [reserved](#support-status) |
 | timestamp | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListDistSQLFlowsResponse-google.protobuf.Timestamp) |  | Timestamp must be in the UTC timezone. | [reserved](#support-status) |
 | status | [DistSQLRemoteFlows.Status](#cockroach.server.serverpb.ListDistSQLFlowsResponse-cockroach.server.serverpb.DistSQLRemoteFlows.Status) |  | Status is the current status of this remote flow. | [reserved](#support-status) |
-| stmt | [string](#cockroach.server.serverpb.ListDistSQLFlowsResponse-string) |  | Stmt is the SQL statement for which this flow is executing. | [reserved](#support-status) |
 
 
 
@@ -2523,9 +1834,7 @@ Info contains an information about a single DistSQL remote flow.
 #### ListActivityError
 
 An error wrapper object for ListContentionEventsResponse and
-ListDistSQLFlowsResponse. Similar to the Statements endpoint, when
-implemented on a tenant, the `node_id` field refers to the instanceIDs that
-identify individual tenant pods.
+ListDistSQLFlowsResponse.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
@@ -2557,54 +1866,7 @@ Support status: [reserved](#support-status)
 | ----- | ---- | ----- | ----------- | -------------- |
 | node_id | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | TODO(abhimadan): use [(gogoproto.customname) = "NodeID"] below. Need to figure out how to teach grpc-gateway about custom names.<br><br>node_id is a string so that "local" can be used to specify that no forwarding is necessary. | [reserved](#support-status) |
 | session_id | [bytes](#cockroach.server.serverpb.CancelSessionRequest-bytes) |  |  | [reserved](#support-status) |
-| username | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelSessionRequest. The caller is responsible for case-folding and NFC normalization. | [reserved](#support-status) |
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| canceled | [bool](#cockroach.server.serverpb.CancelSessionResponse-bool) |  |  | [reserved](#support-status) |
-| error | [string](#cockroach.server.serverpb.CancelSessionResponse-string) |  |  | [reserved](#support-status) |
-
-
-
-
-
-
-
-## CancelLocalSession
-
-`POST /_status/cancel_local_session`
-
-CancelLocalSession forcefully terminates a SQL session running on this node given its ID.
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | TODO(abhimadan): use [(gogoproto.customname) = "NodeID"] below. Need to figure out how to teach grpc-gateway about custom names.<br><br>node_id is a string so that "local" can be used to specify that no forwarding is necessary. | [reserved](#support-status) |
-| session_id | [bytes](#cockroach.server.serverpb.CancelSessionRequest-bytes) |  |  | [reserved](#support-status) |
-| username | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelSessionRequest. The caller is responsible for case-folding and NFC normalization. | [reserved](#support-status) |
+| username | [string](#cockroach.server.serverpb.CancelSessionRequest-string) |  | Username of the user making this cancellation request. This may be omitted if the user is the same as the one issuing the CancelSessionRequest. The caller is responsiblef or case-folding and NFC normalization. | [reserved](#support-status) |
 
 
 
@@ -2921,7 +2183,7 @@ Support status: [reserved](#support-status)
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| files | [cockroach.util.log.FileInfo](#cockroach.server.serverpb.LogFilesListResponse-cockroach.util.log.FileInfo) | repeated | files is the list of log files under this node's configured logging directories. Note that the response does not contain detail about which directory contains which file. The location of each file is known to the server based on its name and the logging configuration. | [reserved](#support-status) |
+| files | [cockroach.util.log.FileInfo](#cockroach.server.serverpb.LogFilesListResponse-cockroach.util.log.FileInfo) | repeated |  | [reserved](#support-status) |
 
 
 
@@ -2948,7 +2210,7 @@ Support status: [reserved](#support-status)
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | node_id | [string](#cockroach.server.serverpb.LogFileRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. | [reserved](#support-status) |
-| file | [string](#cockroach.server.serverpb.LogFileRequest-string) |  | file is the name of the log file to retrieve. Note that it must not be prefixed by a directory name. The full path to the file is computed by the server based on the base name and the logging configuration. | [reserved](#support-status) |
+| file | [string](#cockroach.server.serverpb.LogFileRequest-string) |  |  | [reserved](#support-status) |
 | redact | [bool](#cockroach.server.serverpb.LogFileRequest-bool) |  | redact, if true, requests redaction of sensitive data away from the retrieved log entries. Only admin users can send a request with redact = false. | [reserved](#support-status) |
 
 
@@ -3124,7 +2386,7 @@ of ranges currently considered “hot” by the node(s).
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  | NodeID indicates which node to query for a hot range report. It is possible to populate any node ID; if the node receiving the request is not the target node, it will forward the request to the target node.<br><br>If left empty, the request is forwarded to every node in the cluster. | [alpha](#support-status) |
+| node_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  | NodeID indicates which node to query for a hot range report. It is posssible to populate any node ID; if the node receiving the request is not the target node, it will forward the request to the target node.<br><br>If left empty, the request is forwarded to every node in the cluster. | [alpha](#support-status) |
 
 
 
@@ -3552,7 +2814,6 @@ tenant pods.
 | combined | [bool](#cockroach.server.serverpb.StatementsRequest-bool) |  | If this field is set we will use the combined statements API instead. | [reserved](#support-status) |
 | start | [int64](#cockroach.server.serverpb.StatementsRequest-int64) |  | These fields are used for the combined statements API. | [reserved](#support-status) |
 | end | [int64](#cockroach.server.serverpb.StatementsRequest-int64) |  |  | [reserved](#support-status) |
-| fetch_mode | [StatementsRequest.FetchMode](#cockroach.server.serverpb.StatementsRequest-cockroach.server.serverpb.StatementsRequest.FetchMode) |  |  | [reserved](#support-status) |
 
 
 
@@ -3605,7 +2866,6 @@ tenant pods.
 | key_data | [cockroach.sql.StatementStatisticsKey](#cockroach.server.serverpb.StatementsResponse-cockroach.sql.StatementStatisticsKey) |  |  | [reserved](#support-status) |
 | node_id | [int32](#cockroach.server.serverpb.StatementsResponse-int32) |  |  | [reserved](#support-status) |
 | aggregated_ts | [google.protobuf.Timestamp](#cockroach.server.serverpb.StatementsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-| aggregation_interval | [google.protobuf.Duration](#cockroach.server.serverpb.StatementsResponse-google.protobuf.Duration) |  | The aggregation duration. | [reserved](#support-status) |
 
 
 
@@ -3698,7 +2958,6 @@ Support status: [reserved](#support-status)
 | key_data | [cockroach.sql.StatementStatisticsKey](#cockroach.server.serverpb.StatementsResponse-cockroach.sql.StatementStatisticsKey) |  |  | [reserved](#support-status) |
 | node_id | [int32](#cockroach.server.serverpb.StatementsResponse-int32) |  |  | [reserved](#support-status) |
 | aggregated_ts | [google.protobuf.Timestamp](#cockroach.server.serverpb.StatementsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-| aggregation_interval | [google.protobuf.Duration](#cockroach.server.serverpb.StatementsResponse-google.protobuf.Duration) |  | The aggregation duration. | [reserved](#support-status) |
 
 
 
@@ -3738,8 +2997,6 @@ Support status: [reserved](#support-status)
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | statement_fingerprint | [string](#cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest-string) |  |  | [reserved](#support-status) |
-| min_execution_latency | [google.protobuf.Duration](#cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest-google.protobuf.Duration) |  | MinExecutionLatency, when non-zero, indicates the minimum execution latency of a query for which to collect the diagnostics report. In other words, if a query executes faster than this threshold, then the diagnostics report is not collected on it, and we will try to get a bundle the next time we see the query fingerprint.<br><br>NB: if MinExecutionLatency is non-zero, then all queries that match the fingerprint will be traced until a slow enough query comes along. This tracing might have some performance overhead. | [reserved](#support-status) |
-| expires_after | [google.protobuf.Duration](#cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest-google.protobuf.Duration) |  | ExpiresAfter, when non-zero, sets the expiration interval of this request. | [reserved](#support-status) |
 
 
 
@@ -3776,53 +3033,6 @@ Support status: [reserved](#support-status)
 | statement_fingerprint | [string](#cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse-string) |  |  | [reserved](#support-status) |
 | statement_diagnostics_id | [int64](#cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse-int64) |  |  | [reserved](#support-status) |
 | requested_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-| min_execution_latency | [google.protobuf.Duration](#cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse-google.protobuf.Duration) |  |  | [reserved](#support-status) |
-| expires_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-
-
-
-
-
-
-## CancelStatementDiagnosticsReport
-
-`POST /_status/stmtdiagreports/cancel`
-
-
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| request_id | [int64](#cockroach.server.serverpb.CancelStatementDiagnosticsReportRequest-int64) |  |  | [reserved](#support-status) |
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| canceled | [bool](#cockroach.server.serverpb.CancelStatementDiagnosticsReportResponse-bool) |  | canceled indicates whether the request for the given fingerprint was actually canceled. | [reserved](#support-status) |
-| error | [string](#cockroach.server.serverpb.CancelStatementDiagnosticsReportResponse-string) |  | error is set only if canceled is false. | [reserved](#support-status) |
-
 
 
 
@@ -3880,8 +3090,6 @@ Support status: [reserved](#support-status)
 | statement_fingerprint | [string](#cockroach.server.serverpb.StatementDiagnosticsReportsResponse-string) |  |  | [reserved](#support-status) |
 | statement_diagnostics_id | [int64](#cockroach.server.serverpb.StatementDiagnosticsReportsResponse-int64) |  |  | [reserved](#support-status) |
 | requested_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.StatementDiagnosticsReportsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-| min_execution_latency | [google.protobuf.Duration](#cockroach.server.serverpb.StatementDiagnosticsReportsResponse-google.protobuf.Duration) |  |  | [reserved](#support-status) |
-| expires_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.StatementDiagnosticsReportsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
 
 
 
@@ -4068,7 +3276,6 @@ Request object for issuing a SQL stats reset request.
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | node_id | [string](#cockroach.server.serverpb.ResetSQLStatsRequest-string) |  |  | [reserved](#support-status) |
-| reset_persisted_stats | [bool](#cockroach.server.serverpb.ResetSQLStatsRequest-bool) |  | reset_persisted_stats specifies if the persisted SQL Stats will be reset along with the in-memory SQL stats. | [reserved](#support-status) |
 
 
 
@@ -4127,150 +3334,6 @@ Response object returned by IndexUsageStatistics.
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | statistics | [cockroach.sql.CollectedIndexUsageStatistics](#cockroach.server.serverpb.IndexUsageStatisticsResponse-cockroach.sql.CollectedIndexUsageStatistics) | repeated |  | [reserved](#support-status) |
-| last_reset | [google.protobuf.Timestamp](#cockroach.server.serverpb.IndexUsageStatisticsResponse-google.protobuf.Timestamp) |  | Timestamp of the last index usage stats reset. | [reserved](#support-status) |
-
-
-
-
-
-
-
-## ResetIndexUsageStats
-
-`POST /_status/resetindexusagestats`
-
-
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-Request object for issuing a index usage stats reset request.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| node_id | [string](#cockroach.server.serverpb.ResetIndexUsageStatsRequest-string) |  |  | [reserved](#support-status) |
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-Response object returned by ResetIndexUsageStatsRequest.
-
-
-
-
-
-
-
-
-## TableIndexStats
-
-`GET /_status/databases/{database}/tables/{table}/indexstats`
-
-TableIndexStats retrieves index stats for a table.
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-Request object for issuing TableIndexStatsRequest request.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| database | [string](#cockroach.server.serverpb.TableIndexStatsRequest-string) |  | database is the name of the database that contains the table we're interested in. | [reserved](#support-status) |
-| table | [string](#cockroach.server.serverpb.TableIndexStatsRequest-string) |  | table is the name of the table that we're querying. Table may be schema-qualified (schema.table) and each name component that contains sql unsafe characters such as . or uppercase letters must be surrounded in double quotes like "naughty schema".table. | [reserved](#support-status) |
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-Response object returned by TableIndexStatsResponse.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| statistics | [TableIndexStatsResponse.ExtendedCollectedIndexUsageStatistics](#cockroach.server.serverpb.TableIndexStatsResponse-cockroach.server.serverpb.TableIndexStatsResponse.ExtendedCollectedIndexUsageStatistics) | repeated |  | [reserved](#support-status) |
-| last_reset | [google.protobuf.Timestamp](#cockroach.server.serverpb.TableIndexStatsResponse-google.protobuf.Timestamp) |  | Timestamp of the last index usage stats reset. | [reserved](#support-status) |
-
-
-
-
-
-
-<a name="cockroach.server.serverpb.TableIndexStatsResponse-cockroach.server.serverpb.TableIndexStatsResponse.ExtendedCollectedIndexUsageStatistics"></a>
-#### TableIndexStatsResponse.ExtendedCollectedIndexUsageStatistics
-
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| statistics | [cockroach.sql.CollectedIndexUsageStatistics](#cockroach.server.serverpb.TableIndexStatsResponse-cockroach.sql.CollectedIndexUsageStatistics) |  |  | [reserved](#support-status) |
-| index_name | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | index_name is the name of the index. | [reserved](#support-status) |
-| index_type | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | index_type is the type of the index i.e. primary, secondary. | [reserved](#support-status) |
-| create_statement | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | create_statement is the SQL statement that would re-create the current index if executed. | [reserved](#support-status) |
-| created_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.TableIndexStatsResponse-google.protobuf.Timestamp) |  | CreatedAt is an approximate timestamp at which the index was created. Note that it may not always be populated. | [reserved](#support-status) |
-
-
-
-
-
-
-## UserSQLRoles
-
-`GET /_status/sqlroles`
-
-
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-
-UserSQLRolesRequest requests a list of roles of the logged in SQL user.
-
-
-
-
-
-
-
-
-#### Response Parameters
-
-
-
-
-UserSQLRolesResponse returns a list of roles for the logged SQL user.
-
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| roles | [string](#cockroach.server.serverpb.UserSQLRolesResponse-string) | repeated | roles is a list of roles for the SQL user. | [reserved](#support-status) |
 
 
 
@@ -4352,7 +3415,7 @@ sharedSecret.
 
 
 
-CertBundleResponse contains a copy of all CAs needed to initialize TLS for
+CertBundleResponse contains a copy of all CAs needed to intialize TLS for
 a new node.
 
 
@@ -4574,7 +3637,7 @@ TableDetailsRequest is a request for detailed information about a table.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| database | [string](#cockroach.server.serverpb.TableDetailsRequest-string) |  | database is the name of the database that contains the table we're interested in. | [reserved](#support-status) |
+| database | [string](#cockroach.server.serverpb.TableDetailsRequest-string) |  | database is the database that contains the table we're interested in. | [reserved](#support-status) |
 | table | [string](#cockroach.server.serverpb.TableDetailsRequest-string) |  | table is the name of the table that we're querying. Table may be schema-qualified (schema.table) and each name component that contains sql unsafe characters such as . or uppercase letters must be surrounded in double quotes like "naughty schema".table. | [reserved](#support-status) |
 
 
@@ -4597,13 +3660,12 @@ a table.
 | grants | [TableDetailsResponse.Grant](#cockroach.server.serverpb.TableDetailsResponse-cockroach.server.serverpb.TableDetailsResponse.Grant) | repeated |  | [reserved](#support-status) |
 | columns | [TableDetailsResponse.Column](#cockroach.server.serverpb.TableDetailsResponse-cockroach.server.serverpb.TableDetailsResponse.Column) | repeated |  | [reserved](#support-status) |
 | indexes | [TableDetailsResponse.Index](#cockroach.server.serverpb.TableDetailsResponse-cockroach.server.serverpb.TableDetailsResponse.Index) | repeated |  | [reserved](#support-status) |
-| range_count | [int64](#cockroach.server.serverpb.TableDetailsResponse-int64) |  | range_count is the size of the table in ranges. This provides a rough estimate of the storage requirements for the table. TODO(mrtracy): The TableStats method also returns a range_count field which is more accurate than this one; TableDetails calculates this number using a potentially faster method that is subject to cache staleness. We should consider removing or renaming this field to reflect that difference. See GitHub issue #5435 for more information. | [reserved](#support-status) |
+| range_count | [int64](#cockroach.server.serverpb.TableDetailsResponse-int64) |  | range_count is the size of the table in ranges. This provides a rough estimate of the storage requirements for the table. TODO(mrtracy): The TableStats method also returns a range_count field which is more accurate than this one; TableDetails calculates this number using a potentially faster method that is subject to cache staleness. We should consider removing or renaming this field to reflect that difference. See Github issue #5435 for more information. | [reserved](#support-status) |
 | create_table_statement | [string](#cockroach.server.serverpb.TableDetailsResponse-string) |  | create_table_statement is the output of "SHOW CREATE" for this table; it is a SQL statement that would re-create the table's current schema if executed. | [reserved](#support-status) |
 | zone_config | [cockroach.config.zonepb.ZoneConfig](#cockroach.server.serverpb.TableDetailsResponse-cockroach.config.zonepb.ZoneConfig) |  | The zone configuration in effect for this table. | [reserved](#support-status) |
 | zone_config_level | [ZoneConfigurationLevel](#cockroach.server.serverpb.TableDetailsResponse-cockroach.server.serverpb.ZoneConfigurationLevel) |  | The level at which this object's zone configuration is set. | [reserved](#support-status) |
 | descriptor_id | [int64](#cockroach.server.serverpb.TableDetailsResponse-int64) |  | descriptor_id is an identifier used to uniquely identify this table. It can be used to find events pertaining to this table by filtering on the 'target_id' field of events. | [reserved](#support-status) |
 | configure_zone_statement | [string](#cockroach.server.serverpb.TableDetailsResponse-string) |  | configure_zone_statement is the output of "SHOW ZONE CONFIGURATION FOR TABLE" for this table. It is a SQL statement that would re-configure the table's current zone if executed. | [reserved](#support-status) |
-| stats_last_created_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.TableDetailsResponse-google.protobuf.Timestamp) |  | stats_last_created_at is the time at which statistics were last created. | [reserved](#support-status) |
 
 
 
@@ -4681,7 +3743,7 @@ information about a table.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| database | [string](#cockroach.server.serverpb.TableStatsRequest-string) |  | database is the name of the database that contains the table we're interested in. | [reserved](#support-status) |
+| database | [string](#cockroach.server.serverpb.TableStatsRequest-string) |  | database is the database that contains the table we're interested in. | [reserved](#support-status) |
 | table | [string](#cockroach.server.serverpb.TableStatsRequest-string) |  | table is the name of the table that we're querying. Table may be schema-qualified (schema.table) and each name component that contains sql unsafe characters such as . or uppercase letters must be surrounded in double quotes like "naughty schema".table. | [reserved](#support-status) |
 
 
@@ -5280,6 +4342,124 @@ LivenessResponse contains the liveness status of each node on the cluster.
 
 
 
+## Schedules
+
+`GET /_admin/v1/schedules`
+
+Schedules returns the schedule records for all schedules of the given
+status and type.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+SchedulesRequest requests system schedule information of the given status and type.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| limit | [int32](#cockroach.server.serverpb.SchedulesRequest-int32) |  |  | [reserved](#support-status) |
+| status | [string](#cockroach.server.serverpb.SchedulesRequest-string) |  |  | [reserved](#support-status) |
+| type | [string](#cockroach.server.serverpb.SchedulesRequest-string) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+SchedulesResponse contains the schedule record for each matching schedule.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| schedules | [ScheduleResponse](#cockroach.server.serverpb.SchedulesResponse-cockroach.server.serverpb.ScheduleResponse) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.SchedulesResponse-cockroach.server.serverpb.ScheduleResponse"></a>
+#### ScheduleResponse
+
+ScheduleResponse contains the schedule record for a schedule.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| id | [int64](#cockroach.server.serverpb.SchedulesResponse-int64) |  |  | [reserved](#support-status) |
+| label | [string](#cockroach.server.serverpb.SchedulesResponse-string) |  |  | [reserved](#support-status) |
+| status | [string](#cockroach.server.serverpb.SchedulesResponse-string) |  |  | [reserved](#support-status) |
+| next_run | [string](#cockroach.server.serverpb.SchedulesResponse-string) |  |  | [reserved](#support-status) |
+| state | [string](#cockroach.server.serverpb.SchedulesResponse-string) |  |  | [reserved](#support-status) |
+| recurrence | [string](#cockroach.server.serverpb.SchedulesResponse-string) |  |  | [reserved](#support-status) |
+| running_jobs | [int64](#cockroach.server.serverpb.SchedulesResponse-int64) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+## Schedule
+
+`GET /_admin/v1/schedules/{schedule_id}`
+
+Schedule returns the schedule record for the schedule of the given
+schedule_id.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+ScheduleRequest requests system schedule information for the given
+schedule_id.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| schedule_id | [int64](#cockroach.server.serverpb.ScheduleRequest-int64) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+ScheduleResponse contains the schedule record for a schedule.
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| id | [int64](#cockroach.server.serverpb.ScheduleResponse-int64) |  |  | [reserved](#support-status) |
+| label | [string](#cockroach.server.serverpb.ScheduleResponse-string) |  |  | [reserved](#support-status) |
+| status | [string](#cockroach.server.serverpb.ScheduleResponse-string) |  |  | [reserved](#support-status) |
+| next_run | [string](#cockroach.server.serverpb.ScheduleResponse-string) |  |  | [reserved](#support-status) |
+| state | [string](#cockroach.server.serverpb.ScheduleResponse-string) |  |  | [reserved](#support-status) |
+| recurrence | [string](#cockroach.server.serverpb.ScheduleResponse-string) |  |  | [reserved](#support-status) |
+| running_jobs | [int64](#cockroach.server.serverpb.ScheduleResponse-int64) |  |  | [reserved](#support-status) |
+
+
+
+
+
+
+
 ## Jobs
 
 `GET /_admin/v1/jobs`
@@ -5348,27 +4528,6 @@ JobResponse contains the job record for a job.
 | highwater_timestamp | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobsResponse-google.protobuf.Timestamp) |  | highwater_timestamp is the highwater timestamp returned as normal timestamp. This is appropriate for display to humans. | [reserved](#support-status) |
 | highwater_decimal | [string](#cockroach.server.serverpb.JobsResponse-string) |  | highwater_decimal is the highwater timestamp in the proprietary decimal form used by logical timestamps internally. This is appropriate to pass to a "AS OF SYSTEM TIME" SQL statement. | [reserved](#support-status) |
 | running_status | [string](#cockroach.server.serverpb.JobsResponse-string) |  |  | [reserved](#support-status) |
-| last_run | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-| next_run | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-| num_runs | [int64](#cockroach.server.serverpb.JobsResponse-int64) |  |  | [reserved](#support-status) |
-| execution_failures | [JobResponse.ExecutionFailure](#cockroach.server.serverpb.JobsResponse-cockroach.server.serverpb.JobResponse.ExecutionFailure) | repeated | ExecutionFailures is a log of execution failures of the job. It is not guaranteed to contain all execution failures and some execution failures may not contain an error or end. | [reserved](#support-status) |
-
-
-
-
-
-<a name="cockroach.server.serverpb.JobsResponse-cockroach.server.serverpb.JobResponse.ExecutionFailure"></a>
-#### JobResponse.ExecutionFailure
-
-ExecutionFailure corresponds to a failure to execute the job with the
-attempt starting at start and ending at end.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| status | [string](#cockroach.server.serverpb.JobsResponse-string) |  | Status is the status of the job during the execution. | [reserved](#support-status) |
-| start | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobsResponse-google.protobuf.Timestamp) |  | Start is the time at which the execution started. | [reserved](#support-status) |
-| end | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobsResponse-google.protobuf.Timestamp) |  | End is the time at which the error occurred. | [reserved](#support-status) |
-| error | [string](#cockroach.server.serverpb.JobsResponse-string) |  | Error is the error which occurred. | [reserved](#support-status) |
 
 
 
@@ -5427,28 +4586,7 @@ JobResponse contains the job record for a job.
 | highwater_timestamp | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobResponse-google.protobuf.Timestamp) |  | highwater_timestamp is the highwater timestamp returned as normal timestamp. This is appropriate for display to humans. | [reserved](#support-status) |
 | highwater_decimal | [string](#cockroach.server.serverpb.JobResponse-string) |  | highwater_decimal is the highwater timestamp in the proprietary decimal form used by logical timestamps internally. This is appropriate to pass to a "AS OF SYSTEM TIME" SQL statement. | [reserved](#support-status) |
 | running_status | [string](#cockroach.server.serverpb.JobResponse-string) |  |  | [reserved](#support-status) |
-| last_run | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-| next_run | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
-| num_runs | [int64](#cockroach.server.serverpb.JobResponse-int64) |  |  | [reserved](#support-status) |
-| execution_failures | [JobResponse.ExecutionFailure](#cockroach.server.serverpb.JobResponse-cockroach.server.serverpb.JobResponse.ExecutionFailure) | repeated | ExecutionFailures is a log of execution failures of the job. It is not guaranteed to contain all execution failures and some execution failures may not contain an error or end. | [reserved](#support-status) |
 
-
-
-
-
-
-<a name="cockroach.server.serverpb.JobResponse-cockroach.server.serverpb.JobResponse.ExecutionFailure"></a>
-#### JobResponse.ExecutionFailure
-
-ExecutionFailure corresponds to a failure to execute the job with the
-attempt starting at start and ending at end.
-
-| Field | Type | Label | Description | Support status |
-| ----- | ---- | ----- | ----------- | -------------- |
-| status | [string](#cockroach.server.serverpb.JobResponse-string) |  | Status is the status of the job during the execution. | [reserved](#support-status) |
-| start | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobResponse-google.protobuf.Timestamp) |  | Start is the time at which the execution started. | [reserved](#support-status) |
-| end | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobResponse-google.protobuf.Timestamp) |  | End is the time at which the error occurred. | [reserved](#support-status) |
-| error | [string](#cockroach.server.serverpb.JobResponse-string) |  | Error is the error which occurred. | [reserved](#support-status) |
 
 
 
@@ -5577,10 +4715,9 @@ DrainRequest instructs the receiving node to drain.
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
+| pre201_marker | [int32](#cockroach.server.serverpb.DrainRequest-int32) | repeated | pre_201_marker represents a field that clients stopped using in 20.1. It's maintained to reject requests from such clients, since they're not setting other required fields. | [reserved](#support-status) |
 | shutdown | [bool](#cockroach.server.serverpb.DrainRequest-bool) |  | When true, terminates the process after the server has started draining. Setting both shutdown and do_drain to false causes the request to only operate as a probe. Setting do_drain to false and shutdown to true causes the server to shut down immediately without first draining. | [reserved](#support-status) |
 | do_drain | [bool](#cockroach.server.serverpb.DrainRequest-bool) |  | When true, perform the drain phase. See the comment above on shutdown for an explanation of the interaction between the two. do_drain is also implied by a non-nil deprecated_probe_indicator. | [reserved](#support-status) |
-| node_id | [string](#cockroach.server.serverpb.DrainRequest-string) |  | node_id is a string so that "local" can be used to specify that no forwarding is necessary. For compatibility with v21.2 nodes, an empty node_id is interpreted as "local". This behavior might be removed in subsequent versions. | [reserved](#support-status) |
-| verbose | [bool](#cockroach.server.serverpb.DrainRequest-bool) |  | When true, more detailed information is logged during the range lease drain phase. | [reserved](#support-status) |
 
 
 
@@ -5987,7 +5124,7 @@ MetricMetadataRequest requests metadata for all metrics.
 
 
 
-MetricMetadataResponse contains the metadata for all metrics.
+MetricMetadataResponse contains the metadata for all metics.
 
 
 | Field | Type | Label | Description | Support status |
@@ -6136,23 +5273,6 @@ Support status: [reserved](#support-status)
 
 
 
-
-
-
-## SendKVBatch
-
-
-
-SendKVBatch proxies the given BatchRequest into KV, returning the
-response. It is used by the CLI `debug send-kv-batch` command.
-
-Support status: [reserved](#support-status)
-
-#### Request Parameters
-
-
-
-#### Response Parameters
 
 
 
