@@ -19,12 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -44,17 +44,11 @@ func (s *statusServer) CombinedStatementStats(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
+	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
 		return nil, err
 	}
 
-	return getCombinedStatementStats(
-		ctx,
-		req,
-		s.sqlServer.pgServer.SQLServer.GetSQLStatsProvider(),
-		s.internalExecutor,
-		s.st,
-		s.sqlServer.execCfg.SQLStatsTestingKnobs)
+	return getCombinedStatementStats(ctx, req, s.sqlServer.pgServer.SQLServer.GetSQLStatsProvider(), s.internalExecutor)
 }
 
 func getCombinedStatementStats(
@@ -62,88 +56,95 @@ func getCombinedStatementStats(
 	req *serverpb.CombinedStatementsStatsRequest,
 	statsProvider sqlstats.Provider,
 	ie *sql.InternalExecutor,
-	settings *cluster.Settings,
-	testingKnobs *sqlstats.TestingKnobs,
 ) (*serverpb.StatementsResponse, error) {
 	startTime := getTimeFromSeconds(req.Start)
 	endTime := getTimeFromSeconds(req.End)
-	limit := SQLStatsResponseMax.Get(&settings.SV)
-	whereClause, orderAndLimit, args := getQueryClausesAndArgs(startTime, endTime, limit, testingKnobs)
-	statements, err := collectCombinedStatements(ctx, ie, whereClause, args, orderAndLimit)
+	statements, err := collectCombinedStatements(ctx, ie, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
 
-	transactions, err := collectCombinedTransactions(ctx, ie, whereClause, args, orderAndLimit)
+	transactions, err := collectCombinedTransactions(ctx, ie, startTime, endTime)
+	if err != nil {
+		return nil, err
+	}
+
+	earliestStatementAggregatedTs, err := statsProvider.(*persistedsqlstats.PersistedSQLStats).GetEarliestStatementAggregatedTs(
+		ctx,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	earliestTransactionAggregatedTs, err := statsProvider.(*persistedsqlstats.PersistedSQLStats).GetEarliestTransactionAggregatedTs(
+		ctx,
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	response := &serverpb.StatementsResponse{
-		Statements:            statements,
-		Transactions:          transactions,
-		LastReset:             statsProvider.GetLastReset(),
-		InternalAppNamePrefix: catconstants.InternalAppNamePrefix,
+		Statements:                      statements,
+		Transactions:                    transactions,
+		LastReset:                       statsProvider.GetLastReset(),
+		InternalAppNamePrefix:           catconstants.InternalAppNamePrefix,
+		EarliestStatementAggregatedTs:   earliestStatementAggregatedTs,
+		EarliestTransactionAggregatedTs: earliestTransactionAggregatedTs,
 	}
 
 	return response, nil
 }
 
-// getQueryClausesAndArgs returns:
-// - where clause (filtering by name and aggregates_ts when defined)
-// - order and limit clause
-// - args that will replace the clauses above
-func getQueryClausesAndArgs(
-	start, end *time.Time, limit int64, testingKnobs *sqlstats.TestingKnobs,
-) (whereClause string, orderAndLimitClause string, args []interface{}) {
-	var buffer strings.Builder
-	buffer.WriteString(testingKnobs.GetAOSTClause())
+func getFilterAndParams(start, end *time.Time) (string, []interface{}) {
+	var args []interface{}
 
-	// Filter out internal statements by app name.
-	buffer.WriteString(fmt.Sprintf(" WHERE app_name NOT LIKE '%s%%'", catconstants.InternalAppNamePrefix))
+	if start == nil && end == nil {
+		return "", args
+	}
+
+	var buffer strings.Builder
+	buffer.WriteString("WHERE ")
 
 	if start != nil {
-		buffer.WriteString(" AND aggregated_ts >= $1")
+		buffer.WriteString("aggregated_ts >= $1")
 		args = append(args, *start)
 	}
 
+	if start != nil && end != nil {
+		buffer.WriteString(" AND ")
+	}
+
 	if end != nil {
-		buffer.WriteString(fmt.Sprintf(" AND aggregated_ts <= $%d", len(args)+1))
+		buffer.WriteString(fmt.Sprintf("aggregated_ts <= $%d", len(args)+1))
 		args = append(args, *end)
 	}
 
-	orderAndLimitClause = fmt.Sprintf(` ORDER BY aggregated_ts DESC LIMIT $%d`, len(args)+1)
-	args = append(args, limit)
-
-	return buffer.String(), orderAndLimitClause, args
+	return buffer.String(), args
 }
 
 func collectCombinedStatements(
-	ctx context.Context,
-	ie *sql.InternalExecutor,
-	whereClause string,
-	qargs []interface{},
-	orderAndLimit string,
+	ctx context.Context, ie *sql.InternalExecutor, start, end *time.Time,
 ) ([]serverpb.StatementsResponse_CollectedStatementStatistics, error) {
+	whereClause, qargs := getFilterAndParams(start, end)
 
 	query := fmt.Sprintf(
 		`SELECT
 				fingerprint_id,
 				transaction_fingerprint_id,
 				app_name,
-				max(aggregated_ts) as aggregated_ts,
-				metadata,
-				crdb_internal.merge_statement_stats(array_agg(statistics)) AS statistics,
-				max(sampled_plan) AS sampled_plan,
+				aggregated_ts,
+				jsonb_set(
+					metadata,
+					array['query'],
+					to_jsonb(
+						prettify_statement(metadata ->> 'query', %d, %d, %d)
+					)
+				),
+				statistics,
+				sampled_plan,
 				aggregation_interval
-		FROM crdb_internal.statement_statistics %s
-		GROUP BY
-				fingerprint_id,
-				transaction_fingerprint_id,
-				app_name,
-				metadata,
-				aggregation_interval
-		%s`, whereClause, orderAndLimit)
+			FROM crdb_internal.statement_statistics
+			%s`, tree.ConsoleLineWidth, tree.PrettyAlignAndDeindent, tree.UpperCase, whereClause)
 
 	const expectedNumDatums = 8
 
@@ -234,28 +235,20 @@ func collectCombinedStatements(
 }
 
 func collectCombinedTransactions(
-	ctx context.Context,
-	ie *sql.InternalExecutor,
-	whereClause string,
-	qargs []interface{},
-	orderAndLimit string,
+	ctx context.Context, ie *sql.InternalExecutor, start, end *time.Time,
 ) ([]serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics, error) {
+	whereClause, qargs := getFilterAndParams(start, end)
 
 	query := fmt.Sprintf(
 		`SELECT
 				app_name,
-				max(aggregated_ts) as aggregated_ts,
+				aggregated_ts,
 				fingerprint_id,
 				metadata,
-				crdb_internal.merge_transaction_stats(array_agg(statistics)) AS statistics,
+				statistics,
 				aggregation_interval
-			FROM crdb_internal.transaction_statistics %s
-			GROUP BY
-				app_name,
-				fingerprint_id,
-				metadata,
-				aggregation_interval
-			%s`, whereClause, orderAndLimit)
+			FROM crdb_internal.transaction_statistics
+			%s`, whereClause)
 
 	const expectedNumDatums = 6
 
