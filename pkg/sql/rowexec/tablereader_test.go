@@ -23,8 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -90,14 +90,14 @@ func TestTableReader(t *testing.T) {
 	}{
 		{
 			spec: execinfrapb.TableReaderSpec{
-				FetchSpec: makeFetchSpec(t, td, td.GetPrimaryIndex(), cols[0].GetID(), cols[1].GetID()),
+				ColumnIDs: []descpb.ColumnID{cols[0].GetID(), cols[1].GetID()},
 				Spans:     []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
 			},
 			expected: "[[0 1] [0 2] [0 3] [0 4] [0 5] [0 6] [0 7] [0 8] [0 9] [1 0] [1 1] [1 2] [1 3] [1 4] [1 5] [1 6] [1 7] [1 8] [1 9]]",
 		},
 		{
 			spec: execinfrapb.TableReaderSpec{
-				FetchSpec: makeFetchSpec(t, td, td.GetPrimaryIndex(), cols[3].GetID()),
+				ColumnIDs: []descpb.ColumnID{cols[3].GetID()},
 				Spans:     []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
 			},
 			post: execinfrapb.PostProcessSpec{
@@ -107,8 +107,9 @@ func TestTableReader(t *testing.T) {
 		},
 		{
 			spec: execinfrapb.TableReaderSpec{
-				FetchSpec: makeFetchSpec(t, td, td.ActiveIndexes()[1], cols[0].GetID(), cols[1].GetID()),
+				IndexIdx:  1,
 				Reverse:   true,
+				ColumnIDs: []descpb.ColumnID{cols[0].GetID(), cols[1].GetID()},
 				Spans:     []roachpb.Span{makeIndexSpan(4, 6)},
 				LimitHint: 1,
 			},
@@ -124,6 +125,7 @@ func TestTableReader(t *testing.T) {
 				// them.
 				ts.Spans = make([]roachpb.Span, len(c.spec.Spans))
 				copy(ts.Spans, c.spec.Spans)
+				ts.Table = *td.TableDesc()
 
 				st := s.ClusterSettings()
 				evalCtx := tree.MakeTestingEvalContext(st)
@@ -194,6 +196,13 @@ func TestMisplannedRangesMetadata(t *testing.T) {
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
 				UseDatabase: "test",
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						AllocatorKnobs: &kvserver.AllocatorTestingKnobs{
+							AllowLeaseTransfersToReplicasNeedingSnapshots: true,
+						},
+					},
+				},
 			},
 		})
 	defer tc.Stopper().Stop(ctx)
@@ -236,8 +245,9 @@ ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[
 
 	testutils.RunTrueAndFalse(t, "row-source", func(t *testing.T, rowSource bool) {
 		spec := execinfrapb.TableReaderSpec{
-			FetchSpec: makeFetchSpec(t, td, td.GetPrimaryIndex(), td.PublicColumns()[0].GetID()),
 			Spans:     []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
+			Table:     *td.TableDesc(),
+			ColumnIDs: []descpb.ColumnID{td.PublicColumns()[0].GetID()},
 		}
 		var out execinfra.RowReceiver
 		var buf *distsqlutils.RowBuffer
@@ -339,7 +349,8 @@ func TestTableReaderDrain(t *testing.T) {
 	}
 	spec := execinfrapb.TableReaderSpec{
 		Spans:     []roachpb.Span{td.PrimaryIndexSpan(keys.SystemSQLCodec)},
-		FetchSpec: makeFetchSpec(t, td, td.GetPrimaryIndex(), td.PublicColumns()[0].GetID()),
+		Table:     *td.TableDesc(),
+		ColumnIDs: []descpb.ColumnID{td.PublicColumns()[0].GetID()},
 	}
 	post := execinfrapb.PostProcessSpec{}
 
@@ -386,8 +397,8 @@ func TestLimitScans(t *testing.T) {
 		NodeID: evalCtx.NodeID,
 	}
 	spec := execinfrapb.TableReaderSpec{
-		FetchSpec: makeFetchSpec(t, tableDesc, tableDesc.GetPrimaryIndex()),
-		Spans:     []roachpb.Span{tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)},
+		Table: *tableDesc.TableDesc(),
+		Spans: []roachpb.Span{tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)},
 	}
 	// We're going to ask for 3 rows, all contained in the first range.
 	const limit = 3
@@ -503,10 +514,11 @@ func BenchmarkTableReader(b *testing.B) {
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
 			span := tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
 			spec := execinfrapb.TableReaderSpec{
-				FetchSpec: makeFetchSpec(
-					b, tableDesc, tableDesc.GetPrimaryIndex(),
-					tableDesc.PublicColumns()[0].GetID(), tableDesc.PublicColumns()[1].GetID(),
-				),
+				Table: *tableDesc.TableDesc(),
+				ColumnIDs: []descpb.ColumnID{
+					tableDesc.PublicColumns()[0].GetID(),
+					tableDesc.PublicColumns()[1].GetID(),
+				},
 				// Spans will be set below.
 			}
 			post := execinfrapb.PostProcessSpec{}
@@ -541,14 +553,4 @@ func BenchmarkTableReader(b *testing.B) {
 			}
 		})
 	}
-}
-
-func makeFetchSpec(
-	t testing.TB, table catalog.TableDescriptor, index catalog.Index, colIDs ...descpb.ColumnID,
-) descpb.IndexFetchSpec {
-	var spec descpb.IndexFetchSpec
-	if err := rowenc.InitIndexFetchSpec(&spec, keys.SystemSQLCodec, table, index, colIDs); err != nil {
-		t.Fatal(err)
-	}
-	return spec
 }

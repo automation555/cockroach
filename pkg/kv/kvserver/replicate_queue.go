@@ -304,9 +304,7 @@ func (rq *replicateQueue) process(
 	// selected target.
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		for {
-			requeue, err := rq.processOneChange(
-				ctx, repl, rq.canTransferLeaseFrom, false /* scatter */, false, /* dryRun */
-			)
+			requeue, err := rq.processOneChange(ctx, repl, rq.canTransferLeaseFrom, false /* dryRun */)
 			if isSnapshotError(err) {
 				// If ChangeReplicas failed because the snapshot failed, we log the
 				// error but then return success indicating we should retry the
@@ -343,7 +341,7 @@ func (rq *replicateQueue) processOneChange(
 	ctx context.Context,
 	repl *Replica,
 	canTransferLeaseFrom func(ctx context.Context, repl *Replica) bool,
-	scatter, dryRun bool,
+	dryRun bool,
 ) (requeue bool, _ error) {
 	// Check lease and destroy status here. The queue does this higher up already, but
 	// adminScatter (and potential other future callers) also call this method and don't
@@ -484,17 +482,10 @@ func (rq *replicateQueue) processOneChange(
 	case AllocatorRemoveLearner:
 		return rq.removeLearner(ctx, repl, dryRun)
 	case AllocatorConsiderRebalance:
-		return rq.considerRebalance(
-			ctx,
-			repl,
-			voterReplicas,
-			nonVoterReplicas,
-			canTransferLeaseFrom,
-			scatter,
-			dryRun,
-		)
+		return rq.considerRebalance(ctx, repl, voterReplicas, nonVoterReplicas, canTransferLeaseFrom, dryRun)
 	case AllocatorFinalizeAtomicReplicationChange:
-		_, err := maybeLeaveAtomicChangeReplicasAndRemoveLearners(ctx, repl.store, repl.Desc())
+		_, err :=
+			repl.maybeLeaveAtomicChangeReplicasAndRemoveLearners(ctx, repl.Desc())
 		// Requeue because either we failed to transition out of a joint state
 		// (bad) or we did and there might be more to do for that range.
 		return true, err
@@ -549,29 +540,22 @@ func (rq *replicateQueue) addOrReplaceVoters(
 				break
 			}
 		}
-		// See about transferring the lease away if we're about to remove the
-		// leaseholder.
-		done, err := rq.maybeTransferLeaseAway(
-			ctx, repl, existingVoters[removeIdx].StoreID, dryRun, nil /* canTransferLeaseFrom */)
-		if err != nil {
-			return false, err
-		}
-		if done {
-			// Lease was transferred away. Next leaseholder is going to take over.
-			return false, nil
-		}
 	}
 
 	// The allocator should not try to re-add this replica since there is a reason
 	// we're removing it (i.e. dead or decommissioning). If we left the replica in
 	// the slice, the allocator would not be guaranteed to pick a replica that
 	// fills the gap removeRepl leaves once it's gone.
-	newVoter, details, err := rq.allocator.AllocateVoter(ctx, conf, remainingLiveVoters, remainingLiveNonVoters)
+	newStore, details, err := rq.allocator.AllocateVoter(ctx, conf, remainingLiveVoters, remainingLiveNonVoters)
 	if err != nil {
 		return false, err
 	}
-	if removeIdx >= 0 && newVoter.StoreID == existingVoters[removeIdx].StoreID {
-		return false, errors.AssertionFailedf("allocator suggested to replace replica on s%d with itself", newVoter.StoreID)
+	if removeIdx >= 0 && newStore.StoreID == existingVoters[removeIdx].StoreID {
+		return false, errors.AssertionFailedf("allocator suggested to replace replica on s%d with itself", newStore.StoreID)
+	}
+	newVoter := roachpb.ReplicationTarget{
+		NodeID:  newStore.Node.NodeID,
+		StoreID: newStore.StoreID,
 	}
 
 	clusterNodes := rq.allocator.storePool.ClusterNodeCount()
@@ -594,10 +578,10 @@ func (rq *replicateQueue) addOrReplaceVoters(
 		// This means we are going to up-replicate to an even replica state.
 		// Check if it is possible to go to an odd replica state beyond it.
 		oldPlusNewReplicas := append([]roachpb.ReplicaDescriptor(nil), existingVoters...)
-		oldPlusNewReplicas = append(
-			oldPlusNewReplicas,
-			roachpb.ReplicaDescriptor{NodeID: newVoter.NodeID, StoreID: newVoter.StoreID},
-		)
+		oldPlusNewReplicas = append(oldPlusNewReplicas, roachpb.ReplicaDescriptor{
+			NodeID:  newStore.Node.NodeID,
+			StoreID: newStore.StoreID,
+		})
 		_, _, err := rq.allocator.AllocateVoter(ctx, conf, oldPlusNewReplicas, remainingLiveNonVoters)
 		if err != nil {
 			// It does not seem possible to go to the next odd replica state. Note
@@ -672,12 +656,16 @@ func (rq *replicateQueue) addOrReplaceNonVoters(
 	desc, conf := repl.DescAndSpanConfig()
 	existingNonVoters := desc.Replicas().NonVoterDescriptors()
 
-	newNonVoter, details, err := rq.allocator.AllocateNonVoter(ctx, conf, liveVoterReplicas, liveNonVoterReplicas)
+	newStore, details, err := rq.allocator.AllocateNonVoter(ctx, conf, liveVoterReplicas, liveNonVoterReplicas)
 	if err != nil {
 		return false, err
 	}
 	rq.metrics.AddReplicaCount.Inc(1)
 
+	newNonVoter := roachpb.ReplicationTarget{
+		NodeID:  newStore.Node.NodeID,
+		StoreID: newStore.StoreID,
+	}
 	ops := roachpb.MakeReplicationChanges(roachpb.ADD_NON_VOTER, newNonVoter)
 	if removeIdx < 0 {
 		log.VEventf(ctx, 1, "adding non-voter %+v: %s",
@@ -726,7 +714,7 @@ func (rq *replicateQueue) findRemoveVoter(
 		RaftStatus() *raft.Status
 	},
 	existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
-) (roachpb.ReplicationTarget, string, error) {
+) (roachpb.ReplicaDescriptor, string, error) {
 	_, zone := repl.DescAndSpanConfig()
 	// This retry loop involves quick operations on local state, so a
 	// small MaxBackoff is good (but those local variables change on
@@ -751,7 +739,7 @@ func (rq *replicateQueue) findRemoveVoter(
 		raftStatus := repl.RaftStatus()
 		if raftStatus == nil || raftStatus.RaftState != raft.StateLeader {
 			// If we've lost raft leadership, we're unlikely to regain it so give up immediately.
-			return roachpb.ReplicationTarget{}, "", &benignError{errors.Errorf("not raft leader while range needs removal")}
+			return roachpb.ReplicaDescriptor{}, "", &benignError{errors.Errorf("not raft leader while range needs removal")}
 		}
 		candidates = filterUnremovableReplicas(ctx, raftStatus, existingVoters, lastReplAdded)
 		log.VEventf(ctx, 3, "filtered unremovable replicas from %v to get %v as candidates for removal: %s",
@@ -782,12 +770,8 @@ func (rq *replicateQueue) findRemoveVoter(
 	}
 	if len(candidates) == 0 {
 		// If we timed out and still don't have any valid candidates, give up.
-		return roachpb.ReplicationTarget{}, "", &benignError{
-			errors.Errorf(
-				"no removable replicas from range that needs a removal: %s",
-				rangeRaftProgress(repl.RaftStatus(), existingVoters),
-			),
-		}
+		return roachpb.ReplicaDescriptor{}, "", &benignError{errors.Errorf("no removable replicas from range that needs a removal: %s",
+			rangeRaftProgress(repl.RaftStatus(), existingVoters))}
 	}
 
 	return rq.allocator.RemoveVoter(
@@ -869,6 +853,10 @@ func (rq *replicateQueue) removeVoter(
 	rq.metrics.RemoveReplicaCount.Inc(1)
 	log.VEventf(ctx, 1, "removing voting replica %+v due to over-replication: %s",
 		removeVoter, rangeRaftProgress(repl.RaftStatus(), existingVoters))
+	target := roachpb.ReplicationTarget{
+		NodeID:  removeVoter.NodeID,
+		StoreID: removeVoter.StoreID,
+	}
 	desc := repl.Desc()
 	// TODO(aayush): Directly removing the voter here is a bit of a missed
 	// opportunity since we could potentially be 1 non-voter short and the
@@ -878,7 +866,7 @@ func (rq *replicateQueue) removeVoter(
 	if err := rq.changeReplicas(
 		ctx,
 		repl,
-		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, removeVoter),
+		roachpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, target),
 		desc,
 		kvserverpb.SnapshotRequest_UNKNOWN, // unused
 		kvserverpb.ReasonRangeOverReplicated,
@@ -1074,15 +1062,10 @@ func (rq *replicateQueue) considerRebalance(
 	repl *Replica,
 	existingVoters, existingNonVoters []roachpb.ReplicaDescriptor,
 	canTransferLeaseFrom func(ctx context.Context, repl *Replica) bool,
-	scatter, dryRun bool,
+	dryRun bool,
 ) (requeue bool, _ error) {
 	desc, conf := repl.DescAndSpanConfig()
 	rebalanceTargetType := voterTarget
-
-	scorerOpts := scorerOptions(rq.allocator.scorerOptions())
-	if scatter {
-		scorerOpts = rq.allocator.scorerOptionsForScatter()
-	}
 	if !rq.store.TestingKnobs().DisableReplicaRebalancing {
 		rangeUsageInfo := rangeUsageInfoForRepl(repl)
 		addTarget, removeTarget, details, ok := rq.allocator.RebalanceVoter(
@@ -1093,7 +1076,7 @@ func (rq *replicateQueue) considerRebalance(
 			existingNonVoters,
 			rangeUsageInfo,
 			storeFilterThrottled,
-			scorerOpts,
+			rq.allocator.scorerOptions(),
 		)
 		if !ok {
 			// If there was nothing to do for the set of voting replicas on this
@@ -1107,20 +1090,13 @@ func (rq *replicateQueue) considerRebalance(
 				existingNonVoters,
 				rangeUsageInfo,
 				storeFilterThrottled,
-				scorerOpts,
+				rq.allocator.scorerOptions(),
 			)
 			rebalanceTargetType = nonVoterTarget
 		}
 
 		if !ok {
 			log.VEventf(ctx, 1, "no suitable rebalance target for non-voters")
-		} else if done, err := rq.maybeTransferLeaseAway(
-			ctx, repl, removeTarget.StoreID, dryRun, canTransferLeaseFrom,
-		); err != nil {
-			log.VEventf(ctx, 1, "want to remove self, but failed to transfer lease away: %s", err)
-		} else if done {
-			// Lease is now elsewhere, so we're not in charge any more.
-			return false, nil
 		} else {
 			// If we have a valid rebalance action (ok == true) and we haven't
 			// transferred our lease away, execute the rebalance.
