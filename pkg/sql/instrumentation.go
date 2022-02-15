@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -40,7 +39,6 @@ import (
 )
 
 var collectTxnStatsSampleRate = settings.RegisterFloatSetting(
-	settings.TenantWritable,
 	"sql.txn_stats.sample_rate",
 	"the probability that a given transaction will collect execution statistics (displayed in the DB Console)",
 	0.01,
@@ -93,17 +91,13 @@ type instrumentationHelper struct {
 	// See EXECUTE .. DISCARD ROWS.
 	discardRows bool
 
-	diagRequestID           stmtdiagnostics.RequestID
-	diagRequest             stmtdiagnostics.Request
-	stmtDiagnosticsRecorder *stmtdiagnostics.Registry
-	withStatementTrace      func(trace tracing.Recording, stmt string)
+	diagRequestID               stmtdiagnostics.RequestID
+	finishCollectionDiagnostics func()
+	withStatementTrace          func(trace tracing.Recording, stmt string)
 
-	sp *tracing.Span
-	// shouldFinishSpan determines whether sp needs to be finished in
-	// instrumentationHelper.Finish.
-	shouldFinishSpan bool
-	origCtx          context.Context
-	evalCtx          *tree.EvalContext
+	sp      *tracing.Span
+	origCtx context.Context
+	evalCtx *tree.EvalContext
 
 	// If savePlanForStats is true, the explainPlan will be collected and returned
 	// via PlanForStats().
@@ -118,16 +112,7 @@ type instrumentationHelper struct {
 	// regions used only on EXPLAIN ANALYZE to be displayed as top-level stat.
 	regions []string
 
-	// planGist is a compressed version of plan that can be converted (lossily)
-	// back into a logical plan or be used to get a plan hash.
-	planGist explain.PlanGist
-
-	// costEstimate is the cost of the query as estimated by the optimizer.
-	costEstimate float64
-
-	// indexRecommendations is a string slice containing index recommendations for
-	// the planned statement. This is only set for EXPLAIN statements.
-	indexRecommendations []string
+	planFingerprint explain.Fingerprint
 }
 
 // outputMode indicates how the statement output needs to be populated (for
@@ -165,7 +150,6 @@ func (ih *instrumentationHelper) Setup(
 	ih.fingerprint = fingerprint
 	ih.implicitTxn = implicitTxn
 	ih.codec = cfg.Codec
-	ih.origCtx = ctx
 
 	switch ih.outputMode {
 	case explainAnalyzeDebugOutput:
@@ -180,11 +164,10 @@ func (ih *instrumentationHelper) Setup(
 		ih.discardRows = true
 
 	default:
-		ih.collectBundle, ih.diagRequestID, ih.diagRequest =
+		ih.collectBundle, ih.diagRequestID, ih.finishCollectionDiagnostics =
 			stmtDiagnosticsRecorder.ShouldCollectDiagnostics(ctx, fingerprint)
 	}
 
-	ih.stmtDiagnosticsRecorder = stmtDiagnosticsRecorder
 	ih.withStatementTrace = cfg.TestingKnobs.WithStatementTrace
 
 	ih.savePlanForStats =
@@ -196,14 +179,10 @@ func (ih *instrumentationHelper) Setup(
 			// collection is enabled so that stats are shown in the traces, but
 			// no extra work is needed by the instrumentationHelper.
 			ih.collectExecStats = true
-			// We still, however, want to finish the instrumentationHelper in
-			// case we're collecting a bundle. We also capture the span in order
-			// to fetch the trace from it, but the span won't be finished.
-			ih.sp = sp
-			return ctx, ih.collectBundle
+			return ctx, false
 		}
 	} else {
-		if buildutil.CrdbTestBuild {
+		if util.CrdbTestBuild {
 			panic(errors.AssertionFailedf("the context doesn't have a tracing span"))
 		}
 	}
@@ -221,12 +200,10 @@ func (ih *instrumentationHelper) Setup(
 
 	if !ih.collectBundle && ih.withStatementTrace == nil && ih.outputMode == unmodifiedOutput {
 		if ih.collectExecStats {
-			// If we need to collect stats, create a child span with structured
-			// recording. Stats will be added as structured metadata and processed in
-			// Finish.
-			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement",
-				tracing.WithRecording(tracing.RecordingStructured))
-			ih.shouldFinishSpan = true
+			// If we need to collect stats, create a non-verbose child span. Stats
+			// will be added as structured metadata and processed in Finish.
+			ih.origCtx = ctx
+			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement", tracing.WithForceRealSpan())
 			return newCtx, true
 		}
 		return ctx, false
@@ -234,9 +211,9 @@ func (ih *instrumentationHelper) Setup(
 
 	ih.collectExecStats = true
 	ih.traceMetadata = make(execNodeTraceMetadata)
+	ih.origCtx = ctx
 	ih.evalCtx = p.EvalContext()
-	newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement", tracing.WithRecording(tracing.RecordingVerbose))
-	ih.shouldFinishSpan = true
+	newCtx, ih.sp = tracing.StartVerboseTrace(ctx, cfg.AmbientCtx.Tracer, "traced statement")
 	return newCtx, true
 }
 
@@ -255,15 +232,11 @@ func (ih *instrumentationHelper) Finish(
 	if ih.sp == nil {
 		return retErr
 	}
+	ih.sp.Finish()
 
 	// Record the statement information that we've collected.
 	// Note that in case of implicit transactions, the trace contains the auto-commit too.
-	var trace tracing.Recording
-	if ih.shouldFinishSpan {
-		trace = ih.sp.FinishAndGetConfiguredRecording()
-	} else {
-		trace = ih.sp.GetConfiguredRecording()
-	}
+	trace := ih.sp.GetRecording()
 
 	if ih.withStatementTrace != nil {
 		ih.withStatementTrace(trace, stmtRawSQL)
@@ -286,7 +259,7 @@ func (ih *instrumentationHelper) Finish(
 	queryLevelStats, err := execstats.GetQueryLevelStats(trace, cfg.TestingKnobs.DeterministicExplain, flowsMetadata)
 	if err != nil {
 		const msg = "error getting query level stats for statement: %s: %+v"
-		if buildutil.CrdbTestBuild {
+		if util.CrdbTestBuild {
 			panic(fmt.Sprintf(msg, ih.fingerprint, err))
 		}
 		log.VInfof(ctx, 1, msg, ih.fingerprint, err)
@@ -296,17 +269,6 @@ func (ih *instrumentationHelper) Finish(
 			ImplicitTxn: ih.implicitTxn,
 			Database:    p.SessionData().Database,
 			Failed:      retErr != nil,
-			PlanHash:    ih.planGist.Hash(),
-		}
-		// We populate transaction fingerprint ID if this is an implicit transaction.
-		// See executor_statement_metrics.go:recordStatementSummary() for further
-		// explanation.
-		if ih.implicitTxn {
-			stmtFingerprintID := stmtStatsKey.FingerprintID()
-			txnFingerprintHash := util.MakeFNV64()
-			txnFingerprintHash.Add(uint64(stmtFingerprintID))
-			stmtStatsKey.TransactionFingerprintID =
-				roachpb.TransactionFingerprintID(txnFingerprintHash.Sum())
 		}
 		err = statsCollector.RecordStatementExecStats(stmtStatsKey, queryLevelStats)
 		if err != nil {
@@ -321,22 +283,19 @@ func (ih *instrumentationHelper) Finish(
 
 	var bundle diagnosticsBundle
 	if ih.collectBundle {
-		ie := p.extendedEvalCtx.ExecCfg.InternalExecutor
-		phaseTimes := statsCollector.PhaseTimes()
-		if ih.stmtDiagnosticsRecorder.IsExecLatencyConditionMet(
-			ih.diagRequestID, ih.diagRequest, phaseTimes.GetServiceLatencyNoOverhead(),
-		) {
-			placeholders := p.extendedEvalCtx.Placeholders
-			ob := ih.emitExplainAnalyzePlanToOutputBuilder(
-				explain.Flags{Verbose: true, ShowTypes: true},
-				phaseTimes,
-				&queryLevelStats,
-			)
-			bundle = buildStatementBundle(
-				ih.origCtx, cfg.DB, ie, &p.curPlan, ob.BuildString(), trace, placeholders,
-			)
-			bundle.insert(ctx, ih.fingerprint, ast, cfg.StmtDiagnosticsRecorder, ih.diagRequestID)
-			ih.stmtDiagnosticsRecorder.RemoveOngoing(ih.diagRequestID, ih.diagRequest)
+		ie := p.extendedEvalCtx.InternalExecutor.(*InternalExecutor)
+		placeholders := p.extendedEvalCtx.Placeholders
+		ob := ih.buildExplainAnalyzePlan(
+			explain.Flags{Verbose: true, ShowTypes: true},
+			statsCollector.PhaseTimes(),
+			&queryLevelStats,
+		)
+		bundle = buildStatementBundle(
+			ih.origCtx, cfg.DB, ie, &p.curPlan, ob.BuildString(), trace, placeholders,
+		)
+		bundle.insert(ctx, ih.fingerprint, ast, cfg.StmtDiagnosticsRecorder, ih.diagRequestID)
+		if ih.finishCollectionDiagnostics != nil {
+			ih.finishCollectionDiagnostics()
 			telemetry.Inc(sqltelemetry.StatementDiagnosticsCollectedCounter)
 		}
 	}
@@ -447,10 +406,10 @@ func (ih *instrumentationHelper) PlanForStats(ctx context.Context) *roachpb.Expl
 	return ob.BuildProtoTree()
 }
 
-// emitExplainAnalyzePlanToOutputBuilder creates an explain.OutputBuilder and
-// populates it with the EXPLAIN ANALYZE plan. BuildString/BuildStringRows can
-// be used on the result.
-func (ih *instrumentationHelper) emitExplainAnalyzePlanToOutputBuilder(
+// buildExplainAnalyzePlan creates an explain.OutputBuilder and populates it
+// with the EXPLAIN ANALYZE plan. BuildString/BuildStringRows can be used on the
+// result.
+func (ih *instrumentationHelper) buildExplainAnalyzePlan(
 	flags explain.Flags, phaseTimes *sessionphase.Times, queryStats *execstats.QueryLevelStats,
 ) *explain.OutputBuilder {
 	ob := explain.NewOutputBuilder(flags)
@@ -507,7 +466,7 @@ func (ih *instrumentationHelper) setExplainAnalyzeResult(
 		return nil //nolint:returnerrcheck
 	}
 
-	ob := ih.emitExplainAnalyzePlanToOutputBuilder(ih.explainFlags, phaseTimes, queryLevelStats)
+	ob := ih.buildExplainAnalyzePlan(ih.explainFlags, phaseTimes, queryLevelStats)
 	rows := ob.BuildStringRows()
 	if distSQLFlowInfos != nil {
 		rows = append(rows, "")
@@ -601,13 +560,7 @@ func (m execNodeTraceMetadata) annotateExplain(
 				nodeStats.KVContentionTime.MaybeAdd(stats.KV.ContentionTime)
 				nodeStats.KVBytesRead.MaybeAdd(stats.KV.BytesRead)
 				nodeStats.KVRowsRead.MaybeAdd(stats.KV.TuplesRead)
-				nodeStats.StepCount.MaybeAdd(stats.KV.NumInterfaceSteps)
-				nodeStats.InternalStepCount.MaybeAdd(stats.KV.NumInternalSteps)
-				nodeStats.SeekCount.MaybeAdd(stats.KV.NumInterfaceSeeks)
-				nodeStats.InternalSeekCount.MaybeAdd(stats.KV.NumInternalSeeks)
 				nodeStats.VectorizedBatchCount.MaybeAdd(stats.Output.NumBatches)
-				nodeStats.MaxAllocatedMem.MaybeAdd(stats.Exec.MaxAllocatedMem)
-				nodeStats.MaxAllocatedDisk.MaybeAdd(stats.Exec.MaxAllocatedDisk)
 			}
 			// If we didn't get statistics for all processors, we don't show the
 			// incomplete results. In the future, we may consider an incomplete flag

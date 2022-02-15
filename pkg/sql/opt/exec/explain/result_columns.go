@@ -39,7 +39,7 @@ func getResultColumns(
 	}()
 
 	switch op {
-	case filterOp, invertedFilterOp, limitOp, max1RowOp, sortOp, topKOp, bufferOp, hashSetOpOp,
+	case filterOp, invertedFilterOp, limitOp, max1RowOp, sortOp, bufferOp, hashSetOpOp,
 		streamingSetOpOp, unionAllOp, distinctOp, saveTableOp, recursiveCTEOp:
 		// These ops inherit the columns from their first input.
 		return inputs[0], nil
@@ -81,12 +81,7 @@ func getResultColumns(
 
 	case lookupJoinOp:
 		a := args.(*lookupJoinArgs)
-		cols := joinColumns(a.JoinType, inputs[0], tableColumns(a.Table, a.LookupCols))
-		// The following matches the behavior of execFactory.ConstructLookupJoin.
-		if a.IsFirstJoinInPairedJoiner {
-			cols = append(cols, colinfo.ResultColumn{Name: "cont", Typ: types.Bool})
-		}
-		return cols, nil
+		return joinColumns(a.JoinType, inputs[0], tableColumns(a.Table, a.LookupCols)), nil
 
 	case ordinalityOp:
 		return appendColumns(inputs[0], colinfo.ResultColumn{
@@ -153,10 +148,7 @@ func getResultColumns(
 		return tableColumns(a.Table, a.ReturnCols), nil
 
 	case opaqueOp:
-		if args.(*opaqueArgs).Metadata != nil {
-			return args.(*opaqueArgs).Metadata.Columns(), nil
-		}
-		return nil, nil
+		return args.(*opaqueArgs).Metadata.Columns(), nil
 
 	case alterTableSplitOp:
 		return colinfo.AlterTableSplitColumns, nil
@@ -166,9 +158,6 @@ func getResultColumns(
 
 	case alterTableRelocateOp:
 		return colinfo.AlterTableRelocateColumns, nil
-
-	case alterRangeRelocateOp:
-		return colinfo.AlterRangeRelocateColumns, nil
 
 	case exportOp:
 		return colinfo.ExportColumns, nil
@@ -242,10 +231,8 @@ func groupByColumns(
 	inputCols colinfo.ResultColumns, groupCols []exec.NodeColumnOrdinal, aggregations []exec.AggInfo,
 ) colinfo.ResultColumns {
 	columns := make(colinfo.ResultColumns, 0, len(groupCols)+len(aggregations))
-	if inputCols != nil {
-		for _, col := range groupCols {
-			columns = append(columns, inputCols[col])
-		}
+	for _, col := range groupCols {
+		columns = append(columns, inputCols[col])
 	}
 	for _, agg := range aggregations {
 		columns = append(columns, colinfo.ResultColumn{

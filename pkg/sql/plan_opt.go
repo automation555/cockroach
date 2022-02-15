@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -22,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/indexrec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
@@ -31,13 +31,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
 var queryCacheEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
 	"sql.query_cache.enabled", "enable the query cache", true,
 )
 
@@ -57,7 +56,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 	case *tree.AlterIndex, *tree.AlterTable, *tree.AlterSequence,
 		*tree.Analyze,
 		*tree.BeginTransaction,
-		*tree.CommentOnColumn, *tree.CommentOnConstraint, *tree.CommentOnDatabase, *tree.CommentOnIndex, *tree.CommentOnTable, *tree.CommentOnSchema,
+		*tree.CommentOnColumn, *tree.CommentOnDatabase, *tree.CommentOnIndex, *tree.CommentOnTable,
 		*tree.CommitTransaction,
 		*tree.CopyFrom, *tree.CreateDatabase, *tree.CreateIndex, *tree.CreateView,
 		*tree.CreateSequence,
@@ -106,7 +105,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 				if !isStale {
 					opc.log(ctx, "query cache hit (prepare)")
 					opc.flags.Set(planFlagOptCacheHit)
-					stmt.Prepared.StatementNoConstants = pm.StatementNoConstants
+					stmt.Prepared.AnonymizedStr = pm.AnonymizedStr
 					stmt.Prepared.Columns = pm.Columns
 					stmt.Prepared.Types = pm.Types
 					stmt.Prepared.Memo = cachedData.Memo
@@ -199,7 +198,7 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	}
 
 	// Build the plan tree.
-	if mode := p.SessionData().ExperimentalDistSQLPlanningMode; mode != sessiondatapb.ExperimentalDistSQLPlanningOff {
+	if mode := p.SessionData().ExperimentalDistSQLPlanningMode; mode != sessiondata.ExperimentalDistSQLPlanningOff {
 		planningMode := distSQLDefaultPlanning
 		// If this transaction has modified or created any types, it is not safe to
 		// distribute due to limitations around leasing descriptors modified in the
@@ -216,7 +215,7 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 			p.autoCommit,
 		)
 		if err != nil {
-			if mode == sessiondatapb.ExperimentalDistSQLPlanningAlways &&
+			if mode == sessiondata.ExperimentalDistSQLPlanningAlways &&
 				!strings.Contains(p.stmt.AST.StatementTag(), "SET") {
 				// We do not fallback to the old path because experimental
 				// planning is set to 'always' and we don't have a SET
@@ -351,7 +350,7 @@ func (opc *optPlanningCtx) buildReusableMemo(ctx context.Context) (_ *memo.Memo,
 
 	_, isCanned := opc.p.stmt.AST.(*tree.CannedOptPlan)
 	if isCanned {
-		if !p.EvalContext().SessionData().AllowPrepareAsOptPlan {
+		if !p.EvalContext().SessionData.AllowPrepareAsOptPlan {
 			return nil, pgerror.New(pgcode.InsufficientPrivilege,
 				"PREPARE AS OPT PLAN is a testing facility that should not be used directly",
 			)
@@ -523,16 +522,6 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 	if err := bld.Build(); err != nil {
 		return nil, err
 	}
-
-	// For index recommendations, after building we must interrupt the flow to
-	// find potential index candidates in the memo.
-	_, isExplain := opc.p.stmt.AST.(*tree.Explain)
-	if isExplain && p.SessionData().IndexRecommendationsEnabled {
-		if err := opc.makeQueryIndexRecommendation(); err != nil {
-			return nil, err
-		}
-	}
-
 	if _, isCanned := opc.p.stmt.AST.(*tree.CannedOptPlan); !isCanned {
 		if _, err := opc.optimizer.Optimize(); err != nil {
 			return nil, err
@@ -573,15 +562,11 @@ func (opc *optPlanningCtx) runExecBuilder(
 	var isDDL bool
 	var containsFullTableScan bool
 	var containsFullIndexScan bool
-	var containsLargeFullTableScan bool
-	var containsLargeFullIndexScan bool
-	var containsMutation bool
-	var gf *explain.PlanGistFactory
-	if !opc.p.SessionData().DisablePlanGists {
-		gf = explain.NewPlanGistFactory(f)
-		f = gf
-	}
+	// Currently we record a plan fingerprint on every query, TODO: measure!
+	fpf := explain.NewFingerprintFactory(f)
+	f = fpf
 	if !planTop.instrumentation.ShouldBuildExplainPlan() {
+		// No instrumentation.
 		bld := execbuilder.New(f, &opc.optimizer, mem, &opc.catalog, mem.RootExpr(), evalCtx, allowAutoCommit)
 		plan, err := bld.Build()
 		if err != nil {
@@ -591,9 +576,6 @@ func (opc *optPlanningCtx) runExecBuilder(
 		isDDL = bld.IsDDL
 		containsFullTableScan = bld.ContainsFullTableScan
 		containsFullIndexScan = bld.ContainsFullIndexScan
-		containsLargeFullTableScan = bld.ContainsLargeFullTableScan
-		containsLargeFullIndexScan = bld.ContainsLargeFullIndexScan
-		containsMutation = bld.ContainsMutation
 	} else {
 		// Create an explain factory and record the explain.Plan.
 		explainFactory := explain.NewFactory(f)
@@ -609,16 +591,11 @@ func (opc *optPlanningCtx) runExecBuilder(
 		isDDL = bld.IsDDL
 		containsFullTableScan = bld.ContainsFullTableScan
 		containsFullIndexScan = bld.ContainsFullIndexScan
-		containsLargeFullTableScan = bld.ContainsLargeFullTableScan
-		containsLargeFullIndexScan = bld.ContainsLargeFullIndexScan
-		containsMutation = bld.ContainsMutation
 
 		planTop.instrumentation.RecordExplainPlan(explainPlan)
 	}
-	if gf != nil {
-		planTop.instrumentation.planGist = gf.PlanGist()
-	}
-	planTop.instrumentation.costEstimate = float64(mem.RootExpr().(memo.RelExpr).Cost())
+	planTop.instrumentation.planFingerprint = fpf.Fingerprint()
+	opc.log(context.TODO(), fmt.Sprintf("fingerprint:%s", planTop.instrumentation.planFingerprint.String()))
 
 	if stmt.ExpectedTypes != nil {
 		cols := result.main.planColumns()
@@ -639,86 +616,9 @@ func (opc *optPlanningCtx) runExecBuilder(
 	if containsFullIndexScan {
 		planTop.flags.Set(planFlagContainsFullIndexScan)
 	}
-	if containsLargeFullTableScan {
-		planTop.flags.Set(planFlagContainsLargeFullTableScan)
-	}
-	if containsLargeFullIndexScan {
-		planTop.flags.Set(planFlagContainsLargeFullIndexScan)
-	}
-	if containsMutation {
-		planTop.flags.Set(planFlagContainsMutation)
-	}
 	if planTop.instrumentation.ShouldSaveMemo() {
 		planTop.mem = mem
 		planTop.catalog = &opc.catalog
 	}
-	return nil
-}
-
-// DecodeGist Avoid an import cycle by keeping the cat out of the tree, RFC: is
-// there a better way?
-func (p *planner) DecodeGist(gist string) ([]string, error) {
-	return explain.DecodePlanGistToRows(gist, &p.optPlanningCtx.catalog)
-}
-
-// makeQueryIndexRecommendation builds a statement and walks through it to find
-// potential index candidates. It then optimizes the statement with those
-// indexes hypothetically added to the table. An index recommendation for the
-// query is outputted based on which hypothetical indexes are helpful in the
-// optimal plan.
-func (opc *optPlanningCtx) makeQueryIndexRecommendation() error {
-	// Save the normalized memo created by the optbuilder.
-	savedMemo := opc.optimizer.DetachMemo()
-
-	// Use the optimizer to fully normalize the memo. We need to do this before
-	// finding index candidates because the *memo.SortExpr from the sort enforcer
-	// is only added to the memo in this step. The sort expression is required to
-	// determine certain index candidates.
-	f := opc.optimizer.Factory()
-	f.FoldingControl().AllowStableFolds()
-	f.CopyAndReplace(
-		savedMemo.RootExpr().(memo.RelExpr),
-		savedMemo.RootProps(),
-		f.CopyWithoutAssigningPlaceholders,
-	)
-	opc.optimizer.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
-		return ruleName.IsNormalize()
-	})
-	if _, err := opc.optimizer.Optimize(); err != nil {
-		return err
-	}
-
-	// Walk through the fully normalized memo to determine index candidates and
-	// create hypothetical tables.
-	indexCandidates := indexrec.FindIndexCandidateSet(f.Memo().RootExpr(), f.Metadata())
-	optTables, hypTables := indexrec.BuildOptAndHypTableMaps(indexCandidates)
-
-	// Optimize with the saved memo and hypothetical tables. Walk through the
-	// optimal plan to determine index recommendations.
-	opc.optimizer.Init(f.EvalContext(), &opc.catalog)
-	f.CopyAndReplace(
-		savedMemo.RootExpr().(memo.RelExpr),
-		savedMemo.RootProps(),
-		f.CopyWithoutAssigningPlaceholders,
-	)
-	opc.optimizer.Memo().Metadata().UpdateTableMeta(hypTables)
-	if _, err := opc.optimizer.Optimize(); err != nil {
-		return err
-	}
-
-	indexRecommendations := indexrec.FindIndexRecommendationSet(f.Memo().RootExpr(), f.Metadata())
-	opc.p.instrumentation.indexRecommendations = indexRecommendations.Output()
-
-	// Re-initialize the optimizer (which also re-initializes the factory) and
-	// update the saved memo's metadata with the original table information.
-	// Prepare to re-optimize and create an executable plan.
-	opc.optimizer.Init(f.EvalContext(), &opc.catalog)
-	savedMemo.Metadata().UpdateTableMeta(optTables)
-	f.CopyAndReplace(
-		savedMemo.RootExpr().(memo.RelExpr),
-		savedMemo.RootProps(),
-		f.CopyWithoutAssigningPlaceholders,
-	)
-
 	return nil
 }
