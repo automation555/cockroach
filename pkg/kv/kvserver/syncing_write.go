@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
 	"golang.org/x/time/rate"
 )
 
@@ -33,10 +32,7 @@ const bulkIOWriteBurst = 512 << 10 // 512 KB
 
 const bulkIOWriteLimiterLongWait = 500 * time.Millisecond
 
-// limitBulkIOWrite blocks until the provided limiter permits the specified cost
-// to happen. It returns an error if the Context is canceled or the expected
-// wait time exceeds the Context's Deadline.
-func limitBulkIOWrite(ctx context.Context, limiter *rate.Limiter, cost int) error {
+func limitBulkIOWrite(ctx context.Context, limiter *rate.Limiter, cost int) {
 	// The limiter disallows anything greater than its burst (set to
 	// BulkIOWriteLimiterBurst), so cap the batch size if it would overflow.
 	//
@@ -51,19 +47,17 @@ func limitBulkIOWrite(ctx context.Context, limiter *rate.Limiter, cost int) erro
 
 	begin := timeutil.Now()
 	if err := limiter.WaitN(ctx, cost); err != nil {
-		return errors.Wrapf(err, "error rate limiting bulk io write")
+		log.Errorf(ctx, "error rate limiting bulk io write: %+v", err)
 	}
 
 	if d := timeutil.Since(begin); d > bulkIOWriteLimiterLongWait {
 		log.Warningf(ctx, "bulk io write limiter took %s (>%s):\n%s",
 			d, bulkIOWriteLimiterLongWait, debug.Stack())
 	}
-	return nil
 }
 
 // sstWriteSyncRate wraps "kv.bulk_sst.sync_size". 0 disables syncing.
 var sstWriteSyncRate = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
 	"kv.bulk_sst.sync_size",
 	"threshold after which non-Rocks SST writes must fsync (0 disables)",
 	bulkIOWriteBurst,
@@ -73,7 +67,8 @@ var sstWriteSyncRate = settings.RegisterByteSizeSetting(
 // named by filename -- but with rate limiting and periodic fsyncing controlled
 // by settings and the passed limiter (should be the store's limiter). Periodic
 // fsync provides smooths out disk IO, as mentioned in #20352 and #20279, and
-// provides back-pressure, along with the explicit rate limiting. If the file
+// provides back-pressure, along with the explicit rate limiting.
+// (TODO: catj, is this true because `perm` is used nowhere) If the file
 // does not exist, WriteFile creates it with permissions perm; otherwise
 // WriteFile truncates it before writing.
 func writeFileSyncing(
@@ -81,7 +76,7 @@ func writeFileSyncing(
 	filename string,
 	data []byte,
 	eng storage.Engine,
-	perm os.FileMode,
+	_ os.FileMode,
 	settings *cluster.Settings,
 	limiter *rate.Limiter,
 ) error {
@@ -107,16 +102,14 @@ func writeFileSyncing(
 		}
 		chunk := data[i:end]
 
-		if err = limitBulkIOWrite(ctx, limiter, len(chunk)); err != nil {
-			break
+		// rate limit
+		limitBulkIOWrite(ctx, limiter, len(chunk))
+		_, err = f.Write(chunk)
+		if err == nil && sync {
+			err = f.Sync()
 		}
-		if _, err = f.Write(chunk); err != nil {
+		if err != nil {
 			break
-		}
-		if sync {
-			if err = f.Sync(); err != nil {
-				break
-			}
 		}
 	}
 

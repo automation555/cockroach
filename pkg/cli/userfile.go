@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -470,8 +471,8 @@ func downloadUserfile(
 		return 0, err
 	}
 
-	// os.Create uses a permissive 0666 mode so use OpenFile directly.
-	localFile, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	// os.Create uses a permissive 0666 mode so use sysutil.OpenFile directly.
+	localFile, err := sysutil.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return 0, err
 	}
@@ -563,7 +564,7 @@ func renameUserFile(
 			_, _ = ex.ExecContext(ctx, `ROLLBACK`, nil)
 		}
 	}()
-	//lint:ignore SA1019 DriverConn doesn't support go 1.8 API
+
 	_, err = stmt.Exec([]driver.Value{newFilename, oldFilename})
 	if err != nil {
 		return err
@@ -652,7 +653,6 @@ func uploadUserFile(
 		if n > 0 {
 			// TODO(adityamaru): Switch to StmtExecContext once the copyin driver
 			// supports it.
-			//lint:ignore SA1019 DriverConn doesn't support go 1.8 API
 			_, err = stmt.Exec([]driver.Value{string(send[:n])})
 			if err != nil {
 				return "", err
@@ -698,7 +698,7 @@ var userFileCmd = &cobra.Command{
 	Use:   "userfile [command]",
 	Short: "upload, list and delete user scoped files",
 	Long:  "Upload, list and delete files from the user scoped file storage.",
-	RunE:  UsageAndErr,
+	RunE:  usageAndErr,
 }
 
 func init() {

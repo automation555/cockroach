@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/startupmigrations"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
@@ -168,7 +169,7 @@ The resulting key file will be 32 bytes (random key ID) + key_size in bytes.
 			openMode |= os.O_EXCL
 		}
 
-		f, err := os.OpenFile(encryptionKeyPath, openMode, 0600)
+		f, err := sysutil.OpenFile(encryptionKeyPath, openMode, 0600)
 		if err != nil {
 			return err
 		}
@@ -211,13 +212,13 @@ Output the list of cluster settings known to this binary.
 		settings.NewUpdater(&s.SV).ResetRemaining(context.Background())
 
 		var rows [][]string
-		for _, name := range settings.Keys(settings.ForSystemTenant) {
-			setting, ok := settings.Lookup(name, settings.LookupForLocalAccess, settings.ForSystemTenant)
+		for _, name := range settings.Keys() {
+			setting, ok := settings.Lookup(name, settings.LookupForLocalAccess)
 			if !ok {
 				panic(fmt.Sprintf("could not find setting %q", name))
 			}
 
-			if excludeSystemSettings && setting.Class() == settings.SystemOnly {
+			if excludeSystemSettings && setting.SystemOnly() {
 				continue
 			}
 
@@ -253,7 +254,7 @@ var genCmd = &cobra.Command{
 	Use:   "gen [command]",
 	Short: "generate auxiliary files",
 	Long:  "Generate manpages, example shell settings, example databases, etc.",
-	RunE:  UsageAndErr,
+	RunE:  usageAndErr,
 }
 
 var genCmds = []*cobra.Command{

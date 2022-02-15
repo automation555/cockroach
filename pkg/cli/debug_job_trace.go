@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	tracezipper "github.com/cockroachdb/cockroach/pkg/util/tracing/zipper"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
@@ -51,8 +52,7 @@ func runDebugJobTrace(_ *cobra.Command, args []string) (resErr error) {
 
 func getJobTraceID(sqlConn clisqlclient.Conn, jobID int64) (int64, error) {
 	var traceID int64
-	rows, err := sqlConn.Query(context.Background(),
-		`SELECT trace_id FROM crdb_internal.jobs WHERE job_id=$1`, jobID)
+	rows, err := sqlConn.Query(`SELECT trace_id FROM crdb_internal.jobs WHERE job_id=$1`, []driver.Value{jobID})
 	if err != nil {
 		return traceID, err
 	}
@@ -81,10 +81,17 @@ func getJobTraceID(sqlConn clisqlclient.Conn, jobID int64) (int64, error) {
 }
 
 func constructJobTraceZipBundle(ctx context.Context, sqlConn clisqlclient.Conn, jobID int64) error {
+	maybePrint := func(stmt string) string {
+		if debugCtx.verbose {
+			fmt.Println("querying " + stmt)
+		}
+		return stmt
+	}
+
 	// Check if a timeout has been set for this command.
 	if cliCtx.cmdTimeout != 0 {
-		if err := sqlConn.Exec(context.Background(),
-			`SET statement_timeout = $1`, cliCtx.cmdTimeout.String()); err != nil {
+		stmt := fmt.Sprintf(`SET statement_timeout = '%s'`, cliCtx.cmdTimeout)
+		if err := sqlConn.Exec(maybePrint(stmt), nil); err != nil {
 			return err
 		}
 	}
@@ -102,7 +109,7 @@ func constructJobTraceZipBundle(ctx context.Context, sqlConn clisqlclient.Conn, 
 
 	var f *os.File
 	filename := fmt.Sprintf("%d-%s", jobID, jobTraceZipSuffix)
-	if f, err = os.Create(filename); err != nil {
+	if f, err = sysutil.Create(filename); err != nil {
 		return err
 	}
 	_, err = f.Write(zipBytes)
