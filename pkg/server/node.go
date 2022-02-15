@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -1119,12 +1120,9 @@ func setupSpanForIncomingRPC(
 		// This is a local request which circumvented gRPC. Start a span now.
 		ctx, newSpan = tracing.EnsureChildSpan(ctx, tr, tracing.BatchMethodName, tracing.WithServerSpanKind)
 	} else if parentSpan == nil {
-		// Non-local call. Tracing information comes from the request proto.
 		var remoteParent tracing.SpanMeta
 		if !ba.TraceInfo.Empty() {
-			ctx, newSpan = tr.StartSpanCtx(ctx, tracing.BatchMethodName,
-				tracing.WithRemoteParentFromTraceInfo(&ba.TraceInfo),
-				tracing.WithServerSpanKind)
+			remoteParent = tracing.SpanMetaFromProto(ba.TraceInfo)
 		} else {
 			// For backwards compatibility with 21.2, if tracing info was passed as
 			// gRPC metadata, we use it.
@@ -1133,10 +1131,11 @@ func setupSpanForIncomingRPC(
 			if err != nil {
 				log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
 			}
-			ctx, newSpan = tr.StartSpanCtx(ctx, tracing.BatchMethodName,
-				tracing.WithRemoteParentFromSpanMeta(remoteParent),
-				tracing.WithServerSpanKind)
 		}
+
+		ctx, newSpan = tr.StartSpanCtx(ctx, tracing.BatchMethodName,
+			tracing.WithRemoteParent(remoteParent),
+			tracing.WithServerSpanKind)
 	} else {
 		// It's unexpected to find a span in the context for a non-local request.
 		// Let's create a span for the RPC anyway.
@@ -1187,6 +1186,12 @@ func (n *Node) RangeLookup(
 func (n *Node) RangeFeed(
 	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) error {
+	return n.singleRangeFeed(args, stream)
+}
+
+func (n *Node) singleRangeFeed(
+	args *roachpb.RangeFeedRequest, stream roachpb.RangeFeedEventSink,
+) error {
 	pErr := n.stores.RangeFeed(args, stream)
 	if pErr != nil {
 		var event roachpb.RangeFeedEvent
@@ -1196,6 +1201,58 @@ func (n *Node) RangeFeed(
 		return stream.Send(&event)
 	}
 	return nil
+}
+
+type setRangeIDEventSink struct {
+	ctx      context.Context
+	rangeID  roachpb.RangeID
+	streamID int64
+	wrapped  roachpb.Internal_MuxRangeFeedServer
+}
+
+func (s *setRangeIDEventSink) Context() context.Context {
+	return s.ctx
+}
+
+func (s *setRangeIDEventSink) Send(event *roachpb.RangeFeedEvent) error {
+	response := &roachpb.MuxRangeFeedEvent{
+		RangeFeedEvent: *event,
+		RangeID:        s.rangeID,
+		StreamID:       s.streamID,
+	}
+	return s.wrapped.Send(response)
+}
+
+var _ roachpb.RangeFeedEventSink = (*setRangeIDEventSink)(nil)
+
+func (n *Node) asyncRangeFeed(
+	args roachpb.RangeFeedRequest, stream roachpb.Internal_MuxRangeFeedServer,
+) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		sink := setRangeIDEventSink{
+			ctx:      ctx,
+			rangeID:  args.RangeID,
+			streamID: args.StreamID,
+			wrapped:  stream,
+		}
+		return n.singleRangeFeed(&args, &sink)
+	}
+}
+
+// MuxRangeFeed implements the roachpb.InternalServer interface.
+func (n *Node) MuxRangeFeed(stream roachpb.Internal_MuxRangeFeedServer) error {
+	ctx, cancelFeeds := context.WithCancel(stream.Context())
+	defer cancelFeeds()
+	rfGrp := ctxgroup.WithContext(ctx)
+
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			cancelFeeds()
+			return errors.CombineErrors(err, rfGrp.Wait())
+		}
+		rfGrp.GoCtx(n.asyncRangeFeed(*req, stream))
+	}
 }
 
 // ResetQuorum implements the roachpb.InternalServer interface.
@@ -1549,17 +1606,18 @@ func (emptyMetricStruct) MetricStruct() {}
 func (n *Node) GetSpanConfigs(
 	ctx context.Context, req *roachpb.GetSpanConfigsRequest,
 ) (*roachpb.GetSpanConfigsResponse, error) {
-	targets, err := spanconfig.TargetsFromProtos(req.Targets)
-	if err != nil {
-		return nil, err
+	targets := make([]spanconfig.Target, 0, len(req.Spans))
+	for _, span := range req.Spans {
+		targets = append(targets, spanconfig.MakeSpanTarget(span))
 	}
+
 	records, err := n.spanConfigAccessor.GetSpanConfigRecords(ctx, targets)
 	if err != nil {
 		return nil, err
 	}
 
 	return &roachpb.GetSpanConfigsResponse{
-		SpanConfigEntries: spanconfig.RecordsToEntries(records),
+		SpanConfigEntries: spanconfig.RecordsToSpanConfigEntries(records),
 	}, nil
 }
 
@@ -1570,15 +1628,16 @@ func (n *Node) UpdateSpanConfigs(
 	// TODO(irfansharif): We want to protect ourselves from tenants creating
 	// outlandishly large string buffers here and OOM-ing the host cluster. Is
 	// the maximum protobuf message size enough of a safeguard?
-	toUpsert, err := spanconfig.EntriesToRecords(req.ToUpsert)
-	if err != nil {
-		return nil, err
+
+	toDelete := make([]spanconfig.Target, 0, len(req.ToDelete))
+	for _, toDel := range req.ToDelete {
+		toDelete = append(toDelete, spanconfig.MakeSpanTarget(toDel))
 	}
-	toDelete, err := spanconfig.TargetsFromProtos(req.ToDelete)
+
+	toUpsert := spanconfig.EntriesToRecords(req.ToUpsert)
+
+	err := n.spanConfigAccessor.UpdateSpanConfigRecords(ctx, toDelete, toUpsert)
 	if err != nil {
-		return nil, err
-	}
-	if err := n.spanConfigAccessor.UpdateSpanConfigRecords(ctx, toDelete, toUpsert); err != nil {
 		return nil, err
 	}
 	return &roachpb.UpdateSpanConfigsResponse{}, nil
