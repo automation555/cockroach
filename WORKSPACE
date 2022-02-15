@@ -13,12 +13,12 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # Load go bazel tools. This gives us access to the go bazel SDK/toolchains.
 http_archive(
     name = "io_bazel_rules_go",
-    sha256 = "5c4bd27429b1a307d51cd23d4677126aa6315fff608f0cd85c5bfb642a13b953",
-    strip_prefix = "cockroachdb-rules_go-23b381c",
+    sha256 = "adf650cf3dfded434e3a46c9063863579cdf8960a6e2f27e3e2537eb83a9413b",
+    strip_prefix = "rules_go-1ce9e349278b6e9ea1d52e0f73446c70ad440cbd",
     urls = [
-        # cockroachdb/rules_go as of 23b381cc8a679f5b10fd2459fc87997728b3740c
+        # cockroachdb/rules_go as of 1ce9e349278b6e9ea1d52e0f73446c70ad440cbd
         # (upstream release-0.29 plus a few patches).
-        "https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_go-v0.27.0-52-g23b381c.tar.gz",
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_go-v0.29.0-0-1ce9e349.tar.gz",
     ],
 )
 
@@ -28,6 +28,10 @@ http_archive(
     sha256 = "cfc289523cf1594598215901154a6c2515e8bf3671fd708264a6f6aefe02bf39",
     urls = [
         "https://storage.googleapis.com/public-bazel-artifacts/bazel/rules_nodejs-4.4.6.tar.gz",
+    ],
+    patch_args = ["-p1"],
+    patches = [
+      "@cockroach//build/patches:build_bazel_rules_nodejs.patch",
     ],
 )
 
@@ -123,7 +127,6 @@ http_archive(
         "@io_bazel_rules_go//third_party:go_googleapis-deletebuild.patch",
         "@io_bazel_rules_go//third_party:go_googleapis-directives.patch",
         "@io_bazel_rules_go//third_party:go_googleapis-gazelle.patch",
-        "@cockroach//build/patches:go_googleapis.patch",
     ],
     sha256 = "a85c6a00e9cf0f004992ebea1d10688e3beea9f8e1a5a04ee53f367e72ee85af",
     strip_prefix = "googleapis-409e134ffaacc243052b08e6fb8e2d458014ed37",
@@ -144,7 +147,7 @@ load(
 go_download_sdk(
     name = "go_sdk",
     urls = ["https://storage.googleapis.com/public-bazel-artifacts/go/{}"],
-    version = "1.17.6",
+    version = "1.17.3",
 )
 
 go_rules_dependencies()
