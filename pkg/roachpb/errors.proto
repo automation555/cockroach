@@ -56,12 +56,6 @@ message NotLeaseHolderError {
   optional roachpb.Lease lease = 4;
   optional int64 range_id = 3 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "RangeID", (gogoproto.casttype) = "RangeID"];
-  // The range descriptor generation of the replica the error originated from.
-  // Used by the DistSender's RangeCache to determine whether the error was
-  // returned because the replica had a stale understanding of who the
-  // leaseholder is.
-  optional int64 descriptor_generation = 6 [(gogoproto.nullable) = false,
-    (gogoproto.customname) = "DescriptorGeneration", (gogoproto.casttype) = "RangeGeneration"];
   // If set, the Error() method will return this instead of composing its
   // regular spiel. Useful because we reuse this error when rejecting a command
   // because the lease under which its application was attempted is different
@@ -338,13 +332,6 @@ message WriteIntentError {
 message WriteTooOldError {
   optional util.hlc.Timestamp timestamp = 1 [(gogoproto.nullable) = false];
   optional util.hlc.Timestamp actual_timestamp = 2 [(gogoproto.nullable) = false];
-  // One of the keys at which this error was encountered. There's
-  // no need to return new WriteTooOldErrors for each colliding key; the key
-  // is just present for investigation / logging purposes, and is not expected
-  // to be used in any transaction logic. As a result, it's not even necessary
-  // for this key to be at actual_timestamp; it could be at any timestamp in
-  // between timestamp and actual_timestamp.
-  optional bytes key = 3 [(gogoproto.casttype) = "Key"];
 }
 
 // An OpRequiresTxnError indicates that a command required to be
@@ -377,12 +364,6 @@ message AmbiguousResultError {
   // This can be set to give extra information about which error was converted
   // into an AmbiguousResultError. Useful for tests.
   optional Error wrapped_err = 2;
-}
-
-message ReplicaUnavailableError {
-
-  optional roachpb.RangeDescriptor desc = 2 [(gogoproto.nullable) = false];
-  optional roachpb.ReplicaDescriptor replica = 4 [(gogoproto.nullable) = false];
 }
 
 // A RaftGroupDeletedError indicates a raft group has been deleted for
@@ -484,16 +465,6 @@ message IntegerOverflowError {
 message BatchTimestampBeforeGCError {
   optional util.hlc.Timestamp Timestamp = 1 [(gogoproto.nullable) = false];
   optional util.hlc.Timestamp Threshold = 2 [(gogoproto.nullable) = false];
-  // DataExcludedFromBackup is set to true if the request is targeting a range
-  // that has been marked as excluded from a backup via
-  // `ALTER TABLE ... SET (exclude_data_from_backup = true)`.
-  optional bool data_excluded_from_backup = 3 [(gogoproto.nullable) = false];
-}
-
-// A MVCCHistoryMutationError indicates that MVCC history was unexpectedly
-// mutated.
-message MVCCHistoryMutationError {
-  optional roachpb.Span span = 1 [(gogoproto.nullable) = false];
 }
 
 // An IntentMissingError indicates that a QueryIntent request expected
@@ -574,20 +545,6 @@ message MinTimestampBoundUnsatisfiableError {
   optional util.hlc.Timestamp resolved_timestamp  = 2 [(gogoproto.nullable) = false];
 }
 
-// A RefreshFailedError indicates that a refresh or a range refresh failed because
-// of a recently written key or intent.
-message RefreshFailedError {
-  enum Reason {
-    REASON_COMMITTED_VALUE = 0;
-    REASON_INTENT = 1;
-  }
-  optional Reason reason = 1 [(gogoproto.nullable) = false];
-  optional bytes key = 2 [(gogoproto.casttype) = "Key"];
-
-  // The timestamp the key was last updated.
-  optional util.hlc.Timestamp timestamp = 3 [(gogoproto.nullable) = false];
-}
-
 // ErrorDetail is a union type containing all available errors.
 message ErrorDetail {
   reserved 15, 19, 20, 21, 22, 23, 24, 25, 29, 30, 33;
@@ -628,9 +585,6 @@ message ErrorDetail {
     InvalidLeaseError invalid_lease_error = 40;
     OptimisticEvalConflictsError optimistic_eval_conflicts = 41;
     MinTimestampBoundUnsatisfiableError min_timestamp_bound_unsatisfiable = 42;
-    RefreshFailedError refresh_failed_error = 43;
-    MVCCHistoryMutationError mvcc_history_mutation = 44
-      [(gogoproto.customname) = "MVCCHistoryMutation"];
   }
 }
 
@@ -666,17 +620,6 @@ message ErrPosition {
 message Error {
   option (gogoproto.goproto_stringer) = false;
 
-  // message is a human-readable error message.
-  //
-  // DEPRECATED.
-  optional string message = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "deprecatedMessage"];
-
-  // If transaction_restart is not NONE, the error condition may be handled by
-  // restarting the transaction.
-  //
-  // DEPRECATED.
-  optional TransactionRestart transaction_restart = 3 [(gogoproto.nullable) = false, (gogoproto.customname) = "deprecatedTransactionRestart"];
-
   // An optional updated transaction. This is to be used by the client in case
   // of retryable errors.
   //
@@ -685,12 +628,6 @@ message Error {
 
   // Node at which the error was generated (zero if does not apply).
   optional int32 origin_node = 5 [(gogoproto.nullable) = false, (gogoproto.casttype) = "NodeID"];
-
-  // If an ErrorDetail is present, it may contain additional structured data
-  // about the error.
-  //
-  // DEPRECATED - consult encoded_error instead.
-  optional ErrorDetail detail = 6 [(gogoproto.nullable) = false, (gogoproto.customname) = "deprecatedDetail"];
 
   // encoded_error is the Go error that caused this Error.
   optional errorspb.EncodedError encoded_error = 9 [(gogoproto.nullable) = false];
