@@ -14,6 +14,7 @@ import (
 	"context"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -34,7 +35,6 @@ var CacheEnabledSettingName = "server.authentication_cache.enabled"
 // CacheEnabled is a cluster setting that determines if the
 // sessioninit.Cache and associated logic is enabled.
 var CacheEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
 	CacheEnabledSettingName,
 	"enables a cache used during authentication to avoid lookups to system tables "+
 		"when retrieving per-user authentication-related information",
@@ -59,12 +59,10 @@ type Cache struct {
 type AuthInfo struct {
 	// UserExists is set to true if the user has a row in system.users.
 	UserExists bool
-	// CanLoginSQL is set to false if the user has the NOLOGIN or NOSQLLOGIN role option.
-	CanLoginSQL bool
-	// CanLoginDBConsole is set to false if the user has NOLOGIN role option.
-	CanLoginDBConsole bool
+	// CanLogin is set to false if the user has the NOLOGIN role option.
+	CanLogin bool
 	// HashedPassword is the hashed password and can be nil.
-	HashedPassword security.PasswordHash
+	HashedPassword []byte
 	// ValidUntil is the VALID UNTIL role option.
 	ValidUntil *tree.DTimestamp
 }
@@ -103,12 +101,13 @@ func (a *Cache) GetAuthInfo(
 	readFromSystemTables func(
 		ctx context.Context,
 		txn *kv.Txn,
+		settings *cluster.Settings,
 		ie sqlutil.InternalExecutor,
 		username security.SQLUsername,
 	) (AuthInfo, error),
 ) (aInfo AuthInfo, err error) {
 	if !CacheEnabled.Get(&settings.SV) {
-		return readFromSystemTables(ctx, nil /* txn */, ie, username)
+		return readFromSystemTables(ctx, nil /* txn */, settings, ie, username)
 	}
 	err = f.Txn(ctx, ie, db, func(
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
@@ -140,6 +139,7 @@ func (a *Cache) GetAuthInfo(
 			aInfo, err = readFromSystemTables(
 				ctx,
 				txn,
+				settings,
 				ie,
 				username,
 			)
@@ -163,6 +163,7 @@ func (a *Cache) GetAuthInfo(
 			aInfo, err = readFromSystemTables(
 				ctx,
 				txn,
+				settings,
 				ie,
 				username,
 			)
@@ -223,14 +224,8 @@ func (a *Cache) writeAuthInfoBackToCache(
 	const sizeOfUsername = int(unsafe.Sizeof(security.SQLUsername{}))
 	const sizeOfAuthInfo = int(unsafe.Sizeof(AuthInfo{}))
 	const sizeOfTimestamp = int(unsafe.Sizeof(tree.DTimestamp{}))
-
-	hpSize := 0
-	if aInfo.HashedPassword != nil {
-		hpSize = aInfo.HashedPassword.Size()
-	}
-
 	sizeOfEntry := sizeOfUsername + len(username.Normalized()) +
-		sizeOfAuthInfo + hpSize +
+		sizeOfAuthInfo + len(aInfo.HashedPassword) +
 		sizeOfTimestamp
 	if err := a.boundAccount.Grow(ctx, int64(sizeOfEntry)); err != nil {
 		// If there is no memory available to cache the entry, we can still
@@ -264,6 +259,11 @@ func (a *Cache) GetDefaultSettings(
 		databaseID descpb.ID,
 	) ([]SettingsCacheEntry, error),
 ) (settingsEntries []SettingsCacheEntry, err error) {
+	// TODO(rafi): remove this flag in v21.2.
+	if !settings.Version.IsActive(ctx, clusterversion.DatabaseRoleSettings) {
+		return nil, nil
+	}
+
 	err = f.Txn(ctx, ie, db, func(
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) (err error) {
