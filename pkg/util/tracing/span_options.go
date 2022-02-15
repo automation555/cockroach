@@ -46,12 +46,7 @@ var followsFromAttribute = []attribute.KeyValue{attribute.String("follows-from",
 // field comment below are invoked as arguments to `Tracer.StartSpan`.
 // See the SpanOption interface for a synopsis.
 type spanOptions struct {
-	// Parent, if set, indicates the parent span of the span being created with
-	// these spanOptions.
-	// If parent is set, its refCnt is assumed to have been incremented with the
-	// reference held here (see WithParent()). Thus, this `spanOptions` cannot be
-	// discarded; it must be used exactly once. StartSpan() will decrement refCnt.
-	Parent spanRef // see WithParent
+	Parent *Span // see WithParent
 	// ParentDoesNotCollectRecording is set by WithDetachedRecording. It means
 	// that, although this span has a parent, the parent should generally not
 	// include this child's recording when the parent is asked for its own
@@ -68,7 +63,7 @@ type spanOptions struct {
 	// collection of each processor span recording independently, without relying
 	// on collecting the recording of the flow's span.
 	ParentDoesNotCollectRecording bool
-	RemoteParent                  SpanMeta               // see WithRemoteParentFromSpanMeta
+	RemoteParent                  SpanMeta               // see WithRemoteParent
 	RefType                       spanReferenceType      // see WithFollowsFrom
 	LogTags                       *logtags.Buffer        // see WithLogTags
 	Tags                          map[string]interface{} // see WithTags
@@ -84,7 +79,7 @@ type spanOptions struct {
 }
 
 func (opts *spanOptions) parentTraceID() tracingpb.TraceID {
-	if !opts.Parent.empty() && !opts.Parent.IsNoop() {
+	if opts.Parent != nil && !opts.Parent.IsNoop() {
 		return opts.Parent.i.crdb.traceID
 	} else if !opts.RemoteParent.Empty() {
 		return opts.RemoteParent.traceID
@@ -93,7 +88,7 @@ func (opts *spanOptions) parentTraceID() tracingpb.TraceID {
 }
 
 func (opts *spanOptions) parentSpanID() tracingpb.SpanID {
-	if !opts.Parent.empty() && !opts.Parent.IsNoop() {
+	if opts.Parent != nil && !opts.Parent.IsNoop() {
 		return opts.Parent.i.crdb.spanID
 	} else if !opts.RemoteParent.Empty() {
 		return opts.RemoteParent.spanID
@@ -107,7 +102,7 @@ func (opts *spanOptions) recordingType() RecordingType {
 	}
 
 	recordingType := RecordingOff
-	if !opts.Parent.empty() && !opts.Parent.IsNoop() {
+	if opts.Parent != nil && !opts.Parent.IsNoop() {
 		recordingType = opts.Parent.i.crdb.recordingType()
 	} else if !opts.RemoteParent.Empty() {
 		recordingType = opts.RemoteParent.recordingType
@@ -120,7 +115,7 @@ func (opts *spanOptions) recordingType() RecordingType {
 // RemoteParent,  a SpanContext is returned. If there's no OpenTelemetry parent,
 // both return values will be empty.
 func (opts *spanOptions) otelContext() (oteltrace.Span, oteltrace.SpanContext) {
-	if !opts.Parent.empty() && opts.Parent.i.otelSpan != nil {
+	if opts.Parent != nil && opts.Parent.i.otelSpan != nil {
 		return opts.Parent.i.otelSpan, oteltrace.SpanContext{}
 	}
 	if !opts.RemoteParent.Empty() && opts.RemoteParent.otelCtx.IsValid() {
@@ -133,7 +128,7 @@ func (opts *spanOptions) otelContext() (oteltrace.Span, oteltrace.SpanContext) {
 // A synopsis of the options follows. For details, see their comments.
 //
 // - WithParent: create a child Span with a local parent.
-// - WithRemoteParentFromSpanMeta: create a child Span with a remote parent.
+// - WithRemoteParent: create a child Span with a remote parent.
 // - WithFollowsFrom: hint that child may outlive parent.
 // - WithLogTags: populates the Span tags from a `logtags.Buffer`.
 // - WithCtxLogTags: like WithLogTags, but takes a `context.Context`.
@@ -144,13 +139,13 @@ type SpanOption interface {
 	apply(spanOptions) spanOptions
 }
 
-type parentOption spanRef
+type parentOption Span
 
 // WithParent instructs StartSpan to create a child Span from a (local) parent
 // Span.
 //
 // In case when the parent span is created with a different Tracer (generally,
-// when the parent lives in a different process), WithRemoteParentFromSpanMeta should be
+// when the parent lives in a different process), WithRemoteParent should be
 // used.
 //
 // WithParent will be a no-op (i.e. the span resulting from
@@ -178,55 +173,32 @@ type parentOption spanRef
 // which corresponds to the expectation that the parent span will
 // wait for the child to Finish(). If this expectation does not hold,
 // WithFollowsFrom should be added to the StartSpan invocation.
-//
-// WithParent increments sp's reference count. As such, the resulting option
-// must be passed to StartSpan(opt). Once passed to StartSpan(opt), opt cannot
-// be reused. The child span will be responsible for ultimately doing the
-// decrement. The fact that WithParent takes a reference on sp is important to
-// avoid the possibility of deadlocks when buggy code uses a Span after Finish()
-// (which is illegal). See comments on Span.refCnt for details. By taking the
-// reference, it becomes safe (from a deadlock perspective) to call
-// WithParent(sp) concurrently with sp.Finish(). Note that calling
-// WithParent(sp) after sp was re-allocated cannot result in deadlocks
-// regardless of the reference counting.
 func WithParent(sp *Span) SpanOption {
-	if sp == nil {
-		return (parentOption)(spanRef{})
-	}
-
 	// Panic if the parent has already been finished, if configured to do so. If
 	// the parent has finished and we're configured not to panic, StartSpan() will
 	// deal with it when passed this WithParent option.
-	//
-	// Note that this check is best-effort (like all done() checks). More checking
-	// below.
 	_ = sp.detectUseAfterFinish()
 
-	// Sterile spans don't get children. Noop spans also don't, but that case is
-	// handled in StartSpan, not here, because we want to assert that the parent's
-	// Tracer is the same as the child's. In contrast, in the IsSterile() case, it
-	// is allowed for the "child" to be created with a different Tracer than the
-	// parent.
-	if sp.IsSterile() {
-		return (parentOption)(spanRef{})
+	// The sp.IsNoop() case is handled in StartSpan, not here, because we want to
+	// assert that the parent's Tracer is the same as the child's. In contrast, in
+	// the IsSterile() case, it is allowed for the "child" to be created with a
+	// different Tracer than the parent.
+	if sp == nil || sp.IsSterile() {
+		return (*parentOption)(nil)
 	}
-
-	ref, _ /* ok */ := tryMakeSpanRef(sp)
-	// Note that ref will be empty if tryMakeSpanRef() failed. In that case, the
-	// resulting span will not have a parent.
-	return (parentOption)(ref)
+	return (*parentOption)(sp)
 }
 
-func (p parentOption) apply(opts spanOptions) spanOptions {
-	opts.Parent = (spanRef)(p)
+func (p *parentOption) apply(opts spanOptions) spanOptions {
+	opts.Parent = (*Span)(p)
 	return opts
 }
 
 type remoteParent SpanMeta
 
-// WithRemoteParentFromSpanMeta instructs StartSpan to create a child span
-// descending from a parent described via a SpanMeta. Generally this parent span
-// lives in a different process.
+// WithRemoteParent instructs StartSpan to create a child span descending from a
+// parent described via a SpanMeta. Generally this parent span lives in a
+// different process.
 //
 // For the purposes of trace recordings, there's no mechanism ensuring that the
 // child's recording will be passed to the parent span. When that's desired, it
@@ -240,7 +212,7 @@ type remoteParent SpanMeta
 // node 1                     (network)          node 2
 // --------------------------------------------------------------------------
 // Span.Meta()               ----------> sp2 := Tracer.StartSpan(
-//                                       		WithRemoteParentFromSpanMeta(.))
+//                                       		WithRemoteParent(.))
 //                                       doSomething(sp2)
 // Span.ImportRemoteSpans(.) <---------- sp2.FinishAndGetRecording()
 //
@@ -248,12 +220,7 @@ type remoteParent SpanMeta
 // corresponds to the expectation that the parent span will usually wait for the
 // child to Finish(). If this expectation does not hold, WithFollowsFrom should
 // be added to the StartSpan invocation.
-//
-// If you're in possession of a TraceInfo instead of a SpanMeta, prefer using
-// WithRemoteParentFromTraceInfo instead. If the TraceInfo is heap-allocated,
-// WithRemoteParentFromTraceInfo will not allocate (whereas
-// WithRemoteParentFromSpanMeta allocates).
-func WithRemoteParentFromSpanMeta(parent SpanMeta) SpanOption {
+func WithRemoteParent(parent SpanMeta) SpanOption {
 	if parent.sterile {
 		return remoteParent{}
 	}
@@ -262,23 +229,6 @@ func WithRemoteParentFromSpanMeta(parent SpanMeta) SpanOption {
 
 func (p remoteParent) apply(opts spanOptions) spanOptions {
 	opts.RemoteParent = (SpanMeta)(p)
-	return opts
-}
-
-type remoteParentFromTraceInfoOpt tracingpb.TraceInfo
-
-var _ SpanOption = &remoteParentFromTraceInfoOpt{}
-
-// WithRemoteParentFromTraceInfo is like WithRemoteParentFromSpanMeta, except the remote
-// parent info is passed in as *TraceInfo. This is equivalent to
-// WithRemoteParentFromSpanMeta(SpanMetaFromProto(ti)), but more efficient because it
-// doesn't allocate.
-func WithRemoteParentFromTraceInfo(ti *tracingpb.TraceInfo) SpanOption {
-	return (*remoteParentFromTraceInfoOpt)(ti)
-}
-
-func (r *remoteParentFromTraceInfoOpt) apply(opts spanOptions) spanOptions {
-	opts.RemoteParent = SpanMetaFromProto(*(*tracingpb.TraceInfo)(r))
 	return opts
 }
 
@@ -319,7 +269,7 @@ var followsFromSingleton = SpanOption(followsFromOpt{})
 // WithFollowsFrom instructs StartSpan to link the child span to its parent
 // using a different kind of relationship than the regular parent-child one,
 // should a child span be created (i.e. should WithParent or
-// WithRemoteParentFromSpanMeta be supplied as well). This relationship was
+// WithRemoteParent be supplied as well). This relationship was
 // called "follows-from" in the old OpenTracing API. This only matters if the
 // trace is sent to an OpenTelemetry tracer; CRDB itself ignores it (what
 // matters for CRDB is the WithDetachedTrace option).
@@ -387,7 +337,7 @@ func WithRecording(recType RecordingType) SpanOption {
 	case RecordingOff:
 		panic("invalid recording option: RecordingOff")
 	default:
-		recCpy := recType // copy excaping to the heap
+		recCpy := recType // copy escaping to the heap
 		panic(fmt.Sprintf("invalid recording option: %d", recCpy))
 	}
 }
