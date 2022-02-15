@@ -12,8 +12,11 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
@@ -25,6 +28,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -73,7 +78,7 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 		return nil, err
 	}
 
-	schemas, err := p.Descriptors().GetSchemasForDatabase(ctx, p.txn, dbDesc)
+	schemas, err := p.Descriptors().GetSchemasForDatabase(ctx, p.txn, dbDesc.GetID())
 	if err != nil {
 		return nil, err
 	}
@@ -180,20 +185,10 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		return err
 	}
 
-	metadataUpdater := p.ExecCfg().DescMetadaUpdaterFactory.NewMetadataUpdater(
-		ctx,
-		p.txn,
-		p.SessionData())
-	err := metadataUpdater.DeleteDescriptorComment(
-		int64(n.dbDesc.GetID()),
-		0,
-		keys.DatabaseCommentType)
-	if err != nil {
+	if err := p.removeDbComment(ctx, n.dbDesc.GetID()); err != nil {
 		return err
 	}
-
-	err = metadataUpdater.DeleteDatabaseRoleSettings(ctx, n.dbDesc)
-	if err != nil {
+	if err := p.removeDbRoleSettings(ctx, n.dbDesc.GetID()); err != nil {
 		return err
 	}
 
@@ -308,4 +303,49 @@ func (p *planner) accumulateCascadingViews(
 		}
 	}
 	return nil
+}
+
+func (p *planner) removeDbComment(ctx context.Context, dbID descpb.ID) error {
+	ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	_, err := ie.ExecEx(
+		ctx,
+		"delete-db-comment",
+		p.txn,
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
+		keys.DatabaseCommentType,
+		dbID)
+
+	return err
+}
+
+func (p *planner) removeDbRoleSettings(ctx context.Context, dbID descpb.ID) error {
+	// TODO(rafi): Remove this condition in 21.2.
+	if !p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.DatabaseRoleSettings) {
+		return nil
+	}
+	ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	rowsDeleted, err := ie.ExecEx(
+		ctx,
+		"delete-db-role-settings",
+		p.txn,
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		fmt.Sprintf(
+			`DELETE FROM %s WHERE database_id = $1`,
+			sessioninit.DatabaseRoleSettingsTableName,
+		),
+		dbID,
+	)
+	if err != nil {
+		return err
+	}
+	if rowsDeleted > 0 && sessioninit.CacheEnabled.Get(&p.ExecCfg().Settings.SV) {
+		if err := p.bumpDatabaseRoleSettingsTableVersion(ctx); err != nil {
+			return err
+		}
+	}
+
+	return err
 }

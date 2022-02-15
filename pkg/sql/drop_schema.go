@@ -87,11 +87,6 @@ func (p *planner) DropSchema(ctx context.Context, n *tree.DropSchema) (planNode,
 			}
 			return nil, pgerror.Newf(pgcode.InvalidSchemaName, "unknown schema %q", scName)
 		}
-
-		if scName == tree.PublicSchema {
-			return nil, pgerror.Newf(pgcode.InvalidSchemaName, "cannot drop schema %q", scName)
-		}
-
 		switch sc.SchemaKind() {
 		case catalog.SchemaPublic, catalog.SchemaVirtual, catalog.SchemaTemporary:
 			return nil, pgerror.Newf(pgcode.InvalidSchemaName, "cannot drop schema %q", scName)
@@ -102,7 +97,7 @@ func (p *planner) DropSchema(ctx context.Context, n *tree.DropSchema) (planNode,
 			}
 			if !(isAdmin || hasOwnership) {
 				return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-					"must be owner of schema %s", tree.Name(sc.GetName()))
+					"permission denied to drop schema %q", sc.GetName())
 			}
 			namesBefore := len(d.objectNamesToDelete)
 			if err := d.collectObjectsInSchema(ctx, p, db, sc); err != nil {
@@ -211,10 +206,13 @@ func (p *planner) dropSchemaImpl(
 	} else {
 		// TODO (rohany): This can be removed once RESTORE installs schemas into
 		//  the parent database.
-		parentDB.AddSchemaToDatabase(sc.GetName(), descpb.DatabaseDescriptor_SchemaInfo{
+		if parentDB.Schemas == nil {
+			parentDB.Schemas = make(map[string]descpb.DatabaseDescriptor_SchemaInfo)
+		}
+		parentDB.Schemas[sc.GetName()] = descpb.DatabaseDescriptor_SchemaInfo{
 			ID:      sc.GetID(),
 			Dropped: true,
-		})
+		}
 	}
 
 	// Update the schema descriptor as dropped.
@@ -269,7 +267,9 @@ func (p *planner) createDropSchemaJob(
 }
 
 func (p *planner) removeSchemaComment(ctx context.Context, schemaID descpb.ID) error {
-	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
+	ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	_, err := ie.ExecEx(
 		ctx,
 		"delete-schema-comment",
 		p.txn,

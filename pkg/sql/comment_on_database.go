@@ -14,17 +14,17 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type commentOnDatabaseNode struct {
-	n               *tree.CommentOnDatabase
-	dbDesc          catalog.DatabaseDescriptor
-	metadataUpdater scexec.DescriptorMetadataUpdater
+	n      *tree.CommentOnDatabase
+	dbDesc catalog.DatabaseDescriptor
 }
 
 // CommentOnDatabase add comment on a database.
@@ -50,40 +50,48 @@ func (p *planner) CommentOnDatabase(
 		return nil, err
 	}
 
-	return &commentOnDatabaseNode{n: n,
-		dbDesc: dbDesc,
-		metadataUpdater: p.execCfg.DescMetadaUpdaterFactory.NewMetadataUpdater(
-			ctx,
-			p.txn,
-			p.SessionData(),
-		),
-	}, nil
+	return &commentOnDatabaseNode{n: n, dbDesc: dbDesc}, nil
 }
 
 func (n *commentOnDatabaseNode) startExec(params runParams) error {
+	ie := params.p.extendedEvalCtx.ExecCfg.InternalExecutorFactory(params.ctx, nil /* sessionData */)
+	defer ie.Close(params.ctx)
 	if n.n.Comment != nil {
-		err := n.metadataUpdater.UpsertDescriptorComment(
-			int64(n.dbDesc.GetID()), 0, keys.DatabaseCommentType, *n.n.Comment)
+		_, err := ie.ExecEx(
+			params.ctx,
+			"set-db-comment",
+			params.p.Txn(),
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			"UPSERT INTO system.comments VALUES ($1, $2, 0, $3)",
+			keys.DatabaseCommentType,
+			n.dbDesc.GetID(),
+			*n.n.Comment)
 		if err != nil {
 			return err
 		}
 	} else {
-		err := n.metadataUpdater.DeleteDescriptorComment(
-			int64(n.dbDesc.GetID()), 0, keys.DatabaseCommentType)
+		_, err := ie.ExecEx(
+			params.ctx,
+			"delete-db-comment",
+			params.p.Txn(),
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
+			keys.DatabaseCommentType,
+			n.dbDesc.GetID())
 		if err != nil {
 			return err
 		}
 	}
 
-	dbComment := ""
+	comment := ""
 	if n.n.Comment != nil {
-		dbComment = *n.n.Comment
+		comment = *n.n.Comment
 	}
 	return params.p.logEvent(params.ctx,
 		n.dbDesc.GetID(),
 		&eventpb.CommentOnDatabase{
 			DatabaseName: n.n.Name.String(),
-			Comment:      dbComment,
+			Comment:      comment,
 			NullComment:  n.n.Comment == nil,
 		})
 }

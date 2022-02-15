@@ -18,9 +18,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scsqldeps"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 func init() {
@@ -61,33 +64,28 @@ func (n *newSchemaChangeResumer) run(ctx context.Context, execCtxI interface{}) 
 	// avoid restarts.
 
 	payload := n.job.Payload()
+	progress := n.job.Progress()
+	newSchemaChangeProgress := progress.GetNewSchemaChange()
+	newSchemaChangeDetails := payload.GetNewSchemaChange()
 	deps := scdeps.NewJobRunDependencies(
 		execCfg.CollectionFactory,
 		execCfg.DB,
-		execCfg.InternalExecutor,
+		execCfg.InternalExecutorFactory(ctx, nil /* sessionData */),
 		execCfg.IndexBackfiller,
-		NewRangeCounter(execCfg.DB, execCfg.DistSQLPlanner),
-		func(txn *kv.Txn) scexec.EventLogger {
-			return sql.NewSchemaChangerEventLogger(txn, execCfg, 0)
+		func(ctx context.Context, txn *kv.Txn, depth int, descID descpb.ID, metadata scpb.ElementMetadata, event eventpb.EventPayload) error {
+			return sql.LogEventForSchemaChanger(ctx, execCtx.ExecCfg(), txn, depth, descID, metadata, event)
 		},
 		execCfg.JobRegistry,
 		n.job,
 		execCfg.Codec,
 		execCfg.Settings,
 		execCfg.IndexValidator,
-		execCfg.DescMetadaUpdaterFactory,
+		scsqldeps.NewCCLCallbacks(execCfg.Settings, nil),
 		execCfg.DeclarativeSchemaChangerTestingKnobs,
 		payload.Statement,
-		execCtx.SessionData(),
 	)
 
 	return scrun.RunSchemaChangesInJob(
-		ctx,
-		execCfg.DeclarativeSchemaChangerTestingKnobs,
-		execCfg.Settings,
-		deps,
-		n.job.ID(),
-		payload.DescriptorIDs,
-		n.rollback,
+		ctx, deps, n.job.ID(), payload.DescriptorIDs, *newSchemaChangeDetails, *newSchemaChangeProgress, n.rollback,
 	)
 }

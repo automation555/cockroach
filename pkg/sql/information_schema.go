@@ -21,13 +21,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -37,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
-	"github.com/lib/pq/oid"
 	"golang.org/x/text/collate"
 )
 
@@ -427,7 +424,7 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 		) error {
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(scName)
-			for _, column := range table.AccessibleColumns() {
+			for _, column := range table.PublicColumns() {
 				collationCatalog := tree.DNull
 				collationSchema := tree.DNull
 				collationName := tree.DNull
@@ -619,11 +616,6 @@ https://www.postgresql.org/docs/9.5/infoschema-enabled-roles.html`,
 // string, or if the string's length is not bounded.
 func characterMaximumLength(colType *types.T) tree.Datum {
 	return dIntFnOrNull(func() (int32, bool) {
-		// "char" columns have a width of 1, but should report a NULL maximum
-		// character length.
-		if colType.Oid() == oid.T_char {
-			return 0, false
-		}
 		switch colType.Family() {
 		case types.StringFamily, types.CollatedStringFamily, types.BitFamily:
 			if colType.Width() > 0 {
@@ -640,11 +632,6 @@ func characterMaximumLength(colType *types.T) tree.Datum {
 // string's length is not bounded.
 func characterOctetLength(colType *types.T) tree.Datum {
 	return dIntFnOrNull(func() (int32, bool) {
-		// "char" columns have a width of 1, but should report a NULL octet
-		// length.
-		if colType.Oid() == oid.T_char {
-			return 0, false
-		}
 		switch colType.Family() {
 		case types.StringFamily, types.CollatedStringFamily:
 			if colType.Width() > 0 {
@@ -863,17 +850,17 @@ var (
 	refConstraintRuleCascade    = tree.NewDString("CASCADE")
 )
 
-func dStringForFKAction(action catpb.ForeignKeyAction) tree.Datum {
+func dStringForFKAction(action descpb.ForeignKeyReference_Action) tree.Datum {
 	switch action {
-	case catpb.ForeignKeyAction_NO_ACTION:
+	case descpb.ForeignKeyReference_NO_ACTION:
 		return refConstraintRuleNoAction
-	case catpb.ForeignKeyAction_RESTRICT:
+	case descpb.ForeignKeyReference_RESTRICT:
 		return refConstraintRuleRestrict
-	case catpb.ForeignKeyAction_SET_NULL:
+	case descpb.ForeignKeyReference_SET_NULL:
 		return refConstraintRuleSetNull
-	case catpb.ForeignKeyAction_SET_DEFAULT:
+	case descpb.ForeignKeyReference_SET_DEFAULT:
 		return refConstraintRuleSetDefault
-	case catpb.ForeignKeyAction_CASCADE:
+	case descpb.ForeignKeyReference_CASCADE:
 		return refConstraintRuleCascade
 	}
 	panic(errors.Errorf("unexpected ForeignKeyReference_Action: %v", action))
@@ -974,15 +961,6 @@ https://www.postgresql.org/docs/9.5/infoschema-schemata.html`,
 	},
 }
 
-var builtinTypePrivileges = []struct {
-	grantee *tree.DString
-	kind    *tree.DString
-}{
-	{tree.NewDString(security.RootUser), tree.NewDString(privilege.ALL.String())},
-	{tree.NewDString(security.AdminRole), tree.NewDString(privilege.ALL.String())},
-	{tree.NewDString(security.PublicRole), tree.NewDString(privilege.USAGE.String())},
-}
-
 // Custom; PostgreSQL has data_type_privileges, which only shows one row per type,
 // which may result in confusing semantics for the user compared to this table
 // which has one row for each grantee.
@@ -995,24 +973,24 @@ var informationSchemaTypePrivilegesTable = virtualSchemaTable{
 			func(db catalog.DatabaseDescriptor) error {
 				dbNameStr := tree.NewDString(db.GetName())
 				pgCatalogStr := tree.NewDString("pg_catalog")
-				populateGrantOption := p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption)
-				var isGrantable tree.Datum
-				if populateGrantOption {
-					isGrantable = noString
-				} else {
-					isGrantable = tree.DNull
-				}
+
 				// Generate one for each existing type.
 				for _, typ := range types.OidToType {
-					typeNameStr := tree.NewDString(typ.Name())
-					for _, it := range builtinTypePrivileges {
+					for _, it := range []struct {
+						grantee   *tree.DString
+						privilege *tree.DString
+					}{
+						{tree.NewDString(security.RootUser), tree.NewDString(privilege.ALL.String())},
+						{tree.NewDString(security.AdminRole), tree.NewDString(privilege.ALL.String())},
+						{tree.NewDString(security.PublicRole), tree.NewDString(privilege.USAGE.String())},
+					} {
+						typeNameStr := tree.NewDString(typ.Name())
 						if err := addRow(
-							it.grantee,   // grantee
-							dbNameStr,    // type_catalog
-							pgCatalogStr, // type_schema
-							typeNameStr,  // type_name
-							it.kind,      // privilege_type
-							isGrantable,  // is_grantable
+							it.grantee,
+							dbNameStr,
+							pgCatalogStr,
+							typeNameStr,
+							it.privilege,
 						); err != nil {
 							return err
 						}
@@ -1029,19 +1007,12 @@ var informationSchemaTypePrivilegesTable = virtualSchemaTable{
 					for _, u := range privs {
 						userNameStr := tree.NewDString(u.User.Normalized())
 						for _, priv := range u.Privileges {
-							var isGrantable tree.Datum
-							if populateGrantOption {
-								isGrantable = yesOrNoDatum(priv.GrantOption)
-							} else {
-								isGrantable = tree.DNull
-							}
 							if err := addRow(
-								userNameStr,                         // grantee
-								dbNameStr,                           // type_catalog
-								scNameStr,                           // type_schema
-								typeNameStr,                         // type_name
-								tree.NewDString(priv.Kind.String()), // privilege_type
-								isGrantable,                         // is_grantable
+								userNameStr,           // grantee
+								dbNameStr,             // type_catalog
+								scNameStr,             // type_schema
+								typeNameStr,           // type_name
+								tree.NewDString(priv), // privilege_type
 							); err != nil {
 								return err
 							}
@@ -1062,27 +1033,41 @@ var informationSchemaSchemataTablePrivileges = virtualSchemaTable{
 		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
 			func(db catalog.DatabaseDescriptor) error {
 				return forEachSchema(ctx, p, db, func(sc catalog.SchemaDescriptor) error {
-					privs := sc.GetPrivileges().Show(privilege.Schema)
+					var privs []descpb.UserPrivilegeString
+					if sc.SchemaKind() == catalog.SchemaUserDefined {
+						// User defined schemas have their own privileges.
+						privs = sc.GetPrivileges().Show(privilege.Schema)
+					} else {
+						// Other schemas inherit from the parent database.
+						// TODO(ajwerner): Fix this because it's bogus for everything other
+						// than public.
+						privs = db.GetPrivileges().Show(privilege.Database)
+					}
 					dbNameStr := tree.NewDString(db.GetName())
 					scNameStr := tree.NewDString(sc.GetName())
 					// TODO(knz): This should filter for the current user, see
 					// https://github.com/cockroachdb/cockroach/issues/35572
-					populateGrantOption := p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption)
 					for _, u := range privs {
 						userNameStr := tree.NewDString(u.User.Normalized())
 						for _, priv := range u.Privileges {
-							var isGrantable tree.Datum
-							if populateGrantOption {
-								isGrantable = yesOrNoDatum(priv.GrantOption)
-							} else {
-								isGrantable = tree.DNull
+							privKind := privilege.ByName[priv]
+							// Non-user defined schemas inherit privileges from the database,
+							// but the USAGE privilege is conferred by having SELECT privilege
+							// on the database. (There is no SELECT privilege on schemas.)
+							if sc.SchemaKind() != catalog.SchemaUserDefined {
+								if privKind == privilege.SELECT {
+									priv = privilege.USAGE.String()
+								} else if !privilege.SchemaPrivileges.Contains(privKind) {
+									continue
+								}
 							}
+
 							if err := addRow(
-								userNameStr,                         // grantee
-								dbNameStr,                           // table_catalog
-								scNameStr,                           // table_schema
-								tree.NewDString(priv.Kind.String()), // privilege_type
-								isGrantable,                         // is_grantable
+								userNameStr,           // grantee
+								dbNameStr,             // table_catalog
+								scNameStr,             // table_schema
+								tree.NewDString(priv), // privilege_type
+								tree.DNull,            // is_grantable
 							); err != nil {
 								return err
 							}
@@ -1368,25 +1353,17 @@ func populateTablePrivileges(
 			tbNameStr := tree.NewDString(table.GetName())
 			// TODO(knz): This should filter for the current user, see
 			// https://github.com/cockroachdb/cockroach/issues/35572
-			populateGrantOption := p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption)
 			for _, u := range table.GetPrivileges().Show(privilege.Table) {
-				granteeNameStr := tree.NewDString(u.User.Normalized())
 				for _, priv := range u.Privileges {
-					var isGrantable tree.Datum
-					if populateGrantOption {
-						isGrantable = yesOrNoDatum(priv.GrantOption)
-					} else {
-						isGrantable = tree.DNull
-					}
 					if err := addRow(
-						tree.DNull,                          // grantor
-						granteeNameStr,                      // grantee
-						dbNameStr,                           // table_catalog
-						scNameStr,                           // table_schema
-						tbNameStr,                           // table_name
-						tree.NewDString(priv.Kind.String()), // privilege_type
-						isGrantable,                         // is_grantable
-						yesOrNoDatum(priv.Kind == privilege.SELECT), // with_hierarchy
+						tree.DNull,                           // grantor
+						tree.NewDString(u.User.Normalized()), // grantee
+						dbNameStr,                            // table_catalog
+						scNameStr,                            // table_schema
+						tbNameStr,                            // table_name
+						tree.NewDString(priv),                // privilege_type
+						tree.DNull,                           // is_grantable
+						yesOrNoDatum(priv == "SELECT"),       // with_hierarchy
 					); err != nil {
 						return err
 					}
@@ -1570,99 +1547,27 @@ var informationSchemaSessionVariables = virtualSchemaTable{
 	},
 }
 
-var informationSchemaRoutinePrivilegesTable = virtualSchemaTable{
-	comment: "routine_privileges was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaRoutinePrivileges,
+var informationSchemaDomainConstraintsTable = virtualSchemaTable{
+	comment: "domain_constraints was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaDomainConstraints,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
 	unimplemented: true,
 }
 
-var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
-	comment: "role_routine_grants was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaRoleRoutineGrants,
+var informationSchemaUdtPrivilegesTable = virtualSchemaTable{
+	comment: "udt_privileges was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaUdtPrivileges,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
 	unimplemented: true,
 }
 
-var informationSchemaElementTypesTable = virtualSchemaTable{
-	comment: "element_types was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaElementTypes,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaRoleUdtGrantsTable = virtualSchemaTable{
-	comment: "role_udt_grants was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaRoleUdtGrants,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaColumnOptionsTable = virtualSchemaTable{
-	comment: "column_options was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaColumnOptions,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaForeignDataWrapperOptionsTable = virtualSchemaTable{
-	comment: "foreign_data_wrapper_options was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaForeignDataWrapperOptions,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaTransformsTable = virtualSchemaTable{
-	comment: "transforms was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaTransforms,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaViewColumnUsageTable = virtualSchemaTable{
-	comment: "view_column_usage was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaViewColumnUsage,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaInformationSchemaCatalogNameTable = virtualSchemaTable{
-	comment: "information_schema_catalog_name was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaInformationSchemaCatalogName,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaForeignTablesTable = virtualSchemaTable{
-	comment: "foreign_tables was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaForeignTables,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaViewRoutineUsageTable = virtualSchemaTable{
-	comment: "view_routine_usage was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaViewRoutineUsage,
+var informationSchemaCheckConstraintRoutineUsageTable = virtualSchemaTable{
+	comment: "check_constraint_routine_usage was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaCheckConstraintRoutineUsage,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -1678,18 +1583,27 @@ var informationSchemaRoleColumnGrantsTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaAttributesTable = virtualSchemaTable{
-	comment: "attributes was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaAttributes,
+var informationSchemaTriggeredUpdateColumnsTable = virtualSchemaTable{
+	comment: "triggered_update_columns was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaTriggeredUpdateColumns,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
 	unimplemented: true,
 }
 
-var informationSchemaDomainConstraintsTable = virtualSchemaTable{
-	comment: "domain_constraints was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaDomainConstraints,
+var informationSchemaForeignTablesTable = virtualSchemaTable{
+	comment: "foreign_tables was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaForeignTables,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaUsagePrivilegesTable = virtualSchemaTable{
+	comment: "usage_privileges was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaUsagePrivileges,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -1705,9 +1619,171 @@ var informationSchemaUserMappingsTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaCheckConstraintRoutineUsageTable = virtualSchemaTable{
-	comment: "check_constraint_routine_usage was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaCheckConstraintRoutineUsage,
+var informationSchemaRoleUdtGrantsTable = virtualSchemaTable{
+	comment: "role_udt_grants was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaRoleUdtGrants,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaViewColumnUsageTable = virtualSchemaTable{
+	comment: "view_column_usage was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaViewColumnUsage,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaForeignDataWrapperOptionsTable = virtualSchemaTable{
+	comment: "foreign_data_wrapper_options was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaForeignDataWrapperOptions,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaViewTableUsageTable = virtualSchemaTable{
+	comment: "view_table_usage was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaViewTableUsage,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaSQLPartsTable = virtualSchemaTable{
+	comment: "sql_parts was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaSQLParts,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaRoleUsageGrantsTable = virtualSchemaTable{
+	comment: "role_usage_grants was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaRoleUsageGrants,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaDataTypePrivilegesTable = virtualSchemaTable{
+	comment: "data_type_privileges was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaDataTypePrivileges,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaSQLImplementationInfoTable = virtualSchemaTable{
+	comment: "sql_implementation_info was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaSQLImplementationInfo,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaForeignTableOptionsTable = virtualSchemaTable{
+	comment: "foreign_table_options was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaForeignTableOptions,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
+	comment: "role_routine_grants was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaRoleRoutineGrants,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaInformationSchemaCatalogNameTable = virtualSchemaTable{
+	comment: "information_schema_catalog_name was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaInformationSchemaCatalogName,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaUserDefinedTypesTable = virtualSchemaTable{
+	comment: "user_defined_types was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaUserDefinedTypes,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaForeignServerOptionsTable = virtualSchemaTable{
+	comment: "foreign_server_options was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaForeignServerOptions,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaAttributesTable = virtualSchemaTable{
+	comment: "attributes was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaAttributes,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaUserMappingOptionsTable = virtualSchemaTable{
+	comment: "user_mapping_options was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaUserMappingOptions,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaColumnColumnUsageTable = virtualSchemaTable{
+	comment: "column_column_usage was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaColumnColumnUsage,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaDomainUdtUsageTable = virtualSchemaTable{
+	comment: "domain_udt_usage was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaDomainUdtUsage,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaDomainsTable = virtualSchemaTable{
+	comment: "domains was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaDomains,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaViewRoutineUsageTable = virtualSchemaTable{
+	comment: "view_routine_usage was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaViewRoutineUsage,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -1732,9 +1808,18 @@ var informationSchemaForeignDataWrappersTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaColumnColumnUsageTable = virtualSchemaTable{
-	comment: "column_column_usage was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaColumnColumnUsage,
+var informationSchemaSQLFeaturesTable = virtualSchemaTable{
+	comment: "sql_features was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaSQLFeatures,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaTransformsTable = virtualSchemaTable{
+	comment: "transforms was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaTransforms,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -1750,36 +1835,63 @@ var informationSchemaSQLSizingTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaUsagePrivilegesTable = virtualSchemaTable{
-	comment: "usage_privileges was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaUsagePrivileges,
+var informationSchemaElementTypesTable = virtualSchemaTable{
+	comment: "element_types was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaElementTypes,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
 	unimplemented: true,
 }
 
-var informationSchemaDomainsTable = virtualSchemaTable{
-	comment: "domains was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaDomains,
+var informationSchemaRoutinePrivilegesTable = virtualSchemaTable{
+	comment: "routine_privileges was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaRoutinePrivileges,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
 	unimplemented: true,
 }
 
-var informationSchemaSQLImplementationInfoTable = virtualSchemaTable{
-	comment: "sql_implementation_info was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaSQLImplementationInfo,
+var informationSchemaConstraintTableUsageTable = virtualSchemaTable{
+	comment: "constraint_table_usage was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaConstraintTableUsage,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
 	unimplemented: true,
 }
 
-var informationSchemaUdtPrivilegesTable = virtualSchemaTable{
-	comment: "udt_privileges was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaUdtPrivileges,
+var informationSchemaColumnOptionsTable = virtualSchemaTable{
+	comment: "column_options was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaColumnOptions,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaForeignServersTable = virtualSchemaTable{
+	comment: "foreign_servers was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaForeignServers,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaTriggersTable = virtualSchemaTable{
+	comment: "triggers was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaTriggers,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		return nil
+	},
+	unimplemented: true,
+}
+
+var informationSchemaResourceGroupsTable = virtualSchemaTable{
+	comment: "resource_groups was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaResourceGroups,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -1804,33 +1916,6 @@ var informationSchemaTablespacesExtensionsTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaResourceGroupsTable = virtualSchemaTable{
-	comment: "resource_groups was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaResourceGroups,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaForeignServerOptionsTable = virtualSchemaTable{
-	comment: "foreign_server_options was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaForeignServerOptions,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaStUnitsOfMeasureTable = virtualSchemaTable{
-	comment: "st_units_of_measure was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaStUnitsOfMeasure,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
 var informationSchemaSchemataExtensionsTable = virtualSchemaTable{
 	comment: "schemata_extensions was created for compatibility and is currently unimplemented",
 	schema:  vtable.InformationSchemaSchemataExtensions,
@@ -1849,27 +1934,9 @@ var informationSchemaColumnStatisticsTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaConstraintTableUsageTable = virtualSchemaTable{
-	comment: "constraint_table_usage was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaConstraintTableUsage,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaDataTypePrivilegesTable = virtualSchemaTable{
-	comment: "data_type_privileges was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaDataTypePrivileges,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaRoleUsageGrantsTable = virtualSchemaTable{
-	comment: "role_usage_grants was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaRoleUsageGrants,
+var informationSchemaStUnitsOfMeasureTable = virtualSchemaTable{
+	comment: "st_units_of_measure was created for compatibility and is currently unimplemented",
+	schema:  vtable.InformationSchemaStUnitsOfMeasure,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -1894,27 +1961,9 @@ var informationSchemaEnginesTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaForeignTableOptionsTable = virtualSchemaTable{
-	comment: "foreign_table_options was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaForeignTableOptions,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
 var informationSchemaEventsTable = virtualSchemaTable{
 	comment: "events was created for compatibility and is currently unimplemented",
 	schema:  vtable.InformationSchemaEvents,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaDomainUdtUsageTable = virtualSchemaTable{
-	comment: "domain_udt_usage was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaDomainUdtUsage,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -1933,15 +1982,6 @@ var informationSchemaUserAttributesTable = virtualSchemaTable{
 var informationSchemaKeywordsTable = virtualSchemaTable{
 	comment: "keywords was created for compatibility and is currently unimplemented",
 	schema:  vtable.InformationSchemaKeywords,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaUserMappingOptionsTable = virtualSchemaTable{
-	comment: "user_mapping_options was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaUserMappingOptions,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -1975,36 +2015,9 @@ var informationSchemaColumnsExtensionsTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaUserDefinedTypesTable = virtualSchemaTable{
-	comment: "user_defined_types was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaUserDefinedTypes,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaSQLFeaturesTable = virtualSchemaTable{
-	comment: "sql_features was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaSQLFeatures,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
 var informationSchemaStGeometryColumnsTable = virtualSchemaTable{
 	comment: "st_geometry_columns was created for compatibility and is currently unimplemented",
 	schema:  vtable.InformationSchemaStGeometryColumns,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaSQLPartsTable = virtualSchemaTable{
-	comment: "sql_parts was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaSQLParts,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -2038,33 +2051,6 @@ var informationSchemaProcesslistTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaForeignServersTable = virtualSchemaTable{
-	comment: "foreign_servers was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaForeignServers,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaTriggeredUpdateColumnsTable = virtualSchemaTable{
-	comment: "triggered_update_columns was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaTriggeredUpdateColumns,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaTriggersTable = virtualSchemaTable{
-	comment: "triggers was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaTriggers,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
 var informationSchemaTablesExtensionsTable = virtualSchemaTable{
 	comment: "tables_extensions was created for compatibility and is currently unimplemented",
 	schema:  vtable.InformationSchemaTablesExtensions,
@@ -2092,15 +2078,6 @@ var informationSchemaTablespacesTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaViewTableUsageTable = virtualSchemaTable{
-	comment: "view_table_usage was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaViewTableUsage,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
 // forEachSchema iterates over the physical and virtual schemas.
 func forEachSchema(
 	ctx context.Context,
@@ -2121,15 +2098,7 @@ func forEachSchema(
 		case strings.HasPrefix(name, catconstants.PgTempSchemaName):
 			schemas = append(schemas, schemadesc.NewTemporarySchema(name, id, db.GetID()))
 		case name == tree.PublicSchema:
-			// TODO(richardjcai): Remove this in 22.2. In 22.2, only the system
-			// public schema will continue to use keys.PublicSchemaID (29).
-			if id == keys.PublicSchemaID {
-				schemas = append(schemas, schemadesc.GetPublicSchema())
-			} else {
-				// The default case is a user defined schema. Collect the ID to get the
-				// descriptor later.
-				userDefinedSchemaIDs = append(userDefinedSchemaIDs, id)
-			}
+			schemas = append(schemas, schemadesc.GetPublicSchema())
 		default:
 			// The default case is a user defined schema. Collect the ID to get the
 			// descriptor later.
@@ -2137,7 +2106,7 @@ func forEachSchema(
 		}
 	}
 
-	userDefinedSchemas, err := p.Descriptors().Direct().GetSchemaDescriptorsFromIDs(ctx, p.txn, userDefinedSchemaIDs)
+	userDefinedSchemas, err := catalogkv.GetSchemaDescriptorsFromIDs(ctx, p.txn, p.ExecCfg().Codec, userDefinedSchemaIDs)
 	if err != nil {
 		return err
 	}
@@ -2221,11 +2190,12 @@ func forEachTypeDesc(
 	dbContext catalog.DatabaseDescriptor,
 	fn func(db catalog.DatabaseDescriptor, sc string, typ catalog.TypeDescriptor) error,
 ) error {
-	all, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
+	descs, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
 	if err != nil {
 		return err
 	}
-	lCtx := newInternalLookupCtx(all.OrderedDescriptors(), dbContext)
+	lCtx := newInternalLookupCtx(ctx, descs, dbContext,
+		catalogkv.NewOneLevelUncachedDescGetter(p.txn, p.execCfg.Codec))
 	for _, id := range lCtx.typIDs {
 		typ := lCtx.typDescs[id]
 		dbDesc, err := lCtx.getDatabaseByID(typ.GetParentID())
@@ -2350,18 +2320,18 @@ func getSchemaNames(
 	ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor,
 ) (map[descpb.ID]string, error) {
 	if dbContext != nil {
-		return p.Descriptors().GetSchemasForDatabase(ctx, p.txn, dbContext)
+		return p.Descriptors().GetSchemasForDatabase(ctx, p.txn, dbContext.GetID())
 	}
 	ret := make(map[descpb.ID]string)
-	allDbDescs, err := p.Descriptors().GetAllDatabaseDescriptors(ctx, p.txn)
+	dbs, err := p.Descriptors().GetAllDatabaseDescriptors(ctx, p.txn)
 	if err != nil {
 		return nil, err
 	}
-	for _, db := range allDbDescs {
+	for _, db := range dbs {
 		if db == nil {
 			return nil, catalog.ErrDescriptorNotFound
 		}
-		schemas, err := p.Descriptors().GetSchemasForDatabase(ctx, p.txn, db)
+		schemas, err := p.Descriptors().GetSchemasForDatabase(ctx, p.txn, db.GetID())
 		if err != nil {
 			return nil, err
 		}
@@ -2387,12 +2357,12 @@ func forEachTableDescWithTableLookupInternal(
 	allowAdding bool,
 	fn func(catalog.DatabaseDescriptor, string, catalog.TableDescriptor, tableLookupFn) error,
 ) error {
-	all, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
+	descs, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
 	if err != nil {
 		return err
 	}
 	return forEachTableDescWithTableLookupInternalFromDescriptors(
-		ctx, p, dbContext, virtualOpts, allowAdding, all, fn)
+		ctx, p, dbContext, virtualOpts, allowAdding, descs, fn)
 }
 
 func forEachTypeDescWithTableLookupInternalFromDescriptors(
@@ -2400,10 +2370,11 @@ func forEachTypeDescWithTableLookupInternalFromDescriptors(
 	p *planner,
 	dbContext catalog.DatabaseDescriptor,
 	allowAdding bool,
-	c nstree.Catalog,
+	descs []catalog.Descriptor,
 	fn func(catalog.DatabaseDescriptor, string, catalog.TypeDescriptor, tableLookupFn) error,
 ) error {
-	lCtx := newInternalLookupCtx(c.OrderedDescriptors(), dbContext)
+	lCtx := newInternalLookupCtx(ctx, descs, dbContext,
+		catalogkv.NewOneLevelUncachedDescGetter(p.txn, p.execCfg.Codec))
 
 	for _, typID := range lCtx.typIDs {
 		typDesc := lCtx.typDescs[typID]
@@ -2438,10 +2409,11 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 	dbContext catalog.DatabaseDescriptor,
 	virtualOpts virtualOpts,
 	allowAdding bool,
-	c nstree.Catalog,
+	descs []catalog.Descriptor,
 	fn func(catalog.DatabaseDescriptor, string, catalog.TableDescriptor, tableLookupFn) error,
 ) error {
-	lCtx := newInternalLookupCtx(c.OrderedDescriptors(), dbContext)
+	lCtx := newInternalLookupCtx(ctx, descs, dbContext,
+		catalogkv.NewOneLevelUncachedDescGetter(p.txn, p.execCfg.Codec))
 
 	if virtualOpts == virtualMany || virtualOpts == virtualCurrentDB {
 		// Virtual descriptors first.
@@ -2490,12 +2462,7 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 		var scName string
 		if parentExists {
 			var ok bool
-			scName, ok, err = lCtx.GetSchemaName(
-				ctx, table.GetParentSchemaID(), table.GetParentID(), p.ExecCfg().Settings.Version,
-			)
-			if err != nil {
-				return err
-			}
+			scName, ok = lCtx.schemaNames[table.GetParentSchemaID()]
 			// Look up the schemas for this database if we discover that there is a
 			// missing temporary schema name. The only schemas which do not have
 			// descriptors are the public schema and temporary schemas. The public
@@ -2513,22 +2480,11 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 						table.GetParentSchemaID())
 				}
 				for id, n := range namesForSchema {
-					_, exists, err := lCtx.GetSchemaName(ctx, id, dbDesc.GetID(), p.ExecCfg().Settings.Version)
-					if err != nil {
-						return err
-					}
-					if exists {
+					if _, exists := lCtx.schemaNames[id]; exists {
 						continue
 					}
 					lCtx.schemaNames[id] = n
-					var found bool
-					scName, found, err = lCtx.GetSchemaName(ctx, id, dbDesc.GetID(), p.ExecCfg().Settings.Version)
-					if err != nil {
-						return err
-					}
-					if !found {
-						return errors.AssertionFailedf("schema id %d not found", id)
-					}
+					scName = lCtx.schemaNames[table.GetParentSchemaID()]
 				}
 			}
 		}
@@ -2586,7 +2542,8 @@ func (r roleOptions) createRole() (tree.DBool, error) {
 }
 
 func forEachRoleQuery(ctx context.Context, p *planner) string {
-	return `
+	if p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.DatabaseRoleSettings) {
+		return `
 SELECT
 	u.username,
 	"isRole",
@@ -2601,6 +2558,21 @@ FROM
 GROUP BY
 	u.username, "isRole", drs.settings;
 `
+	}
+
+	return `
+SELECT
+	u.username,
+	"isRole",
+	NULL::STRING[] AS settings,
+	json_object_agg(COALESCE(ro.option, 'null'), ro.value)
+FROM
+	system.users AS u
+	LEFT JOIN system.role_options AS ro ON
+			ro.username = u.username
+GROUP BY
+	u.username, "isRole", settings;
+`
 }
 
 func forEachRole(
@@ -2614,7 +2586,9 @@ func forEachRole(
 	// logic test fail in 3node-tenant config with 'txn already encountered an
 	// error' (because of the context cancellation), so we buffer all roles
 	// first.
-	rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryBuffered(
+	ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	rows, err := ie.QueryBuffered(
 		ctx, "read-roles", p.txn, query,
 	)
 	if err != nil {
@@ -2649,7 +2623,9 @@ func forEachRoleMembership(
 	ctx context.Context, p *planner, fn func(role, member security.SQLUsername, isAdmin bool) error,
 ) (retErr error) {
 	query := `SELECT "role", "member", "isAdmin" FROM system.role_members`
-	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIterator(
+	ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	it, err := ie.QueryIterator(
 		ctx, "read-members", p.txn, query,
 	)
 	if err != nil {

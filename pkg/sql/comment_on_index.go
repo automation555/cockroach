@@ -14,19 +14,20 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type commentOnIndexNode struct {
-	n               *tree.CommentOnIndex
-	tableDesc       *tabledesc.Mutable
-	index           catalog.Index
-	metadataUpdater scexec.DescriptorMetadataUpdater
+	n         *tree.CommentOnIndex
+	tableDesc *tabledesc.Mutable
+	index     catalog.Index
 }
 
 // CommentOnIndex adds a comment on an index.
@@ -45,31 +46,21 @@ func (p *planner) CommentOnIndex(ctx context.Context, n *tree.CommentOnIndex) (p
 		return nil, err
 	}
 
-	return &commentOnIndexNode{
-		n:         n,
-		tableDesc: tableDesc,
-		index:     index,
-		metadataUpdater: p.execCfg.DescMetadaUpdaterFactory.NewMetadataUpdater(
-			ctx,
-			p.txn,
-			p.SessionData(),
-		)}, nil
+	return &commentOnIndexNode{n: n, tableDesc: tableDesc, index: index}, nil
 }
 
 func (n *commentOnIndexNode) startExec(params runParams) error {
 	if n.n.Comment != nil {
-		err := n.metadataUpdater.UpsertDescriptorComment(
-			int64(n.tableDesc.ID),
-			int64(n.index.GetID()),
-			keys.IndexCommentType,
-			*n.n.Comment,
-		)
+		err := params.p.upsertIndexComment(
+			params.ctx,
+			n.tableDesc.ID,
+			n.index.GetID(),
+			*n.n.Comment)
 		if err != nil {
 			return err
 		}
 	} else {
-		err := n.metadataUpdater.DeleteDescriptorComment(
-			int64(n.tableDesc.ID), int64(n.index.GetID()), keys.IndexCommentType)
+		err := params.p.removeIndexComment(params.ctx, n.tableDesc.ID, n.index.GetID())
 		if err != nil {
 			return err
 		}
@@ -93,6 +84,43 @@ func (n *commentOnIndexNode) startExec(params runParams) error {
 			Comment:     comment,
 			NullComment: n.n.Comment == nil,
 		})
+}
+
+func (p *planner) upsertIndexComment(
+	ctx context.Context, tableID descpb.ID, indexID descpb.IndexID, comment string,
+) error {
+	ie := p.extendedEvalCtx.ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	_, err := ie.ExecEx(
+		ctx,
+		"set-index-comment",
+		p.Txn(),
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		"UPSERT INTO system.comments VALUES ($1, $2, $3, $4)",
+		keys.IndexCommentType,
+		tableID,
+		indexID,
+		comment)
+
+	return err
+}
+
+func (p *planner) removeIndexComment(
+	ctx context.Context, tableID descpb.ID, indexID descpb.IndexID,
+) error {
+	ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	_, err := ie.ExecEx(
+		ctx,
+		"delete-index-comment",
+		p.txn,
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3",
+		keys.IndexCommentType,
+		tableID,
+		indexID)
+
+	return err
 }
 
 func (n *commentOnIndexNode) Next(runParams) (bool, error) { return false, nil }

@@ -174,6 +174,10 @@ func (p *planner) SetZoneConfig(ctx context.Context, n *tree.SetZoneConfig) (pla
 	if err := checkPrivilegeForSetZoneConfig(ctx, p, n.ZoneSpecifier); err != nil {
 		return nil, err
 	}
+	if !ZonesTableExists(ctx, p.ExecCfg().Codec, p.ExecCfg().Settings.Version) {
+		// Can't set a zone configuration if `system.zones` doesn't exist.
+		return nil, errorutil.UnsupportedWithMultiTenancy(MultitenancyZoneCfgIssueNo)
+	}
 
 	if err := p.CheckZoneConfigChangePermittedForMultiRegion(
 		ctx,
@@ -452,7 +456,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		// resolveZone determines the ID of the target object of the zone
 		// specifier. This ought to succeed regardless of whether there is
 		// already a zone config for the target object.
-		targetID, err := resolveZone(params.ctx, params.p.txn, params.p.Descriptors(), &zs, params.ExecCfg().Settings.Version)
+		targetID, err := resolveZone(params.ctx, params.ExecCfg().Codec, params.p.txn, &zs)
 		if err != nil {
 			return err
 		}
@@ -1037,6 +1041,10 @@ func prepareZoneConfigWrites(
 	zone *zonepb.ZoneConfig,
 	hasNewSubzones bool,
 ) (_ *zoneConfigUpdate, err error) {
+	if !ZonesTableExists(ctx, execCfg.Codec, execCfg.Settings.Version) {
+		// Can't write zone configurations if `system.zones` doesn't exist.
+		return nil, errorutil.UnsupportedWithMultiTenancy(MultitenancyZoneCfgIssueNo)
+	}
 	if len(zone.Subzones) > 0 {
 		st := execCfg.Settings
 		zone.SubzoneSpans, err = GenerateSubzoneSpans(
@@ -1077,11 +1085,13 @@ func writeZoneConfig(
 func writeZoneConfigUpdate(
 	ctx context.Context, txn *kv.Txn, execCfg *ExecutorConfig, update *zoneConfigUpdate,
 ) (numAffected int, _ error) {
+	ie := execCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
 	if update.value == nil {
-		return execCfg.InternalExecutor.Exec(ctx, "delete-zone", txn,
+		return ie.Exec(ctx, "delete-zone", txn,
 			"DELETE FROM system.zones WHERE id = $1", update.id)
 	}
-	return execCfg.InternalExecutor.Exec(ctx, "update-zone", txn,
+	return ie.Exec(ctx, "update-zone", txn,
 		"UPSERT INTO system.zones (id, config) VALUES ($1, $2)", update.id, update.value)
 }
 
@@ -1091,6 +1101,11 @@ func writeZoneConfigUpdate(
 func getZoneConfigRaw(
 	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, settings *cluster.Settings, id descpb.ID,
 ) (*zonepb.ZoneConfig, error) {
+	if !ZonesTableExists(ctx, codec, settings.Version) {
+		// There can't be zone configs for individual objects if `system.zones` does
+		// not exist. Nothing to do here.
+		return nil, nil
+	}
 	kv, err := txn.Get(ctx, config.MakeZoneKey(codec, id))
 	if err != nil {
 		return nil, err
@@ -1115,6 +1130,11 @@ func getZoneConfigRawBatch(
 	settings *cluster.Settings,
 	ids []descpb.ID,
 ) (map[descpb.ID]*zonepb.ZoneConfig, error) {
+	if !ZonesTableExists(ctx, codec, settings.Version) {
+		// There can't be zone configs for individual objects if `system.zones` does
+		// not exist. Nothing to do here.
+		return nil, nil
+	}
 	b := txn.NewBatch()
 	for _, id := range ids {
 		b.Get(config.MakeZoneKey(codec, id))

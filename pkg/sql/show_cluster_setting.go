@@ -53,8 +53,10 @@ func (p *planner) showVersionSetting(
 
 			// The (slight ab)use of WithMaxAttempts achieves convenient context cancellation.
 			return retry.WithMaxAttempts(ctx, retry.Options{}, math.MaxInt32, func() error {
+				ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+				defer ie.Close(ctx)
 				return p.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-					datums, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
+					datums, err := ie.QueryRowEx(
 						ctx, "read-setting",
 						txn,
 						sessiondata.InternalExecutorOverride{User: security.RootUserName()},
@@ -91,8 +93,6 @@ func (p *planner) showVersionSetting(
 
 					localRawVal := []byte(s.Get(&st.SV))
 					if !bytes.Equal(localRawVal, kvRawVal) {
-						// NB: errors.Wrapf(nil, ...) returns nil.
-						// nolint:errwrap
 						return errors.Errorf(
 							"value differs between local setting (%v) and KV (%v); try again later (%v after %s)",
 							localRawVal, kvRawVal, ctx.Err(), timeutil.Since(tBegin))
@@ -119,9 +119,7 @@ func (p *planner) ShowClusterSetting(
 ) (planNode, error) {
 	name := strings.ToLower(n.Name)
 	st := p.ExecCfg().Settings
-	val, ok := settings.Lookup(
-		name, settings.LookupForLocalAccess, p.ExecCfg().Codec.ForSystemTenant(),
-	)
+	val, ok := settings.Lookup(name, settings.LookupForLocalAccess)
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
 	}

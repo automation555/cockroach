@@ -14,7 +14,6 @@ import (
 	"context"
 	"math/rand"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -30,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -151,7 +151,6 @@ func (t *truncateNode) Close(context.Context)        {}
 // split points that we re-create on a table after a truncate. It's scaled by
 // the number of nodes in the cluster.
 var PreservedSplitCountMultiple = settings.RegisterIntSetting(
-	settings.TenantWritable,
 	"sql.truncate.preserved_split_count_multiple",
 	"set to non-zero to cause TRUNCATE to preserve range splits from the "+
 		"table's indexes. The multiple given will be multiplied with the number of "+
@@ -175,12 +174,12 @@ func (p *planner) truncateTable(ctx context.Context, id descpb.ID, jobDesc strin
 		return err
 	}
 
-	// Exit early with an error if the table is undergoing a declarative schema
+	// Exit early with an error if the table is undergoing a new-style schema
 	// change, before we try to get job IDs and update job statuses later. See
 	// createOrUpdateSchemaChangeJob.
-	if tableDesc.GetDeclarativeSchemaChangerState() != nil {
+	if tableDesc.NewSchemaChangeJobID != 0 {
 		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-			"cannot perform a schema change on table %q while it is undergoing a declarative schema change",
+			"cannot perform a schema change on table %q while it is undergoing a new-style schema change",
 			tableDesc.GetName(),
 		)
 	}
@@ -209,8 +208,7 @@ func (p *planner) truncateTable(ctx context.Context, id descpb.ID, jobDesc strin
 	}
 
 	// Create new ID's for all of the indexes in the table.
-	version := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
-	if err := tableDesc.AllocateIDs(ctx, version); err != nil {
+	if err := tableDesc.AllocateIDs(ctx); err != nil {
 		return err
 	}
 
@@ -241,14 +239,10 @@ func (p *planner) truncateTable(ctx context.Context, id descpb.ID, jobDesc strin
 		return err
 	}
 
-	// TODO(Chengxiong): remove this block in 22.2
-	st := p.EvalContext().Settings
-	if !st.Version.IsActive(ctx, clusterversion.UnsplitRangesInAsyncGCJobs) {
-		// Unsplit all manually split ranges in the table so they can be
-		// automatically merged by the merge queue.
-		if err := p.unsplitRangesForTable(ctx, tableDesc); err != nil {
-			return err
-		}
+	// Unsplit all manually split ranges in the table so they can be
+	// automatically merged by the merge queue.
+	if err := p.unsplitRangesForTable(ctx, tableDesc); err != nil {
+		return err
 	}
 
 	oldIndexIDs := make([]descpb.IndexID, len(oldIndexes))
@@ -382,7 +376,7 @@ func ClearTableDataInChunks(
 ) error {
 	const chunkSize = row.TableTruncateChunkSize
 	var resume roachpb.Span
-	alloc := &tree.DatumAlloc{}
+	alloc := &rowenc.DatumAlloc{}
 	for rowIdx, done := 0, false; !done; rowIdx += chunkSize {
 		resumeAt := resume
 		if traceKV {
@@ -424,7 +418,9 @@ func (p *planner) copySplitPointsToNewIndexes(
 	if preservedSplitsMultiple <= 0 {
 		return nil
 	}
-	row, err := p.execCfg.InternalExecutor.QueryRowEx(
+	ie := p.execCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	row, err := ie.QueryRowEx(
 		// Run as Root, since ordinary users can't select from this table.
 		ctx, "count-active-nodes", nil, sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		"SELECT count(*) FROM crdb_internal.kv_node_status")
@@ -558,7 +554,9 @@ func (p *planner) reassignIndexComments(
 	ctx context.Context, table *tabledesc.Mutable, indexIDMapping map[descpb.IndexID]descpb.IndexID,
 ) error {
 	// Check if there are any index comments that need to be updated.
-	row, err := p.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRowEx(
+	ie := p.extendedEvalCtx.ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	row, err := ie.QueryRowEx(
 		ctx,
 		"update-table-comments",
 		p.txn,
@@ -575,7 +573,7 @@ func (p *planner) reassignIndexComments(
 	}
 	if int(tree.MustBeDInt(row[0])) > 0 {
 		for old, new := range indexIDMapping {
-			if _, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
+			if _, err := ie.ExecEx(
 				ctx,
 				"update-table-comments",
 				p.txn,

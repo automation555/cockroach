@@ -16,20 +16,16 @@ import (
 	gojson "encoding/json"
 	"fmt"
 	"sort"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -160,6 +156,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 			"%q was not resolved as a table but is %T", resolved, resolved)
 	}
 
+	ie := params.ExecCfg().InternalExecutorFactory(params.ctx, params.SessionData())
+	defer ie.Close(params.ctx)
 	for i, cmd := range n.n.Cmds {
 		telemetry.Inc(cmd.TelemetryCounter())
 
@@ -180,6 +178,15 @@ func (n *alterTableNode) startExec(params runParams) error {
 					"add the column first, then run ALTER TABLE ... ADD CONSTRAINT to add a "+
 						"UNIQUE WITHOUT INDEX constraint on the column",
 				)
+			}
+			if t.ColumnDef.GeneratedIdentity.IsGeneratedAsIdentity {
+				evalCtx := params.EvalContext()
+				ctx := params.ctx
+				if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.GeneratedAsIdentity) {
+					return pgerror.Newf(pgcode.FeatureNotSupported,
+						"version %v must be finalized to use GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY expression",
+						clusterversion.GeneratedAsIdentity)
+				}
 			}
 			var err error
 			params.p.runWithOptions(resolveFlags{contextDatabaseID: n.tableDesc.ParentID}, func() {
@@ -216,10 +223,9 @@ func (n *alterTableNode) startExec(params runParams) error {
 				if d.PrimaryKey {
 					// Translate this operation into an ALTER PRIMARY KEY command.
 					alterPK := &tree.AlterTableAlterPrimaryKey{
-						Columns:       d.Columns,
-						Sharded:       d.Sharded,
-						Name:          d.Name,
-						StorageParams: d.StorageParams,
+						Columns: d.Columns,
+						Sharded: d.Sharded,
+						Name:    d.Name,
 					}
 					if err := params.p.AlterPrimaryKey(
 						params.ctx,
@@ -272,7 +278,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 					Name:             string(d.Name),
 					Unique:           true,
 					StoreColumnNames: d.Storing.ToStrings(),
-					CreatedAtNanos:   params.EvalContext().GetTxnTimestamp(time.Microsecond).UnixNano(),
 				}
 				if err := idx.FillColumns(d.Columns); err != nil {
 					return err
@@ -310,8 +315,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 				// We need to allocate IDs upfront in the event we need to update the zone config
 				// in the same transaction.
-				version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
-				if err := n.tableDesc.AllocateIDs(params.ctx, version); err != nil {
+				if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
 					return err
 				}
 				if err := params.p.configureZoneConfigForNewIndexPartitioning(
@@ -807,8 +811,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 						"constraint %q in the middle of being added, try again later", t.Constraint)
 				}
 				if err := validateCheckInTxn(
-					params.ctx, &params.p.semaCtx, params.ExecCfg().InternalExecutorFactory,
-					params.SessionData(), n.tableDesc, params.EvalContext().Txn, ck.Expr,
+					params.ctx, &params.p.semaCtx, ie, params.SessionData(), n.tableDesc, params.EvalContext().Txn, ck.Expr,
 				); err != nil {
 					return err
 				}
@@ -830,13 +833,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 						"constraint %q in the middle of being added, try again later", t.Constraint)
 				}
 				if err := validateFkInTxn(
-					params.ctx,
-					params.ExecCfg().InternalExecutorFactory,
-					params.p.SessionData(),
-					n.tableDesc,
-					params.EvalContext().Txn,
-					params.p.Descriptors(),
-					name,
+					params.ctx, params.p.LeaseMgr(), ie,
+					n.tableDesc, params.EvalContext().Txn, name, params.EvalContext().Codec,
 				); err != nil {
 					return err
 				}
@@ -859,9 +857,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 							"constraint %q in the middle of being added, try again later", t.Constraint)
 					}
 					if err := validateUniqueWithoutIndexConstraintInTxn(
-						params.ctx, params.ExecCfg().InternalExecutorFactory(
-							params.ctx, params.SessionData(),
-						), n.tableDesc, params.EvalContext().Txn, name,
+						params.ctx, ie, n.tableDesc, params.EvalContext().Txn, name,
 					); err != nil {
 						return err
 					}
@@ -972,47 +968,10 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
-		case *tree.AlterTableSetStorageParams:
-			var ttlBefore *descpb.TableDescriptor_RowLevelTTL
-			if ttl := n.tableDesc.GetRowLevelTTL(); ttl != nil {
-				ttlBefore = protoutil.Clone(ttl).(*descpb.TableDescriptor_RowLevelTTL)
-			}
-			if err := paramparse.SetStorageParameters(
-				params.ctx,
-				params.p.SemaCtx(),
-				params.EvalContext(),
-				t.StorageParams,
-				paramparse.NewTableStorageParamObserver(n.tableDesc),
-			); err != nil {
-				return err
-			}
-			descriptorChanged = true
-
-			if err := handleTTLStorageParamChange(params, ttlBefore, n.tableDesc.GetRowLevelTTL()); err != nil {
-				return err
-			}
-
-		case *tree.AlterTableResetStorageParams:
-			var ttlBefore *descpb.TableDescriptor_RowLevelTTL
-			if ttl := n.tableDesc.GetRowLevelTTL(); ttl != nil {
-				ttlBefore = protoutil.Clone(ttl).(*descpb.TableDescriptor_RowLevelTTL)
-			}
-			if err := paramparse.ResetStorageParameters(
-				params.ctx,
-				params.EvalContext(),
-				t.Params,
-				paramparse.NewTableStorageParamObserver(n.tableDesc),
-			); err != nil {
-				return err
-			}
-			descriptorChanged = true
-
-			if err := handleTTLStorageParamChange(params, ttlBefore, n.tableDesc.GetRowLevelTTL()); err != nil {
-				return err
-			}
-
 		case *tree.AlterTableRenameColumn:
-			descChanged, err := params.p.renameColumn(params.ctx, n.tableDesc, t.Column, t.NewName)
+			const allowRenameOfShardColumn = false
+			descChanged, err := params.p.renameColumn(params.ctx, n.tableDesc,
+				&t.Column, &t.NewName, allowRenameOfShardColumn)
 			if err != nil {
 				return err
 			}
@@ -1073,8 +1032,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 		}
 
 		// Allocate IDs now, so new IDs are available to subsequent commands
-		version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
-		if err := n.tableDesc.AllocateIDs(params.ctx, version); err != nil {
+		if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
 			return err
 		}
 	}
@@ -1140,6 +1098,36 @@ func (n *alterTableNode) Next(runParams) (bool, error) { return false, nil }
 func (n *alterTableNode) Values() tree.Datums          { return tree.Datums{} }
 func (n *alterTableNode) Close(context.Context)        {}
 
+// addIndexMutationWithSpecificPrimaryKey adds an index mutation into the given
+// table descriptor, but sets up the index with KeySuffixColumnIDs from the
+// given index, rather than the table's primary key.
+func addIndexMutationWithSpecificPrimaryKey(
+	ctx context.Context,
+	table *tabledesc.Mutable,
+	toAdd *descpb.IndexDescriptor,
+	primary *descpb.IndexDescriptor,
+) error {
+	// Reset the ID so that a call to AllocateIDs will set up the index.
+	toAdd.ID = 0
+	if err := table.AddIndexMutation(toAdd, descpb.DescriptorMutation_ADD); err != nil {
+		return err
+	}
+	if err := table.AllocateIDs(ctx); err != nil {
+		return err
+	}
+	// Use the columns in the given primary index to construct this indexes
+	// KeySuffixColumnIDs list.
+	presentColIDs := catalog.MakeTableColSet(toAdd.KeyColumnIDs...)
+	presentColIDs.UnionWith(catalog.MakeTableColSet(toAdd.StoreColumnIDs...))
+	toAdd.KeySuffixColumnIDs = nil
+	for _, colID := range primary.KeyColumnIDs {
+		if !presentColIDs.Contains(colID) {
+			toAdd.KeySuffixColumnIDs = append(toAdd.KeySuffixColumnIDs, colID)
+		}
+	}
+	return nil
+}
+
 // applyColumnMutation applies the mutation specified in `mut` to the given
 // columnDescriptor, and saves the containing table descriptor. If the column's
 // dependencies on sequences change, it updates them as well.
@@ -1169,13 +1157,19 @@ func applyColumnMutation(
 		}
 
 	case *tree.AlterTableSetOnUpdate:
+		if !params.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.OnUpdateExpressions) {
+			return pgerror.Newf(pgcode.FeatureNotSupported,
+				"version %v must be finalized to use ON UPDATE",
+				clusterversion.ByKey(clusterversion.OnUpdateExpressions))
+		}
+
 		// We want to reject uses of ON UPDATE where there is also a foreign key ON
 		// UPDATE.
 		for _, fk := range tableDesc.OutboundFKs {
 			for _, colID := range fk.OriginColumnIDs {
 				if colID == col.GetID() &&
-					fk.OnUpdate != catpb.ForeignKeyAction_NO_ACTION &&
-					fk.OnUpdate != catpb.ForeignKeyAction_RESTRICT {
+					fk.OnUpdate != descpb.ForeignKeyReference_NO_ACTION &&
+					fk.OnUpdate != descpb.ForeignKeyReference_RESTRICT {
 					return pgerror.Newf(
 						pgcode.InvalidColumnDefinition,
 						"column %s(%d) cannot have both an ON UPDATE expression and a foreign"+
@@ -1231,9 +1225,8 @@ func applyColumnMutation(
 		for k := range info {
 			inuseNames[k] = struct{}{}
 		}
-		check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), tableDesc.GetNextConstraintID(), inuseNames, descpb.ConstraintValidity_Validating)
+		check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), inuseNames, descpb.ConstraintValidity_Validating)
 		tableDesc.AddNotNullMutation(check, descpb.DescriptorMutation_ADD)
-		tableDesc.NextConstraintID++
 
 	case *tree.AlterTableDropNotNull:
 		if col.IsNullable() {
@@ -1271,9 +1264,8 @@ func applyColumnMutation(
 
 		// Add a check constraint equivalent to the non-null constraint and drop
 		// it in the schema changer.
-		check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), tableDesc.GetNextConstraintID(), inuseNames, descpb.ConstraintValidity_Dropping)
+		check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), inuseNames, descpb.ConstraintValidity_Dropping)
 		tableDesc.Checks = append(tableDesc.Checks, check)
-		tableDesc.NextConstraintID++
 		tableDesc.AddNotNullMutation(check, descpb.DescriptorMutation_DROP)
 
 	case *tree.AlterTableDropStored:
@@ -1469,8 +1461,11 @@ func injectTableStats(
 		return err
 	}
 
+	ie := params.extendedEvalCtx.ExecCfg.InternalExecutorFactory(params.ctx, nil /* sessionData */)
+	defer ie.Close(params.ctx)
+
 	// First, delete all statistics for the table.
-	if _ /* rows */, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+	if _ /* rows */, err := ie.Exec(
 		params.ctx,
 		"delete-stats",
 		params.EvalContext().Txn,
@@ -1529,10 +1524,11 @@ func insertJSONStatistic(
 ) error {
 	var (
 		ctx      = params.ctx
-		ie       = params.ExecCfg().InternalExecutor
+		ie       = params.ExecCfg().InternalExecutorFactory(ctx, params.SessionData())
 		txn      = params.EvalContext().Txn
 		settings = params.ExecCfg().Settings
 	)
+	defer ie.Close(params.ctx)
 
 	var name interface{}
 	if s.Name != "" {
@@ -1594,7 +1590,9 @@ func insertJSONStatistic(
 func (p *planner) removeColumnComment(
 	ctx context.Context, tableID descpb.ID, columnID descpb.ColumnID,
 ) error {
-	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
+	ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	_, err := ie.ExecEx(
 		ctx,
 		"delete-column-comment",
 		p.txn,
@@ -1644,33 +1642,11 @@ func validateConstraintNameIsNotUsed(
 				return false, pgerror.Newf(pgcode.InvalidTableDefinition,
 					"multiple primary keys for table %q are not allowed", tableDesc.Name)
 			}
-
-			// Allow the PRIMARY KEY to have the same name as the existing PRIMARY KEY
-			// if the existing PRIMARY KEY is the implicit rowid column.
-			// This allows CREATE TABLE without a PRIMARY KEY, then adding a
-			// PRIMARY KEY with the same autogenerated name as postgres does
-			// without erroring if the rowid PRIMARY KEY name conflicts.
-			// The implicit rowid PRIMARY KEY index will be deleted anyway, so we're
-			// ok with the conflict in this case.
-			defaultPKName := tabledesc.PrimaryKeyIndexName(tableDesc.GetName())
-			if tableDesc.HasPrimaryKey() && tableDesc.IsPrimaryIndexDefaultRowID() &&
-				tableDesc.PrimaryIndex.GetName() == defaultPKName &&
-				name == tree.Name(defaultPKName) {
-				return false, nil
-			}
-			// If there is no active primary key, then adding one with the exact
-			// same name is allowed.
-			if !tableDesc.HasPrimaryKey() &&
-				tableDesc.PrimaryIndex.Name == name.String() {
-				return false, nil
-			}
 		}
 		if name == "" {
 			return false, nil
 		}
-		idx, _ := tableDesc.FindIndexWithName(string(name))
-		// If an index is found and its disabled, then we know it will be dropped
-		// later on.
+		idx, _ := tableDesc.FindIndexWithName(name.String())
 		if idx == nil {
 			return false, nil
 		}
@@ -1695,23 +1671,8 @@ func validateConstraintNameIsNotUsed(
 		// Unexpected error: table descriptor should be valid at this point.
 		return false, errors.WithAssertionFailure(err)
 	}
-	constraintInfo, isInUse := info[name.String()]
-	if !isInUse {
+	if _, isInUse := info[name.String()]; !isInUse {
 		return false, nil
-	}
-	// If the primary index is being replaced, then the name can be reused for
-	// another constraint.
-	if isInUse &&
-		constraintInfo.Index != nil &&
-		constraintInfo.Index.ID == tableDesc.PrimaryIndex.ID {
-		for _, mut := range tableDesc.GetMutations() {
-			if primaryKeySwap := mut.GetPrimaryKeySwap(); primaryKeySwap != nil &&
-				primaryKeySwap.OldPrimaryIndexId == tableDesc.PrimaryIndex.ID &&
-				primaryKeySwap.NewPrimaryIndexName != name.String() {
-				return false, nil
-			}
-		}
-
 	}
 	if hasIfNotExists {
 		return true, nil
@@ -1759,39 +1720,6 @@ func (p *planner) updateFKBackReferenceName(
 		}
 	}
 	return errors.Errorf("missing backreference for foreign key %s", ref.Name)
-}
-
-func handleTTLStorageParamChange(
-	params runParams, before, after *descpb.TableDescriptor_RowLevelTTL,
-) error {
-	switch {
-	case before == nil && after == nil:
-		// Do not have to do anything here.
-	case before != nil && after != nil:
-		if before.DeletionCron != after.DeletionCron {
-			env := JobSchedulerEnv(params.ExecCfg())
-			s, err := jobs.LoadScheduledJob(
-				params.ctx,
-				env,
-				after.ScheduleID,
-				params.ExecCfg().InternalExecutor,
-				params.p.txn,
-			)
-			if err != nil {
-				return err
-			}
-			if err := s.SetSchedule(rowLevelTTLSchedule(after)); err != nil {
-				return err
-			}
-			if err := s.Update(params.ctx, params.ExecCfg().InternalExecutor, params.p.txn); err != nil {
-				return err
-			}
-		}
-	default:
-		// TODO(#75428): handle adding or dropping TTL
-	}
-
-	return nil
 }
 
 // tryRemoveFKBackReferences determines whether the provided unique constraint

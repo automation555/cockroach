@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -34,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ui"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -78,7 +78,7 @@ var ConfigureOIDC = func(
 	ctx context.Context,
 	st *cluster.Settings,
 	locality roachpb.Locality,
-	handleHTTP func(pattern string, handler http.Handler),
+	mux *http.ServeMux,
 	userLoginFromSSO func(ctx context.Context, username string) (*http.Cookie, error),
 	ambientCtx log.AmbientContext,
 	cluster uuid.UUID,
@@ -87,7 +87,6 @@ var ConfigureOIDC = func(
 }
 
 var webSessionTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
 	"server.web_session_timeout",
 	"the duration that a newly created web session will be valid",
 	7*24*time.Hour,
@@ -95,16 +94,14 @@ var webSessionTimeout = settings.RegisterDurationSetting(
 ).WithPublic()
 
 type authenticationServer struct {
-	cfg       *base.Config
-	sqlServer *SQLServer
+	server *Server
 }
 
 // newAuthenticationServer allocates and returns a new REST server for
 // authentication APIs.
-func newAuthenticationServer(cfg *base.Config, s *SQLServer) *authenticationServer {
+func newAuthenticationServer(s *Server) *authenticationServer {
 	return &authenticationServer{
-		cfg:       cfg,
-		sqlServer: s,
+		server: s,
 	}
 }
 
@@ -148,7 +145,7 @@ func (s *authenticationServer) UserLogin(
 	username, _ := security.MakeSQLUsernameFromUserInput(req.Username, security.UsernameValidation)
 
 	// Verify the provided username/password pair.
-	verified, expired, err := s.verifyPasswordDBConsole(ctx, username, req.Password)
+	verified, expired, err := s.verifyPassword(ctx, username, req.Password)
 	if err != nil {
 		return nil, apiInternalError(ctx, err)
 	}
@@ -212,7 +209,7 @@ func (s *authenticationServer) demoLogin(w http.ResponseWriter, req *http.Reques
 	// without further normalization.
 	username, _ := security.MakeSQLUsernameFromUserInput(userInput, security.UsernameValidation)
 	// Verify the provided username/password pair.
-	verified, expired, err := s.verifyPasswordDBConsole(ctx, username, password)
+	verified, expired, err := s.verifyPassword(ctx, username, password)
 	if err != nil {
 		fail(err)
 		return
@@ -257,10 +254,10 @@ func (s *authenticationServer) UserLoginFromSSO(
 	// without further normalization.
 	username, _ := security.MakeSQLUsernameFromUserInput(reqUsername, security.UsernameValidation)
 
-	exists, _, canLoginDBConsole, _, _, _, err := sql.GetUserSessionInitInfo(
+	exists, canLogin, _, _, _, _, err := sql.GetUserSessionInitInfo(
 		ctx,
-		s.sqlServer.execCfg,
-		s.sqlServer.execCfg.InternalExecutor,
+		s.server.sqlServer.execCfg,
+		s.server.sqlServer.execCfg.InternalExecutorFactory(ctx, nil /* sessionData */),
 		username,
 		"", /* databaseName */
 	)
@@ -268,7 +265,8 @@ func (s *authenticationServer) UserLoginFromSSO(
 	if err != nil {
 		return nil, errors.Wrap(err, "failed creating session for username")
 	}
-	if !exists || !canLoginDBConsole {
+
+	if !exists || !canLogin {
 		return nil, errWebAuthenticationFailure
 	}
 
@@ -294,7 +292,7 @@ func (s *authenticationServer) createSessionFor(
 		ID:     id,
 		Secret: secret,
 	}
-	return EncodeSessionCookie(cookieValue, !s.cfg.DisableTLSForHTTP)
+	return EncodeSessionCookie(cookieValue, !s.server.cfg.DisableTLSForHTTP)
 }
 
 // UserLogout allows a user to terminate their currently active session.
@@ -318,7 +316,7 @@ func (s *authenticationServer) UserLogout(
 	}
 
 	// Revoke the session.
-	if n, err := s.sqlServer.internalExecutor.ExecEx(
+	if n, err := s.server.sqlServer.internalExecutor.ExecEx(
 		ctx,
 		"revoke-auth-session",
 		nil, /* txn */
@@ -368,7 +366,7 @@ WHERE id = $1`
 		isRevoked    bool
 	)
 
-	row, err := s.sqlServer.internalExecutor.QueryRowEx(
+	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
 		ctx,
 		"lookup-auth-session",
 		nil, /* txn */
@@ -395,7 +393,7 @@ WHERE id = $1`
 		return false, "", nil
 	}
 
-	if now := s.sqlServer.execCfg.Clock.PhysicalTime(); !now.Before(expiresAt) {
+	if now := s.server.clock.PhysicalTime(); !now.Before(expiresAt) {
 		return false, "", nil
 	}
 
@@ -409,56 +407,41 @@ WHERE id = $1`
 	return true, username, nil
 }
 
-// verifyPasswordDBConsole verifies the passed username/password pair against the
+// verifyPassword verifies the passed username/password pair against the
 // system.users table. The returned boolean indicates whether or not the
 // verification succeeded; an error is returned if the validation process could
 // not be completed.
 //
-// This function should *not* be used to validate logins into the SQL
-// shell since it checks a separate authentication scheme.
-//
 // The caller is responsible for ensuring that the username is normalized.
 // (CockroachDB has case-insensitive usernames, unlike PostgreSQL.)
-func (s *authenticationServer) verifyPasswordDBConsole(
+func (s *authenticationServer) verifyPassword(
 	ctx context.Context, username security.SQLUsername, password string,
 ) (valid bool, expired bool, err error) {
-	exists, _, canLoginDBConsole, _, _, pwRetrieveFn, err := sql.GetUserSessionInitInfo(
+	exists, canLogin, _, validUntil, _, pwRetrieveFn, err := sql.GetUserSessionInitInfo(
 		ctx,
-		s.sqlServer.execCfg,
-		s.sqlServer.execCfg.InternalExecutor,
+		s.server.sqlServer.execCfg,
+		s.server.sqlServer.execCfg.InternalExecutorFactory(ctx, nil /* sessionData */),
 		username,
 		"", /* databaseName */
 	)
 	if err != nil {
 		return false, false, err
 	}
-	if !exists || !canLoginDBConsole {
+	if !exists || !canLogin {
 		return false, false, nil
 	}
-	expired, hashedPassword, err := pwRetrieveFn(ctx)
+	hashedPassword, err := pwRetrieveFn(ctx)
 	if err != nil {
 		return false, false, err
 	}
 
-	if expired {
-		return false, true, nil
+	if validUntil != nil {
+		if validUntil.Time.Sub(timeutil.Now()) < 0 {
+			return false, true, nil
+		}
 	}
 
-	ok, err := security.CompareHashAndCleartextPassword(ctx, hashedPassword, password)
-	if ok && err == nil {
-		// Password authentication succeeded using cleartext.  If the
-		// stored hash was encoded using crdb-bcrypt, we might want to
-		// upgrade it to SCRAM instead.
-		//
-		// This auto-conversion is a CockroachDB-specific feature, which
-		// pushes clusters upgraded from a previous version into using
-		// SCRAM-SHA-256.
-		sql.MaybeUpgradeStoredPasswordHash(ctx,
-			s.sqlServer.execCfg,
-			username,
-			password, hashedPassword)
-	}
-	return ok, false, err
+	return security.CompareHashAndPassword(ctx, hashedPassword, password) == nil, false, nil
 }
 
 // CreateAuthSecret creates a secret, hash pair to populate a session auth token.
@@ -486,7 +469,7 @@ func (s *authenticationServer) newAuthSession(
 		return 0, nil, err
 	}
 
-	expiration := s.sqlServer.execCfg.Clock.PhysicalTime().Add(webSessionTimeout.Get(&s.sqlServer.execCfg.Settings.SV))
+	expiration := s.server.clock.PhysicalTime().Add(webSessionTimeout.Get(&s.server.st.SV))
 
 	insertSessionStmt := `
 INSERT INTO system.web_sessions ("hashedSecret", username, "expiresAt")
@@ -495,7 +478,7 @@ RETURNING id
 `
 	var id int64
 
-	row, err := s.sqlServer.internalExecutor.QueryRowEx(
+	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
 		ctx,
 		"create-auth-session",
 		nil, /* txn */

@@ -26,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -197,8 +197,8 @@ func (t *typeSchemaChanger) getTypeDescFromStore(
 	ctx context.Context,
 ) (catalog.TypeDescriptor, error) {
 	var typeDesc catalog.TypeDescriptor
-	if err := DescsTxn(ctx, t.execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-		typeDesc, err = col.Direct().MustGetTypeDescByID(ctx, txn, t.typeID)
+	if err := t.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+		typeDesc, err = catalogkv.MustGetTypeDescByID(ctx, txn, t.execCfg.Codec, t.typeID)
 		return err
 	}); err != nil {
 		return nil, err
@@ -250,11 +250,13 @@ func (t *typeSchemaChanger) exec(ctx context.Context) error {
 		return err
 	}
 
+	ie := t.execCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
 	// If there are any names to drain, then do so.
 	if len(typeDesc.GetDrainingNames()) > 0 {
 		if err := drainNamesForDescriptor(
 			ctx, typeDesc.GetID(), t.execCfg.CollectionFactory, t.execCfg.DB,
-			t.execCfg.InternalExecutor, codec, nil,
+			ie, codec, nil,
 		); err != nil {
 			return err
 		}
@@ -767,6 +769,8 @@ func (t *typeSchemaChanger) canRemoveEnumValue(
 	member *descpb.TypeDescriptor_EnumMember,
 	descsCol *descs.Collection,
 ) error {
+	ie := t.execCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
 	for _, ID := range typeDesc.ReferencingDescriptorIDs {
 		desc, err := descsCol.GetImmutableTableByID(ctx, txn, ID, tree.ObjectLookupFlags{})
 		if err != nil {
@@ -936,7 +940,7 @@ func (t *typeSchemaChanger) canRemoveEnumValue(
 				User:     security.RootUserName(),
 				Database: dbDesc.GetName(),
 			}
-			rows, err := t.execCfg.InternalExecutor.QueryRowEx(ctx, "count-value-usage", txn, override, query.String())
+			rows, err := ie.QueryRowEx(ctx, "count-value-usage", txn, override, query.String())
 			if err != nil {
 				return errors.Wrapf(err, validationErr, member.LogicalRepresentation)
 			}
@@ -957,7 +961,7 @@ func (t *typeSchemaChanger) canRemoveEnumValue(
 			if err != nil {
 				return err
 			}
-			if catpb.RegionName(member.LogicalRepresentation) == homedRegion {
+			if descpb.RegionName(member.LogicalRepresentation) == homedRegion {
 				return errors.Newf("could not remove enum value %q as it is the home region for table %q",
 					member.LogicalRepresentation, desc.GetName())
 			}
@@ -1073,7 +1077,7 @@ func findUsageOfEnumValueInEncodedPartitioningValue(
 	foundUsage bool,
 	member *descpb.TypeDescriptor_EnumMember,
 ) (bool, error) {
-	var d tree.DatumAlloc
+	var d rowenc.DatumAlloc
 	tuple, _, err := rowenc.DecodePartitionTuple(
 		&d, codec, table, index, partitioning, v, fakePrefixDatums,
 	)
@@ -1100,6 +1104,8 @@ func (t *typeSchemaChanger) canRemoveEnumValueFromArrayUsages(
 	txn *kv.Txn,
 	descsCol *descs.Collection,
 ) error {
+	ie := t.execCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
 	const validationErr = "could not validate removal of enum value %q"
 	for i := 0; i < arrayTypeDesc.NumReferencingDescriptors(); i++ {
 		id := arrayTypeDesc.GetReferencingDescriptorID(i)
@@ -1164,7 +1170,7 @@ func (t *typeSchemaChanger) canRemoveEnumValueFromArrayUsages(
 			User:     security.RootUserName(),
 			Database: dbDesc.GetName(),
 		}
-		rows, err := t.execCfg.InternalExecutor.QueryRowEx(
+		rows, err := ie.QueryRowEx(
 			ctx,
 			"count-array-type-value-usage",
 			txn,
@@ -1177,7 +1183,7 @@ func (t *typeSchemaChanger) canRemoveEnumValueFromArrayUsages(
 		if len(rows) > 0 {
 			// Use an FQN in the error message.
 			parentSchema, err := descsCol.GetImmutableSchemaByID(
-				ctx, txn, desc.GetParentSchemaID(), tree.SchemaLookupFlags{Required: true})
+				ctx, txn, desc.GetParentSchemaID(), tree.SchemaLookupFlags{})
 			if err != nil {
 				return err
 			}
@@ -1297,9 +1303,11 @@ func (t *typeChangeResumer) OnFailOrCancel(ctx context.Context, execCtx interfac
 			return err
 		}
 
+		ie := tc.execCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+		defer ie.Close(ctx)
 		if err := drainNamesForDescriptor(
 			ctx, tc.typeID, tc.execCfg.CollectionFactory, tc.execCfg.DB,
-			tc.execCfg.InternalExecutor, tc.execCfg.Codec,
+			ie, tc.execCfg.Codec,
 			nil, /* beforeDrainNames */
 		); err != nil {
 			return err

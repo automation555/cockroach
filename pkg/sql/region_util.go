@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -38,10 +37,10 @@ import (
 
 // LiveClusterRegions is a set representing regions that are live in
 // a given cluster.
-type LiveClusterRegions map[catpb.RegionName]struct{}
+type LiveClusterRegions map[descpb.RegionName]struct{}
 
 // IsActive returns whether the given region is a live region.
-func (s *LiveClusterRegions) IsActive(region catpb.RegionName) bool {
+func (s *LiveClusterRegions) IsActive(region descpb.RegionName) bool {
 	_, ok := (*s)[region]
 	return ok
 }
@@ -71,7 +70,9 @@ func GetLiveClusterRegions(ctx context.Context, p PlanHookState) (LiveClusterReg
 		User: security.RootUserName(),
 	}
 
-	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
+	ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	it, err := ie.QueryIteratorEx(
 		ctx,
 		"get_live_cluster_regions",
 		p.ExtendedEvalContext().Txn,
@@ -82,11 +83,11 @@ func GetLiveClusterRegions(ctx context.Context, p PlanHookState) (LiveClusterReg
 		return nil, err
 	}
 
-	var ret LiveClusterRegions = make(map[catpb.RegionName]struct{})
+	var ret LiveClusterRegions = make(map[descpb.RegionName]struct{})
 	var ok bool
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 		row := it.Cur()
-		ret[catpb.RegionName(*row[0].(*tree.DString))] = struct{}{}
+		ret[descpb.RegionName(*row[0].(*tree.DString))] = struct{}{}
 	}
 	if err != nil {
 		return nil, err
@@ -97,7 +98,7 @@ func GetLiveClusterRegions(ctx context.Context, p PlanHookState) (LiveClusterReg
 // CheckClusterRegionIsLive checks whether a region supplied is one of the
 // currently active cluster regions.
 func CheckClusterRegionIsLive(
-	liveClusterRegions LiveClusterRegions, region catpb.RegionName,
+	liveClusterRegions LiveClusterRegions, region descpb.RegionName,
 ) error {
 	if !liveClusterRegions.IsActive(region) {
 		return errors.WithHintf(
@@ -113,7 +114,7 @@ func CheckClusterRegionIsLive(
 	return nil
 }
 
-func makeRequiredConstraintForRegion(r catpb.RegionName) zonepb.Constraint {
+func makeRequiredConstraintForRegion(r descpb.RegionName) zonepb.Constraint {
 	return zonepb.Constraint{
 		Type:  zonepb.Constraint_REQUIRED,
 		Key:   "region",
@@ -192,7 +193,7 @@ func zoneConfigForMultiRegionDatabase(
 // the attributes `num_replicas` and `constraints` will be inherited from the
 // database level zone config.
 func zoneConfigForMultiRegionPartition(
-	partitionRegion catpb.RegionName, regionConfig multiregion.RegionConfig,
+	partitionRegion descpb.RegionName, regionConfig multiregion.RegionConfig,
 ) (zonepb.ZoneConfig, error) {
 	numVoters, _ := getNumVotersAndNumReplicas(regionConfig)
 	zc := zonepb.NewZoneConfig()
@@ -279,7 +280,7 @@ func getNumVotersAndNumReplicas(
 // Under region survivability, we will constrain exactly <quorum - 1> voting
 // replicas in the primary/home region.
 func synthesizeVoterConstraints(
-	region catpb.RegionName, regionConfig multiregion.RegionConfig,
+	region descpb.RegionName, regionConfig multiregion.RegionConfig,
 ) ([]zonepb.ConstraintsConjunction, error) {
 	numVoters, _ := getNumVotersAndNumReplicas(regionConfig)
 	switch regionConfig.SurvivalGoal() {
@@ -381,7 +382,7 @@ func synthesizeVoterConstraints(
 // `zonepb.MultiRegionZoneConfigFields`) will be overwritten by the calling function
 // into an existing ZoneConfig.
 func zoneConfigForMultiRegionTable(
-	localityConfig catpb.LocalityConfig, regionConfig multiregion.RegionConfig,
+	localityConfig descpb.TableDescriptor_LocalityConfig, regionConfig multiregion.RegionConfig,
 ) (*zonepb.ZoneConfig, error) {
 	// We only care about NumVoters here at the table level. NumReplicas is set at
 	// the database level, not at the table/partition level.
@@ -389,7 +390,7 @@ func zoneConfigForMultiRegionTable(
 	ret := zonepb.NewZoneConfig()
 
 	switch l := localityConfig.Locality.(type) {
-	case *catpb.LocalityConfig_Global_:
+	case *descpb.TableDescriptor_LocalityConfig_Global_:
 		// Enable non-blocking transactions.
 		ret.GlobalReads = proto.Bool(true)
 
@@ -425,7 +426,7 @@ func zoneConfigForMultiRegionTable(
 		// Inherit lease preference from the database. We do
 		// nothing here because `NewZoneConfig()` already marks the field as
 		// 'inherited'.
-	case *catpb.LocalityConfig_RegionalByTable_:
+	case *descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
 		if l.RegionalByTable.Region == nil {
 			// If we don't have an explicit primary
 			// region, use the same configuration as the database and return a blank
@@ -448,7 +449,7 @@ func zoneConfigForMultiRegionTable(
 		ret.LeasePreferences = []zonepb.LeasePreference{
 			{Constraints: []zonepb.Constraint{makeRequiredConstraintForRegion(preferredRegion)}},
 		}
-	case *catpb.LocalityConfig_RegionalByRow_:
+	case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
 		// We purposely do not set anything here at table level - this should be done at
 		// partition level instead.
 		return ret, nil
@@ -533,7 +534,7 @@ func isPlaceholderZoneConfigForMultiRegion(zc zonepb.ZoneConfig) bool {
 // applyZoneConfigForMultiRegionTableOptionTableNewConfig applies table zone
 // configs on the entire table with the given new locality config.
 func applyZoneConfigForMultiRegionTableOptionTableNewConfig(
-	newConfig catpb.LocalityConfig,
+	newConfig descpb.TableDescriptor_LocalityConfig,
 ) applyZoneConfigForMultiRegionTableOption {
 	return func(
 		zc zonepb.ZoneConfig,
@@ -758,8 +759,10 @@ func applyZoneConfigForMultiRegionDatabase(
 		zonepb.MultiRegionZoneConfigFields,
 	)
 	// If the new zone config is the same as a blank zone config, delete it.
+	ie := execConfig.InternalExecutorFactory(ctx, nil)
+	defer ie.Close(ctx)
 	if newZoneConfig.Equal(zonepb.NewZoneConfig()) {
-		_, err = execConfig.InternalExecutor.Exec(
+		_, err = ie.Exec(
 			ctx,
 			"delete-zone-multiregion-database",
 			txn,
@@ -1129,7 +1132,7 @@ func SynthesizeRegionConfig(
 
 	regionConfig := multiregion.RegionConfig{}
 	_, dbDesc, err := descsCol.GetImmutableDatabaseByID(ctx, txn, dbID, tree.DatabaseLookupFlags{
-		AvoidLeased:    !o.useCache,
+		AvoidCached:    !o.useCache,
 		Required:       true,
 		IncludeOffline: o.includeOffline,
 	})
@@ -1148,7 +1151,7 @@ func SynthesizeRegionConfig(
 		regionEnumID,
 		tree.ObjectLookupFlags{
 			CommonLookupFlags: tree.CommonLookupFlags{
-				AvoidLeased:    !o.useCache,
+				AvoidCached:    !o.useCache,
 				IncludeOffline: o.includeOffline,
 			},
 		},
@@ -1157,7 +1160,7 @@ func SynthesizeRegionConfig(
 		return multiregion.RegionConfig{}, err
 	}
 
-	var regionNames catpb.RegionNames
+	var regionNames descpb.RegionNames
 	if o.forValidation {
 		regionNames, err = regionEnum.RegionNamesForValidation()
 	} else {
@@ -1347,7 +1350,7 @@ func (p *planner) CheckZoneConfigChangePermittedForMultiRegion(
 type zoneConfigForMultiRegionValidator interface {
 	getExpectedDatabaseZoneConfig() (zonepb.ZoneConfig, error)
 	getExpectedTableZoneConfig(desc catalog.TableDescriptor) (zonepb.ZoneConfig, error)
-	transitioningRegions() catpb.RegionNames
+	transitioningRegions() descpb.RegionNames
 
 	newMismatchFieldError(descType string, descName string, field string) error
 	newMissingSubzoneError(descType string, descName string, field string) error
@@ -1368,7 +1371,7 @@ func (v *zoneConfigForMultiRegionValidatorSetInitialRegion) getExpectedDatabaseZ
 	return *zonepb.NewZoneConfig(), nil
 }
 
-func (v *zoneConfigForMultiRegionValidatorSetInitialRegion) transitioningRegions() catpb.RegionNames {
+func (v *zoneConfigForMultiRegionValidatorSetInitialRegion) transitioningRegions() descpb.RegionNames {
 	// There are no transitioning regions at setup time.
 	return nil
 }
@@ -1459,7 +1462,7 @@ func (v *zoneConfigForMultiRegionValidatorExistingMultiRegionObject) getExpected
 	return expectedZoneConfig, err
 }
 
-func (v *zoneConfigForMultiRegionValidatorExistingMultiRegionObject) transitioningRegions() catpb.RegionNames {
+func (v *zoneConfigForMultiRegionValidatorExistingMultiRegionObject) transitioningRegions() descpb.RegionNames {
 	return v.regionConfig.TransitioningRegions()
 }
 
