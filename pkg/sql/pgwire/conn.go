@@ -15,6 +15,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"go.opentelemetry.io/otel/attribute"
 	"io"
 	"net"
 	"strconv"
@@ -32,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -44,11 +45,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/lib/pq/oid"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // conn implements a pgwire network connection (version 3 of the protocol,
@@ -352,7 +351,7 @@ func (c *conn) serveImpl(
 		close(dummyCh)
 		procCh = dummyCh
 
-		if err := c.sendReadyForQuery(0 /* queryCancelKey */); err != nil {
+		if err := c.sendReadyForQuery(); err != nil {
 			reserved.Close(ctx)
 			return
 		}
@@ -456,18 +455,7 @@ func (c *conn) serveImpl(
 				return false, isSimpleQuery, c.stmtBuf.Push(ctx, sql.Sync{})
 
 			case pgwirebase.ClientMsgExecute:
-				// To support the 1PC txn fast path, we peek at the next command to
-				// see if it is a Sync. This is because in the extended protocol, an
-				// implicit transaction cannot commit until the Sync is seen. If there's
-				// an error while peeking (for example, there are no bytes in the
-				// buffer), the error is ignored since it will be handled on the next
-				// loop iteration.
-				followedBySync := false
-				if nextMsgType, err := c.rd.Peek(1); err == nil &&
-					pgwirebase.ClientMessageType(nextMsgType[0]) == pgwirebase.ClientMsgSync {
-					followedBySync = true
-				}
-				return false, isSimpleQuery, c.handleExecute(ctx, &c.readBuf, timeReceived, followedBySync)
+				return false, isSimpleQuery, c.handleExecute(ctx, &c.readBuf, timeReceived)
 
 			case pgwirebase.ClientMsgParse:
 				return false, isSimpleQuery, c.handleParse(ctx, &c.readBuf, parser.NakedIntTypeFromDefaultIntSize(atomic.LoadInt32(atomicUnqualifiedIntSize)))
@@ -737,19 +725,24 @@ func (c *conn) sendInitialConnData(
 		return sql.ConnectionHandler{}, err
 	}
 
-	if err := c.sendReadyForQuery(connHandler.GetQueryCancelKey()); err != nil {
+	if err := c.sendReadyForQuery(); err != nil {
 		return sql.ConnectionHandler{}, err
 	}
 	return connHandler, nil
 }
 
 // sendReadyForQuery sends the final messages of the connection handshake.
-// This includes a BackendKeyData message and a ServerMsgReady
+// This includes a placeholder BackendKeyData message and a ServerMsgReady
 // message indicating that there is no active transaction.
-func (c *conn) sendReadyForQuery(queryCancelKey pgwirecancel.BackendKeyData) error {
-	// Send our BackendKeyData to the client, so they can cancel the connection.
+func (c *conn) sendReadyForQuery() error {
+	// Send the client a dummy BackendKeyData message. This is necessary for
+	// compatibility with tools that require this message. This information is
+	// normally used by clients to send a CancelRequest message:
+	// https://www.postgresql.org/docs/9.6/static/protocol-flow.html#AEN112861
+	// CockroachDB currently ignores all CancelRequests.
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgBackendKeyData)
-	c.msgBuilder.putInt64(int64(queryCancelKey))
+	c.msgBuilder.putInt32(0)
+	c.msgBuilder.putInt32(0)
 	if err := c.msgBuilder.finishMsg(c.conn); err != nil {
 		return err
 	}
@@ -1108,7 +1101,7 @@ func (c *conn) handleBind(ctx context.Context, buf *pgwirebase.ReadBuffer) error
 // An error is returned iff the statement buffer has been closed. In that case,
 // the connection should be considered toast.
 func (c *conn) handleExecute(
-	ctx context.Context, buf *pgwirebase.ReadBuffer, timeReceived time.Time, followedBySync bool,
+	ctx context.Context, buf *pgwirebase.ReadBuffer, timeReceived time.Time,
 ) error {
 	telemetry.Inc(sqltelemetry.ExecuteRequestCounter)
 	portalName, err := buf.GetString()
@@ -1120,10 +1113,9 @@ func (c *conn) handleExecute(
 		return c.stmtBuf.Push(ctx, sql.SendError{Err: err})
 	}
 	return c.stmtBuf.Push(ctx, sql.ExecPortal{
-		Name:           portalName,
-		TimeReceived:   timeReceived,
-		Limit:          int(limit),
-		FollowedBySync: followedBySync,
+		Name:         portalName,
+		TimeReceived: timeReceived,
+		Limit:        int(limit),
 	})
 }
 

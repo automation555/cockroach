@@ -13,8 +13,9 @@ package pgwire
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"fmt"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"go.opentelemetry.io/otel/attribute"
 	"io"
 	"net"
 	"net/url"
@@ -26,7 +27,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -50,13 +49,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	"go.opentelemetry.io/otel/attribute"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // ATTENTION: After changing this value in a unit test, you probably want to
@@ -136,24 +131,6 @@ var (
 		Help:        "Latency to establish and authenticate a SQL connection",
 		Measurement: "Nanoseconds",
 		Unit:        metric.Unit_NANOSECONDS,
-	}
-	MetaPGWireCancelTotal = metric.Metadata{
-		Name:        "sql.pgwire_cancel.total",
-		Help:        "Counter of the number of pgwire query cancel requests",
-		Measurement: "Requests",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaPGWireCancelIgnored = metric.Metadata{
-		Name:        "sql.pgwire_cancel.ignored",
-		Help:        "Counter of the number of pgwire query cancel requests that were ignored due to rate limiting",
-		Measurement: "Requests",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaPGWireCancelSuccessful = metric.Metadata{
-		Name:        "sql.pgwire_cancel.successful",
-		Help:        "Counter of the number of pgwire query cancel requests that were successful",
-		Measurement: "Requests",
-		Unit:        metric.Unit_COUNT,
 	}
 )
 
@@ -251,32 +228,26 @@ type Server struct {
 
 // ServerMetrics is the set of metrics for the pgwire server.
 type ServerMetrics struct {
-	BytesInCount                *metric.Counter
-	BytesOutCount               *metric.Counter
-	Conns                       *metric.Gauge
-	NewConns                    *metric.Counter
-	ConnLatency                 *metric.Histogram
-	PGWireCancelTotalCount      *metric.Counter
-	PGWireCancelIgnoredCount    *metric.Counter
-	PGWireCancelSuccessfulCount *metric.Counter
-	ConnMemMetrics              sql.BaseMemoryMetrics
-	SQLMemMetrics               sql.MemoryMetrics
+	BytesInCount   *metric.Counter
+	BytesOutCount  *metric.Counter
+	Conns          *metric.Gauge
+	NewConns       *metric.Counter
+	ConnLatency    *metric.Histogram
+	ConnMemMetrics sql.BaseMemoryMetrics
+	SQLMemMetrics  sql.MemoryMetrics
 }
 
 func makeServerMetrics(
 	sqlMemMetrics sql.MemoryMetrics, histogramWindow time.Duration,
 ) ServerMetrics {
 	return ServerMetrics{
-		BytesInCount:                metric.NewCounter(MetaBytesIn),
-		BytesOutCount:               metric.NewCounter(MetaBytesOut),
-		Conns:                       metric.NewGauge(MetaConns),
-		NewConns:                    metric.NewCounter(MetaNewConns),
-		ConnLatency:                 metric.NewLatency(MetaConnLatency, histogramWindow),
-		PGWireCancelTotalCount:      metric.NewCounter(MetaPGWireCancelTotal),
-		PGWireCancelIgnoredCount:    metric.NewCounter(MetaPGWireCancelIgnored),
-		PGWireCancelSuccessfulCount: metric.NewCounter(MetaPGWireCancelSuccessful),
-		ConnMemMetrics:              sql.MakeBaseMemMetrics("conns", histogramWindow),
-		SQLMemMetrics:               sqlMemMetrics,
+		BytesInCount:   metric.NewCounter(MetaBytesIn),
+		BytesOutCount:  metric.NewCounter(MetaBytesOut),
+		Conns:          metric.NewGauge(MetaConns),
+		NewConns:       metric.NewCounter(MetaNewConns),
+		ConnLatency:    metric.NewLatency(MetaConnLatency, histogramWindow),
+		ConnMemMetrics: sql.MakeBaseMemMetrics("conns", histogramWindow),
+		SQLMemMetrics:  sqlMemMetrics,
 	}
 }
 
@@ -407,7 +378,6 @@ func (s *Server) Metrics() (res []interface{}) {
 		&s.SQLServer.InternalMetrics.EngineMetrics,
 		&s.SQLServer.InternalMetrics.GuardrailMetrics,
 		&s.SQLServer.ServerMetrics.StatsMetrics,
-		&s.SQLServer.ServerMetrics.ContentionSubsystemMetrics,
 	}
 }
 
@@ -645,8 +615,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	case versionCancel:
 		// The cancel message is rather peculiar: it is sent without
 		// authentication, always over an unencrypted channel.
-		s.handleCancel(ctx, conn, &buf)
-		return nil
+		return handleCancel(conn)
 
 	case versionGSSENC:
 		// This is a request for an unsupported feature: GSS encryption.
@@ -697,8 +666,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 		// Yet, we've found clients in the wild that send the cancel
 		// after the TLS handshake, for example at
 		// https://github.com/cockroachlabs/support/issues/600.
-		s.handleCancel(ctx, conn, &buf)
-		return nil
+		return handleCancel(conn)
 
 	default:
 		// We don't know this protocol.
@@ -757,50 +725,12 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	return nil
 }
 
-// handleCancel handles a pgwire query cancellation request. Note that the
-// request is unauthenticated. To mitigate the security risk (i.e., a
-// malicious actor spamming this endpoint with random data to try to cancel
-// a query), the logic is rate-limited by a semaphore. Refer to the comments
-// in the pgwirecancel package for more information.
-//
-// This function does not return an error, so the caller (and possible
-// attacker) will not know if the cancellation attempt succeeded. Errors are
-// logged so that an operator can be aware of any possibly malicious requests.
-func (s *Server) handleCancel(ctx context.Context, conn net.Conn, buf *pgwirebase.ReadBuffer) {
+func handleCancel(conn net.Conn) error {
+	// Since we don't support this, close the door in the client's
+	// face. Make a note of that use in telemetry.
 	telemetry.Inc(sqltelemetry.CancelRequestCounter)
-	s.metrics.PGWireCancelTotalCount.Inc(1)
-
-	resp, err := func() (*serverpb.CancelQueryByKeyResponse, error) {
-		backendKeyDataBits, err := buf.GetUint64()
-		// The connection that issued the cancel is not a SQL session -- it's an
-		// entirely new connection that's created just to send the cancel. We close
-		// the connection as soon as possible after reading the data, since there
-		// is nothing to send back to the client.
-		_ = conn.Close()
-		if err != nil {
-			return nil, err
-		}
-		cancelKey := pgwirecancel.BackendKeyData(backendKeyDataBits)
-		// The request is forwarded to the appropriate node.
-		req := &serverpb.CancelQueryByKeyRequest{
-			SQLInstanceID:  cancelKey.GetSQLInstanceID(),
-			CancelQueryKey: cancelKey,
-		}
-		resp, err := s.execCfg.SQLStatusServer.CancelQueryByKey(ctx, req)
-		if len(resp.Error) > 0 {
-			err = errors.CombineErrors(err, errors.Newf("error from CancelQueryByKeyResponse: %s", resp.Error))
-		}
-		return resp, err
-	}()
-
-	if resp != nil && resp.Canceled {
-		s.metrics.PGWireCancelSuccessfulCount.Inc(1)
-	} else if err != nil {
-		if status := status.Convert(err); status.Code() == codes.ResourceExhausted {
-			s.metrics.PGWireCancelIgnoredCount.Inc(1)
-		}
-		log.Sessions.Warningf(ctx, "unexpected while handling pgwire cancellation request: %v", err)
-	}
+	_ = conn.Close()
+	return nil
 }
 
 // parseClientProvidedSessionParameters reads the incoming k/v pairs
@@ -851,19 +781,10 @@ func parseClientProvidedSessionParameters(
 			// here, so that further lookups for authentication have the correct
 			// identifier.
 			args.User, _ = security.MakeSQLUsernameFromUserInput(value, security.UsernameValidation)
-			// IsSuperuser will get updated later when we load the user's session
-			// initialization information.
+			// TODO(#sql-experience): we should retrieve the admin status during
+			// authentication using the roles cache, instead of using a simple/naive
+			// username match. See #69355.
 			args.IsSuperuser = args.User.IsRootUser()
-
-		case "crdb:session_revival_token_base64":
-			token, err := base64.StdEncoding.DecodeString(value)
-			if err != nil {
-				return sql.SessionArgs{}, pgerror.Wrapf(
-					err, pgcode.ProtocolViolation,
-					"%s", key,
-				)
-			}
-			args.SessionRevivalToken = token
 
 		case "results_buffer_size":
 			if args.ConnResultsBufferSize, err = humanizeutil.ParseBytes(value); err != nil {

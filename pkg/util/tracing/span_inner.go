@@ -50,13 +50,6 @@ func (s *spanInner) TraceID() tracingpb.TraceID {
 	return s.crdb.TraceID()
 }
 
-func (s *spanInner) SpanID() tracingpb.SpanID {
-	if s.isNoop() {
-		return 0
-	}
-	return s.crdb.SpanID()
-}
-
 func (s *spanInner) isNoop() bool {
 	return s.crdb == nil && s.netTr == nil && s.otelSpan == nil
 }
@@ -76,15 +69,11 @@ func (s *spanInner) SetVerbose(to bool) {
 	s.crdb.SetVerbose(to)
 }
 
-// GetRecording returns the span's recording.
-//
-// finishing indicates whether s is in the process of finishing. If it isn't,
-// the recording will include an "_unfinished" tag.
-func (s *spanInner) GetRecording(recType RecordingType, finishing bool) Recording {
+func (s *spanInner) GetRecording(recType RecordingType) Recording {
 	if s.isNoop() {
 		return nil
 	}
-	return s.crdb.GetRecording(recType, finishing)
+	return s.crdb.GetRecording(recType)
 }
 
 func (s *spanInner) ImportRemoteSpans(remoteSpans []tracingpb.RecordedSpan) {
@@ -92,12 +81,17 @@ func (s *spanInner) ImportRemoteSpans(remoteSpans []tracingpb.RecordedSpan) {
 }
 
 func (s *spanInner) Finish() {
-	if s == nil || s.isNoop() {
+	if s == nil {
+		return
+	}
+	if s.isNoop() {
 		return
 	}
 
 	if !s.crdb.finish() {
-		// Short-circuit because netTr.Finish does not tolerate double-finish.
+		// The span was already finished. External spans and net/trace are not
+		// always forgiving about spans getting finished twice, but it may happen so
+		// let's be resilient to it.
 		return
 	}
 
@@ -151,29 +145,42 @@ func (s *spanInner) OperationName() string {
 	return s.crdb.operation
 }
 
-func (s *spanInner) SetTag(key string, value attribute.Value) *spanInner {
+func (s *spanInner) SetTag(key string, value attribute.Value, statusTag bool) *spanInner {
 	if s.isNoop() {
 		return s
 	}
-	return s.setTagInner(key, value, false /* locked */)
+	if !statusTag {
+		if s.otelSpan != nil {
+			s.otelSpan.SetAttributes(attribute.KeyValue{
+				Key:   attribute.Key(key),
+				Value: value,
+			})
+		}
+		if s.netTr != nil {
+			s.netTr.LazyPrintf("%s:%v", key, value)
+		}
+	}
+	s.crdb.mu.Lock()
+	defer s.crdb.mu.Unlock()
+	s.crdb.setTagLocked(key, value)
+	return s
 }
 
-func (s *spanInner) setTagInner(key string, value attribute.Value, locked bool) *spanInner {
-	if s.otelSpan != nil {
-		s.otelSpan.SetAttributes(attribute.KeyValue{
-			Key:   attribute.Key(key),
-			Value: value,
-		})
+func (s *spanInner) SetLazyTag(key string, value fmt.Stringer) *spanInner {
+	if s.isNoop() {
+		return s
 	}
-	if s.netTr != nil {
-		s.netTr.LazyPrintf("%s:%v", key, value)
+	s.crdb.mu.Lock()
+	defer s.crdb.mu.Unlock()
+	s.crdb.setLazyTagLocked(key, value)
+	return s
+}
+
+func (s *spanInner) ClearStatusTag(key string) *spanInner {
+	if s.isNoop() {
+		return s
 	}
-	// The internal tags will be used if we start a recording on this Span.
-	if !locked {
-		s.crdb.mu.Lock()
-		defer s.crdb.mu.Unlock()
-	}
-	s.crdb.setTagLocked(key, value)
+	s.crdb.clearTag(key)
 	return s
 }
 
