@@ -137,7 +137,7 @@ type hashBasedPartitioner struct {
 
 	partitioners      []*colcontainer.PartitionedDiskQueue
 	partitionedInputs []*partitionerToOperator
-	tupleDistributor  *colexechash.TupleHashDistributor
+	tupleDistributors []*colexechash.TupleHashDistributor
 	// maxNumberActivePartitions determines the maximum number of active
 	// partitions that the operator is allowed to have. This number is computed
 	// semi-dynamically and will influence the choice of numBuckets value.
@@ -227,7 +227,8 @@ func newHashBasedPartitioner(
 	// operators. The cache mode is chosen to automatically close the cache
 	// belonging to partitions at a parent level when repartitioning.
 	diskQueueCfg := args.DiskQueueCfg
-	diskQueueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeClearAndReuseCache)
+	diskQueueCfg.CacheMode = colcontainer.DiskQueueCacheModeClearAndReuseCache
+	diskQueueCfg.SetDefaultBufferSizeBytesForCacheMode()
 	partitionedDiskQueueSemaphore := args.FDSemaphore
 	if !args.TestingKnobs.DelegateFDAcquisitions {
 		// To avoid deadlocks with other disk queues, we manually attempt to
@@ -344,10 +345,13 @@ func (op *hashBasedPartitioner) Init(ctx context.Context) {
 	// In the processing phase, the in-memory operator will use the default init
 	// hash value, so in order to use a "different" hash function in the
 	// partitioning phase we use a different init hash value.
-	op.tupleDistributor = colexechash.NewTupleHashDistributor(
-		colexechash.DefaultInitHashValue+1, op.numBuckets,
-	)
-	op.tupleDistributor.Init(op.Ctx)
+	op.tupleDistributors = make([]*colexechash.TupleHashDistributor, len(op.hashCols))
+	for i := range op.hashCols {
+		op.tupleDistributors[i] = colexechash.NewTupleHashDistributor(
+			colexechash.DefaultInitHashValue+1, op.numBuckets, op.hashCols[i],
+		)
+		op.tupleDistributors[i].Init(op.Ctx)
+	}
 	op.state = hbpInitialPartitioning
 }
 
@@ -359,7 +363,7 @@ func (op *hashBasedPartitioner) partitionBatch(
 		return
 	}
 	scratchBatch := op.scratch.batches[inputIdx]
-	selections := op.tupleDistributor.Distribute(batch, op.hashCols[inputIdx])
+	selections := op.tupleDistributors[inputIdx].Distribute(batch)
 	for idx, sel := range selections {
 		partitionIdx := op.partitionIdxOffset + idx
 		if len(sel) > 0 {
@@ -453,9 +457,6 @@ StateChanged:
 					"%s is performing %d'th repartition", op.name, op.numRepartitions,
 				)
 			}
-			// In order to use a different hash function when repartitioning, we
-			// need to increase the seed value of the tuple distributor.
-			op.tupleDistributor.InitHashValue++
 			// We're actively will be using op.numBuckets + 1 partitions
 			// (because we're repartitioning one side at a time), so we can set
 			// op.numBuckets higher than in the initial partitioning step.
@@ -463,7 +464,12 @@ StateChanged:
 			// op.numBuckets being a power of two (finalizeHash step is faster
 			// if so).
 			op.numBuckets = op.maxNumberActivePartitions - 1
-			op.tupleDistributor.ResetNumOutputs(op.numBuckets)
+			for i := range op.tupleDistributors {
+				// In order to use a different hash function when repartitioning, we
+				// need to increase the seed value of the tuple distributor.
+				op.tupleDistributors[i].InitHashValue++
+				op.tupleDistributors[i].ResetNumOutputs(op.numBuckets)
+			}
 			for parentPartitionIdx, parentPartitionInfo := range op.partitionsToProcessUsingMain {
 				for i := range op.inputs {
 					batch := op.recursiveScratch.batches[i]
@@ -536,7 +542,7 @@ StateChanged:
 				if partitionInfo.memSize <= op.maxPartitionSizeToProcessUsingMain {
 					log.VEventf(op.Ctx, 2,
 						`%s processes partition with idx %d of size %s using the "main" strategy`,
-						op.name, partitionIdx, humanizeutil.IBytes(partitionInfo.memSize),
+						op.name, partitionIdx, redact.SafeString(humanizeutil.IBytes(partitionInfo.memSize)),
 					)
 					for i := range op.partitionedInputs {
 						op.partitionedInputs[i].partitionIdx = partitionIdx
@@ -618,7 +624,7 @@ StateChanged:
 			return b
 
 		case hbpFinished:
-			if err := op.Close(op.Ctx); err != nil {
+			if err := op.Close(); err != nil {
 				colexecerror.InternalError(err)
 			}
 			return coldata.ZeroBatch
@@ -629,10 +635,11 @@ StateChanged:
 	}
 }
 
-func (op *hashBasedPartitioner) Close(ctx context.Context) error {
+func (op *hashBasedPartitioner) Close() error {
 	if !op.CloserHelper.Close() {
 		return nil
 	}
+	ctx := op.EnsureCtx()
 	log.VEventf(ctx, 1, "%s is closed", op.name)
 	var retErr error
 	for i := range op.inputs {
@@ -643,7 +650,7 @@ func (op *hashBasedPartitioner) Close(ctx context.Context) error {
 	// The in-memory main operator might be a Closer (e.g. the in-memory hash
 	// aggregator), and we need to close it if so.
 	if c, ok := op.inMemMainOp.(colexecop.Closer); ok {
-		if err := c.Close(ctx); err != nil {
+		if err := c.Close(); err != nil {
 			retErr = err
 		}
 	}
@@ -651,7 +658,7 @@ func (op *hashBasedPartitioner) Close(ctx context.Context) error {
 	// it will still be closed appropriately because we accumulate all closers
 	// in NewColOperatorResult.
 	if c, ok := op.diskBackedFallbackOp.(colexecop.Closer); ok {
-		if err := c.Close(ctx); err != nil {
+		if err := c.Close(); err != nil {
 			retErr = err
 		}
 	}
