@@ -423,7 +423,6 @@ var charts = []sectionDescription{
 					"distsender.rpc.err.leaserejectederrtype",
 					"distsender.rpc.err.mergeinprogresserrtype",
 					"distsender.rpc.err.mintimestampboundunsatisfiableerrtype",
-					"distsender.rpc.err.mvcchistorymutationerrtype",
 					"distsender.rpc.err.nodeunavailableerrtype",
 					"distsender.rpc.err.notleaseholdererrtype",
 					"distsender.rpc.err.oprequirestxnerrtype",
@@ -882,33 +881,26 @@ var charts = []sectionDescription{
 			{
 				Title:       "Latch",
 				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
 				Metrics:     []string{"requests.slow.latch"},
 			},
 			{
 				Title:       "Stuck Acquiring Lease",
 				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
 				Metrics:     []string{"requests.slow.lease"},
 			},
 			{
 				Title:       "Stuck in Raft",
 				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
 				Metrics:     []string{"requests.slow.raft"},
 			},
 			{
 				Title:       "Stuck sending RPCs to range",
 				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
 				Metrics:     []string{"requests.slow.distsender"},
-			},
-			{
-				Title:       "Replicas with tripped circuit breakers",
-				Downsampler: DescribeAggregator_SUM,
-				Metrics:     []string{"kv.replica_circuit_breaker.num_tripped_replicas"},
-			},
-			{
-				Title:       "Replica circuit breaker trip events",
-				Downsampler: DescribeAggregator_MAX,
-				Rate:        DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
-				Metrics:     []string{"kv.replica_circuit_breaker.num_tripped_events"},
 			},
 		},
 	},
@@ -1568,10 +1560,6 @@ var charts = []sectionDescription{
 				Title:   "Raft Leader Transfers",
 				Metrics: []string{"range.raftleadertransfers"},
 			},
-			{
-				Title:   "Unsafe Loss of Quorum Recoveries",
-				Metrics: []string{"range.recoveries"},
-			},
 		},
 	},
 	{
@@ -1874,23 +1862,6 @@ var charts = []sectionDescription{
 				Title:   "Number of stale statement/transaction roles removed by cleanup job",
 				Metrics: []string{"sql.stats.cleanup.rows_removed"},
 			},
-			{
-				Title:   "Time took in nanoseconds to collect transaction stats",
-				Metrics: []string{"sql.stats.txn_stats_collection.duration"},
-			},
-		},
-	},
-	{
-		Organization: [][]string{{SQLLayer, "Contention"}},
-		Charts: []chartDescription{
-			{
-				Title:   "Transaction ID Cache Miss",
-				Metrics: []string{"sql.contention.txn_id_cache.miss"},
-			},
-			{
-				Title:   "Transaction ID Cache Read",
-				Metrics: []string{"sql.contention.txn_id_cache.read"},
-			},
 		},
 	},
 	{
@@ -1934,37 +1905,6 @@ var charts = []sectionDescription{
 					"sql.optimizer.plan_cache.misses.internal",
 				},
 				AxisLabel: "Plane Cache Accesses",
-			},
-		},
-	},
-	{
-		Organization: [][]string{{SQLLayer, "Row-Level TTL"}},
-		Charts: []chartDescription{
-			{
-				Title: "Jobs Running",
-				Metrics: []string{
-					"jobs.row_level_ttl.currently_running",
-					"jobs.row_level_ttl.currently_idle",
-				},
-			},
-			{
-				Title: "Jobs Statistics",
-				Metrics: []string{
-					"jobs.row_level_ttl.fail_or_cancel_completed",
-					"jobs.row_level_ttl.fail_or_cancel_failed",
-					"jobs.row_level_ttl.fail_or_cancel_retry_error",
-					"jobs.row_level_ttl.resume_completed",
-					"jobs.row_level_ttl.resume_failed",
-					"jobs.row_level_ttl.resume_retry_error",
-				},
-			},
-			{
-				Title: "Scheduled Jobs Statistics",
-				Metrics: []string{
-					"schedules.scheduled-row-level-ttl-executor.succeeded",
-					"schedules.scheduled-row-level-ttl-executor.started",
-					"schedules.scheduled-row-level-ttl-executor.failed",
-				},
 			},
 		},
 	},
@@ -2090,6 +2030,19 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{SQLLayer, "SQL Memory", "Catalog"}},
+		Charts: []chartDescription{
+			{
+				Title:   "Current",
+				Metrics: []string{"sql.mem.lease-manager-memory.current"},
+			},
+			{
+				Title:   "Max",
+				Metrics: []string{"sql.mem.lease-manager-memory.max"},
+			},
+		},
+	},
+	{
 		Organization: [][]string{{SQLLayer, "SQL Memory"}},
 		Charts: []chartDescription{
 			{
@@ -2163,14 +2116,6 @@ var charts = []sectionDescription{
 				AxisLabel: "Transactions",
 			},
 			{
-				Title: "Active Statements",
-				Metrics: []string{
-					"sql.statements.active",
-					"sql.statements.active.internal",
-				},
-				AxisLabel: "Active Statements",
-			},
-			{
 				Title: "Full Table Index Scans",
 				Metrics: []string{
 					"sql.full.scan.count",
@@ -2209,15 +2154,6 @@ var charts = []sectionDescription{
 				},
 				AxisLabel: "Latency",
 			},
-			{
-				Title: "Cancel Requests (Postgres Protocol)",
-				Metrics: []string{
-					"sql.pgwire_cancel.total",
-					"sql.pgwire_cancel.ignored",
-					"sql.pgwire_cancel.successful",
-				},
-				AxisLabel: "Count",
-			},
 		},
 	},
 	{
@@ -2251,7 +2187,6 @@ var charts = []sectionDescription{
 					"sql.delete.count",
 					"sql.insert.count",
 					"sql.misc.count",
-					"sql.copy.count",
 					"sql.query.count",
 					"sql.select.count",
 					"sql.update.count",
@@ -2265,7 +2200,6 @@ var charts = []sectionDescription{
 					"sql.delete.started.count",
 					"sql.insert.started.count",
 					"sql.misc.started.count",
-					"sql.copy.started.count",
 					"sql.query.started.count",
 					"sql.select.started.count",
 					"sql.update.started.count",
@@ -2278,7 +2212,6 @@ var charts = []sectionDescription{
 					"sql.delete.count.internal",
 					"sql.insert.count.internal",
 					"sql.misc.count.internal",
-					"sql.copy.count.internal",
 					"sql.query.count.internal",
 					"sql.select.count.internal",
 					"sql.update.count.internal",
@@ -2291,7 +2224,6 @@ var charts = []sectionDescription{
 					"sql.delete.started.count.internal",
 					"sql.insert.started.count.internal",
 					"sql.misc.started.count.internal",
-					"sql.copy.started.count.internal",
 					"sql.query.started.count.internal",
 					"sql.select.started.count.internal",
 					"sql.update.started.count.internal",
@@ -2710,26 +2642,6 @@ var charts = []sectionDescription{
 					"jobs.auto_span_config_reconciliation.currently_running",
 					"jobs.auto_sql_stats_compaction.currently_running",
 					"jobs.stream_replication.currently_running",
-				},
-			},
-			{
-				Title: "Currently Idle",
-				Metrics: []string{
-					"jobs.auto_create_stats.currently_idle",
-					"jobs.auto_span_config_reconciliation.currently_idle",
-					"jobs.auto_sql_stats_compaction.currently_idle",
-					"jobs.backup.currently_idle",
-					"jobs.changefeed.currently_idle",
-					"jobs.create_stats.currently_idle",
-					"jobs.import.currently_idle",
-					"jobs.migration.currently_idle",
-					"jobs.new_schema_change.currently_idle",
-					"jobs.restore.currently_idle",
-					"jobs.schema_change.currently_idle",
-					"jobs.schema_change_gc.currently_idle",
-					"jobs.stream_ingestion.currently_idle",
-					"jobs.stream_replication.currently_idle",
-					"jobs.typedesc_schema_change.currently_idle",
 				},
 			},
 			{

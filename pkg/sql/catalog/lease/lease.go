@@ -29,9 +29,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
@@ -40,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -123,8 +123,7 @@ func (m *Manager) WaitForOneVersion(
 ) (desc catalog.Descriptor, _ error) {
 	for lastCount, r := 0, retry.Start(retryOpts); r.Next(); {
 		if err := m.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			version := m.storage.settings.Version.ActiveVersion(ctx)
-			desc, err = catkv.MustGetDescriptorByID(ctx, txn, m.Codec(), version, id, catalog.Any)
+			desc, err = catalogkv.MustGetDescriptorByID(ctx, txn, m.Codec(), id)
 			return err
 		}); err != nil {
 			return nil, err
@@ -287,7 +286,7 @@ func getDescriptorsFromStoreForInterval(
 				if err := value.GetProto(&desc); err != nil {
 					return err
 				}
-				descBuilder := descbuilder.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
+				descBuilder := catalogkv.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
 
 				// Construct a historical descriptor with expiration.
 				histDesc := historicalDescriptor{
@@ -414,7 +413,12 @@ func (m *Manager) insertDescriptorVersions(id descpb.ID, versions []historicalDe
 		existingVersion := t.mu.active.findVersion(versions[i].desc.GetVersion())
 		if existingVersion == nil {
 			t.mu.active.insert(
-				newDescriptorVersionState(t, versions[i].desc, versions[i].expiration, false))
+				newDescriptorVersionState(t, versions[i].desc, versions[i].expiration, false),
+			)
+			// Grow leaseMgr monitor for new leased descriptor.
+			if err := m.mu.boundAccount.Grow(context.Background(), versions[i].desc.ByteSize()); err != nil {
+				log.Warningf(context.Background(), "Unable to grow leaseMgr bound account for id %d", id)
+			}
 		}
 	}
 }
@@ -639,12 +643,18 @@ type Manager struct {
 	storage          storage
 	mu               struct {
 		syncutil.Mutex
-		// TODO(james): Track size of leased descriptors in memory.
+		//TODO(james): Track size of leased descriptors in memory.
 		descriptors map[descpb.ID]*descriptorState
 
 		// updatesResolvedTimestamp keeps track of a timestamp before which all
 		// descriptor updates have already been seen.
 		updatesResolvedTimestamp hlc.Timestamp
+
+		// mon is a memory monitor linked with the leaseMgr on creation.
+		mon *mon.BytesMonitor
+		// boundAccount is associated with mon and is used to track memory allocations
+		// during lease acquires.
+		boundAccount mon.BoundAccount
 	}
 
 	draining atomic.Value
@@ -679,6 +689,7 @@ func NewLeaseManager(
 	testingKnobs ManagerTestingKnobs,
 	stopper *stop.Stopper,
 	rangeFeedFactory *rangefeed.Factory,
+	monitor *mon.BytesMonitor,
 ) *Manager {
 	lm := &Manager{
 		storage: storage{
@@ -709,6 +720,10 @@ func NewLeaseManager(
 	lm.mu.updatesResolvedTimestamp = db.Clock().Now()
 
 	lm.draining.Store(false)
+
+	lm.mu.mon = monitor
+	lm.mu.boundAccount = lm.mu.mon.MakeBoundAccount()
+
 	return lm
 }
 
@@ -792,6 +807,7 @@ func (m *Manager) AcquireByName(
 		// m.names.get() incremented the refcount, we decrement it to get a new
 		// version.
 		descVersion.Release(ctx)
+
 		// Return a valid descriptor for the timestamp.
 		leasedDesc, err := m.Acquire(ctx, timestamp, descVersion.GetID())
 		if err != nil {
@@ -874,7 +890,8 @@ func (m *Manager) resolveName(
 	parentID descpb.ID,
 	parentSchemaID descpb.ID,
 	name string,
-) (id descpb.ID, _ error) {
+) (descpb.ID, error) {
+	id := descpb.InvalidID
 	if err := m.storage.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		// Run the name lookup as high-priority, thereby pushing any intents out of
 		// its way. We don't want schema changes to prevent name resolution/lease
@@ -887,9 +904,16 @@ func (m *Manager) resolveName(
 		if err := txn.SetFixedTimestamp(ctx, timestamp); err != nil {
 			return err
 		}
+		var found bool
 		var err error
-		id, err = catkv.LookupID(ctx, txn, m.storage.codec, parentID, parentSchemaID, name)
-		return err
+		found, id, err = catalogkv.LookupObjectID(ctx, txn, m.storage.codec, parentID, parentSchemaID, name)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		return nil
 	}); err != nil {
 		return id, err
 	}
@@ -1298,12 +1322,16 @@ func (m *Manager) Codec() keys.SQLCodec {
 // registration.
 type Metrics struct {
 	OutstandingLeases *metric.Gauge
+	CurBytesCount     *metric.Gauge
+	MaxBytesHist      *metric.Histogram
 }
 
 // MetricsStruct returns a struct containing all of this Manager's metrics.
-func (m *Manager) MetricsStruct() Metrics {
+func (m *Manager) MetricsStruct(gauge *metric.Gauge, histogram *metric.Histogram) Metrics {
 	return Metrics{
 		OutstandingLeases: m.storage.outstandingLeases,
+		CurBytesCount:     gauge,
+		MaxBytesHist:      histogram,
 	}
 }
 

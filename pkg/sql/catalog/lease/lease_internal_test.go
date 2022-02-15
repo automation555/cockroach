@@ -25,15 +25,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
@@ -161,7 +163,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	var tables []catalog.TableDescriptor
 	var expiration hlc.Timestamp
@@ -279,7 +281,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	futureTime := s.Clock().Now().Add(500*time.Millisecond.Nanoseconds(), 0).WithSynthetic(true)
 
 	getLatestDesc := func() catalog.TableDescriptor {
@@ -384,7 +386,7 @@ CREATE TEMP TABLE t2 (temp int);
 	}
 
 	for _, tableName := range []string{"t", "t2"} {
-		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "defaultdb", tableName)
+		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "defaultdb", tableName)
 		lease := leaseManager.names.get(
 			context.Background(),
 			tableDesc.GetParentID(),
@@ -418,7 +420,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Rename.
 	if _, err := db.Exec("ALTER TABLE t.test RENAME TO t.test2;"); err != nil {
@@ -473,7 +475,7 @@ CREATE TABLE t.%s (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName)
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName)
 
 	// Check the assumptions this tests makes: that there is a cache entry
 	// (with a valid lease).
@@ -528,7 +530,7 @@ CREATE TABLE t.%s (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName)
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName)
 
 	// Populate the name cache.
 	if _, err := db.Exec("SELECT * FROM t.test;"); err != nil {
@@ -593,7 +595,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Check that we cannot get the table by a different name.
 	if leaseManager.names.get(
@@ -635,7 +637,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Populate the name cache.
 	ctx := context.Background()
@@ -741,7 +743,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	var wg sync.WaitGroup
 	numRoutines := 10
@@ -791,7 +793,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	var wg sync.WaitGroup
 	numRoutines := 10
@@ -1212,6 +1214,168 @@ func TestReadOlderVersionForTimestamp(t *testing.T) {
 		})
 	}
 }
+
+
+// TestManagerLeaseMemoryMonitorNewVersions confirms the leased descriptor
+// memory size is accurately recorded in the lease manager's memory monitor when
+// new/multiple versions of the descriptor are created.
+func TestManagerLeaseMemoryMonitorNewVersions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var stopper *stop.Stopper
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	stopper = s.Stopper()
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
+
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	manager := s.LeaseManager().(*Manager)
+	// Prevent non-explicit Acquire to leases for testing purposes.
+	tdb.Exec(t, "SET CLUSTER SETTING sql.tablecache.lease.refresh_limit = 0")
+
+	for _, tc := range []struct {
+		sqlCommand string
+		descName   string
+		descID     descpb.ID
+		N          int
+	}{
+		{
+			sqlCommand: "CREATE TABLE foo (i INT PRIMARY KEY)",
+			descName:   "foo",
+			N:          5,
+		},
+		{
+			sqlCommand: "CREATE SCHEMA IF NOT EXISTS schema_one",
+			descName:   "schema_one",
+			N:          1,
+		},
+	} {
+		t.Run(fmt.Sprintf("%d versions of %v", tc.N, tc.descName), func(t *testing.T) {
+
+			tdb.Exec(t, tc.sqlCommand)
+			tdb.QueryRow(t, "SELECT id FROM system.namespace WHERE name = '"+tc.descName+"'").Scan(&tc.descID)
+			descs := make([]catalog.Descriptor, tc.N+1)
+
+			// Create total N versions of descriptor.
+			for i := 0; i < tc.N; i++ {
+				_, err := manager.Publish(ctx, tc.descID, func(desc catalog.MutableDescriptor) error {
+					descs[i] = desc.ImmutableCopy()
+					return nil
+				}, nil)
+				require.NoError(t, err)
+			}
+			{
+				last, err := manager.Acquire(ctx, s.Clock().Now(), tc.descID)
+				require.NoError(t, err)
+				descs[tc.N] = last.Underlying()
+				last.Release(ctx)
+			}
+
+			// Confirm leased descriptor memory count is tracked in monitor.
+			prevUsed := manager.mu.boundAccount.Used()
+			for i := 0; i < tc.N; i++ {
+				acquired, err := manager.Acquire(ctx, descs[tc.N-i-1].GetModificationTime(), tc.descID)
+				require.NoError(t, err)
+
+				expMemSize := prevUsed + acquired.Underlying().ByteSize()
+				currMemSize := manager.mu.boundAccount.Used()
+				require.Equal(t, expMemSize, currMemSize,
+					"Lease acquisition memory consumption does not match")
+				prevUsed = currMemSize
+			}
+
+// TestManagerLeaseMemoryMonitorDropDeletes confirms the memory size shrinks
+// accordingly to the size of the table descriptor when table is dropped.
+func TestManagerLeaseMemoryMonitorDropDeletes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	var tableID descpb.ID
+	type DropReleaseMu struct {
+		mu     syncutil.Mutex
+		isDrop bool
+	}
+	dropReleaseMu := DropReleaseMu{
+		mu:     syncutil.Mutex{},
+		isDrop: false,
+	}
+	releaseChan := make(chan descpb.ID)
+	serverArgs := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLLeaseManager: &ManagerTestingKnobs{
+				LeaseStoreTestingKnobs: StorageTestingKnobs{
+					LeaseReleasedEvent: func(id descpb.ID, _ descpb.DescriptorVersion, _ error) {
+						dropReleaseMu.mu.Lock()
+						if id == tableID && dropReleaseMu.isDrop {
+							dropReleaseMu.isDrop = false
+							dropReleaseMu.mu.Unlock()
+							releaseChan <- id
+						} else {
+							dropReleaseMu.mu.Unlock()
+						}
+					},
+				},
+			},
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, serverArgs)
+
+	stopper := s.Stopper()
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
+
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	// Prevent non-explicit Acquire to leases for testing purposes.
+	tdb.Exec(t, "SET CLUSTER SETTING sql.tablecache.lease.refresh_limit = 0")
+	// Lower GC TTL since drops have delays waiting for GC job.
+	tdb.Exec(t, "ALTER DATABASE defaultdb CONFIGURE ZONE USING gc.ttlseconds = 1")
+
+	// Create table with some values.
+	tdb.Exec(t, "CREATE TABLE foo (col1 INT, col2 INT)")
+	tdb.Exec(t, "COMMENT ON TABLE foo IS 'hello'")
+	tdb.QueryRow(t, "SELECT id FROM system.namespace WHERE name = 'foo'").Scan(&tableID)
+
+	// Acquire leases on the tableDescriptor.
+	manager := s.LeaseManager().(*Manager)
+	var tableDesc catalog.Descriptor
+	_, err := manager.Publish(ctx, tableID, func(desc catalog.MutableDescriptor) error {
+		tableDesc = desc.ImmutableCopy()
+		return nil
+	}, nil)
+	require.NoError(t, err)
+	{
+		last, err := manager.Acquire(ctx, s.Clock().Now(), tableID)
+		require.NoError(t, err)
+		last.Release(ctx)
+	}
+
+	// Confirm leased descriptor memory count is tracked in monitor.
+	prevUsed := manager.mu.boundAccount.Used()
+	log.Infof(ctx, "before acquire: %v", prevUsed)
+	acquired, err := manager.Acquire(ctx, tableDesc.GetModificationTime(), tableID)
+	require.NoError(t, err)
+
+	log.Infof(ctx, "Leased Descriptor %v Size: %v", acquired.GetID(), acquired.Underlying().ByteSize())
+	expMemSize := prevUsed + acquired.Underlying().ByteSize()
+	currMemSize := manager.mu.boundAccount.Used()
+	log.Infof(ctx, "after acquire: %v", currMemSize)
+	require.Equal(t, expMemSize, currMemSize,
+		"Lease acquisition memory consumption does not match")
+	prevUsed = currMemSize
+
+	// Drop table and release acquired lease on tableDescriptor.
+	log.Infof(ctx, "Before drop: %v", currMemSize)
+	dropReleaseMu.mu.Lock()
+	dropReleaseMu.isDrop = true
+	dropReleaseMu.mu.Unlock()
+	tdb.Exec(t, "DROP TABLE foo")
+	acquired.Release(ctx)
+
+	// Confirm the dropped table is reflected in the memory monitor.
+	<-releaseChan
+	expMemSize = prevUsed - acquired.Underlying().ByteSize()
+	currMemSize = manager.mu.boundAccount.Used()
+	log.Infof(ctx, "After drop: %v", currMemSize)
+	require.Equal(t, expMemSize, currMemSize,
+		"Lease drop memory does not match")
 
 // TestDescriptorByteSizeOrder inserts different amount of data in each
 // descriptor and guarantees the relative order of the Descriptor sizes are
