@@ -271,7 +271,7 @@ func maybeGetExistingMirror(call *syntax.CallExpr) (string, existingMirror, erro
 		switch bx := arg.(type) {
 		case *syntax.BinaryExpr:
 			if bx.Op != syntax.EQ {
-				return "", existingMirror{}, fmt.Errorf("unexpected binary expression Op %d", bx.Op)
+				return "", existingMirror{}, fmt.Errorf("Unexpected binary expression Op %d", bx.Op)
 			}
 			kwarg, err := expectIdent(bx.X)
 			if err != nil {
@@ -380,17 +380,10 @@ func dumpPatchArgsForRepo(repoName string) error {
 }
 
 func buildFileProtoModeForRepo(repoName string) string {
-	if repoName == "com_github_prometheus_client_model" {
+	if repoName == "com_github_prometheus_client_model" || repoName == "com_github_jaegertracing_jaeger_idl" {
 		return "package"
 	}
 	return "disable_global"
-}
-
-func dumpBuildDirectivesForRepo(repoName string) {
-	if repoName == "com_github_cockroachdb_pebble" {
-		fmt.Printf(`        build_directives = ["gazelle:build_tags invariants"],
-`)
-	}
 }
 
 func dumpBuildNamingConventionArgsForRepo(repoName string) {
@@ -455,10 +448,9 @@ def go_deps():
 		}
 		fmt.Printf(`    go_repository(
         name = "%s",
-`, repoName)
-		dumpBuildDirectivesForRepo(repoName)
-		fmt.Printf(`        build_file_proto_mode = "%s",
-`, buildFileProtoModeForRepo(repoName))
+        build_file_proto_mode = "%s",
+`, repoName, buildFileProtoModeForRepo(repoName))
+
 		dumpBuildNamingConventionArgsForRepo(repoName)
 		expectedURL := formatURL(replaced.Path, replaced.Version)
 		fmt.Printf("        importpath = \"%s\",\n", mod.Path)
