@@ -412,9 +412,9 @@ func (ds *ServerImpl) setupFlow(
 	useLeaf := false
 	for _, proc := range req.Flow.Processors {
 		if jr := proc.Core.JoinReader; jr != nil {
-			if !jr.MaintainOrdering && jr.IsIndexJoin() {
-				// Index joins when ordering doesn't have to be maintained are
-				// executed via the Streamer API that has concurrency.
+			if jr.IsIndexJoin() {
+				// Index joins are executed via the Streamer API that has
+				// concurrency.
 				useLeaf = true
 				break
 			}
@@ -591,19 +591,20 @@ func (ds *ServerImpl) setupSpanForIncomingRPC(
 			tracing.WithServerSpanKind)
 	}
 
+	var remoteParent tracing.SpanMeta
 	if !req.TraceInfo.Empty() {
-		return tr.StartSpanCtx(ctx, tracing.SetupFlowMethodName,
-			tracing.WithRemoteParentFromTraceInfo(&req.TraceInfo),
-			tracing.WithServerSpanKind)
-	}
-	// For backwards compatibility with 21.2, if tracing info was passed as
-	// gRPC metadata, we use it.
-	remoteParent, err := tracing.ExtractSpanMetaFromGRPCCtx(ctx, tr)
-	if err != nil {
-		log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
+		remoteParent = tracing.SpanMetaFromProto(req.TraceInfo)
+	} else {
+		// For backwards compatibility with 21.2, if tracing info was passed as
+		// gRPC metadata, we use it.
+		var err error
+		remoteParent, err = tracing.ExtractSpanMetaFromGRPCCtx(ctx, tr)
+		if err != nil {
+			log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
+		}
 	}
 	return tr.StartSpanCtx(ctx, tracing.SetupFlowMethodName,
-		tracing.WithRemoteParentFromSpanMeta(remoteParent),
+		tracing.WithRemoteParent(remoteParent),
 		tracing.WithServerSpanKind)
 }
 
