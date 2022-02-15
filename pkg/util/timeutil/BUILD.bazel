@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "timeutil",
     srcs = [
+        "doc.go",
         "manual_time.go",
         "stopwatch.go",
         "time.go",
@@ -58,9 +59,5 @@ genrule(
     exec_tools = [
         "//pkg/util/timeutil/gen",
         "@com_github_cockroachdb_crlfmt//:crlfmt",
-    ],
-    visibility = [
-        ":__pkg__",
-        "//pkg/gen:__pkg__",
     ],
 )
