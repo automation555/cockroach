@@ -1954,7 +1954,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	}
 
 	if !s.cfg.SpanConfigsDisabled {
-		s.cfg.SpanConfigSubscriber.Subscribe(func(ctx context.Context, update roachpb.Span) {
+		s.cfg.SpanConfigSubscriber.Subscribe(func(update roachpb.Span) {
 			s.onSpanConfigUpdate(ctx, update)
 		})
 
@@ -2261,7 +2261,7 @@ func (s *Store) startRangefeedUpdater(ctx context.Context) {
 						if r == nil {
 							continue
 						}
-						r.handleClosedTimestampUpdate(ctx, r.GetClosedTimestamp(ctx))
+						r.handleClosedTimestampUpdate(ctx, r.GetCurrentClosedTimestamp(ctx))
 					}
 				case <-confCh:
 					// Loop around to use the updated timer.
@@ -3107,7 +3107,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		if w := metrics.LockTableMetrics.TopKLocksByWaiters[0].Waiters; w > maxLockWaitQueueWaitersForLock {
 			maxLockWaitQueueWaitersForLock = w
 		}
-		mc := rep.GetClosedTimestamp(ctx)
+		mc := rep.GetCurrentClosedTimestamp(ctx)
 		if minMaxClosedTS.IsEmpty() || mc.Less(minMaxClosedTS) {
 			minMaxClosedTS = mc
 		}
@@ -3265,8 +3265,7 @@ func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracing.Rec
 	defer collectAndFinish()
 	canTransferLease := func(ctx context.Context, repl *Replica) bool { return true }
 	_, err := s.replicateQueue.processOneChange(
-		ctx, repl, canTransferLease, false /* scatter */, true, /* dryRun */
-	)
+		ctx, repl, canTransferLease, true /* dryRun */)
 	if err != nil {
 		log.Eventf(ctx, "error simulating allocator on replica %s: %s", repl, err)
 	}
