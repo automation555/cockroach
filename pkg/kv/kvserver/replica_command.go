@@ -49,15 +49,6 @@ import (
 // why this value was chosen in particular, but it seems to work.
 const mergeApplicationTimeout = 5 * time.Second
 
-// sendSnapshotTimeout is the timeout for sending snapshots. While a snapshot is
-// in transit, Raft log truncation is halted to allow the recipient to catch up.
-// If the snapshot takes very long to transfer for whatever reason this can
-// cause the Raft log to grow very large. We therefore set a conservative
-// timeout to eventually allow Raft log truncation while avoiding snapshot
-// starvation -- even if another snapshot is sent immediately, this still
-// allows truncation up to the new snapshot index.
-const sendSnapshotTimeout = 20 * time.Minute
-
 // AdminSplit divides the range into into two ranges using args.SplitKey.
 func (r *Replica) AdminSplit(
 	ctx context.Context, args roachpb.AdminSplitRequest, reason string,
@@ -1562,15 +1553,26 @@ func (r *Replica) initializeRaftLearners(
 	default:
 		log.Fatalf(ctx, "unexpected replicaType %s", replicaType)
 	}
-	// Lock learner snapshots even before we run the ConfChange txn to add them
-	// to prevent a race with the raft snapshot queue trying to send it first.
+	// Before we run the ConfChange:
 	//
-	// Also note that the lock only prevents the raft snapshot queue from sending
-	// snapshots to learners and non-voters, it will still send them to voters.
-	// There are more details about this locking in
+	// 1. Lock log truncation so that we don't truncate above the index the snapshot
+	// is being generated off of. If we were to truncate above the snapshot's index,
+	// the replica would need another fresh snapshot anyway.
+	//
+	// 2. Lock learner snapshots to prevent a race with the raft snapshot queue
+	// trying to send it first. Also note that the lock only prevents the raft
+	// snapshot queue from sending snapshots to learners and non-voters, it will
+	// still send them to voters. There are more details about this locking in
 	_ = (*raftSnapshotQueue)(nil).processRaftSnapshot
 	// as well as a TODO about fixing all this to be less subtle and brittle.
-	releaseSnapshotLockFn := r.lockLearnerSnapshot(ctx, targets)
+	//
+	// This is all done before we even add the learner because as of
+	// https://github.com/etcd-io/etcd/pull/11037, the Raft leader will proactively
+	// probe newly added follower replicas which can in-turn trigger a "Raft
+	// snapshot" from the raftSnapshotQueue. If the raftSnapshotQueue wins this
+	// race, this `ChangeReplicas` call will fail and we will end up repeating the
+	// work of adding / upreplicating a new learner.
+	releaseSnapshotLockFn := r.lockLogTruncationAndLearnerSnaps(ctx, targets)
 	defer releaseSnapshotLockFn()
 
 	// If we fail to add or send a snapshot to the learners we're adding, roll
@@ -1681,7 +1683,7 @@ func (r *Replica) initializeRaftLearners(
 		// or non-voter replica if its store is already sending a snapshot to that
 		// replica. That would race with this snapshot, except that we've put a
 		// (best effort) lock on it before the conf change txn was run (see call to
-		// `lockLearnerSnapshot` above). This is best effort because the lock can
+		// `lockLogTruncationAndLearnerSnaps` above). This is best effort because the lock can
 		// time out and the lock is local to this node, while the raft leader could
 		// be on another node entirely (they're usually co-located but this is not
 		// guaranteed).
@@ -1700,12 +1702,16 @@ func (r *Replica) initializeRaftLearners(
 	return desc, nil
 }
 
-// lockLearnerSnapshot stops the raft snapshot queue from sending snapshots to
-// the soon-to-be added learner replicas to prevent duplicate snapshots from
-// being sent. This lock is best effort because it times out and it is a node
-// local lock while the raft snapshot queue might be running on a different
-// node. An idempotent unlock function is returned.
-func (r *Replica) lockLearnerSnapshot(
+// lockLogTruncationAndLearnerSnaps stops all[1] log truncation so that we don't
+// truncate above the snapshot and stops the raft snapshot queue from sending
+// snapshots to the soon-to-be added learner replicas to prevent duplicate
+// snapshots from being sent. This lock is best effort because it times out and
+// it is a node local lock while the raft snapshot queue might be running on a
+// different node. An idempotent unlock function is returned.
+//
+// [1] We even disallow log truncations that are truncating below the index of
+// an in-flight snapshot.
+func (r *Replica) lockLogTruncationAndLearnerSnaps(
 	ctx context.Context, additions []roachpb.ReplicationTarget,
 ) (unlock func()) {
 	// TODO(dan): The way this works is hacky, but it was added at the last minute
@@ -2516,18 +2522,14 @@ func (r *Replica) sendSnapshot(
 	sent := func() {
 		r.store.metrics.RangeSnapshotsGenerated.Inc(1)
 	}
-	err = contextutil.RunWithTimeout(
-		ctx, "send-snapshot", sendSnapshotTimeout, func(ctx context.Context) error {
-			return r.store.cfg.Transport.SendSnapshot(
-				ctx,
-				r.store.allocator.storePool,
-				req,
-				snap,
-				newBatchFn,
-				sent,
-			)
-		})
-	if err != nil {
+	if err := r.store.cfg.Transport.SendSnapshot(
+		ctx,
+		r.store.allocator.storePool,
+		req,
+		snap,
+		newBatchFn,
+		sent,
+	); err != nil {
 		if errors.Is(err, errMalformedSnapshot) {
 			tag := fmt.Sprintf("r%d_%s", r.RangeID, snap.SnapUUID.Short())
 			if dir, err := r.store.checkpoint(ctx, tag); err != nil {
