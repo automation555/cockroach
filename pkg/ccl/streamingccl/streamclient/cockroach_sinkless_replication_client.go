@@ -18,7 +18,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -37,24 +36,22 @@ func newPGWireReplicationClient(remote *url.URL) (Client, error) {
 	return &sinklessReplicationClient{remote: remote}, nil
 }
 
-// Create implements the Client interface.
+// Plan implements the Client interface.
 func (m *sinklessReplicationClient) Create(
 	ctx context.Context, tenantID roachpb.TenantID,
-) (streaming.StreamID, error) {
-	return streaming.StreamID(tenantID.ToUint64()), nil
+) (StreamID, error) {
+	return StreamID(tenantID.ToUint64()), nil
 }
 
 // Heartbeat implements the Client interface.
 func (m *sinklessReplicationClient) Heartbeat(
-	ctx context.Context, streamID streaming.StreamID, complete hlc.Timestamp,
+	ctx context.Context, streamID StreamID, complete hlc.Timestamp,
 ) error {
 	return nil
 }
 
 // Plan implements the Client interface.
-func (m *sinklessReplicationClient) Plan(
-	ctx context.Context, ID streaming.StreamID,
-) (Topology, error) {
+func (m *sinklessReplicationClient) Plan(ctx context.Context, ID StreamID) (Topology, error) {
 	// The core changefeed clients only have 1 partition, and it's located at the
 	// stream address.
 	return Topology([]PartitionInfo{
@@ -66,19 +63,14 @@ func (m *sinklessReplicationClient) Plan(
 	}), nil
 }
 
-// Close implements the Client interface.
-func (m *sinklessReplicationClient) Close() error {
-	return nil
-}
-
-// Subscribe implements the Client interface.
+// ConsumePartition implements the Client interface.
 func (m *sinklessReplicationClient) Subscribe(
-	ctx context.Context, stream streaming.StreamID, spec SubscriptionToken, checkpoint hlc.Timestamp,
-) (Subscription, error) {
+	ctx context.Context, stream StreamID, spec SubscriptionToken, checkpoint hlc.Timestamp,
+) (chan streamingccl.Event, chan error, error) {
 	tenantToReplicate := string(spec)
 	tenantID, err := strconv.Atoi(tenantToReplicate)
 	if err != nil {
-		return nil, errors.Wrap(err, "parsing tenant")
+		return nil, nil, errors.Wrap(err, "parsing tenant")
 	}
 
 	streamTenantQuery := fmt.Sprintf(
@@ -90,96 +82,78 @@ func (m *sinklessReplicationClient) Subscribe(
 
 	db, err := gosql.Open("postgres", m.remote.String())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	_, err = conn.ExecContext(ctx, `SET enable_experimental_stream_replication = true`)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	rows, err := conn.QueryContext(ctx, streamTenantQuery)
+	// Excluding from linter because of https://github.com/jingyugao/rowserrcheck/issues/19.
+	rows, err := conn.QueryContext(ctx, streamTenantQuery) //nolint:rowserrcheck
 	if err != nil {
-		return nil, errors.Wrap(err, "creating source replication stream")
+		return nil, nil, errors.Wrap(err, "creating source replication stream")
 	}
 
-	sub := &sinklessReplicationSubscription{eventCh: make(chan streamingccl.Event)}
-	sub.receiveFn = func(ctx context.Context) error {
-		defer close(sub.eventCh)
+	eventCh := make(chan streamingccl.Event)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(eventCh)
+		defer close(errCh)
 		defer db.Close()
 		defer rows.Close()
 		for rows.Next() {
 			var ignoreTopic gosql.NullString
 			var k, v []byte
 			if err := rows.Scan(&ignoreTopic, &k, &v); err != nil {
-				sub.err = err
-				return err
+				errCh <- err
+				return
 			}
 
 			var event streamingccl.Event
 			if len(k) == 0 {
 				var resolved hlc.Timestamp
 				if err := protoutil.Unmarshal(v, &resolved); err != nil {
-					sub.err = err
-					return err
+					errCh <- err
+					return
 				}
 				event = streamingccl.MakeCheckpointEvent(resolved)
 			} else {
 				var kv roachpb.KeyValue
 				kv.Key = k
 				if err := protoutil.Unmarshal(v, &kv.Value); err != nil {
-					sub.err = err
-					return err
+					errCh <- err
+					return
 				}
 				event = streamingccl.MakeKVEvent(kv)
 			}
 
 			select {
-			case sub.eventCh <- event:
+			case eventCh <- event:
 			case <-ctx.Done():
-				sub.err = err
-				return ctx.Err()
+				errCh <- ctx.Err()
+				return
 			}
 		}
 		if err := rows.Err(); err != nil {
 			if errors.Is(err, driver.ErrBadConn) {
 				select {
-				case sub.eventCh <- streamingccl.MakeGenerationEvent():
+				case eventCh <- streamingccl.MakeGenerationEvent():
 				case <-ctx.Done():
-					sub.err = ctx.Err()
+					errCh <- ctx.Err()
 				}
 			} else {
-				sub.err = err
+				errCh <- err
 			}
-			return err
+			return
 		}
-		return nil
-	}
+	}()
 
-	return sub, nil
-}
-
-type sinklessReplicationSubscription struct {
-	eventCh   chan streamingccl.Event
-	err       error
-	receiveFn func(ctx context.Context) error
-}
-
-// Subscribe implements the Subscription interface.
-func (s *sinklessReplicationSubscription) Subscribe(ctx context.Context) error {
-	return s.receiveFn(ctx)
-}
-
-// Events implements the Subscription interface.
-func (s *sinklessReplicationSubscription) Events() <-chan streamingccl.Event {
-	return s.eventCh
-}
-
-// Err implements the Subscription interface.
-func (s *sinklessReplicationSubscription) Err() error {
-	return s.err
+	return eventCh, errCh, nil
 }

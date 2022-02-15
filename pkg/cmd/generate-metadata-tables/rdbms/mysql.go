@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/cockroachdb/errors"
 	// gosql implementation.
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -31,7 +32,7 @@ const mysqlDescribeSchema = `
 		data_type 
 	FROM information_schema.columns
 	WHERE table_schema = ?
-	ORDER BY table_name
+	ORDER BY table_name, column_name
 `
 
 var mysqlExclusions = []*excludePattern{
@@ -64,13 +65,13 @@ func (conn mysqlMetadataConnection) DatabaseVersion(
 
 func (conn mysqlMetadataConnection) DescribeSchema(
 	ctx context.Context,
-) (*ColumnMetadataList, error) {
+) (list *ColumnMetadataList, retErr error) {
 	metadata := &ColumnMetadataList{exclusions: mysqlExclusions}
 	rows, err := conn.QueryContext(ctx, mysqlDescribeSchema, conn.catalog)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { retErr = errors.CombineErrors(retErr, rows.Close()) }()
 
 	for rows.Next() {
 		row := new(columnMetadata)
@@ -80,6 +81,9 @@ func (conn mysqlMetadataConnection) DescribeSchema(
 		row.tableName = strings.ToLower(row.tableName)
 		row.columnName = strings.ToLower(row.columnName)
 		metadata.data = append(metadata.data, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return metadata, nil

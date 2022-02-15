@@ -74,7 +74,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/lib/pq"
-	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
 )
 
@@ -165,8 +164,8 @@ import (
 // # cluster-opt: opt1 opt2
 //
 // The options are:
-// - disable-span-config: If specified, the span configs infrastructure will be
-//   disabled.
+// - enable-span-config: If specified, the span configs infrastructure will be
+//   enabled. This is equivalent to setting COCKROACH_EXPERIMENTAL_SPAN_CONFIGS.
 // - tracing-off: If specified, tracing defaults to being turned off. This is
 //   used to override the environment, which may ask for tracing to be on by
 //   default.
@@ -431,8 +430,6 @@ var (
 	showSQL = flag.Bool("show-sql", false,
 		"print the individual SQL statement/queries before processing",
 	)
-
-	showDiff          = flag.Bool("show-diff", false, "generate a diff for expectation mismatches when possible")
 	printErrorSummary = flag.Bool("error-summary", false,
 		"print a per-error summary of failing queries at the end of testing, "+
 			"when -allow-prepare-fail is set",
@@ -507,9 +504,6 @@ type testClusterConfig struct {
 	// localities is set if nodes should be set to a particular locality.
 	// Nodes are 1-indexed.
 	localities map[int]roachpb.Locality
-	// declarativeSchemaChanger determines if the declarative schema changer
-	// is enabled.
-	declarativeSchemaChanger bool
 }
 
 const threeNodeTenantConfigName = "3node-tenant"
@@ -585,13 +579,6 @@ var logicTestConfigs = []testClusterConfig{
 		overrideAutoStats:   "false",
 	},
 	{
-		name:                     "local-declarative-schema",
-		numNodes:                 5,
-		overrideDistSQLMode:      "off",
-		overrideAutoStats:        "false",
-		declarativeSchemaChanger: true,
-	},
-	{
 		name:                "local-vec-off",
 		numNodes:            1,
 		overrideDistSQLMode: "off",
@@ -605,6 +592,15 @@ var logicTestConfigs = []testClusterConfig{
 		overrideAutoStats:   "false",
 		bootstrapVersion:    roachpb.Version{Major: 1},
 		binaryVersion:       roachpb.Version{Major: 1, Minor: 1},
+		disableUpgrade:      true,
+	},
+	{
+		name:                "local-mixed-21.1-21.2",
+		numNodes:            1,
+		overrideDistSQLMode: "off",
+		overrideAutoStats:   "false",
+		bootstrapVersion:    roachpb.Version{Major: 21, Minor: 1},
+		binaryVersion:       roachpb.Version{Major: 21, Minor: 2},
 		disableUpgrade:      true,
 	},
 	{
@@ -767,15 +763,6 @@ var logicTestConfigs = []testClusterConfig{
 		localities:        multiregion9node3region3azsLocalities,
 		overrideVectorize: "off",
 	},
-	{
-		name:                "local-mixed-21.2-22.1",
-		numNodes:            1,
-		overrideDistSQLMode: "off",
-		overrideAutoStats:   "false",
-		bootstrapVersion:    roachpb.Version{Major: 21, Minor: 2},
-		binaryVersion:       roachpb.Version{Major: 22, Minor: 1},
-		disableUpgrade:      true,
-	},
 }
 
 // An index in the above slice.
@@ -809,7 +796,6 @@ var (
 	defaultConfigName  = "default-configs"
 	defaultConfigNames = []string{
 		"local",
-		"local-declarative-schema",
 		"local-vec-off",
 		"local-spec-planning",
 		"fakedist",
@@ -1164,10 +1150,6 @@ type logicQuery struct {
 	// rawOpts are the query options, before parsing. Used to display in error
 	// messages.
 	rawOpts string
-
-	// roundFloatsInStrings can be set to use a regular expression to find floats
-	// that may be embedded in strings and replace them with rounded versions.
-	roundFloatsInStrings bool
 }
 
 var allowedKVOpTypes = []string{
@@ -1232,7 +1214,7 @@ type logicTest struct {
 	// new one, but keep some shared resources across the entire test. An example
 	// would be an IO directory used throughout the test.
 	testCleanupFuncs []func()
-	// progress holds the number of statements executed so far.
+	// progress holds the number of tests executed so far.
 	progress int
 	// failures holds the number of tests failed so far, when
 	// -try-harder is set.
@@ -1340,13 +1322,11 @@ func (t *logicTest) close() {
 // out emits a message both on stdout and the log files if
 // verbose is set.
 func (t *logicTest) outf(format string, args ...interface{}) {
-	if !t.verbose {
-		return
+	if t.verbose {
+		fmt.Printf(format, args...)
+		fmt.Println()
+		log.Infof(context.Background(), format, args...)
 	}
-	log.Infof(context.Background(), format, args...)
-	msg := fmt.Sprintf(format, args...)
-	now := timeutil.Now().Format("15:04:05")
-	fmt.Printf("[%s] %s\n", now, msg)
 }
 
 // setUser sets the DB client to the specified user.
@@ -1676,14 +1656,6 @@ func (t *logicTest) newCluster(serverArgs TestServerArgs, opts []clusterOpt) {
 		); err != nil {
 			t.Fatal(err)
 		}
-
-		if cfg.declarativeSchemaChanger {
-			if _, err := conn.Exec(
-				"SET CLUSTER SETTING sql.defaults.experimental_new_schema_changer.enabled = 'on'",
-			); err != nil {
-				t.Fatal(err)
-			}
-		}
 	}
 
 	if cfg.overrideDistSQLMode != "" {
@@ -1911,15 +1883,14 @@ type clusterOpt interface {
 	apply(args *base.TestServerArgs)
 }
 
-// clusterOptDisableSpanConfigs corresponds to the disable-span-configs
-// directive.
-type clusterOptDisableSpanConfigs struct{}
+// clusterOptSpanConfigs corresponds to the enable-span-configs directive.
+type clusterOptSpanConfigs struct{}
 
-var _ clusterOpt = clusterOptDisableSpanConfigs{}
+var _ clusterOpt = clusterOptSpanConfigs{}
 
 // apply implements the clusterOpt interface.
-func (c clusterOptDisableSpanConfigs) apply(args *base.TestServerArgs) {
-	args.DisableSpanConfigs = true
+func (c clusterOptSpanConfigs) apply(args *base.TestServerArgs) {
+	args.EnableSpanConfigs = true
 }
 
 // clusterOptTracingOff corresponds to the tracing-off directive.
@@ -1930,21 +1901,6 @@ var _ clusterOpt = clusterOptTracingOff{}
 // apply implements the clusterOpt interface.
 func (c clusterOptTracingOff) apply(args *base.TestServerArgs) {
 	args.TracingDefault = tracing.TracingModeOnDemand
-}
-
-// clusterOptIgnoreStrictGCForTenants corresponds to the
-// ignore-tenant-strict-gc-enforcement directive.
-type clusterOptIgnoreStrictGCForTenants struct{}
-
-var _ clusterOpt = clusterOptIgnoreStrictGCForTenants{}
-
-// apply implements the clusterOpt interface.
-func (c clusterOptIgnoreStrictGCForTenants) apply(args *base.TestServerArgs) {
-	_, ok := args.Knobs.Store.(*kvserver.StoreTestingKnobs)
-	if !ok {
-		args.Knobs.Store = &kvserver.StoreTestingKnobs{}
-	}
-	args.Knobs.Store.(*kvserver.StoreTestingKnobs).IgnoreStrictGCEnforcement = true
 }
 
 // readClusterOptions looks around the beginning of the file for a line looking like:
@@ -1983,12 +1939,10 @@ func readClusterOptions(t *testing.T, path string) []clusterOpt {
 			}
 			for _, opt := range fields[2:] {
 				switch opt {
-				case "disable-span-configs":
-					res = append(res, clusterOptDisableSpanConfigs{})
+				case "enable-span-configs":
+					res = append(res, clusterOptSpanConfigs{})
 				case "tracing-off":
 					res = append(res, clusterOptTracingOff{})
-				case "ignore-tenant-strict-gc-enforcement":
-					res = append(res, clusterOptIgnoreStrictGCForTenants{})
 				default:
 					t.Fatalf("unrecognized cluster option: %s", opt)
 				}
@@ -2327,9 +2281,6 @@ func (t *logicTest) processSubtest(subtest subtestDetails, path string) error {
 						case "noticetrace":
 							query.noticetrace = true
 
-						case "round-in-strings":
-							query.roundFloatsInStrings = true
-
 						default:
 							if strings.HasPrefix(opt, "nodeidx=") {
 								idx, err := strconv.ParseInt(strings.SplitN(opt, "=", 2)[1], 10, 64)
@@ -2495,11 +2446,6 @@ func (t *logicTest) processSubtest(subtest subtestDetails, path string) error {
 					}
 				}
 			} else {
-				if *rewriteResultsInTestfiles {
-					for _, l := range query.expectedResultsRaw {
-						t.emit(l)
-					}
-				}
 				s.LogAndResetSkip(t)
 			}
 			repeat = 1
@@ -2535,6 +2481,12 @@ func (t *logicTest) processSubtest(subtest subtestDetails, path string) error {
 			}
 			if rows.Next() {
 				return errors.Errorf("%s: more than one row returned by query  %s", stmt.pos, stmt.sql)
+			}
+			if err := rows.Err(); err != nil {
+				return errors.Wrapf(err, "%s: error after running query %s", stmt.pos, stmt.sql)
+			}
+			if err := rows.Close(); err != nil {
+				return errors.Wrapf(err, "%s: error closing query rows %s", stmt.pos, stmt.sql)
 			}
 			t.t().Logf("let %s = %s\n", varName, val)
 			t.varMap[varName] = val
@@ -2987,11 +2939,7 @@ func (t *logicTest) execQuery(query logicQuery) error {
 						if val == "" {
 							val = "·"
 						}
-						s := fmt.Sprint(val)
-						if query.roundFloatsInStrings {
-							s = roundFloatsInString(s)
-						}
-						actualResultsRaw = append(actualResultsRaw, s)
+						actualResultsRaw = append(actualResultsRaw, fmt.Sprint(val))
 					} else {
 						actualResultsRaw = append(actualResultsRaw, "NULL")
 					}
@@ -3049,15 +2997,11 @@ func (t *logicTest) execQuery(query logicQuery) error {
 
 	resultsMatch := func() error {
 		makeError := func() error {
-			var expFormatted strings.Builder
-			var actFormatted strings.Builder
+			var buf bytes.Buffer
+			fmt.Fprintf(&buf, "%s: %s\nexpected:\n", query.pos, query.sql)
 			for _, line := range query.expectedResultsRaw {
-				fmt.Fprintf(&expFormatted, "    %s\n", line)
+				fmt.Fprintf(&buf, "    %s\n", line)
 			}
-			for _, line := range t.formatValues(actualResultsRaw, query.valsPerLine) {
-				fmt.Fprintf(&actFormatted, "    %s\n", line)
-			}
-
 			sortMsg := ""
 			if query.sorter != nil {
 				// We performed an order-insensitive comparison of "actual" vs "expected"
@@ -3066,23 +3010,11 @@ func (t *logicTest) execQuery(query logicQuery) error {
 				// rows in the order in which the query returned them.
 				sortMsg = " -> ignore the following ordering of rows"
 			}
-			var buf bytes.Buffer
-			fmt.Fprintf(&buf, "%s: %s\nexpected:\n%s", query.pos, query.sql, expFormatted.String())
-			fmt.Fprintf(&buf, "but found (query options: %q%s) :\n%s", query.rawOpts, sortMsg, actFormatted.String())
-			if *showDiff {
-				if diff, err := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
-					A:        difflib.SplitLines(expFormatted.String()),
-					B:        difflib.SplitLines(actFormatted.String()),
-					FromFile: "Expected",
-					FromDate: "",
-					ToFile:   "Actual",
-					ToDate:   "",
-					Context:  1,
-				}); err == nil {
-					fmt.Fprintf(&buf, "\nDiff:\n%s", diff)
-				}
+			fmt.Fprintf(&buf, "but found (query options: %q%s) :\n", query.rawOpts, sortMsg)
+			for _, line := range t.formatValues(actualResultsRaw, query.valsPerLine) {
+				fmt.Fprintf(&buf, "    %s\n", line)
 			}
-			return errors.Newf("%s\n", buf.String())
+			return errors.Newf("%s", buf.String())
 		}
 		if len(query.expectedResults) != len(actualResults) {
 			return makeError()
@@ -3274,7 +3206,7 @@ func (t *logicTest) success(file string) {
 	now := timeutil.Now()
 	if now.Sub(t.lastProgress) >= 2*time.Second {
 		t.lastProgress = now
-		t.outf("--- progress: %s: %d statements", file, t.progress)
+		t.outf("--- progress: %s: %d statements/queries", file, t.progress)
 	}
 }
 
@@ -3336,7 +3268,8 @@ func (t *logicTest) validateAfterTestCompletion() error {
 
 	// Ensure that all of the created descriptors can round-trip through json.
 	{
-		rows, err := t.db.Query(
+		// Excluding from linter because of https://github.com/jingyugao/rowserrcheck/issues/19.
+		rows, err := t.db.Query( //nolint:rowserrcheck
 			`
 SELECT encode(descriptor, 'hex') AS descriptor
   FROM system.descriptor
@@ -3647,7 +3580,7 @@ func RunLogicTestWithDefaultConfig(
 					now := timeutil.Now()
 					if now.Sub(progress.lastProgress) >= 2*time.Second {
 						progress.lastProgress = now
-						lt.outf("--- total progress: %d statements", progress.total)
+						lt.outf("--- total progress: %d statements/queries", progress.total)
 					}
 				})
 			}
@@ -3939,14 +3872,4 @@ func (t *logicTest) printCompletion(path string, config testClusterConfig) {
 	}
 	t.outf("--- done: %s with config %s: %d tests, %d failures%s", path, config.name,
 		t.progress, t.failures, unsupportedMsg)
-}
-
-func roundFloatsInString(s string) string {
-	return string(regexp.MustCompile(`(\d+\.\d+)`).ReplaceAllFunc([]byte(s), func(x []byte) []byte {
-		f, err := strconv.ParseFloat(string(x), 64)
-		if err != nil {
-			return []byte(err.Error())
-		}
-		return []byte(fmt.Sprintf("%.6g", f))
-	}))
 }
