@@ -263,12 +263,10 @@ const (
 	// PostAddRaftAppliedIndexTermMigration is used for asserting that
 	// RaftAppliedIndexTerm is populated.
 	PostAddRaftAppliedIndexTermMigration
-	// DontProposeWriteTimestampForLeaseTransfers stops setting the WriteTimestamp
-	// on lease transfer Raft proposals. New leaseholders now forward their clock
-	// directly to the new lease start time.
-	DontProposeWriteTimestampForLeaseTransfers
-	// TenantSettingsTable adds the system table for tracking tenant usage.
-	TenantSettingsTable
+	// LooselyCoupledRaftLogTruncation allows the cluster to reduce the coupling
+	// for raft log truncation, by allowing each replica to treat a truncation
+	// proposal as an upper bound on what should be truncated.
+	LooselyCoupledRaftLogTruncation
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -422,12 +420,8 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 58},
 	},
 	{
-		Key:     DontProposeWriteTimestampForLeaseTransfers,
+		Key:     LooselyCoupledRaftLogTruncation,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 60},
-	},
-	{
-		Key:     TenantSettingsTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 62},
 	},
 
 	// *************************************************

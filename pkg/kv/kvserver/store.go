@@ -711,6 +711,7 @@ type Store struct {
 	replicateQueue     *replicateQueue             // Replication queue
 	replicaGCQueue     *replicaGCQueue             // Replica GC queue
 	raftLogQueue       *raftLogQueue               // Raft log truncation queue
+	raftTruncator      raftLogTruncator            // Enacts truncation
 	raftSnapshotQueue  *raftSnapshotQueue          // Raft repair queue
 	tsMaintenanceQueue *timeSeriesMaintenanceQueue // Time series maintenance queue
 	scanner            *replicaScanner             // Replica scanner
@@ -1150,6 +1151,7 @@ func NewStore(
 		)
 	}
 	s.replRankings = newReplicaRankings()
+	s.raftTruncator = makeRaftLogTruncator(s)
 
 	s.draining.Store(false)
 	s.scheduler = newRaftScheduler(cfg.AmbientCtx, s.metrics, s, storeSchedulerConcurrency)
@@ -1954,7 +1956,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	}
 
 	if !s.cfg.SpanConfigsDisabled {
-		s.cfg.SpanConfigSubscriber.Subscribe(func(ctx context.Context, update roachpb.Span) {
+		s.cfg.SpanConfigSubscriber.Subscribe(func(update roachpb.Span) {
 			s.onSpanConfigUpdate(ctx, update)
 		})
 
@@ -3265,8 +3267,7 @@ func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracing.Rec
 	defer collectAndFinish()
 	canTransferLease := func(ctx context.Context, repl *Replica) bool { return true }
 	_, err := s.replicateQueue.processOneChange(
-		ctx, repl, canTransferLease, false /* scatter */, true, /* dryRun */
-	)
+		ctx, repl, canTransferLease, true /* dryRun */)
 	if err != nil {
 		log.Eventf(ctx, "error simulating allocator on replica %s: %s", repl, err)
 	}
@@ -3442,6 +3443,11 @@ func (s *Store) unregisterLeaseholderByID(ctx context.Context, rangeID roachpb.R
 // tracking.
 func (s *Store) getRootMemoryMonitorForKV() *mon.BytesMonitor {
 	return s.cfg.KVMemoryMonitor
+}
+
+// getReplicaForTruncator implements storeForTruncator.
+func (s *Store) getReplicaForTruncator(rangeID roachpb.RangeID) (replicaForTruncator, error) {
+	return s.GetReplica(rangeID)
 }
 
 // WriteClusterVersion writes the given cluster version to the store-local

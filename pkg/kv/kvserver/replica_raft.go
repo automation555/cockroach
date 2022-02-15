@@ -107,7 +107,7 @@ func (r *Replica) evalAndPropose(
 ) (chan proposalResult, func(), kvserverbase.CmdIDKey, *roachpb.Error) {
 	defer tok.DoneIfNotMoved(ctx)
 	idKey := makeIDKey()
-	proposal, pErr := r.requestToProposal(ctx, idKey, ba, st, ui, g)
+	proposal, pErr := r.requestToProposal(ctx, idKey, ba, st, ui, g.LatchSpans())
 	log.Event(proposal.ctx, "evaluated request")
 
 	// If the request hit a server-side concurrency retry error, immediately
@@ -868,7 +868,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		r.mu.leaderID = leaderID
 		// Clear the remote proposal set. Would have been nil already if not
 		// previously the leader.
-		becameLeader = r.mu.leaderID == r.replicaID
+		becameLeader = r.mu.leaderID == r.mu.replicaID
 	}
 	r.mu.Unlock()
 
@@ -1040,8 +1040,8 @@ func (r *Replica) tick(ctx context.Context, livenessMap liveness.IsLiveMap) (boo
 	// into the local Raft group. The leader won't hit that path, so we update
 	// it whenever it ticks. In effect, this makes sure it always sees itself as
 	// alive.
-	if r.replicaID == r.mu.leaderID {
-		r.mu.lastUpdateTimes.update(r.replicaID, timeutil.Now())
+	if r.mu.replicaID == r.mu.leaderID {
+		r.mu.lastUpdateTimes.update(r.mu.replicaID, timeutil.Now())
 	}
 
 	r.mu.ticks++
@@ -1585,7 +1585,7 @@ func (r *Replica) withRaftGroupLocked(
 		ctx := r.AnnotateCtx(context.TODO())
 		raftGroup, err := raft.NewRawNode(newRaftConfig(
 			raft.Storage((*replicaRaftStorage)(r)),
-			uint64(r.replicaID),
+			uint64(r.mu.replicaID),
 			r.mu.state.RaftAppliedIndex,
 			r.store.cfg,
 			&raftLogger{ctx: ctx},
@@ -1709,7 +1709,7 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 	// method were to be called on an uninitialized replica (which
 	// has no state and thus an empty raft config), this might cause
 	// problems.
-	if _, currentMember := r.mu.state.Desc.GetReplicaDescriptorByID(r.replicaID); !currentMember {
+	if _, currentMember := r.mu.state.Desc.GetReplicaDescriptorByID(r.mu.replicaID); !currentMember {
 		return
 	}
 
@@ -1999,9 +1999,9 @@ func ComputeRaftLogSize(
 	var totalSideloaded int64
 	if sideloaded != nil {
 		var err error
-		// Truncating all indexes strictly smaller than zero is a no-op but
-		// gives us the number of bytes in the storage back.
-		_, totalSideloaded, err = sideloaded.TruncateTo(ctx, 0)
+		// The remaining bytes if one were to truncate [0, 0) gives us the total
+		// number of bytes in sideloaded files.
+		_, totalSideloaded, err = sideloaded.BytesIfTruncatedFromTo(ctx, 0, 0)
 		if err != nil {
 			return 0, err
 		}
