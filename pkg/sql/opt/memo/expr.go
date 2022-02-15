@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -594,10 +593,10 @@ func (sj *SemiJoinExpr) getMultiplicity() props.JoinMultiplicity {
 // WindowFrame denotes the definition of a window frame for an individual
 // window function, excluding the OFFSET expressions, if present.
 type WindowFrame struct {
-	Mode           treewindow.WindowFrameMode
-	StartBoundType treewindow.WindowFrameBoundType
-	EndBoundType   treewindow.WindowFrameBoundType
-	FrameExclusion treewindow.WindowFrameExclusion
+	Mode           tree.WindowFrameMode
+	StartBoundType tree.WindowFrameBoundType
+	EndBoundType   tree.WindowFrameBoundType
+	FrameExclusion tree.WindowFrameExclusion
 }
 
 // HasOffset returns true if the WindowFrame contains a specific offset.
@@ -608,21 +607,21 @@ func (f *WindowFrame) HasOffset() bool {
 func (f *WindowFrame) String() string {
 	var bld strings.Builder
 	switch f.Mode {
-	case treewindow.GROUPS:
+	case tree.GROUPS:
 		fmt.Fprintf(&bld, "groups")
-	case treewindow.ROWS:
+	case tree.ROWS:
 		fmt.Fprintf(&bld, "rows")
-	case treewindow.RANGE:
+	case tree.RANGE:
 		fmt.Fprintf(&bld, "range")
 	}
 
-	frameBoundName := func(b treewindow.WindowFrameBoundType) string {
+	frameBoundName := func(b tree.WindowFrameBoundType) string {
 		switch b {
-		case treewindow.UnboundedFollowing, treewindow.UnboundedPreceding:
+		case tree.UnboundedFollowing, tree.UnboundedPreceding:
 			return "unbounded"
-		case treewindow.CurrentRow:
+		case tree.CurrentRow:
 			return "current-row"
-		case treewindow.OffsetFollowing, treewindow.OffsetPreceding:
+		case tree.OffsetFollowing, tree.OffsetPreceding:
 			return "offset"
 		}
 		panic(errors.AssertionFailedf("unexpected bound"))
@@ -632,11 +631,11 @@ func (f *WindowFrame) String() string {
 		frameBoundName(f.EndBoundType),
 	)
 	switch f.FrameExclusion {
-	case treewindow.ExcludeCurrentRow:
+	case tree.ExcludeCurrentRow:
 		bld.WriteString(" exclude current row")
-	case treewindow.ExcludeGroup:
+	case tree.ExcludeGroup:
 		bld.WriteString(" exclude group")
-	case treewindow.ExcludeTies:
+	case tree.ExcludeTies:
 		bld.WriteString(" exclude ties")
 	}
 	return bld.String()
@@ -830,6 +829,53 @@ func (prj *ProjectExpr) initUnexportedFields(mem *Memo) {
 // columns plus the synthesized columns.
 func (prj *ProjectExpr) InternalFDs() *props.FuncDepSet {
 	return &prj.internalFuncDeps
+}
+
+func (prjs *ProjectSetExpr) initUnexportedFields(mem *Memo) {
+	inputProps := prjs.Input.Relational()
+	// Determine the not-null columns.
+	prjs.notNullCols = inputProps.NotNullCols.Copy()
+	for i := range prjs.Zip {
+		item := &prjs.Zip[i]
+		if ExprIsNeverNull(item.Fn, inputProps.NotNullCols) {
+			for _, col := range item.Cols {
+				prjs.notNullCols.Add(col)
+			}
+		}
+	}
+
+	// Determine the "internal" functional dependencies (for the union of input
+	// columns and synthesized columns).
+	prjs.internalFuncDeps.CopyFrom(&inputProps.FuncDeps)
+	for i := range prjs.Zip {
+		item := &prjs.Zip[i]
+		if v, ok := item.Fn.(*VariableExpr); ok && inputProps.OutputCols.Contains(v.Col) {
+			// Handle any column that is a direct reference to an input column.
+			prjs.internalFuncDeps.AddEquivalency(v.Col, item.Cols[0])
+			continue
+		}
+
+		if !item.scalar.VolatilitySet.HasVolatile() {
+			from := item.scalar.OuterCols.Intersection(inputProps.OutputCols)
+
+			// We want to set up the FD: from --> colID.
+			// This does not necessarily hold for "composite" types like decimals or
+			// collated strings. For example if d is a decimal, d::TEXT can have
+			// different values for equal values of d, like 1 and 1.0.
+			if !CanBeCompositeSensitive(mem.Metadata(), item.Fn) {
+				for _, col := range item.Cols {
+					prjs.internalFuncDeps.AddSynthesizedCol(from, col)
+				}
+			}
+		}
+	}
+	prjs.internalFuncDeps.MakeNotNull(prjs.notNullCols)
+}
+
+// InternalFDs returns the functional dependencies for the set of all input
+// columns plus the synthesized columns.
+func (prjs *ProjectSetExpr) InternalFDs() *props.FuncDepSet {
+	return &prjs.internalFuncDeps
 }
 
 // ExprIsNeverNull makes a best-effort attempt to prove that the provided
