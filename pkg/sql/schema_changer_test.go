@@ -37,11 +37,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
@@ -60,11 +58,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -88,13 +88,14 @@ func TestSchemaChangeProcess(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
+	var id = descpb.ID(keys.MinNonPredefinedUserDescID + 1 /* skip over DB ID */)
 	var instance = base.SQLInstanceID(2)
 	stopper := stop.NewStopper()
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
-	rf, err := rangefeed.NewFactory(stopper, kvDB, execCfg.Settings, nil /* knobs */)
+	rf, err := rangefeed.NewFactory(stopper, kvDB, nil /* knobs */)
 	require.NoError(t, err)
 	leaseMgr := lease.NewLeaseManager(
-		s.AmbientCtx(),
+		log.AmbientContext{Tracer: tracing.NewTracer()},
 		execCfg.NodeID,
 		execCfg.DB,
 		execCfg.Clock,
@@ -107,6 +108,8 @@ func TestSchemaChangeProcess(t *testing.T) {
 	)
 	jobRegistry := s.JobRegistry().(*jobs.Registry)
 	defer stopper.Stop(context.Background())
+	changer := sql.NewSchemaChangerForTesting(
+		id, 0, instance, kvDB, leaseMgr, jobRegistry, &execCfg, cluster.MakeTestingClusterSettings())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -116,13 +119,8 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 		t.Fatal(err)
 	}
 
-	tableID := descpb.ID(sqlutils.QueryTableID(t, sqlDB, "t", "public", "test"))
-
-	changer := sql.NewSchemaChangerForTesting(
-		tableID, 0, instance, kvDB, leaseMgr, jobRegistry, &execCfg, cluster.MakeTestingClusterSettings())
-
 	// Read table descriptor for version.
-	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	expectedVersion := tableDesc.Version
 	ctx := context.Background()
 
@@ -132,7 +130,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 		t.Fatal(err)
 	}
 
-	tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	newVersion := tableDesc.Version
 	if newVersion != expectedVersion {
 		t.Fatalf("bad version; e = %d, v = %d", expectedVersion, newVersion)
@@ -146,7 +144,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	index.ID = tableDesc.NextIndexID
 	tableDesc.NextIndexID++
 	changer = sql.NewSchemaChangerForTesting(
-		tableID, tableDesc.NextMutationID, instance, kvDB, leaseMgr, jobRegistry,
+		id, tableDesc.NextMutationID, instance, kvDB, leaseMgr, jobRegistry,
 		&execCfg, cluster.MakeTestingClusterSettings(),
 	)
 	tableDesc.TableDesc().Mutations = append(tableDesc.TableDesc().Mutations, descpb.DescriptorMutation{
@@ -181,7 +179,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 				t.Fatal(err)
 			}
 
-			tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
+			tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 				kvDB, keys.SystemSQLCodec, "t", "test")
 			newVersion = tableDesc.Version
 			if newVersion != expectedVersion {
@@ -194,7 +192,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 		}
 	}
 	// RunStateMachineBeforeBackfill() doesn't complete the schema change.
-	tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
+	tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
 	if len(tableDesc.Mutations) == 0 {
 		t.Fatalf("table expected to have an outstanding schema change: %v", tableDesc)
@@ -225,7 +223,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	}
 
 	// Read table descriptor for version.
-	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
+	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// A long running schema change operation runs through
@@ -247,7 +245,7 @@ CREATE INDEX foo ON t.test (v)
 
 	// Wait until index is created.
 	for r := retry.Start(retryOpts); r.Next(); {
-		tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
+		tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", "test")
 		if len(tableDesc.PublicNonPrimaryIndexes()) == 1 {
 			break
@@ -260,7 +258,7 @@ CREATE INDEX foo ON t.test (v)
 	mTest.CheckQueryResults(t, indexQuery, [][]string{{"b"}, {"d"}})
 
 	// Ensure that the version has been incremented.
-	tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
+	tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "t", "test")
 	newVersion := tableDesc.Version
 	if newVersion != expectedVersion {
@@ -274,7 +272,7 @@ CREATE INDEX foo ON t.test (v)
 
 	for r := retry.Start(retryOpts); r.Next(); {
 		// Ensure that the version gets incremented.
-		tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
+		tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", "test")
 		name := tableDesc.PublicNonPrimaryIndexes()[0].GetName()
 		if name != "ufo" {
@@ -294,7 +292,7 @@ CREATE INDEX foo ON t.test (v)
 	}
 	// Wait until indexes are created.
 	for r := retry.Start(retryOpts); r.Next(); {
-		tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(
+		tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", "test")
 		if len(tableDesc.PublicNonPrimaryIndexes()) == count+1 {
 			break
@@ -542,7 +540,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	}
 
 	// Split the table into multiple ranges.
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	var sps []sql.SplitPoint
 	for i := 1; i <= numNodes-1; i++ {
 		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
@@ -716,7 +714,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	}
 
 	// Split the table into multiple ranges.
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	var sps []sql.SplitPoint
 	for i := 1; i <= numNodes-1; i++ {
 		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
@@ -808,7 +806,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Bulk insert.
 	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
@@ -954,7 +952,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 `); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	// Add a zone config for the table.
 	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
@@ -1185,7 +1183,7 @@ CREATE TABLE t.test (
 	}
 
 	// Read table descriptor.
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if len(tableDesc.GetChecks()) != 3 {
 		t.Fatalf("Expected 3 checks but got %d ", len(tableDesc.GetChecks()))
 	}
@@ -1195,7 +1193,7 @@ CREATE TABLE t.test (
 	}
 
 	// Re-read table descriptor.
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	// Only check_ab should remain
 	if len(tableDesc.GetChecks()) != 1 {
 		checkExprs := make([]string, 0)
@@ -1380,42 +1378,28 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	id := tableDesc.GetID()
 	ctx := context.Background()
 
 	upTableVersion = func() {
 		leaseMgr := s.LeaseManager().(*lease.Manager)
 		var version descpb.DescriptorVersion
-
-		// Use a timeout shorter than the lease duration to ensure that we aren't
-		// just waiting for the lease to expire.
-		timeoutCtx, cancel := context.WithTimeout(ctx, base.DefaultDescriptorLeaseDuration/2)
-		defer cancel()
-		if err := sql.TestingDescsTxn(timeoutCtx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-			tbl, err := col.Direct().MustGetTableDescByID(ctx, txn, tableDesc.GetID())
-			if err != nil {
-				return err
-			}
-			table := tabledesc.NewBuilder(tbl.TableDesc()).BuildExistingMutableTable()
+		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			table, err := catalogkv.MustGetMutableTableDescByID(
+				ctx, txn, keys.SystemSQLCodec, tableDesc.GetID())
 			if err != nil {
 				return err
 			}
 			table.MaybeIncrementVersion()
 			ba := txn.NewBatch()
-			if err := col.WriteDescToBatch(ctx, false /* kvTrace */, table, ba); err != nil {
+			if err := catalogkv.WriteDescToBatch(
+				ctx, false /* kvTrace */, s.ClusterSettings(), ba,
+				keys.SystemSQLCodec, table.GetID(), table,
+			); err != nil {
 				return err
 			}
 			version = table.GetVersion()
-
-			// Here we don't want to actually wait for the backfill to drop its lease.
-			// To avoid that, we hack the machinery which tries oh so hard to make it
-			// impossible to avoid, by calling the ReleaseAll method on the
-			// collection to reset its state. In practice, this machinery exists only
-			// for the lower-level usages in the connExecutor and probably ought not
-			// to exist on the object passed to descs.Txn, but, we have it, and it's
-			// effective, so, let's use it.
-			defer col.ReleaseAll(ctx)
 			return txn.Run(ctx, ba)
 		}); err != nil {
 			t.Error(err)
@@ -1423,11 +1407,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 		// Grab a lease at the latest version so that we are confident
 		// that all future leases will be taken at the latest version.
-		table, err := leaseMgr.TestingAcquireAndAssertMinVersion(timeoutCtx, s.Clock().Now(), id, version)
+		table, err := leaseMgr.TestingAcquireAndAssertMinVersion(ctx, s.Clock().Now(), id, version)
 		if err != nil {
 			t.Error(err)
 		}
-		table.Release(timeoutCtx)
+		table.Release(ctx)
 	}
 
 	// Bulk insert.
@@ -1539,7 +1523,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Allow async schema change purge to attempt backfill and error.
 	atomic.StoreUint32(&enableAsyncSchemaChanges, 1)
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	// deal with schema change knob
 	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
@@ -1553,6 +1537,15 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		}
 		return nil
 	})
+
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+
+	// There is still a DROP INDEX mutation waiting for GC.
+	if e := 1; len(tableDesc.GetGCMutations()) != e {
+		t.Fatalf("the table has %d instead of %d GC mutations", len(tableDesc.GetGCMutations()), e)
+	} else if m := tableDesc.GetGCMutations()[0]; m.IndexID != 2 && m.DropTime == 0 && m.JobID == 0 {
+		t.Fatalf("unexpected GC mutation %v", m)
+	}
 
 	// There is still some garbage index data that needs to be purged. All the
 	// rows from k = 0 to k = chunkSize - 1 have index values.
@@ -1572,11 +1565,19 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	// above garbage left behind.
 	atomic.StoreUint32(&enableAsyncSchemaChanges, 1)
 
-	// No garbage left behind.
 	testutils.SucceedsSoon(t, func() error {
-		numGarbageValues = 0
-		return sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue+1+numGarbageValues)
+		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+		if len(tableDesc.GetGCMutations()) > 0 {
+			return errors.Errorf("%d GC mutations remaining", len(tableDesc.GetGCMutations()))
+		}
+		return nil
 	})
+
+	// No garbage left behind.
+	numGarbageValues = 0
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 1, maxValue+1+numGarbageValues); err != nil {
+		t.Fatal(err)
+	}
 
 	// A new attempt cleans up a chunk of data.
 	if attempts != expectedAttempts+1 {
@@ -1630,7 +1631,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 `); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
 	// TTL into the system with AddImmediateGCZoneConfig.
@@ -1682,7 +1683,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Check that constraints are cleaned up on the latest version of the
 	// descriptor.
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if checks := tableDesc.AllActiveAndInactiveChecks(); len(checks) > 0 {
 		t.Fatalf("found checks %+v", checks)
 	}
@@ -1737,7 +1738,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	testCases := []struct {
 		sql       string
@@ -1784,14 +1785,14 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 		_, err := sqlDB.Exec(tc.sql)
 		if tc.errString == "" {
 			if err != nil {
-				t.Fatalf("%s: %v", tc.sql, err)
+				t.Fatal(err)
 			}
 		} else {
 			if err == nil {
-				t.Fatalf("%s: expected error", tc.sql)
+				t.Fatal("expected error")
 			}
 			if !strings.Contains(err.Error(), tc.errString) {
-				t.Fatalf("%s: %v", tc.sql, err)
+				t.Fatal(err)
 			}
 		}
 	}
@@ -1802,7 +1803,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 	expectedCols := []string{"k", "b", "d"}
 	// Wait until all the mutations have been processed.
 	testutils.SucceedsSoon(t, func() error {
-		tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 		if len(tableDesc.AllMutations()) > 0 {
 			return errors.Errorf("%d mutations remaining", len(tableDesc.AllMutations()))
 		}
@@ -1907,12 +1908,20 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 		t.Fatal(err)
 	}
 
+	testutils.SucceedsSoon(t, func() error {
+		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+		if len(tableDesc.GetGCMutations()) > 0 {
+			return errors.Errorf("%d gc mutations remaining", len(tableDesc.GetGCMutations()))
+		}
+		return nil
+	})
+
 	ctx := context.Background()
 
-	testutils.SucceedsSoon(t, func() error {
-		// Check that the number of k-v pairs is accurate.
-		return sqltestutils.CheckTableKeyCount(ctx, kvDB, 3, maxValue)
-	})
+	// Check that the number of k-v pairs is accurate.
+	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, 3, maxValue); err != nil {
+		t.Fatal(err)
+	}
 
 	// State of jobs table
 	skip.WithIssue(t, 51796, "TODO(pbardea): The following fails due to causes seemingly unrelated to GC")
@@ -1976,7 +1985,7 @@ CREATE TABLE t.test (
 `); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if tableDesc.GetFamilies()[0].DefaultColumnID != 0 {
 		t.Fatalf("default column id not set properly: %s", tableDesc)
 	}
@@ -2018,7 +2027,7 @@ CREATE TABLE t.test (
 	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD COLUMN v INT FAMILY F1`); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if tableDesc.GetFamilies()[0].DefaultColumnID != 2 {
 		t.Fatalf("default column id not set properly: %s", tableDesc)
 	}
@@ -2216,7 +2225,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT UNIQUE DEFAULT 23 CREATE FAMILY F3
 	<-waitUntilRevert
 
 	// The index is not regenerated.
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 {
 		t.Fatalf("indexes %+v", tableDesc.PublicNonPrimaryIndexes())
 	}
@@ -2235,95 +2244,6 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT UNIQUE DEFAULT 23 CREATE FAMILY F3
 	}
 
 	close(waitUntilRevert)
-}
-
-// TestDropIndexNoRevert tests that failed DROP INDEX requests are not
-// reverted.
-func TestDropIndexNoRevert(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
-	server, sqlDB, _ := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop(context.Background())
-
-	_, err := sqlDB.Exec(`
-CREATE TABLE t (pk INT PRIMARY KEY, b int, c int);
-CREATE INDEX index_to_drop ON t (b);
-INSERT INTO t VALUES (1, 1, 1), (2, 2, 1);
-`)
-	require.NoError(t, err)
-
-	txn, err := sqlDB.Begin()
-	require.NoError(t, err)
-
-	_, err = txn.Exec("DROP INDEX index_to_drop")
-	require.NoError(t, err)
-
-	// This CREATE INDEX should fail on commit because of a
-	// duplicate key violation.
-	_, err = txn.Exec("CREATE UNIQUE INDEX ON t (c)")
-	require.NoError(t, err)
-
-	err = txn.Commit()
-	require.Error(t, err)
-
-	// Index is dropped even though the commit failed.
-	r := sqlDB.QueryRow("SELECT DISTINCT(index_name) FROM [SHOW INDEXES FROM t] WHERE index_name = $1", "index_to_drop")
-	var n string
-	require.EqualError(t, r.Scan(&n), "sql: no rows in result set")
-}
-
-// TestOldRevertedDropIndexesAreIgnored tests previously reverted DROP
-// INDEX mutations are no longer respected. That is, we continue to
-// DROP the index when the job is resumed.
-func TestOldRevertedDropIndexesAreIgnored(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
-
-	var (
-		server serverutils.TestServerInterface
-		sqlDB  *gosql.DB
-		kvDB   *kv.DB
-	)
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeResume: func(jobspb.JobID) error {
-				mut := desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
-				for _, m := range mut.AllMutations() {
-					if m.Adding() && m.AsIndex() != nil {
-						// Make this schema change addition look like a rollback from a failed DROP
-						mut.Mutations[m.MutationOrdinal()].Rollback = true
-					}
-				}
-				require.NoError(t, kvDB.Put(
-					context.Background(),
-					catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, mut.GetID()),
-					mut.DescriptorProto(),
-				))
-				return nil
-			},
-		},
-		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-	}
-
-	server, sqlDB, kvDB = serverutils.StartServer(t, params)
-	defer server.Stopper().Stop(context.Background())
-
-	_, err := sqlDB.Exec("CREATE DATABASE test; CREATE TABLE test.t (pk INT PRIMARY KEY, b int)")
-	require.NoError(t, err)
-
-	// This create index is mutated above to look like it was the
-	// result of a rollback.
-	_, err = sqlDB.Exec("CREATE INDEX pretend_drop_revert ON test.t (b)")
-	require.NoError(t, err)
-
-	// Index should never get added because the revert should be
-	// dropped.
-	r := sqlDB.QueryRow("SELECT DISTINCT(index_name) FROM [SHOW INDEXES FROM test.t] WHERE index_name = $1", "pretend_drop_revert")
-	var n string
-	require.EqualError(t, r.Scan(&n), "sql: no rows in result set")
-
 }
 
 // TestVisibilityDuringPrimaryKeyChange tests visibility of different indexes
@@ -2353,7 +2273,7 @@ func TestVisibilityDuringPrimaryKeyChange(t *testing.T) {
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
 CREATE TABLE t.test (x INT PRIMARY KEY, y INT NOT NULL, z INT, INDEX i (z));
-INSERT INTO t.test VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
+INSERT INTO t.test VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3); 
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -2379,7 +2299,8 @@ INSERT INTO t.test VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
 	y INT8 NOT NULL,
 	z INT8 NULL,
 	CONSTRAINT test_pkey PRIMARY KEY (x ASC),
-	INDEX i (z ASC)
+	INDEX i (z ASC),
+	FAMILY "primary" (x, y, z)
 )`
 	if create != expected {
 		t.Fatalf("expected %s, found %s", expected, create)
@@ -2400,7 +2321,8 @@ INSERT INTO t.test VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
 	z INT8 NULL,
 	CONSTRAINT test_pkey PRIMARY KEY (y ASC),
 	UNIQUE INDEX test_x_key (x ASC),
-	INDEX i (z ASC)
+	INDEX i (z ASC),
+	FAMILY "primary" (x, y, z)
 )`
 	if create != expected {
 		t.Fatalf("expected %s, found %s", expected, create)
@@ -2593,8 +2515,6 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 		t.Fatal(err)
 	}
 
-	tableID := descpb.ID(sqlutils.QueryTableID(t, sqlDB, "t", "public", "test"))
-
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -2608,7 +2528,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 
 	// Test that trying different schema changes results an error.
 	_, err := sqlDB.Exec(`ALTER TABLE t.test ADD COLUMN z INT`)
-	expected := fmt.Sprintf(`pq: relation "test" \(%d\): unimplemented: cannot perform a schema change operation while a primary key change is in progress`, tableID)
+	expected := `pq: relation "test" \(53\): unimplemented: cannot perform a schema change operation while a primary key change is in progress`
 	if !testutils.IsError(err, expected) {
 		t.Fatalf("expected to find error %s but found %+v", expected, err)
 	}
@@ -2678,7 +2598,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 	}
 	// GC the old indexes to be dropped after the PK change immediately.
 	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
@@ -2890,7 +2810,7 @@ COMMIT;
 	}
 	// Ensure that t.test doesn't have any pending mutations
 	// after the primary key change.
-	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if len(desc.AllMutations()) != 0 {
 		t.Fatalf("expected to find 0 mutations, but found %d", len(desc.AllMutations()))
 	}
@@ -2923,24 +2843,21 @@ func TestPrimaryKeyChangeKVOps(t *testing.T) {
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
-	defer close(waitBeforeContinuing)
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
 CREATE TABLE t.test (
-	x INT PRIMARY KEY,
-	y INT NOT NULL,
-	z INT,
-	a INT,
-	b INT,
+	x INT PRIMARY KEY, 
+	y INT NOT NULL, 
+	z INT, 
+	a INT, 
+	b INT, 
 	c INT,
 	FAMILY (x), FAMILY (y), FAMILY (z, a), FAMILY (b), FAMILY (c)
 )
 `); err != nil {
 		t.Fatal(err)
 	}
-
-	tableID := descpb.ID(sqlutils.QueryTableID(t, sqlDB, "t", "public", "test"))
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -2968,91 +2885,91 @@ CREATE TABLE t.test (
 	}
 
 	// Test that we only insert the necessary k/v's.
-	rows, err := sqlDB.Query(fmt.Sprintf(`
+	rows, err := sqlDB.Query(`
 	SET TRACING=on,kv,results;
 	INSERT INTO t.test VALUES (1, 2, 3, NULL, NULL, 6);
 	SET TRACING=off;
 	SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE
-		message LIKE 'InitPut /Table/%d/2%%' ORDER BY message;`, tableID))
+		message LIKE 'InitPut /Table/53/2%' ORDER BY message;`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected := []string{
-		fmt.Sprintf("InitPut /Table/%d/2/2/0 -> /TUPLE/1:1:Int/1", tableID),
+		"InitPut /Table/53/2/2/0 -> /TUPLE/1:1:Int/1",
 		// TODO (rohany): this k/v is spurious and should be removed
 		//  when #45343 is fixed.
-		fmt.Sprintf("InitPut /Table/%d/2/2/1/1 -> /INT/2", tableID),
-		fmt.Sprintf("InitPut /Table/%d/2/2/2/1 -> /TUPLE/3:3:Int/3", tableID),
-		fmt.Sprintf("InitPut /Table/%d/2/2/4/1 -> /INT/6", tableID),
+		"InitPut /Table/53/2/2/1/1 -> /INT/2",
+		"InitPut /Table/53/2/2/2/1 -> /TUPLE/3:3:Int/3",
+		"InitPut /Table/53/2/2/4/1 -> /INT/6",
 	}
 	require.Equal(t, expected, scanToArray(rows))
 
 	// Test that we remove all families when deleting.
-	rows, err = sqlDB.Query(fmt.Sprintf(`
+	rows, err = sqlDB.Query(`
 	SET TRACING=on, kv, results;
 	DELETE FROM t.test WHERE y = 2;
 	SET TRACING=off;
 	SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE
-		message LIKE 'Del /Table/%d/2%%' ORDER BY message;`, tableID))
+		message LIKE 'Del /Table/53/2%' ORDER BY message;`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected = []string{
-		fmt.Sprintf("Del /Table/%d/2/2/0", tableID),
-		fmt.Sprintf("Del /Table/%d/2/2/1/1", tableID),
-		fmt.Sprintf("Del /Table/%d/2/2/2/1", tableID),
-		fmt.Sprintf("Del /Table/%d/2/2/3/1", tableID),
-		fmt.Sprintf("Del /Table/%d/2/2/4/1", tableID),
+		"Del /Table/53/2/2/0",
+		"Del /Table/53/2/2/1/1",
+		"Del /Table/53/2/2/2/1",
+		"Del /Table/53/2/2/3/1",
+		"Del /Table/53/2/2/4/1",
 	}
 	require.Equal(t, expected, scanToArray(rows))
 
 	// Test that we update all families when the key changes.
-	rows, err = sqlDB.Query(fmt.Sprintf(`
+	rows, err = sqlDB.Query(`
 	INSERT INTO t.test VALUES (1, 2, 3, NULL, NULL, 6);
 	SET TRACING=on, kv, results;
 	UPDATE t.test SET y = 3 WHERE y = 2;
 	SET TRACING=off;
 	SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE
-		message LIKE 'Put /Table/%d/2%%' OR
-		message LIKE 'Del /Table/%d/2%%' OR
-		message LIKE 'CPut /Table/%d/2%%';`, tableID, tableID, tableID))
+		message LIKE 'Put /Table/53/2%' OR
+		message LIKE 'Del /Table/53/2%' OR
+		message LIKE 'CPut /Table/53/2%';`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected = []string{
-		fmt.Sprintf("Del /Table/%d/2/2/0", tableID),
-		fmt.Sprintf("CPut /Table/%d/2/3/0 -> /TUPLE/1:1:Int/1 (expecting does not exist)", tableID),
+		"Del /Table/53/2/2/0",
+		"CPut /Table/53/2/3/0 -> /TUPLE/1:1:Int/1 (expecting does not exist)",
 		// TODO (rohany): this k/v is spurious and should be removed
 		//  when #45343 is fixed.
-		fmt.Sprintf("Del /Table/%d/2/2/1/1", tableID),
-		fmt.Sprintf("CPut /Table/%d/2/3/1/1 -> /INT/3 (expecting does not exist)", tableID),
-		fmt.Sprintf("Del /Table/%d/2/2/2/1", tableID),
-		fmt.Sprintf("CPut /Table/%d/2/3/2/1 -> /TUPLE/3:3:Int/3 (expecting does not exist)", tableID),
-		fmt.Sprintf("Del /Table/%d/2/2/4/1", tableID),
-		fmt.Sprintf("CPut /Table/%d/2/3/4/1 -> /INT/6 (expecting does not exist)", tableID),
+		"Del /Table/53/2/2/1/1",
+		"CPut /Table/53/2/3/1/1 -> /INT/3 (expecting does not exist)",
+		"Del /Table/53/2/2/2/1",
+		"CPut /Table/53/2/3/2/1 -> /TUPLE/3:3:Int/3 (expecting does not exist)",
+		"Del /Table/53/2/2/4/1",
+		"CPut /Table/53/2/3/4/1 -> /INT/6 (expecting does not exist)",
 	}
 	require.Equal(t, expected, scanToArray(rows))
 
 	// Test that we only update necessary families when the key doesn't change.
-	rows, err = sqlDB.Query(fmt.Sprintf(`
+	rows, err = sqlDB.Query(`
 	SET TRACING=on, kv, results;
 	UPDATE t.test SET z = NULL, b = 5, c = NULL WHERE y = 3;
 	SET TRACING=off;
 	SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE
-		message LIKE 'Put /Table/%d/2%%' OR
-		message LIKE 'Del /Table/%d/2%%' OR
-		message LIKE 'CPut /Table/%d/2%%';`, tableID, tableID, tableID))
+		message LIKE 'Put /Table/53/2%' OR
+		message LIKE 'Del /Table/53/2%' OR
+		message LIKE 'CPut /Table/53/2%';`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected = []string{
-		fmt.Sprintf("Del /Table/%d/2/3/2/1", tableID),
-		fmt.Sprintf("CPut /Table/%d/2/3/3/1 -> /INT/5 (expecting does not exist)", tableID),
-		fmt.Sprintf("Del /Table/%d/2/3/4/1", tableID),
+		"Del /Table/53/2/3/2/1",
+		"CPut /Table/53/2/3/3/1 -> /INT/5 (expecting does not exist)",
+		"Del /Table/53/2/3/4/1",
 	}
 	require.Equal(t, expected, scanToArray(rows))
 
@@ -3089,7 +3006,7 @@ ALTER TABLE t.test ALTER PRIMARY KEY USING COLUMNS (v);
 	}
 
 	// Wait for the async schema changer to run.
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
@@ -3165,7 +3082,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 	// Ensure that the mutations corresponding to the primary key change are cleaned up and
 	// that the job did not succeed even though it was canceled.
 	testutils.SucceedsSoon(t, func() error {
-		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 		if len(tableDesc.AllMutations()) != 0 {
 			return errors.Errorf("expected 0 mutations after cancellation, found %d", len(tableDesc.AllMutations()))
 		}
@@ -3177,7 +3094,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 
 	// Stop any further attempts at cancellation, so the GC jobs don't fail.
 	shouldCancel = false
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if _, err := sqltestutils.AddImmediateGCZoneConfig(db, tableDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
@@ -3230,7 +3147,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 	<-hasAttemptedCancel
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	testutils.SucceedsSoon(t, func() error {
 		return jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 			Description:   "CLEANUP JOB for 'ALTER TABLE t.public.test ALTER PRIMARY KEY USING COLUMNS (k)'",
@@ -3262,7 +3179,7 @@ func TestMultiplePrimaryKeyChanges(t *testing.T) {
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
 CREATE TABLE t.test (x INT NOT NULL, y INT NOT NULL, z INT NOT NULL, w int, INDEX i (w));
-INSERT INTO t.test VALUES (1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, 3);
+INSERT INTO t.test VALUES (1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, 3); 
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -3469,7 +3386,7 @@ INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
 
 	// Wait until both mutations are queued up.
 	testutils.SucceedsSoon(t, func() error {
-		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 		if l := len(tableDesc.AllMutations()); l != 3 {
 			return errors.Errorf("number of mutations = %d", l)
 		}
@@ -3560,13 +3477,14 @@ INSERT INTO t.test (k, v, length) VALUES (2, 3, 1);
 	v INT8 NULL,
 	length INT8 NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (k ASC),
-	INDEX v_idx (v ASC)
+	INDEX v_idx (v ASC),
+	FAMILY "primary" (k, v, length)
 )`
 	if create != expect {
 		t.Fatalf("got: %s\nexpected: %s", create, expect)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if l := len(tableDesc.AllMutations()); l != 3 {
 		t.Fatalf("number of mutations = %d", l)
 	}
@@ -3670,7 +3588,7 @@ func TestBackfillCompletesOnChunkBoundary(t *testing.T) {
 	}
 
 	// Split the table into multiple ranges.
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	var sps []sql.SplitPoint
 	for i := 1; i <= numNodes-1; i++ {
 		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
@@ -3731,6 +3649,13 @@ INSERT INTO t.kv VALUES ('a', 'b');
 		secondStmt  string
 		expectedErr string
 	}{
+		// DROP TABLE followed by CREATE TABLE case.
+		{
+			name:        `drop-create`,
+			firstStmt:   `DROP TABLE t.kv`,
+			secondStmt:  `CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR)`,
+			expectedErr: `table "kv" is being dropped, try again later`,
+		},
 		// schema change followed by another statement works.
 		{
 			name:        `createindex-insert`,
@@ -3837,7 +3762,7 @@ CREATE TABLE d.t (
 `); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
+	tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
 		kvDB, keys.SystemSQLCodec, "d", "t")
 	// Verify that this descriptor uses the new STORING encoding. Overwrite it
 	// with one that uses the old encoding.
@@ -3869,7 +3794,7 @@ CREATE TABLE d.t (
 	}
 	// Ensure that the decoder sees the old encoding.
 	for indexName, expExplainRow := range map[string]string{
-		"i": "fetched: /t/i/1/11/2 -> <undecoded>",
+		"i": "fetched: /t/i/1/11/2 -> NULL",
 		"u": "fetched: /t/u/1 -> /11/2",
 	} {
 		t.Run("index scan", func(t *testing.T) {
@@ -3972,7 +3897,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// Split the table into multiple ranges.
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	var sps []sql.SplitPoint
 	for i := 1; i <= numNodes-1; i++ {
 		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
@@ -4137,7 +4062,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Add a zone config.
 	cfg := zonepb.DefaultZoneConfig()
@@ -4163,7 +4088,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14
 	require.NoError(t, row.Scan(&count))
 	require.Equal(t, 0, count)
 
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if tableDesc.Adding() {
 		t.Fatalf("bad state = %s", tableDesc.GetState())
 	}
@@ -4236,7 +4161,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Add a zone config.
 	var cfg zonepb.ZoneConfig
@@ -4280,7 +4205,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 	}
 
 	// Get the table descriptor after the truncation.
-	newTableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	newTableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if newTableDesc.Adding() {
 		t.Fatalf("bad state = %s", newTableDesc.GetState())
 	}
@@ -4300,7 +4225,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 		return nil
 	})
 
-	fkTableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "pi")
+	fkTableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "pi")
 	tablePrefix = keys.SystemSQLCodec.TablePrefix(uint32(fkTableDesc.GetID()))
 	tableEnd = tablePrefix.PrefixEnd()
 	if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
@@ -4320,6 +4245,132 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 		Description: "TRUNCATE TABLE t.public.test",
 		DescriptorIDs: descpb.IDs{
 			tableDesc.GetID(),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Test TRUNCATE during a column backfill.
+func TestTruncateWhileColumnBackfill(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.WithIssue(t, 43990)
+
+	backfillNotification := make(chan struct{})
+	backfillCount := int64(0)
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		// Runs schema changes asynchronously.
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			// TODO (lucy): if/when this test gets reinstated, figure out what knobs are
+			// needed.
+		},
+		DistSQL: &execinfra.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				switch atomic.LoadInt64(&backfillCount) {
+				case 3:
+					// Notify in the middle of a backfill.
+					if backfillNotification != nil {
+						close(backfillNotification)
+						backfillNotification = nil
+					}
+					// Never complete the backfill.
+					return context.DeadlineExceeded
+				default:
+					atomic.AddInt64(&backfillCount, 1)
+				}
+				return nil
+			},
+		},
+	}
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	const maxValue = 5000
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	notify := backfillNotification
+
+	const add_column = `ALTER TABLE t.public.test ADD COLUMN x DECIMAL NOT NULL DEFAULT 1.4::DECIMAL, ADD CHECK (x >= 0)`
+	if _, err := sqlDB.Exec(add_column); err != nil {
+		t.Fatal(err)
+	}
+
+	const drop_column = `ALTER TABLE t.public.test DROP COLUMN v`
+	if _, err := sqlDB.Exec(drop_column); err != nil {
+		t.Fatal(err)
+	}
+
+	// Check that an outstanding schema change exists.
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	oldID := tableDesc.GetID()
+	if lenMutations := len(tableDesc.AllMutations()); lenMutations != 3 {
+		t.Fatalf("%d outstanding schema change", lenMutations)
+	}
+
+	// Run TRUNCATE.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		<-notify
+		if _, err := sqlDB.Exec("TRUNCATE TABLE t.test"); err != nil {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+	wg.Wait()
+
+	// The new table is truncated.
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.GetID()))
+	tableEnd := tablePrefix.PrefixEnd()
+	if kvs, err := kvDB.Scan(context.Background(), tablePrefix, tableEnd, 0); err != nil {
+		t.Fatal(err)
+	} else if e := 0; len(kvs) != e {
+		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
+	}
+
+	// Col "x" is public and col "v" is dropped.
+	if num := len(tableDesc.AllMutations()); num > 0 {
+		t.Fatalf("%d outstanding mutation", num)
+	}
+	if lenCols := len(tableDesc.PublicColumns()); lenCols != 2 {
+		t.Fatalf("%d columns", lenCols)
+	}
+	if k, x := tableDesc.PublicColumns()[0].GetName(), tableDesc.PublicColumns()[1].GetName(); k != "k" && x != "x" {
+		t.Fatalf("columns %q, %q in descriptor", k, x)
+	}
+	if checks := tableDesc.AllActiveAndInactiveChecks(); len(checks) != 1 {
+		t.Fatalf("expected 1 check, found %d", len(checks))
+	}
+
+	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+	if err := jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
+		Username:    security.RootUserName(),
+		Description: add_column,
+		DescriptorIDs: descpb.IDs{
+			oldID,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
+		Username:    security.RootUserName(),
+		Description: drop_column,
+		DescriptorIDs: descpb.IDs{
+			oldID,
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -4625,7 +4676,7 @@ ALTER TABLE t.test ADD COLUMN c INT AS (v + 4) STORED, ADD COLUMN d INT DEFAULT 
 	}
 
 	// The descriptor version hasn't changed.
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if tableDesc.GetVersion() != 1 {
 		t.Fatalf("invalid version = %d", tableDesc.GetVersion())
 	}
@@ -4695,7 +4746,7 @@ func TestCancelSchemaChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	// Split the table into multiple ranges.
 	var sps []sql.SplitPoint
 	const numSplits = numNodes * 2
@@ -4817,7 +4868,7 @@ func TestCancelSchemaChange(t *testing.T) {
 	})
 
 	// Check that constraints are cleaned up.
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if checks := tableDesc.AllActiveAndInactiveChecks(); len(checks) != 1 {
 		t.Fatalf("expected 1 check, found %+v", checks)
 	}
@@ -5135,7 +5186,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatal(err)
 	}
 
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Bulk insert enough rows to exceed the chunk size.
 	inserts := make([]string, maxValue+1)
@@ -5153,7 +5204,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatal(err)
 	}
 
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 || len(tableDesc.AllMutations()) > 0 {
 		t.Fatalf("descriptor broken %d, %d", len(tableDesc.PublicNonPrimaryIndexes()), len(tableDesc.AllMutations()))
 	}
@@ -5206,7 +5257,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v JSON);
 		t.Fatal(err)
 	}
 
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	r := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	// Insert enough rows to exceed the chunk size.
@@ -5227,7 +5278,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v JSON);
 		t.Fatal(err)
 	}
 
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if len(tableDesc.PublicNonPrimaryIndexes()) > 0 || len(tableDesc.AllMutations()) > 0 {
 		t.Fatalf("descriptor broken %d, %d", len(tableDesc.PublicNonPrimaryIndexes()), len(tableDesc.AllMutations()))
 	}
@@ -5776,7 +5827,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 `); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
@@ -5865,7 +5916,7 @@ func TestSchemaChangeJobRunningStatusValidation(t *testing.T) {
 	var runBeforeConstraintValidation func() error
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeConstraintValidation: func(constraints []catalog.ConstraintToUpdate) error {
+			RunBeforeConstraintValidation: func() error {
 				return runBeforeConstraintValidation()
 			},
 		},
@@ -5884,7 +5935,7 @@ INSERT INTO t.test (k, v) VALUES (1, 99), (2, 100);
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	runBeforeConstraintValidation = func() error {
@@ -5918,7 +5969,7 @@ func TestFKReferencesAddedOnlyOnceOnRetry(t *testing.T) {
 	errorReturned := false
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeConstraintValidation: func(constraints []catalog.ConstraintToUpdate) error {
+			RunBeforeConstraintValidation: func() error {
 				return runBeforeConstraintValidation()
 			},
 		},
@@ -5965,6 +6016,103 @@ ALTER TABLE t.test2 ADD FOREIGN KEY (k) REFERENCES t.test;
 	if _, err := sqlDB.Query(`SHOW CONSTRAINTS FROM t.test2`); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestOrphanedGCMutationsRemoved tests that if a table descriptor has a
+// GCMutations which references a job that does not exist anymore, that it will
+// eventually be cleaned up anyway. One way this can arise is when a table
+// was backed up right after an index deletion.
+func TestOrphanedGCMutationsRemoved(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 51796, "TODO (lucy): get rid of this test once GCMutations goes away")
+	params, _ := tests.CreateTestServerParams()
+	const chunkSize = 200
+	// Disable synchronous schema change processing so that the mutations get
+	// processed asynchronously.
+	var enableAsyncSchemaChanges uint32
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			BackfillChunkSize: chunkSize,
+		},
+	}
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+
+	// Disable strict GC TTL enforcement because we're going to shove a zero-value
+	// TTL into the system with AddImmediateGCZoneConfig.
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
+
+	retryOpts := retry.Options{
+		InitialBackoff: 20 * time.Millisecond,
+		MaxBackoff:     200 * time.Millisecond,
+		Multiplier:     2,
+	}
+
+	// Create a k-v table.
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
+`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`CREATE INDEX t_v ON t.test(v)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add some data.
+	const maxValue = chunkSize + 1
+	if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	// Wait until indexes are created.
+	for r := retry.Start(retryOpts); r.Next(); {
+		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+		if len(tableDesc.PublicNonPrimaryIndexes()) == 1 {
+			break
+		}
+	}
+
+	if _, err := sqlDB.Exec(`DROP INDEX t.t_v`); err != nil {
+		t.Fatal(err)
+	}
+
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	if e := 1; e != len(tableDesc.GetGCMutations()) {
+		t.Fatalf("e = %d, v = %d", e, len(tableDesc.GetGCMutations()))
+	}
+
+	// Delete the associated job.
+	jobID := tableDesc.GetGCMutations()[0].JobID
+	if _, err := sqlDB.Exec(fmt.Sprintf("DELETE FROM system.jobs WHERE id=%d", jobID)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure the GCMutations has not yet been completed.
+	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	if e := 1; e != len(tableDesc.GetGCMutations()) {
+		t.Fatalf("e = %d, v = %d", e, len(tableDesc.GetGCMutations()))
+	}
+
+	// Enable async schema change processing for purged schema changes.
+	atomic.StoreUint32(&enableAsyncSchemaChanges, 1)
+
+	// Add immediate GC TTL to allow index creation purge to complete.
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure that GC mutations that cannot find their job will eventually be
+	// cleared.
+	testutils.SucceedsSoon(t, func() error {
+		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+		if len(tableDesc.GetGCMutations()) > 0 {
+			return errors.Errorf("%d gc mutations remaining", len(tableDesc.GetGCMutations()))
+		}
+		return nil
+	})
 }
 
 // TestMultipleRevert starts a schema change then cancels it. After the canceled
@@ -6083,7 +6231,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 INSERT INTO t.test VALUES (1, 2), (2, 2);
 `)
 		require.NoError(t, err)
-		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 		// Add a zone config for the table.
 		_, err = sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID())
 		require.NoError(t, err)
@@ -6351,7 +6499,7 @@ CREATE INDEX i ON t.test (a) WHERE b > 2
 		t.Fatal(err)
 	}
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	index, err := tableDesc.FindIndexWithName("i")
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
@@ -6369,6 +6517,61 @@ CREATE INDEX i ON t.test (a) WHERE b > 2
 	if numKeys != expectedNumKeys {
 		t.Errorf("partial index contains an incorrect number of keys: expected %d, but found %d", expectedNumKeys, numKeys)
 	}
+}
+
+// TestDrainingNamesCannotBeResolved tests that during the draining names state
+// for renamed descriptors, old names cannot be used via the uncached name
+// resolution path.
+func TestDrainingNamesCannotBeResolved(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		// Don't drain names. This also means that we don't wait for leases to
+		// drain before returning, which is fine since we're testing the non-
+		// leased name resolution path.
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			SchemaChangeJobNoOp: func() bool { return true },
+		},
+		SQLTypeSchemaChanger: &sql.TypeSchemaChangerTestingKnobs{
+			TypeSchemaChangeJobNoOp: func() bool { return true },
+		},
+	}
+
+	ctx := context.Background()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+
+	// Create descriptors and rename them so that the old names get stuck as
+	// draining names.
+	sqlRun.Exec(t, `
+CREATE TABLE tbl();
+ALTER TABLE tbl RENAME TO tbl2;
+
+CREATE TYPE typ AS ENUM();
+ALTER TYPE typ RENAME TO typ2;
+
+CREATE SCHEMA sc;
+ALTER SCHEMA sc RENAME TO sc2;
+
+CREATE DATABASE db;
+ALTER DATABASE db RENAME TO db2;
+`)
+
+	// Ensure that the old namespace entries still exist.
+	sqlRun.CheckQueryResults(t, `SELECT count(*) FROM system.namespace WHERE name = 'tbl'`, [][]string{{"1"}})
+	sqlRun.CheckQueryResults(t, `SELECT count(*) FROM system.namespace WHERE name = 'typ'`, [][]string{{"1"}})
+	sqlRun.CheckQueryResults(t, `SELECT count(*) FROM system.namespace WHERE name = 'sc'`, [][]string{{"1"}})
+	sqlRun.CheckQueryResults(t, `SELECT count(*) FROM system.namespace WHERE name = 'db'`, [][]string{{"1"}})
+
+	// Test uncached name resolution by attempting schema changes. As of 20.2 we
+	// have some internal inconsistency in error messages.
+	sqlRun.ExpectErr(t, `relation "tbl" does not exist`, `ALTER TABLE tbl RENAME TO tbl3`)
+	sqlRun.ExpectErr(t, `type "typ" does not exist`, `ALTER TYPE typ RENAME TO typ3`)
+	sqlRun.ExpectErr(t, `unknown schema "sc"`, `ALTER SCHEMA sc RENAME TO sc3`)
+	sqlRun.ExpectErr(t, `database "db" does not exist`, `ALTER DATABASE db RENAME TO db3`)
 }
 
 // TestAddingTableResolution tests that table names cannot be resolved in the
@@ -6466,7 +6669,7 @@ func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 		jobsErrGroup.Go(func() error {
 			return testutils.SucceedsSoonError(func() error {
 				return sqlDB.QueryRow(`
-SELECT job_id FROM crdb_internal.jobs
+SELECT job_id FROM crdb_internal.jobs 
  WHERE description LIKE '%` + idxName + `%'`).Scan(&jobIDs[i])
 			})
 		})
@@ -6554,7 +6757,7 @@ func TestCancelMultipleQueued(t *testing.T) {
 		jobsErrGroup.Go(func() error {
 			return testutils.SucceedsSoonError(func() error {
 				return sqlDB.QueryRow(`
-SELECT job_id FROM crdb_internal.jobs
+SELECT job_id FROM crdb_internal.jobs 
  WHERE description LIKE '%` + idxName + `%'`).Scan(&jobIDs[i])
 			})
 		})
@@ -7334,114 +7537,54 @@ func TestJobsWithoutMutationsAreCancelable(t *testing.T) {
 	require.Equal(t, scJobID, id)
 }
 
-func TestShardColumnConstraintSkipValidation(t *testing.T) {
+// TestMemoryMonitorErrorsDuringBackfillAreRetried tests that we properly classify memory
+// monitor errors as retriable. It's a regression test to ensure that we don't end up
+// trying to revert schema changes which encounter such errors. Prior to the commit which
+// added this test, these errors would result in failures which looked like:
+//
+//  reversing schema change \d+ due to irrecoverable error: memory budget exceeded: 1 bytes requested, 2 currently allocated, 2 bytes in budget
+func TestMemoryMonitorErrorsDuringBackfillAreRetried(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	constraintsToValidate := make(chan []catalog.ConstraintToUpdate, 1)
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeConstraintValidation: func(constraints []catalog.ConstraintToUpdate) error {
-				constraintsToValidate <- constraints
-				return nil
+	// Run across both nodes to make sure that the error makes it across distsql
+	// boundaries.
+	testutils.RunTrueAndFalse(t, "local", func(t *testing.T, local bool) {
+		var shouldFail int64
+		knobs := &execinfra.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				switch atomic.AddInt64(&shouldFail, 1) {
+				case 1:
+					return mon.MemoryResource.NewBudgetExceededError(1, 2, 2)
+				case 2:
+					return mon.DiskResource.NewBudgetExceededError(1, 3, 3)
+				default:
+					return nil
+				}
 			},
-		},
-	}
-
-	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-	tdb := sqlutils.MakeSQLRunner(sqlDB)
-
-	tdb.Exec(t, `
-CREATE DATABASE t;
-CREATE TABLE t.test(a INT PRIMARY KEY, b INT NOT NULL);
-INSERT INTO t.test VALUES (1, 2);
-`,
-	)
-
-	// Make sure non-shard column constraint is validated.
-	tdb.Exec(t, `ALTER TABLE t.test ADD CONSTRAINT check_b_positive CHECK (b > 0);`)
-	require.Len(t, <-constraintsToValidate, 1)
-
-	// Make sure shard column constraint is not validated.
-	tdb.Exec(t, `
-SET experimental_enable_hash_sharded_indexes = ON;
-CREATE INDEX ON t.test (b) USING HASH WITH (bucket_count=8);
-`,
-	)
-	require.Len(t, constraintsToValidate, 0)
-}
-
-func TestHashShardedIndexRangePreSplit(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-
-	getShardedIndexRanges := func(tableDesc *tabledesc.Mutable, kvDB *kv.DB, codec keys.SQLCodec) ([]kv.KeyValue, error) {
-		indexSpan := tableDesc.IndexSpan(codec, descpb.IndexID(2))
-		ranges, err := kvDB.Scan(
-			ctx,
-			keys.RangeMetaKey(keys.MustAddr(indexSpan.Key)),
-			keys.RangeMetaKey(keys.MustAddr(indexSpan.EndKey)),
-
-			100,
-		)
-		if err != nil {
-			return nil, err
 		}
-		return ranges, nil
-	}
 
-	var runBeforePreSplitting func(tbl *tabledesc.Mutable, kvDB *kv.DB, codec keys.SQLCodec) error
-	var runAfterPreSplitting func(tbl *tabledesc.Mutable, kvDB *kv.DB, codec keys.SQLCodec) error
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeHashShardedIndexRangePreSplit: func(tbl *tabledesc.Mutable, kvDB *kv.DB, codec keys.SQLCodec) error {
-				return runBeforePreSplitting(tbl, kvDB, codec)
+		var dataNode, otherNode int
+		if local {
+			dataNode, otherNode = 0, 1
+		} else {
+			dataNode, otherNode = 1, 0
+		}
+		tca := base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgsPerNode: map[int]base.TestServerArgs{
+				otherNode: {},
+				dataNode:  {Knobs: base.TestingKnobs{DistSQL: knobs}},
 			},
-			RunAfterHashShardedIndexRangePreSplit: func(tbl *tabledesc.Mutable, kvDB *kv.DB, codec keys.SQLCodec) error {
-				return runAfterPreSplitting(tbl, kvDB, codec)
-			},
-		},
-	}
-
-	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-	tdb := sqlutils.MakeSQLRunner(sqlDB)
-
-	tdb.Exec(t, `
-CREATE DATABASE t;
-CREATE TABLE t.test_split(a INT PRIMARY KEY, b INT NOT NULL);
-`,
-	)
-
-	runBeforePreSplitting = func(tableDesc *tabledesc.Mutable, kvDB *kv.DB, codec keys.SQLCodec) error {
-		ranges, err := getShardedIndexRanges(tableDesc, kvDB, codec)
-		if err != nil {
-			return err
 		}
-		if len(ranges) != 0 {
-			return errors.Newf("expected 0 ranges but found %d", len(ranges))
-		}
-		return nil
-	}
-
-	runAfterPreSplitting = func(tableDesc *tabledesc.Mutable, kvDB *kv.DB, codec keys.SQLCodec) error {
-		ranges, err := getShardedIndexRanges(tableDesc, kvDB, codec)
-		if err != nil {
-			return err
-		}
-		if len(ranges) != 8 {
-			return errors.Newf("expected 8 ranges but found %d", len(ranges))
-		}
-		return nil
-	}
-
-	tdb.Exec(t, `
-SET experimental_enable_hash_sharded_indexes = on;
-CREATE INDEX idx_test_split_b ON t.test_split (b) USING HASH WITH (bucket_count=8);
-`)
+		tc := testcluster.StartTestCluster(t, 2, tca)
+		defer tc.Stopper().Stop(ctx)
+		tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+		tdb.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
+		tdb.Exec(t, "INSERT INTO foo VALUES (1)")
+		tdb.Exec(t, `ALTER TABLE foo EXPERIMENTAL_RELOCATE SELECT ARRAY[$1], 1`,
+			tc.Server(dataNode).GetFirstStoreID())
+		tdb.Exec(t, `ALTER TABLE foo ADD COLUMN j INT NOT NULL DEFAULT 42`)
+	})
 }
