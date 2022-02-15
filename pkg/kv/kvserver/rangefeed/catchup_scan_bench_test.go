@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors/oserror"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
@@ -45,33 +44,29 @@ func runCatchUpBenchmark(b *testing.B, emk engineMaker, opts benchOptions) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		func() {
-			iter := rangefeed.NewCatchUpIterator(eng, &roachpb.RangeFeedRequest{
-				Header: roachpb.Header{
-					Timestamp: opts.ts,
-				},
-				WithDiff: opts.withDiff,
-				Span:     span,
-			}, opts.useTBI, func() {})
-			defer iter.Close()
-			counter := 0
-			err := iter.CatchUpScan(storage.MakeMVCCMetadataKey(startKey), storage.MakeMVCCMetadataKey(endKey), opts.ts, opts.withDiff, func(*roachpb.RangeFeedEvent) error {
-				counter++
-				return nil
-			})
-			if err != nil {
-				b.Fatalf("failed catchUp scan: %+v", err)
-			}
-			if counter < 1 {
-				b.Fatalf("didn't emit any events!")
-			}
-		}()
+		iter := rangefeed.NewCatchUpIterator(eng, &roachpb.RangeFeedRequest{
+			Header: roachpb.Header{
+				Timestamp: opts.ts,
+			},
+			WithDiff: opts.withDiff,
+			Span:     span,
+		}, opts.useTBI, func() {})
+		defer iter.Close()
+		counter := 0
+		err := iter.CatchUpScan(storage.MakeMVCCMetadataKey(startKey), storage.MakeMVCCMetadataKey(endKey), opts.ts, opts.withDiff, func(*roachpb.RangeFeedEvent) error {
+			counter++
+			return nil
+		})
+		if err != nil {
+			b.Fatalf("failed catchUp scan: %+v", err)
+		}
+		if counter < 1 {
+			b.Fatalf("didn't emit any events!")
+		}
 	}
 }
 
 func BenchmarkCatchUpScan(b *testing.B) {
-	defer log.Scope(b).Close(b)
-
 	numKeys := 1_000_000
 	valueBytes := 64
 
@@ -188,7 +183,6 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 	opts.FS = vfs.Default
 	opts.LBaseMaxBytes = lBaseMaxBytes
 	opts.ReadOnly = readOnly
-	opts.FormatMajorVersion = pebble.FormatBlockPropertyCollector
 	peb, err := storage.NewPebble(
 		context.Background(),
 		storage.PebbleConfig{

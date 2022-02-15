@@ -13,7 +13,6 @@ package storage
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -48,10 +47,9 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
-	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 )
 
 const maxSyncDurationFatalOnExceededDefault = true
@@ -62,7 +60,6 @@ var maxSyncDurationDefault = envutil.EnvOrDefaultDuration("COCKROACH_ENGINE_MAX_
 // MaxSyncDuration is the threshold above which an observed engine sync duration
 // triggers either a warning or a fatal error.
 var MaxSyncDuration = settings.RegisterDurationSetting(
-	settings.TenantWritable,
 	"storage.max_sync_duration",
 	"maximum duration for disk operations; any operations that take longer"+
 		" than this setting trigger a warning log entry or process crash",
@@ -72,7 +69,6 @@ var MaxSyncDuration = settings.RegisterDurationSetting(
 // MaxSyncDurationFatalOnExceeded governs whether disk stalls longer than
 // MaxSyncDuration fatal the Cockroach process. Defaults to true.
 var MaxSyncDurationFatalOnExceeded = settings.RegisterBoolSetting(
-	settings.TenantWritable,
 	"storage.max_sync_duration.fatal.enabled",
 	"if true, fatal the process when a disk operation exceeds storage.max_sync_duration",
 	maxSyncDurationFatalOnExceededDefault,
@@ -93,15 +89,9 @@ func EngineKeyCompare(a, b []byte) int {
 		return bytes.Compare(a, b)
 	}
 
-	// Compute the index of the separator between the key and the version. If the
-	// separator is found to be at -1 for both keys, then we are comparing bare
-	// suffixes without a user key part. Pebble requires bare suffixes to be
-	// comparable with the same ordering as if they had a common user key.
+	// Compute the index of the separator between the key and the version.
 	aSep := aEnd - int(a[aEnd])
 	bSep := bEnd - int(b[bEnd])
-	if aSep == -1 && bSep == -1 {
-		aSep, bSep = 0, 0 // comparing bare suffixes
-	}
 	if aSep < 0 || bSep < 0 {
 		// This should never happen unless there is some sort of corruption of
 		// the keys.
@@ -233,14 +223,6 @@ var MVCCMerger = &pebble.Merger{
 	},
 }
 
-// TODO(sumeer): consider removing pebbleTimeBoundPropCollector for the 22.2
-// release, since 22.1 nodes will be using BlockPropertyCollectors and there
-// shouldn't be significant sstables that do not get rewritten for 6 months
-// (we would have no time bound optimization for such sstables). Since it is
-// possible for users to upgrade to 22.1 and then to 22.2 in quick succession
-// this duration argument is not really valid. To be safe we could wait until
-// 23.1.
-
 // pebbleTimeBoundPropCollector implements a property collector for MVCC
 // Timestamps. Its behavior matches TimeBoundTblPropCollector in
 // table_props.cc.
@@ -257,12 +239,6 @@ var MVCCMerger = &pebble.Merger{
 // the timestamp both in the intent and in the timestamped record that
 // immediately follows it, we only need to unmarshal the MVCCMetadata if it is
 // the last key in the sstable.
-// The metadata unmarshaling logic discussed in the previous paragraph is
-// flawed (see the comment
-// https://github.com/cockroachdb/cockroach/issues/43799#issuecomment-576830234
-// and its preceding comment), and we've worked around it as indicated in that
-// issue. Due to that workaround, we need not unmarshal the metadata record at
-// all.
 type pebbleTimeBoundPropCollector struct {
 	min, max  []byte
 	lastValue []byte
@@ -295,7 +271,7 @@ func (t *pebbleTimeBoundPropCollector) Finish(userProps map[string]string) error
 			return nil //nolint:returnerrcheck
 		}
 		if meta.Txn != nil {
-			ts := encodeMVCCTimestamp(meta.Timestamp.ToTimestamp())
+			ts := encodeTimestamp(meta.Timestamp.ToTimestamp())
 			t.updateBounds(ts)
 		}
 	}
@@ -320,15 +296,6 @@ func (t *pebbleTimeBoundPropCollector) Name() string {
 	return "TimeBoundTblPropCollectorFactory"
 }
 
-func (t *pebbleTimeBoundPropCollector) UpdateKeySuffixes(
-	oldProps map[string]string, oldSuffix []byte, newSuffix []byte,
-) error {
-	t.updateBounds(newSuffix)
-	return nil
-}
-
-var _ sstable.SuffixReplaceableTableCollector = (*pebbleTimeBoundPropCollector)(nil)
-
 // pebbleDeleteRangeCollector is the equivalent table collector as the RocksDB
 // DeleteRangeTblPropCollector. Pebble does not require it because Pebble will
 // prioritize its own compactions of range tombstones.
@@ -348,130 +315,10 @@ func (pebbleDeleteRangeCollector) Name() string {
 	return "DeleteRangeTblPropCollectorFactory"
 }
 
-func (t *pebbleDeleteRangeCollector) UpdateKeySuffixes(
-	_ map[string]string, _ []byte, _ []byte,
-) error {
-	return nil
-}
-
-var _ sstable.SuffixReplaceableTableCollector = (*pebbleTimeBoundPropCollector)(nil)
-
 // PebbleTablePropertyCollectors is the list of Pebble TablePropertyCollectors.
 var PebbleTablePropertyCollectors = []func() pebble.TablePropertyCollector{
 	func() pebble.TablePropertyCollector { return &pebbleTimeBoundPropCollector{} },
 	func() pebble.TablePropertyCollector { return &pebbleDeleteRangeCollector{} },
-}
-
-// pebbleDataBlockMVCCTimeIntervalCollector provides an implementation of
-// pebble.DataBlockIntervalCollector that is used to construct a
-// pebble.BlockPropertyCollector. This provides per-block filtering, which
-// also gets aggregated to the sstable-level and filters out sstables. It must
-// only be used for MVCCKeyIterKind iterators, since it will ignore
-// blocks/sstables that contain intents (and any other key that is not a real
-// MVCC key).
-type pebbleDataBlockMVCCTimeIntervalCollector struct {
-	// min, max are the encoded timestamps.
-	min, max []byte
-}
-
-var _ sstable.DataBlockIntervalCollector = &pebbleDataBlockMVCCTimeIntervalCollector{}
-var _ sstable.SuffixReplaceableBlockCollector = (*pebbleDataBlockMVCCTimeIntervalCollector)(nil)
-
-func (tc *pebbleDataBlockMVCCTimeIntervalCollector) Add(key pebble.InternalKey, _ []byte) error {
-	return tc.add(key.UserKey)
-}
-
-// add collects the given slice in the collector. The slice may be an entire
-// encoded MVCC key, or the bare suffix of an encoded key.
-func (tc *pebbleDataBlockMVCCTimeIntervalCollector) add(b []byte) error {
-	if len(b) == 0 {
-		return nil
-	}
-	// Last byte is the version length + 1 when there is a version,
-	// else it is 0.
-	versionLen := int(b[len(b)-1])
-	if versionLen == 0 {
-		// This is not an MVCC key that we can collect.
-		return nil
-	}
-	// prefixPartEnd points to the sentinel byte, unless this is a bare suffix, in
-	// which case the index is -1.
-	prefixPartEnd := len(b) - 1 - versionLen
-	// Sanity check: the index should be >= -1. Additionally, if the index is >=
-	// 0, it should point to the sentinel byte, as this is a full EngineKey.
-	if prefixPartEnd < -1 || (prefixPartEnd >= 0 && b[prefixPartEnd] != sentinel) {
-		return errors.Errorf("invalid key %s", roachpb.Key(b).String())
-	}
-	// We don't need the last byte (the version length).
-	versionLen--
-	// Only collect if this looks like an MVCC timestamp.
-	if versionLen == engineKeyVersionWallTimeLen ||
-		versionLen == engineKeyVersionWallAndLogicalTimeLen ||
-		versionLen == engineKeyVersionWallLogicalAndSyntheticTimeLen {
-		// INVARIANT: -1 <= prefixPartEnd < len(b) - 1.
-		// Version consists of the bytes after the sentinel and before the length.
-		b = b[prefixPartEnd+1 : len(b)-1]
-		// Lexicographic comparison on the encoded timestamps is equivalent to the
-		// comparison on decoded timestamps, so delay decoding.
-		if len(tc.min) == 0 || bytes.Compare(b, tc.min) < 0 {
-			tc.min = append(tc.min[:0], b...)
-		}
-		if len(tc.max) == 0 || bytes.Compare(b, tc.max) > 0 {
-			tc.max = append(tc.max[:0], b...)
-		}
-	}
-	return nil
-}
-
-func decodeWallTime(ts []byte) uint64 {
-	return binary.BigEndian.Uint64(ts[0:engineKeyVersionWallTimeLen])
-}
-
-func (tc *pebbleDataBlockMVCCTimeIntervalCollector) FinishDataBlock() (
-	lower uint64,
-	upper uint64,
-	err error,
-) {
-	if len(tc.min) == 0 {
-		// No calls to Add that contained a timestamped key.
-		return 0, 0, nil
-	}
-	// Construct a [lower, upper) walltime that will contain all the
-	// hlc.Timestamps in this block.
-	lower = decodeWallTime(tc.min)
-	// Remember that we have to reset tc.min and tc.max to get ready for the
-	// next data block, as specified in the DataBlockIntervalCollector interface
-	// help and help too.
-	tc.min = tc.min[:0]
-	// The actual value encoded into walltime is an int64, so +1 will not
-	// overflow.
-	upper = decodeWallTime(tc.max) + 1
-	tc.max = tc.max[:0]
-	if lower >= upper {
-		return 0, 0,
-			errors.Errorf("corrupt timestamps lower %d >= upper %d", lower, upper)
-	}
-	return lower, upper, nil
-}
-
-func (tc *pebbleDataBlockMVCCTimeIntervalCollector) UpdateKeySuffixes(
-	_ []byte, _, newSuffix []byte,
-) error {
-	return tc.add(newSuffix)
-}
-
-const mvccWallTimeIntervalCollector = "MVCCTimeInterval"
-
-// PebbleBlockPropertyCollectors is the list of functions to construct
-// BlockPropertyCollectors.
-var PebbleBlockPropertyCollectors = []func() pebble.BlockPropertyCollector{
-	func() pebble.BlockPropertyCollector {
-		return sstable.NewBlockIntervalCollector(
-			mvccWallTimeIntervalCollector,
-			&pebbleDataBlockMVCCTimeIntervalCollector{}, /* points */
-			nil, /* ranges */
-		)
-	},
 }
 
 // DefaultPebbleOptions returns the default pebble options.
@@ -495,7 +342,6 @@ func DefaultPebbleOptions() *pebble.Options {
 		MemTableStopWritesThreshold: 4,
 		Merger:                      MVCCMerger,
 		TablePropertyCollectors:     PebbleTablePropertyCollectors,
-		BlockPropertyCollectors:     PebbleBlockPropertyCollectors,
 	}
 	// Automatically flush 10s after the first range tombstone is added to a
 	// memtable. This ensures that we can reclaim space even when there's no
@@ -505,6 +351,13 @@ func DefaultPebbleOptions() *pebble.Options {
 	// SSDs, that kick off an expensive GC if a lot of files are deleted at
 	// once.
 	opts.Experimental.MinDeletionRate = 128 << 20 // 128 MB
+	// Disable read sampling and by extension read-triggered compactions. Read-
+	// triggered compactions are known to cause excessively high write
+	// amplification on some read heavy workloads. See:
+	// https://github.com/cockroachdb/pebble/issues/1143
+	//
+	// TODO(bilal): Remove this line when the above issue is addressed.
+	opts.Experimental.ReadSamplingMultiplier = -1
 	// Validate min/max keys in each SSTable when performing a compaction. This
 	// serves as a simple protection against corruption or programmer-error in
 	// Pebble.
@@ -551,6 +404,10 @@ func DefaultPebbleOptions() *pebble.Options {
 	if diskHealthCheckInterval.Seconds() > maxSyncDurationDefault.Seconds() {
 		diskHealthCheckInterval = maxSyncDurationDefault
 	}
+	// If we encounter ENOSPC, exit with an informative exit code.
+	opts.FS = vfs.OnDiskFull(opts.FS, func() {
+		exit.WithCode(exit.DiskFull())
+	})
 	// Instantiate a file system with disk health checking enabled. This FS wraps
 	// vfs.Default, and can be wrapped for encryption-at-rest.
 	opts.FS = vfs.WithDiskHealthChecks(vfs.Default, diskHealthCheckInterval,
@@ -560,10 +417,6 @@ func DefaultPebbleOptions() *pebble.Options {
 				Duration: duration,
 			})
 		})
-	// If we encounter ENOSPC, exit with an informative exit code.
-	opts.FS = vfs.OnDiskFull(opts.FS, func() {
-		exit.WithCode(exit.DiskFull())
-	})
 	return opts
 }
 
@@ -617,7 +470,6 @@ type Pebble struct {
 	ballastSize int64
 	maxSize     int64
 	attrs       roachpb.Attributes
-	properties  roachpb.StoreProperties
 	// settings must be non-nil if this Pebble instance will be used to write
 	// intents.
 	settings     *cluster.Settings
@@ -629,6 +481,9 @@ type Pebble struct {
 	writeStallCount int64
 	diskSlowCount   int64
 	diskStallCount  int64
+
+	// Copied from testing knobs.
+	disableSeparatedIntents bool
 
 	// Relevant options copied over from pebble.Options.
 	fs            vfs.FS
@@ -653,6 +508,13 @@ type EncryptionEnv struct {
 	FS vfs.FS
 	// StatsHandler exposes encryption-at-rest state for observability.
 	StatsHandler EncryptionStatsHandler
+	// UpgradeVersion is a temporary field that allows Pebble to inform
+	// low-level encryption-at-rest machinery that the CockroachDB 21.2
+	// version has been finalized, and it's okay to begin writing in a
+	// backwards in-compatible format.
+	//
+	// TODO(jackson): Remove this in 22.1.
+	UpgradeVersion func() error
 }
 
 var _ Engine = &Pebble{}
@@ -748,7 +610,7 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 	}
 	ballastPath := base.EmergencyBallastFile(cfg.Opts.FS.PathJoin, cfg.Dir)
 
-	// For some purposes, we want to always use an unencrypted
+	// For some purposes, we want to always use an unecrypted
 	// filesystem. The call below to ResolveEncryptedEnvOptions will
 	// replace cfg.Opts.FS with a VFS wrapped with encryption-at-rest if
 	// necessary. Before we do that, save a handle on the unencrypted
@@ -799,24 +661,22 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 		}
 	}
 
-	storeProps := computeStoreProperties(ctx, cfg.Dir, cfg.Opts.ReadOnly, env != nil /* encryptionEnabled */)
-
 	p := &Pebble{
-		readOnly:         cfg.Opts.ReadOnly,
-		path:             cfg.Dir,
-		auxDir:           auxDir,
-		ballastPath:      ballastPath,
-		ballastSize:      cfg.BallastSize,
-		maxSize:          cfg.MaxSize,
-		attrs:            cfg.Attrs,
-		properties:       storeProps,
-		settings:         cfg.Settings,
-		encryption:       env,
-		fileRegistry:     fileRegistry,
-		fs:               cfg.Opts.FS,
-		unencryptedFS:    unencryptedFS,
-		logger:           cfg.Opts.Logger,
-		storeIDPebbleLog: storeIDContainer,
+		readOnly:                cfg.Opts.ReadOnly,
+		path:                    cfg.Dir,
+		auxDir:                  auxDir,
+		ballastPath:             ballastPath,
+		ballastSize:             cfg.BallastSize,
+		maxSize:                 cfg.MaxSize,
+		attrs:                   cfg.Attrs,
+		settings:                cfg.Settings,
+		encryption:              env,
+		fileRegistry:            fileRegistry,
+		fs:                      cfg.Opts.FS,
+		unencryptedFS:           unencryptedFS,
+		logger:                  cfg.Opts.Logger,
+		storeIDPebbleLog:        storeIDContainer,
+		disableSeparatedIntents: cfg.DisableSeparatedIntents,
 	}
 	cfg.Opts.EventListener = pebble.TeeEventListener(
 		pebble.MakeLoggingEventListener(pebbleLogger{
@@ -826,7 +686,7 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 		p.makeMetricEventListener(ctx),
 	)
 	p.eventListener = &cfg.Opts.EventListener
-	p.wrappedIntentWriter = wrapIntentWriter(ctx, p)
+	p.wrappedIntentWriter = wrapIntentWriter(ctx, p, cfg.DisableSeparatedIntents)
 
 	// Read the current store cluster version.
 	storeClusterVersion, err := getMinVersion(unencryptedFS, cfg.Dir)
@@ -914,12 +774,19 @@ func (p *Pebble) Close() {
 		return
 	}
 	p.closed = true
-	_ = p.db.Close()
+	err := p.db.Close()
 	if p.fileRegistry != nil {
-		_ = p.fileRegistry.Close()
+		if err2 := p.fileRegistry.Close(); err2 != nil {
+			err = errors.CombineErrors(err, err2)
+		}
 	}
 	if p.encryption != nil {
-		_ = p.encryption.Closer.Close()
+		if err2 := p.encryption.Closer.Close(); err != nil {
+			err = errors.CombineErrors(err, err2)
+		}
+	}
+	if err != nil {
+		p.logger.Fatalf("closing engine: %v", err)
 	}
 }
 
@@ -930,11 +797,21 @@ func (p *Pebble) Closed() bool {
 
 // ExportMVCCToSst is part of the engine.Reader interface.
 func (p *Pebble) ExportMVCCToSst(
-	ctx context.Context, exportOptions ExportOptions, dest io.Writer,
+	ctx context.Context,
+	startKey, endKey roachpb.Key,
+	startTS, endTS hlc.Timestamp,
+	firstKeyTS hlc.Timestamp,
+	exportAllRevisions bool,
+	targetSize, maxSize uint64,
+	stopMidKey bool,
+	useTBI bool,
+	dest io.Writer,
 ) (roachpb.BulkOpSummary, roachpb.Key, hlc.Timestamp, error) {
 	r := wrapReader(p)
 	// Doing defer r.Free() does not inline.
-	summary, k, err := pebbleExportToSst(ctx, r, exportOptions, dest)
+	maxIntentCount := MaxIntentsPerWriteIntentError.Get(&p.settings.SV)
+	summary, k, err := pebbleExportToSst(ctx, r, MVCCKey{Key: startKey, Timestamp: firstKeyTS}, endKey, startTS, endTS,
+		exportAllRevisions, targetSize, maxSize, stopMidKey, useTBI, dest, maxIntentCount)
 	r.Free()
 	return summary, k.Key, k.Timestamp, err
 }
@@ -998,13 +875,12 @@ func (p *Pebble) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) MVCCIt
 		}
 		return iter
 	}
-
-	iter := newPebbleIterator(p.db, nil, opts)
+	iter := MVCCIterator(newPebbleIterator(p.db, nil, opts))
 	if iter == nil {
 		panic("couldn't create a new iterator")
 	}
 	if util.RaceEnabled {
-		return wrapInUnsafeIter(iter)
+		iter = wrapInUnsafeIter(iter)
 	}
 	return iter
 }
@@ -1061,9 +937,12 @@ func (p *Pebble) ClearUnversioned(key roachpb.Key) error {
 }
 
 // ClearIntent implements the Engine interface.
-func (p *Pebble) ClearIntent(key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID) error {
-	_, err := p.wrappedIntentWriter.ClearIntent(key, txnDidNotUpdateMeta, txnUUID, nil)
-	return err
+func (p *Pebble) ClearIntent(
+	key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+) (int, error) {
+	_, separatedIntentCountDelta, err :=
+		p.wrappedIntentWriter.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID, nil)
+	return separatedIntentCountDelta, err
 }
 
 // ClearEngineKey implements the Engine interface.
@@ -1078,7 +957,7 @@ func (p *Pebble) clear(key MVCCKey) error {
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
-	return p.db.Delete(EncodeMVCCKey(key), pebble.Sync)
+	return p.db.Delete(EncodeKey(key), pebble.Sync)
 }
 
 // SingleClearEngineKey implements the Engine interface.
@@ -1107,8 +986,8 @@ func (p *Pebble) ClearMVCCRange(start, end MVCCKey) error {
 }
 
 func (p *Pebble) clearRange(start, end MVCCKey) error {
-	bufStart := EncodeMVCCKey(start)
-	bufEnd := EncodeMVCCKey(end)
+	bufStart := EncodeKey(start)
+	bufEnd := EncodeKey(end)
 	return p.db.DeleteRange(bufStart, bufEnd, pebble.Sync)
 }
 
@@ -1129,7 +1008,7 @@ func (p *Pebble) Merge(key MVCCKey, value []byte) error {
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
-	return p.db.Merge(EncodeMVCCKey(key), value, pebble.Sync)
+	return p.db.Merge(EncodeKey(key), value, pebble.Sync)
 }
 
 // PutMVCC implements the Engine interface.
@@ -1147,10 +1026,17 @@ func (p *Pebble) PutUnversioned(key roachpb.Key, value []byte) error {
 
 // PutIntent implements the Engine interface.
 func (p *Pebble) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
-) error {
-	_, err := p.wrappedIntentWriter.PutIntent(ctx, key, value, txnUUID, nil)
-	return err
+	ctx context.Context,
+	key roachpb.Key,
+	value []byte,
+	state PrecedingIntentState,
+	txnDidNotUpdateMeta bool,
+	txnUUID uuid.UUID,
+) (int, error) {
+
+	_, separatedIntentCountDelta, err :=
+		p.wrappedIntentWriter.PutIntent(ctx, key, value, state, txnDidNotUpdateMeta, txnUUID, nil)
+	return separatedIntentCountDelta, err
 }
 
 // PutEngineKey implements the Engine interface.
@@ -1161,11 +1047,21 @@ func (p *Pebble) PutEngineKey(key EngineKey, value []byte) error {
 	return p.db.Set(key.Encode(), value, pebble.Sync)
 }
 
+// OverrideTxnDidNotUpdateMetaToFalse implements the Engine interface.
+func (p *Pebble) OverrideTxnDidNotUpdateMetaToFalse(ctx context.Context) bool {
+	return overrideTxnDidNotUpdateMetaToFalse(ctx, p.settings)
+}
+
+// IsSeparatedIntentsEnabledForTesting implements the Engine interface.
+func (p *Pebble) IsSeparatedIntentsEnabledForTesting(ctx context.Context) bool {
+	return !p.disableSeparatedIntents
+}
+
 func (p *Pebble) put(key MVCCKey, value []byte) error {
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
-	return p.db.Set(EncodeMVCCKey(key), value, pebble.Sync)
+	return p.db.Set(EncodeKey(key), value, pebble.Sync)
 }
 
 // LogData implements the Engine interface.
@@ -1181,11 +1077,6 @@ func (p *Pebble) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails
 // Attrs implements the Engine interface.
 func (p *Pebble) Attrs() roachpb.Attributes {
 	return p.attrs
-}
-
-// Properties implements the Engine interface.
-func (p *Pebble) Properties() roachpb.StoreProperties {
-	return p.properties
 }
 
 // Capacity implements the Engine interface.
@@ -1414,7 +1305,9 @@ func (p *Pebble) GetAuxiliaryDir() string {
 
 // NewBatch implements the Engine interface.
 func (p *Pebble) NewBatch() Batch {
-	return newPebbleBatch(p.db, p.db.NewIndexedBatch(), false /* writeOnly */)
+	return newPebbleBatch(
+		p.db, p.db.NewIndexedBatch(), false, /* writeOnly */
+		p.disableSeparatedIntents, overrideTxnDidNotUpdateMetaToFalse(context.TODO(), p.settings))
 }
 
 // NewReadOnly implements the Engine interface.
@@ -1424,7 +1317,8 @@ func (p *Pebble) NewReadOnly() ReadWriter {
 
 // NewUnindexedBatch implements the Engine interface.
 func (p *Pebble) NewUnindexedBatch(writeOnly bool) Batch {
-	return newPebbleBatch(p.db, p.db.NewBatch(), writeOnly)
+	return newPebbleBatch(p.db, p.db.NewBatch(), writeOnly, p.disableSeparatedIntents,
+		overrideTxnDidNotUpdateMetaToFalse(context.TODO(), p.settings))
 }
 
 // NewSnapshot implements the Engine interface.
@@ -1461,13 +1355,13 @@ func (p *Pebble) ApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
 
 // Compact implements the Engine interface.
 func (p *Pebble) Compact() error {
-	return p.db.Compact(nil, EncodeMVCCKey(MVCCKeyMax))
+	return p.db.Compact(nil, EncodeKey(MVCCKeyMax))
 }
 
 // CompactRange implements the Engine interface.
 func (p *Pebble) CompactRange(start, end roachpb.Key, forceBottommost bool) error {
-	bufStart := EncodeMVCCKey(MVCCKey{start, hlc.Timestamp{}})
-	bufEnd := EncodeMVCCKey(MVCCKey{end, hlc.Timestamp{}})
+	bufStart := EncodeKey(MVCCKey{start, hlc.Timestamp{}})
+	bufEnd := EncodeKey(MVCCKey{end, hlc.Timestamp{}})
 	return p.db.Compact(bufStart, bufEnd)
 }
 
@@ -1592,13 +1486,13 @@ func (p *Pebble) SetMinVersion(version roachpb.Version) error {
 	formatVers := pebble.FormatMostCompatible
 	// Cases are ordered from newer to older versions.
 	switch {
-	case !version.Less(clusterversion.ByKey(clusterversion.PebbleFormatBlockPropertyCollector)):
-		if formatVers < pebble.FormatBlockPropertyCollector {
-			formatVers = pebble.FormatBlockPropertyCollector
-		}
-	case !version.Less(clusterversion.ByKey(clusterversion.TODOPreV21_2)):
+	case !version.Less(clusterversion.ByKey(clusterversion.PebbleSetWithDelete)):
 		if formatVers < pebble.FormatSetWithDelete {
 			formatVers = pebble.FormatSetWithDelete
+		}
+	case !version.Less(clusterversion.ByKey(clusterversion.PebbleFormatVersioned)):
+		if formatVers < pebble.FormatVersioned {
+			formatVers = pebble.FormatVersioned
 		}
 	}
 	if p.db.FormatMajorVersion() < formatVers {
@@ -1606,7 +1500,32 @@ func (p *Pebble) SetMinVersion(version roachpb.Version) error {
 			return errors.Wrap(err, "ratcheting format major version")
 		}
 	}
+
+	if p.fileRegistry != nil {
+		recordsRegistryCV := clusterversion.ByKey(clusterversion.RecordsBasedRegistry)
+		if !version.Less(recordsRegistryCV) {
+			if err := p.fileRegistry.StopUsingOldRegistry(); err != nil {
+				return err
+			}
+		}
+	}
+	if p.encryption != nil {
+		markerDataKeysRegistryCV := clusterversion.ByKey(clusterversion.MarkerDataKeysRegistry)
+		if !version.Less(markerDataKeysRegistryCV) {
+			if err := p.encryption.UpgradeVersion(); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+// UsingRecordsEncryptionRegistry implements the Engine interface.
+func (p *Pebble) UsingRecordsEncryptionRegistry() (bool, error) {
+	if p.fileRegistry != nil {
+		return p.fileRegistry.UpgradedToRecordsVersion(), nil
+	}
+	return true, nil
 }
 
 // MinVersionIsAtLeastTargetVersion implements the Engine interface.
@@ -1676,13 +1595,16 @@ func (p *pebbleReadOnly) Close() {
 		panic("closing an already-closed pebbleReadOnly")
 	}
 	p.closed = true
-	// Setting iter to nil is sufficient since it will be closed by one of the
-	// subsequent destroy calls.
-	p.iter = nil
 	p.prefixIter.destroy()
 	p.normalIter.destroy()
 	p.prefixEngineIter.destroy()
 	p.normalEngineIter.destroy()
+	if p.iter != nil {
+		if err := p.iter.Close(); err != nil {
+			panic(err)
+		}
+		p.iter = nil
+	}
 
 	pebbleReadOnlyPool.Put(p)
 }
@@ -1693,11 +1615,21 @@ func (p *pebbleReadOnly) Closed() bool {
 
 // ExportMVCCToSst is part of the engine.Reader interface.
 func (p *pebbleReadOnly) ExportMVCCToSst(
-	ctx context.Context, exportOptions ExportOptions, dest io.Writer,
+	ctx context.Context,
+	startKey, endKey roachpb.Key,
+	startTS, endTS hlc.Timestamp,
+	firstKeyTS hlc.Timestamp,
+	exportAllRevisions bool,
+	targetSize, maxSize uint64,
+	stopMidKey bool,
+	useTBI bool,
+	dest io.Writer,
 ) (roachpb.BulkOpSummary, roachpb.Key, hlc.Timestamp, error) {
 	r := wrapReader(p)
 	// Doing defer r.Free() does not inline.
-	summary, k, err := pebbleExportToSst(ctx, r, exportOptions, dest)
+	maxIntentCount := MaxIntentsPerWriteIntentError.Get(&p.parent.settings.SV)
+	summary, k, err := pebbleExportToSst(ctx, r, MVCCKey{Key: startKey, Timestamp: firstKeyTS}, endKey, startTS, endTS,
+		exportAllRevisions, targetSize, maxSize, stopMidKey, useTBI, dest, maxIntentCount)
 	r.Free()
 	return summary, k.Key, k.Timestamp, err
 }
@@ -1869,8 +1801,8 @@ func (p *pebbleReadOnly) ClearUnversioned(key roachpb.Key) error {
 }
 
 func (p *pebbleReadOnly) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) error {
+	key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+) (int, error) {
 	panic("not implemented")
 }
 
@@ -1911,8 +1843,13 @@ func (p *pebbleReadOnly) PutUnversioned(key roachpb.Key, value []byte) error {
 }
 
 func (p *pebbleReadOnly) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
-) error {
+	ctx context.Context,
+	key roachpb.Key,
+	value []byte,
+	state PrecedingIntentState,
+	txnDidNotUpdateMeta bool,
+	txnUUID uuid.UUID,
+) (int, error) {
 	panic("not implemented")
 }
 
@@ -1925,6 +1862,10 @@ func (p *pebbleReadOnly) LogData(data []byte) error {
 }
 
 func (p *pebbleReadOnly) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails) {
+	panic("not implemented")
+}
+
+func (p *pebbleReadOnly) OverrideTxnDidNotUpdateMetaToFalse(ctx context.Context) bool {
 	panic("not implemented")
 }
 
@@ -1950,11 +1891,21 @@ func (p *pebbleSnapshot) Closed() bool {
 
 // ExportMVCCToSst is part of the engine.Reader interface.
 func (p *pebbleSnapshot) ExportMVCCToSst(
-	ctx context.Context, exportOptions ExportOptions, dest io.Writer,
+	ctx context.Context,
+	startKey, endKey roachpb.Key,
+	startTS, endTS hlc.Timestamp,
+	firstKeyTS hlc.Timestamp,
+	exportAllRevisions bool,
+	targetSize, maxSize uint64,
+	stopMidKey bool,
+	useTBI bool,
+	dest io.Writer,
 ) (roachpb.BulkOpSummary, roachpb.Key, hlc.Timestamp, error) {
 	r := wrapReader(p)
 	// Doing defer r.Free() does not inline.
-	summary, k, err := pebbleExportToSst(ctx, r, exportOptions, dest)
+	maxIntentCount := MaxIntentsPerWriteIntentError.Get(&p.settings.SV)
+	summary, k, err := pebbleExportToSst(ctx, r, MVCCKey{Key: startKey, Timestamp: firstKeyTS}, endKey, startTS, endTS,
+		exportAllRevisions, targetSize, maxSize, stopMidKey, useTBI, dest, maxIntentCount)
 	r.Free()
 	return summary, k.Key, k.Timestamp, err
 }
@@ -2075,7 +2026,17 @@ func (e *ExceedMaxSizeError) Error() string {
 }
 
 func pebbleExportToSst(
-	ctx context.Context, reader Reader, options ExportOptions, dest io.Writer,
+	ctx context.Context,
+	reader Reader,
+	startKey MVCCKey,
+	endKey roachpb.Key,
+	startTS, endTS hlc.Timestamp,
+	exportAllRevisions bool,
+	targetSize, maxSize uint64,
+	stopMidKey bool,
+	useTBI bool,
+	dest io.Writer,
+	maxIntentCount int64,
 ) (roachpb.BulkOpSummary, MVCCKey, error) {
 	var span *tracing.Span
 	ctx, span = tracing.ChildSpan(ctx, "pebbleExportToSst")
@@ -2088,29 +2049,29 @@ func pebbleExportToSst(
 	iter := NewMVCCIncrementalIterator(
 		reader,
 		MVCCIncrementalIterOptions{
-			EndKey:                              options.EndKey,
-			EnableTimeBoundIteratorOptimization: options.UseTBI,
-			StartTime:                           options.StartTS,
-			EndTime:                             options.EndTS,
+			EndKey:                              endKey,
+			EnableTimeBoundIteratorOptimization: useTBI,
+			StartTime:                           startTS,
+			EndTime:                             endTS,
 			IntentPolicy:                        MVCCIncrementalIterIntentPolicyAggregate,
 		})
 	defer iter.Close()
 	var curKey roachpb.Key // only used if exportAllRevisions
 	var resumeKey roachpb.Key
 	var resumeTS hlc.Timestamp
-	paginated := options.TargetSize > 0
-	trackKeyBoundary := paginated || options.ResourceLimiter != nil
-	firstIteration := true
-	for iter.SeekGE(options.StartKey); ; {
+	paginated := targetSize > 0
+	for iter.SeekGE(startKey); ; {
 		ok, err := iter.Valid()
 		if err != nil {
+			// This is an underlying iterator error, return it to the caller to deal
+			// with.
 			return roachpb.BulkOpSummary{}, MVCCKey{}, err
 		}
 		if !ok {
 			break
 		}
 		unsafeKey := iter.UnsafeKey()
-		if unsafeKey.Key.Compare(options.EndKey) >= 0 {
+		if unsafeKey.Key.Compare(endKey) >= 0 {
 			break
 		}
 
@@ -2119,62 +2080,35 @@ func pebbleExportToSst(
 		}
 
 		unsafeValue := iter.UnsafeValue()
-		isNewKey := !options.ExportAllRevisions || !unsafeKey.Key.Equal(curKey)
-		if trackKeyBoundary && options.ExportAllRevisions && isNewKey {
+		isNewKey := !exportAllRevisions || !unsafeKey.Key.Equal(curKey)
+		if paginated && exportAllRevisions && isNewKey {
 			curKey = append(curKey[:0], unsafeKey.Key...)
-		}
-
-		if options.ResourceLimiter != nil {
-			// Don't check resources on first iteration to ensure we can make some progress regardless
-			// of starvation. Otherwise operations could spin indefinitely.
-			if firstIteration {
-				firstIteration = false
-			} else {
-				// In happy day case we want to only stop at key boundaries as it allows callers to use
-				// produced sst's directly. But if we can't find key boundary within reasonable number of
-				// iterations we would split mid key.
-				// To achieve that we use soft and hard thresholds in limiter. Once soft limit is reached
-				// we would start searching for key boundary and return as soon as it is reached. If we
-				// can't find it before hard limit is reached and caller requested mid key stop we would
-				// immediately return.
-				limit := options.ResourceLimiter.IsExhausted()
-				// We can stop at key once any threshold is reached or force stop at hard limit if midkey
-				// split is allowed.
-				if limit >= ResourceLimitReachedSoft && isNewKey || limit == ResourceLimitReachedHard && options.StopMidKey {
-					// Reached iteration limit, stop with resume span
-					resumeKey = append(make(roachpb.Key, 0, len(unsafeKey.Key)), unsafeKey.Key...)
-					if !isNewKey {
-						resumeTS = unsafeKey.Timestamp
-					}
-					break
-				}
-			}
 		}
 
 		// Skip tombstone (len=0) records when start time is zero (non-incremental)
 		// and we are not exporting all versions.
-		skipTombstones := !options.ExportAllRevisions && options.StartTS.IsEmpty()
+		skipTombstones := !exportAllRevisions && startTS.IsEmpty()
 		if len(unsafeValue) > 0 || !skipTombstones {
 			if err := rows.Count(unsafeKey.Key); err != nil {
 				return roachpb.BulkOpSummary{}, MVCCKey{}, errors.Wrapf(err, "decoding %s", unsafeKey)
 			}
 			curSize := rows.BulkOpSummary.DataSize
-			reachedTargetSize := curSize > 0 && uint64(curSize) >= options.TargetSize
+			reachedTargetSize := curSize > 0 && uint64(curSize) >= targetSize
 			newSize := curSize + int64(len(unsafeKey.Key)+len(unsafeValue))
-			reachedMaxSize := options.MaxSize > 0 && newSize > int64(options.MaxSize)
+			reachedMaxSize := maxSize > 0 && newSize > int64(maxSize)
 			// When paginating we stop writing in two cases:
 			// - target size is reached and we wrote all versions of a key
 			// - maximum size reached and we are allowed to stop mid key
-			if paginated && (isNewKey && reachedTargetSize || options.StopMidKey && reachedMaxSize) {
+			if paginated && (isNewKey && reachedTargetSize || stopMidKey && reachedMaxSize) {
 				// Allocate the right size for resumeKey rather than using curKey.
 				resumeKey = append(make(roachpb.Key, 0, len(unsafeKey.Key)), unsafeKey.Key...)
-				if options.StopMidKey && !isNewKey {
+				if stopMidKey && !isNewKey {
 					resumeTS = unsafeKey.Timestamp
 				}
 				break
 			}
 			if reachedMaxSize {
-				return roachpb.BulkOpSummary{}, MVCCKey{}, &ExceedMaxSizeError{reached: newSize, maxSize: options.MaxSize}
+				return roachpb.BulkOpSummary{}, MVCCKey{}, &ExceedMaxSizeError{reached: newSize, maxSize: maxSize}
 			}
 			if unsafeKey.Timestamp.IsEmpty() {
 				// This should never be an intent since the incremental iterator returns
@@ -2190,7 +2124,7 @@ func pebbleExportToSst(
 			rows.BulkOpSummary.DataSize = newSize
 		}
 
-		if options.ExportAllRevisions {
+		if exportAllRevisions {
 			iter.Next()
 		} else {
 			iter.NextKey()
@@ -2201,7 +2135,7 @@ func pebbleExportToSst(
 	// If we do it means this export can't complete and is aborted. We need to loop over remaining data
 	// to collect all matching intents before returning them in an error to the caller.
 	if iter.NumCollectedIntents() > 0 {
-		for uint64(iter.NumCollectedIntents()) < options.MaxIntents {
+		for int64(iter.NumCollectedIntents()) < maxIntentCount {
 			iter.NextKey()
 			// If we encounter other errors during intent collection, we return our original write intent failure.
 			// We would find this new error again upon retry.
@@ -2225,4 +2159,12 @@ func pebbleExportToSst(
 	}
 
 	return rows.BulkOpSummary, MVCCKey{Key: resumeKey, Timestamp: resumeTS}, nil
+}
+
+// See the comment for Writer.OverrideTxnDidNotUpdateMetaToFalse.
+func overrideTxnDidNotUpdateMetaToFalse(ctx context.Context, st *cluster.Settings) bool {
+	// The fix to the single delete bug in 21.2 has nothing to do with
+	// PebbleFormatVersioned, but both are part of the 21.2 beta, which will be
+	// the earliest production version of 21.2.
+	return !st.Version.ActiveVersionOrEmpty(ctx).IsActive(clusterversion.PebbleFormatVersioned)
 }
