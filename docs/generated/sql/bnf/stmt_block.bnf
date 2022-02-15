@@ -243,6 +243,7 @@ show_stmt ::=
 	| show_tables_stmt
 	| show_trace_stmt
 	| show_transactions_stmt
+	| show_transfer_stmt
 	| show_users_stmt
 	| show_zone_stmt
 	| show_full_scans_stmt
@@ -779,6 +780,10 @@ show_transactions_stmt ::=
 	'SHOW' opt_cluster 'TRANSACTIONS'
 	| 'SHOW' 'ALL' opt_cluster 'TRANSACTIONS'
 
+show_transfer_stmt ::=
+	'SHOW' 'TRANSFER' 'STATE' 'WITH' name
+	| 'SHOW' 'TRANSFER' 'STATE'
+
 show_users_stmt ::=
 	'SHOW' 'USERS'
 
@@ -969,7 +974,7 @@ unreserved_keyword ::=
 	| 'INCLUDING'
 	| 'INCREMENT'
 	| 'INCREMENTAL'
-	| 'INCREMENTAL_LOCATION'
+	| 'INCREMENTAL_STORAGE'
 	| 'INDEXES'
 	| 'INHERITS'
 	| 'INJECT'
@@ -1157,6 +1162,7 @@ unreserved_keyword ::=
 	| 'SQL'
 	| 'SQLLOGIN'
 	| 'START'
+	| 'STATE'
 	| 'STATEMENTS'
 	| 'STATISTICS'
 	| 'STDIN'
@@ -1183,6 +1189,7 @@ unreserved_keyword ::=
 	| 'TRACE'
 	| 'TRANSACTION'
 	| 'TRANSACTIONS'
+	| 'TRANSFER'
 	| 'TRIGGER'
 	| 'TRUNCATE'
 	| 'TRUSTED'
@@ -1894,7 +1901,7 @@ backup_options ::=
 	| 'REVISION_HISTORY'
 	| 'DETACHED'
 	| 'KMS' '=' string_or_placeholder_opt_list
-	| 'INCREMENTAL_LOCATION' '=' string_or_placeholder_opt_list
+	| 'INCREMENTAL_STORAGE' '=' string_or_placeholder_opt_list
 
 c_expr ::=
 	d_expr
@@ -2138,7 +2145,7 @@ restore_options ::=
 	| 'SKIP_LOCALITIES_CHECK'
 	| 'DEBUG_PAUSE_ON' '=' string_or_placeholder
 	| 'NEW_DB_NAME' '=' string_or_placeholder
-	| 'INCREMENTAL_LOCATION' '=' string_or_placeholder_opt_list
+	| 'INCREMENTAL_STORAGE' '=' string_or_placeholder_opt_list
 
 scrub_option_list ::=
 	( scrub_option ) ( ( ',' scrub_option ) )*
