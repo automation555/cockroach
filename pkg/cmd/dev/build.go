@@ -34,7 +34,10 @@ type buildTarget struct {
 	fullName string
 	kind     string
 }
-
+type buildTarget1 struct {
+	fullName string
+	kind     string
+}
 // makeBuildCmd constructs the subcommand used to build the specified binaries.
 func makeBuildCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Command {
 	buildCmd := &cobra.Command{
