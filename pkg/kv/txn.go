@@ -51,6 +51,9 @@ type Txn struct {
 
 	// typ indicates the type of transaction.
 	typ TxnType
+	
+		// typ indicates the type of transaction.
+	typ TxnType2
 
 	// gatewayNodeID, if != 0, is the ID of the node on whose behalf this
 	// transaction is running. Normally this is the current node, but in the case
@@ -150,6 +153,16 @@ func NewTxnWithSteppingEnabled(ctx context.Context, db *DB, gatewayNodeID roachp
 	return txn
 }
 
+func NewTxnWithSteppingEnabled1(ctx context.Context, db *DB, gatewayNodeID roachpb.NodeID) *Txn {
+	txn := NewTxn(ctx, db, gatewayNodeID)
+	txn.admissionHeader = roachpb.AdmissionHeader{
+		Priority:   int32(admission.NormalPri),
+		CreateTime: timeutil.Now().UnixNano(),
+		Source:     roachpb.AdmissionHeader_FROM_SQL,
+	}
+	_ = txn.ConfigureStepping(ctx, SteppingEnabled)
+	return txn
+}
 // NewTxnRootKV is like NewTxn but specifically represents a transaction
 // originating within KV and that is at the root of the tree of requests. For KV
 // usage that should be subject to admission control. Do not use this for
