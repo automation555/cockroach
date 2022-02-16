@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -39,20 +38,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const exportFilePattern = "export*-n*.0.csv"
-
 func setupExportableBank(t *testing.T, nodes, rows int) (*sqlutils.SQLRunner, string, func()) {
 	ctx := context.Background()
 	dir, cleanupDir := testutils.TempDir(t)
 
 	tc := testcluster.StartTestCluster(t, nodes,
-		base.TestClusterArgs{
-			ServerArgs: base.TestServerArgs{
-				ExternalIODir:      dir,
-				UseDatabase:        "test",
-				DisableSpanConfigs: true,
-			},
-		},
+		base.TestClusterArgs{ServerArgs: base.TestServerArgs{ExternalIODir: dir, UseDatabase: "test"}},
 	)
 	conn := tc.Conns[0]
 	db := sqlutils.MakeSQLRunner(conn)
@@ -113,15 +104,13 @@ func TestExportImportBank(t *testing.T) {
 
 			schema := bank.FromRows(1).Tables()[0].Schema
 			exportedFiles := filepath.Join(exportDir, "*")
-			db.Exec(t, fmt.Sprintf("CREATE TABLE bank2 %s", schema))
-			db.Exec(t, fmt.Sprintf(`IMPORT INTO bank2 CSV DATA ($1) WITH delimiter = '|'%s`, nullIf), exportedFiles)
+			db.Exec(t, fmt.Sprintf(`IMPORT TABLE bank2 %s CSV DATA ($1) WITH delimiter = '|'%s`, schema, nullIf), exportedFiles)
 
 			db.CheckQueryResults(t,
 				fmt.Sprintf(`SELECT * FROM bank AS OF SYSTEM TIME %s ORDER BY id`, asOf), db.QueryStr(t, `SELECT * FROM bank2 ORDER BY id`),
 			)
 			db.CheckQueryResults(t,
-				`SELECT fingerprint FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank2]`,
-				db.QueryStr(t, `SELECT fingerprint FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank]`),
+				`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank2`, db.QueryStr(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank`),
 			)
 			db.Exec(t, "DROP TABLE bank2")
 		})
@@ -158,12 +147,11 @@ func TestExportNullWithEmptyNullAs(t *testing.T) {
 	// Case when `nullas` option is specified: operation is successful and NULLs are encoded to "None"
 	const stmtWithNullas = `EXPORT INTO CSV 'nodelocal://0/t' WITH nullas="None" FROM SELECT * FROM accounts`
 	db.Exec(t, stmtWithNullas)
-	contents := readFileByGlob(t, filepath.Join(dir, "t", exportFilePattern))
+	contents := readFileByGlob(t, filepath.Join(dir, "t", "export*-n1.0.csv"))
 	require.Equal(t, "1,None\n2,8\n", string(contents))
 
 	// Verify successful IMPORT statement `WITH nullif="None"` to complete round trip
-	const importStmt = `IMPORT INTO accounts2 CSV DATA ('nodelocal://0/t/export*-n*.0.csv') WITH nullif="None"`
-	db.Exec(t, `CREATE TABLE accounts2(id INT PRIMARY KEY, balance INT)`)
+	const importStmt = `IMPORT TABLE accounts2(id INT PRIMARY KEY, balance INT) CSV DATA ('nodelocal://0/t/export*-n1.0.csv') WITH nullif="None"`
 	db.Exec(t, importStmt)
 	db.CheckQueryResults(t,
 		"SELECT * FROM accounts2", db.QueryStr(t, "SELECT * FROM accounts"),
@@ -264,7 +252,7 @@ func TestExportOrder(t *testing.T) {
 	sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 12, 3, 14), (2, 22, 2, 24), (3, 32, 1, 34)`)
 
 	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal://0/order' FROM SELECT * FROM foo ORDER BY y ASC LIMIT 2`)
-	content := readFileByGlob(t, filepath.Join(dir, "order", exportFilePattern))
+	content := readFileByGlob(t, filepath.Join(dir, "order", "export*-n1.0.csv"))
 
 	if expected, got := "3,32,1,34\n2,22,2,24\n", string(content); expected != got {
 		t.Fatalf("expected %q, got %q", expected, got)
@@ -342,7 +330,7 @@ INSERT INTO greeting_table VALUES ('hello', 'hello'), ('hi', 'hi');
 		sqlDB.Exec(t, stmt)
 
 		// Read the dumped file.
-		contents := readFileByGlob(t, filepath.Join(dir, path, exportFilePattern))
+		contents := readFileByGlob(t, filepath.Join(dir, path, "export*-n1.0.csv"))
 
 		require.Equal(t, test.expected, string(contents))
 	}
@@ -368,7 +356,7 @@ func TestExportOrderCompressed(t *testing.T) {
 	sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 12, 3, 14), (2, 22, 2, 24), (3, 32, 1, 34)`)
 
 	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal://0/order' with compression = gzip from select * from foo order by y asc limit 2`)
-	compressed := readFileByGlob(t, filepath.Join(dir, "order", exportFilePattern+".gz"))
+	compressed := readFileByGlob(t, filepath.Join(dir, "order", "export*-n1.0.csv.gz"))
 
 	gzipReader, err := gzip.NewReader(bytes.NewReader(compressed))
 	defer close(gzipReader)
@@ -396,7 +384,7 @@ func TestExportShow(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal://0/show' FROM SELECT database_name, owner FROM [SHOW DATABASES] ORDER BY database_name`)
-	content := readFileByGlob(t, filepath.Join(dir, "show", exportFilePattern))
+	content := readFileByGlob(t, filepath.Join(dir, "show", "export*-n1.0.csv"))
 
 	if expected, got := "defaultdb,"+security.RootUser+"\npostgres,"+security.RootUser+"\nsystem,"+
 		security.NodeUser+"\n", string(content); expected != got {
@@ -436,11 +424,11 @@ func TestExportFeatureFlag(t *testing.T) {
 	sqlDB.Exec(t, `SET CLUSTER SETTING feature.export.enabled = FALSE`)
 	sqlDB.Exec(t, `CREATE TABLE feature_flags (a INT PRIMARY KEY)`)
 	sqlDB.ExpectErr(t, `feature EXPORT was disabled by the database administrator`,
-		`EXPORT INTO CSV 'nodelocal://0/%s/' FROM TABLE feature_flags`)
+		`EXPORT INTO CSV 'nodelocal://0/abc/' FROM TABLE feature_flags`)
 
 	// Feature flag is on — test that EXPORT does not error.
 	sqlDB.Exec(t, `SET CLUSTER SETTING feature.export.enabled = TRUE`)
-	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal://0/%s/' FROM TABLE feature_flags`)
+	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal://0/abc/' FROM TABLE feature_flags`)
 }
 
 func TestExportPrivileges(t *testing.T) {
@@ -519,30 +507,4 @@ func TestExportTargetFileSizeSetting(t *testing.T) {
 	zipFiles, err := ioutil.ReadDir(filepath.Join(dir, "foo-compressed"))
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(zipFiles), 6)
-}
-
-func TestExportInsideTenant(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	dir, cleanupDir := testutils.TempDir(t)
-	defer cleanupDir()
-
-	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
-	defer srv.Stopper().Stop(context.Background())
-
-	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
-	defer conn10.Close()
-	tenant10 := sqlutils.MakeSQLRunner(conn10)
-
-	tenant10.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY, x INT, y INT, z INT, INDEX (y))`)
-	tenant10.Exec(t, `INSERT INTO foo VALUES (1, 12, 3, 14), (2, 22, 2, 24), (3, 32, 1, 34)`)
-
-	tenant10.Exec(t, `EXPORT INTO CSV 'userfile:///order' FROM SELECT * FROM foo ORDER BY y ASC LIMIT 2`)
-	csvFileIDs := tenant10.QueryStr(t, `SELECT file_id FROM userfiles_root_upload_files WHERE filename LIKE '%csv'`)
-	require.Len(t, csvFileIDs, 1)
-	filePayloads := tenant10.QueryStr(t, `
-SELECT payload FROM userfiles_root_upload_payload WHERE file_id = $1`, csvFileIDs[0][0])
-	require.Len(t, filePayloads, 1)
-
-	require.Equal(t, filePayloads[0][0], "3,32,1,34\n2,22,2,24\n")
 }
