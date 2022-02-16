@@ -12,6 +12,7 @@ package colrpc
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"sync/atomic"
@@ -27,12 +28,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
 
@@ -78,9 +77,6 @@ type Inbox struct {
 	// goroutine should exit while waiting for a stream.
 	timeoutCh chan error
 
-	// flowCtxDone is the Done() channel of the flow context of the Inbox host.
-	flowCtxDone <-chan struct{}
-
 	// errCh is the channel that RunWithStream will block on, waiting until the
 	// Inbox does not need a stream any more. An error will only be sent on this
 	// channel in the event of a cancellation or a non-io.EOF error originating
@@ -94,16 +90,18 @@ type Inbox struct {
 	// done prevents double closing. It should not be used by the RunWithStream
 	// goroutine.
 	done bool
-	// bufferedMeta buffers any metadata found in Next when reading from the
-	// stream and is returned by DrainMeta.
+	// streamingMetaReceiver, if set, is used to propagate all of the metadata
+	// received in Next in a streaming fashion.
+	streamingMetaReceiver colexecop.StreamingMetadataReceiver
+	// bufferedMeta is used if streamingMetaReceiver is not set (which can
+	// happen only in test environment) or an error is encountered when pushing
+	// the metadata in a streaming fashion. It accumulates the metadata to be
+	// returned by DrainMeta.
 	bufferedMeta []execinfrapb.ProducerMetadata
 
 	// stream is the RPC stream. It is set when RunWithStream is called but
 	// only the Next/DrainMeta goroutine may access it.
 	stream flowStreamServer
-
-	admissionQ    *admission.WorkQueue
-	admissionInfo admission.WorkInfo
 
 	// statsAtomics are the execution statistics that need to be atomically
 	// accessed. This is necessary since Get*() methods can be called from
@@ -129,6 +127,7 @@ type Inbox struct {
 }
 
 var _ colexecop.Operator = &Inbox{}
+var _ colexecop.StreamingMetadataSource = &Inbox{}
 
 // NewInbox creates a new Inbox.
 func NewInbox(
@@ -158,41 +157,6 @@ func NewInbox(
 	return i, nil
 }
 
-// NewInboxWithFlowCtxDone creates a new Inbox when the done channel of the flow
-// context is available.
-func NewInboxWithFlowCtxDone(
-	allocator *colmem.Allocator,
-	typs []*types.T,
-	streamID execinfrapb.StreamID,
-	flowCtxDone <-chan struct{},
-) (*Inbox, error) {
-	i, err := NewInbox(allocator, typs, streamID)
-	if err != nil {
-		return nil, err
-	}
-	i.flowCtxDone = flowCtxDone
-	return i, nil
-}
-
-// NewInboxWithAdmissionControl creates a new Inbox that does admission
-// control on responses received from DistSQL.
-func NewInboxWithAdmissionControl(
-	allocator *colmem.Allocator,
-	typs []*types.T,
-	streamID execinfrapb.StreamID,
-	flowCtxDone <-chan struct{},
-	admissionQ *admission.WorkQueue,
-	admissionInfo admission.WorkInfo,
-) (*Inbox, error) {
-	i, err := NewInboxWithFlowCtxDone(allocator, typs, streamID, flowCtxDone)
-	if err != nil {
-		return nil, err
-	}
-	i.admissionQ = admissionQ
-	i.admissionInfo = admissionInfo
-	return i, err
-}
-
 // close closes the inbox, ensuring that any call to RunWithStream will return
 // immediately. close is idempotent.
 // NOTE: it is very important to close the Inbox only when execution terminates
@@ -205,22 +169,15 @@ func (i *Inbox) close() {
 	}
 }
 
-// checkFlowCtxCancellation returns an error if the flow context has already
-// been canceled.
-func (i *Inbox) checkFlowCtxCancellation() error {
-	select {
-	case <-i.flowCtxDone:
-		return cancelchecker.QueryCanceledError
-	default:
-		return nil
-	}
-}
-
 // RunWithStream sets the Inbox's stream and waits until either streamCtx is
-// canceled, the Inbox's host cancels the flow context, a caller of Next cancels
-// the context passed into Init, or any error is encountered on the stream by
-// the Next goroutine.
-func (i *Inbox) RunWithStream(streamCtx context.Context, stream flowStreamServer) error {
+// canceled, a caller of Next cancels the context passed into Init, or any error
+// is encountered on the stream by the Next goroutine.
+//
+// flowCtxDone is listened on only during the setup of the handler, before the
+// readerCtx is received. This is needed in case Inbox.Init is never called.
+func (i *Inbox) RunWithStream(
+	streamCtx context.Context, stream flowStreamServer, flowCtxDone <-chan struct{},
+) error {
 	streamCtx = logtags.AddTag(streamCtx, "streamID", i.streamID)
 	log.VEvent(streamCtx, 2, "Inbox handling stream")
 	defer log.VEvent(streamCtx, 2, "Inbox exited stream handler")
@@ -235,8 +192,8 @@ func (i *Inbox) RunWithStream(streamCtx context.Context, stream flowStreamServer
 	case readerCtx = <-i.contextCh:
 		log.VEvent(streamCtx, 2, "Inbox reader arrived")
 	case <-streamCtx.Done():
-		return errors.Wrap(streamCtx.Err(), "streamCtx error while waiting for reader (remote client canceled)")
-	case <-i.flowCtxDone:
+		return fmt.Errorf("%s: streamCtx while waiting for reader (remote client canceled)", streamCtx.Err())
+	case <-flowCtxDone:
 		// The flow context of the inbox host has been canceled. This can occur
 		// e.g. when the query is canceled, or when another stream encountered
 		// an unrecoverable error forcing it to shutdown the flow.
@@ -246,24 +203,21 @@ func (i *Inbox) RunWithStream(streamCtx context.Context, stream flowStreamServer
 	// Now wait for one of the events described in the method comment. If a
 	// cancellation is encountered, nothing special must be done to cancel the
 	// reader goroutine as returning from the handler will close the stream.
+	//
+	// Note that we don't listen for cancellation on flowCtxDone because
+	// readerCtx must be the child of the flow context.
 	select {
 	case err := <-i.errCh:
 		// nil will be read from errCh when the channel is closed.
 		return err
-	case <-i.flowCtxDone:
-		// The flow context of the inbox host has been canceled. This can occur
-		// e.g. when the query is canceled, or when another stream encountered
-		// an unrecoverable error forcing it to shutdown the flow.
-		return cancelchecker.QueryCanceledError
 	case <-readerCtx.Done():
-		// readerCtx is canceled, but we don't know whether it was because the
-		// flow context was canceled or for other reason. In the former case we
-		// have an ungraceful shutdown whereas in the latter case we have a
-		// graceful one.
-		return i.checkFlowCtxCancellation()
+		// The reader canceled the stream meaning that it no longer needs any
+		// more data from the outbox. This is a graceful termination, so we
+		// return nil.
+		return nil
 	case <-streamCtx.Done():
 		// The client canceled the stream.
-		return errors.Wrap(streamCtx.Err(), "streamCtx error in Inbox stream handler (remote client canceled)")
+		return fmt.Errorf("%s: streamCtx in Inbox stream handler (remote client canceled)", streamCtx.Err())
 	}
 }
 
@@ -271,6 +225,11 @@ func (i *Inbox) RunWithStream(streamCtx context.Context, stream flowStreamServer
 // established (i.e. RunWithStream to be called).
 func (i *Inbox) Timeout(err error) {
 	i.timeoutCh <- err
+}
+
+// SetReceiver is part of the colexecop.StreamingMetadataSource interface.
+func (i *Inbox) SetReceiver(receiver colexecop.StreamingMetadataReceiver) {
+	i.streamingMetaReceiver = receiver
 }
 
 // Init is part of the Operator interface.
@@ -288,21 +247,15 @@ func (i *Inbox) Init(ctx context.Context) {
 		select {
 		case i.stream = <-i.streamCh:
 		case err := <-i.timeoutCh:
-			i.errCh <- errors.Wrap(err, "remote stream arrived too late")
+			i.errCh <- fmt.Errorf("%s: remote stream arrived too late", err)
 			return err
-		case <-i.flowCtxDone:
-			i.errCh <- cancelchecker.QueryCanceledError
-			return cancelchecker.QueryCanceledError
 		case <-i.Ctx.Done():
-			// errToThrow is propagated to the reader of the Inbox.
-			errToThrow := i.Ctx.Err()
-			if err := i.checkFlowCtxCancellation(); err != nil {
-				// This is an ungraceful termination because the flow context
-				// has been canceled.
-				i.errCh <- err
-				errToThrow = err
-			}
-			return errToThrow
+			// Our reader canceled the context meaning that it no longer needs
+			// any more data from the outbox. This is a graceful termination, so
+			// we don't send any error on errCh and only return an error. This
+			// will close the inbox (making the stream handler exit gracefully)
+			// and will stop the current goroutine from proceeding further.
+			return i.Ctx.Err()
 		}
 
 		if i.ctxInterceptorFn != nil {
@@ -359,9 +312,9 @@ func (i *Inbox) Next() coldata.Batch {
 			}
 			// Note that here err can be stream's context cancellation.
 			// Regardless of the cause we want to propagate such an error as
-			// expected one in all cases so that the caller could decide on how
+			// expected on in all cases so that the caller could decide on how
 			// to handle it.
-			err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "inbox communication error")
+			err = pgerror.Newf(pgcode.InternalConnectionFailure, "inbox communication error: %s", err)
 			i.errCh <- err
 			colexecerror.ExpectedError(err)
 		}
@@ -371,13 +324,18 @@ func (i *Inbox) Next() coldata.Batch {
 				if !ok {
 					continue
 				}
-				if meta.Err != nil {
-					// If an error was encountered, it needs to be propagated
-					// immediately. All other metadata will simply be buffered
-					// and returned in DrainMeta.
-					colexecerror.ExpectedError(meta.Err)
+				if i.streamingMetaReceiver == nil || i.streamingMetaReceiver.PushStreamingMeta(i.Ctx, &meta) != nil {
+					// Either we don't have a streaming metadata receiver or we
+					// encountered an error when using it. Buffer up this
+					// metadata.
+					if meta.Err != nil {
+						// If an error was encountered, it needs to be propagated
+						// immediately. All other metadata will simply be buffered
+						// and returned in DrainMeta.
+						colexecerror.ExpectedError(meta.Err)
+					}
+					i.bufferedMeta = append(i.bufferedMeta, meta)
 				}
-				i.bufferedMeta = append(i.bufferedMeta, meta)
 			}
 			// Continue until we get the next batch or EOF.
 			continue
@@ -391,15 +349,6 @@ func (i *Inbox) Next() coldata.Batch {
 		// Update the allocator since we're holding onto the serialized bytes
 		// for now.
 		i.allocator.AdjustMemoryUsage(numSerializedBytes)
-		// Do admission control after memory accounting for the serialized bytes
-		// and before deserialization.
-		if i.admissionQ != nil {
-			if _, err := i.admissionQ.Admit(i.Ctx, i.admissionInfo); err != nil {
-				// err includes the case of context cancellation while waiting for
-				// admission.
-				colexecerror.ExpectedError(err)
-			}
-		}
 		i.scratch.data = i.scratch.data[:0]
 		batchLength, err := i.serializer.Deserialize(&i.scratch.data, m.Data.RawBytes)
 		// Eagerly throw away the RawBytes memory.
@@ -407,7 +356,8 @@ func (i *Inbox) Next() coldata.Batch {
 		if err != nil {
 			colexecerror.InternalError(err)
 		}
-		// We rely on the outboxes to produce reasonably sized batches.
+		// For now, we don't enforce any footprint-based memory limit.
+		// TODO(yuzefovich): refactor this.
 		const maxBatchMemSize = math.MaxInt64
 		i.scratch.b, _ = i.allocator.ResetMaybeReallocate(i.typs, i.scratch.b, batchLength, maxBatchMemSize)
 		i.allocator.PerformOperation(i.scratch.b.ColVecs(), func() {
@@ -459,17 +409,15 @@ func (i *Inbox) sendDrainSignal(ctx context.Context) error {
 // DrainMeta is part of the colexecop.MetadataSource interface. DrainMeta may
 // not be called concurrently with Next.
 func (i *Inbox) DrainMeta() []execinfrapb.ProducerMetadata {
-	allMeta := i.bufferedMeta
-	i.bufferedMeta = i.bufferedMeta[:0]
-
+	drainedMeta := i.bufferedMeta
 	if i.done {
 		// Next exhausted the stream of metadata.
-		return allMeta
+		return drainedMeta
 	}
 	defer i.close()
 
 	if err := i.sendDrainSignal(i.Ctx); err != nil {
-		return allMeta
+		return drainedMeta
 	}
 
 	for {
@@ -481,16 +429,16 @@ func (i *Inbox) DrainMeta() []execinfrapb.ProducerMetadata {
 			if log.V(1) {
 				log.Warningf(i.Ctx, "Inbox Recv connection error while draining metadata: %+v", err)
 			}
-			return allMeta
+			return drainedMeta
 		}
 		for _, remoteMeta := range msg.Data.Metadata {
 			meta, ok := execinfrapb.RemoteProducerMetaToLocalMeta(i.Ctx, remoteMeta)
 			if !ok {
 				continue
 			}
-			allMeta = append(allMeta, meta)
+			drainedMeta = append(drainedMeta, meta)
 		}
 	}
 
-	return allMeta
+	return drainedMeta
 }

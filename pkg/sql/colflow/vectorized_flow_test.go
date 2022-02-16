@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 )
@@ -52,11 +51,7 @@ func (c callbackRemoteComponentCreator) newOutbox(
 }
 
 func (c callbackRemoteComponentCreator) newInbox(
-	allocator *colmem.Allocator,
-	typs []*types.T,
-	streamID execinfrapb.StreamID,
-	_ <-chan struct{},
-	_ admissionOptions,
+	allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
 ) (*colrpc.Inbox, error) {
 	return c.newInboxFn(allocator, typs, streamID)
 }
@@ -206,8 +201,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 			// number of metadata sources and then that the input types are what we
 			// expect from the input DAG.
 			require.Len(t, input.MetadataSources, 1)
-			inbox := colexec.MaybeUnwrapInvariantsChecker(input.MetadataSources[0].(colexecop.Operator)).(*colrpc.Inbox)
-			require.Len(t, inboxToNumInputTypes[inbox], numInputTypesToOutbox)
+			require.Len(t, inboxToNumInputTypes[input.MetadataSources[0].(*colexec.InvariantsChecker).Input.(*colrpc.Inbox)], numInputTypesToOutbox)
 			return colrpc.NewOutbox(allocator, input, typs, nil /* getStats */)
 		},
 		newInboxFn: func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error) {
@@ -222,17 +216,15 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
 	f := &flowinfra.FlowBase{
-		FlowCtx: execinfra.FlowCtx{
-			Cfg:     &execinfra.ServerConfig{},
-			EvalCtx: &evalCtx,
-			NodeID:  base.TestingIDContainer,
+		FlowCtx: execinfra.FlowCtx{EvalCtx: &evalCtx,
+			NodeID: base.TestingIDContainer,
 		},
 	}
 	var wg sync.WaitGroup
 	vfc := newVectorizedFlowCreator(
 		&vectorizedFlowCreatorHelper{f: f}, componentCreator, false, false, &wg, &execinfra.RowChannel{},
 		nil /* batchSyncFlowConsumer */, nil /* nodeDialer */, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
-		nil /* fdSemaphore */, descs.DistSQLTypeResolver{}, admission.WorkInfo{},
+		nil /* fdSemaphore */, descs.DistSQLTypeResolver{},
 	)
 
 	_, _, err := vfc.setupFlow(ctx, &f.FlowCtx, procs, nil /* localProcessors */, flowinfra.FuseNormally)
@@ -257,7 +249,7 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	// We use an on-disk engine for this test since we're testing FS interactions
 	// and want to get the same behavior as a non-testing environment.
 	tempPath, dirCleanup := testutils.TempDir(t)
-	ngn, err := storage.Open(ctx, storage.Filesystem(tempPath), storage.CacheSize(0))
+	ngn, err := storage.NewDefaultEngine(0 /* cacheSize */, base.StorageConfig{Dir: tempPath})
 	require.NoError(t, err)
 	defer ngn.Close()
 	defer dirCleanup()
