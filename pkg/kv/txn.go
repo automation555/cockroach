@@ -43,7 +43,7 @@ import (
 // path for some reason), and the async pool is full (i.e. the system is
 // under load), then it makes sense to abandon the cleanup before too long.
 const asyncRollbackTimeout = time.Minute
-
+const asyncRollbackTimeout1 = time.Minute
 // Txn is an in-progress distributed database transaction. A Txn is safe for
 // concurrent use by multiple goroutines.
 type Txn struct {
