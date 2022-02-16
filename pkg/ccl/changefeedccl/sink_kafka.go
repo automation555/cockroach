@@ -14,14 +14,17 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"math"
+	"io/ioutil"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/Shopify/sarama"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
-	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -29,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -57,12 +61,6 @@ func init() {
 	ctx := context.Background()
 	ctx = logtags.AddTag(ctx, "kafka-producer", nil)
 	sarama.Logger = &kafkaLogAdapter{ctx: ctx}
-
-	// Sarama should not be rejecting messages based on some arbitrary limits.
-	// This sink already manages its resource usage.  Sarama should attempt to deliver
-	// messages, no matter their size.  Of course, the downstream kafka may reject
-	// those messages, but this rejection should not be done locally.
-	sarama.MaxRequestSize = math.MaxInt32
 }
 
 // kafkaClient is a small interface restricting the functionality in sarama.Client
@@ -92,11 +90,11 @@ type kafkaSink struct {
 	stopWorkerCh chan struct{}
 	worker       sync.WaitGroup
 	scratch      bufalloc.ByteAllocator
-	metrics      *sliMetrics
 
 	// Only synchronized between the client goroutine and the worker goroutine.
 	mu struct {
 		syncutil.Mutex
+		mem      mon.BoundAccount
 		inflight int64
 		flushErr error
 		flushCh  chan struct{}
@@ -191,6 +189,12 @@ func (s *kafkaSink) Dial() error {
 
 // Close implements the Sink interface.
 func (s *kafkaSink) Close() error {
+	defer func() {
+		s.mu.Lock()
+		s.mu.mem.Close(s.ctx)
+		s.mu.Unlock()
+	}()
+
 	close(s.stopWorkerCh)
 	s.worker.Wait()
 	// If we're shutting down, we don't care what happens to the outstanding
@@ -203,19 +207,9 @@ func (s *kafkaSink) Close() error {
 	return nil
 }
 
-type messageMetadata struct {
-	alloc         kvevent.Alloc
-	updateMetrics recordEmittedMessagesCallback
-	mvcc          hlc.Timestamp
-}
-
 // EmitRow implements the Sink interface.
 func (s *kafkaSink) EmitRow(
-	ctx context.Context,
-	topicDescr TopicDescriptor,
-	key, value []byte,
-	updated, mvcc hlc.Timestamp,
-	alloc kvevent.Alloc,
+	ctx context.Context, topicDescr TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
 	topic, isKnownTopic := s.topics[topicDescr.GetID()]
 	if !isKnownTopic {
@@ -223,10 +217,9 @@ func (s *kafkaSink) EmitRow(
 	}
 
 	msg := &sarama.ProducerMessage{
-		Topic:    topic,
-		Key:      sarama.ByteEncoder(key),
-		Value:    sarama.ByteEncoder(value),
-		Metadata: messageMetadata{alloc: alloc, mvcc: mvcc, updateMetrics: s.metrics.recordEmittedMessages()},
+		Topic: topic,
+		Key:   sarama.ByteEncoder(key),
+		Value: sarama.ByteEncoder(value),
 	}
 	return s.emitMessage(ctx, msg)
 }
@@ -235,8 +228,6 @@ func (s *kafkaSink) EmitRow(
 func (s *kafkaSink) EmitResolvedTimestamp(
 	ctx context.Context, encoder Encoder, resolved hlc.Timestamp,
 ) error {
-	defer s.metrics.recordResolvedCallback()()
-
 	// Periodically ping sarama to refresh its metadata. This means talking to
 	// zookeeper, so it shouldn't be done too often, but beyond that this
 	// constant was picked pretty arbitrarily.
@@ -288,8 +279,6 @@ func (s *kafkaSink) EmitResolvedTimestamp(
 
 // Flush implements the Sink interface.
 func (s *kafkaSink) Flush(ctx context.Context) error {
-	defer s.metrics.recordFlushRequestCallback()()
-
 	flushCh := make(chan struct{}, 1)
 
 	s.mu.Lock()
@@ -321,11 +310,25 @@ func (s *kafkaSink) Flush(ctx context.Context) error {
 	}
 }
 
-func (s *kafkaSink) startInflightMessage(ctx context.Context) error {
+func kafkaMessageBytes(m *sarama.ProducerMessage) (s int64) {
+	if m.Key != nil {
+		s += int64(m.Key.Length())
+	}
+	if m.Value != nil {
+		s += int64(m.Value.Length())
+	}
+	return
+}
+
+func (s *kafkaSink) startInflightMessage(ctx context.Context, msg *sarama.ProducerMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.mu.mem.Grow(ctx, kafkaMessageBytes(msg)); err != nil {
+		return err
+	}
 
 	s.mu.inflight++
+
 	if log.V(2) {
 		log.Infof(ctx, "emitting %d inflight records to kafka", s.mu.inflight)
 	}
@@ -333,7 +336,7 @@ func (s *kafkaSink) startInflightMessage(ctx context.Context) error {
 }
 
 func (s *kafkaSink) emitMessage(ctx context.Context, msg *sarama.ProducerMessage) error {
-	if err := s.startInflightMessage(ctx); err != nil {
+	if err := s.startInflightMessage(ctx, msg); err != nil {
 		return err
 	}
 
@@ -362,15 +365,9 @@ func (s *kafkaSink) workerLoop() {
 			ackMsg, ackError = err.Msg, err.Err
 		}
 
-		if m, ok := ackMsg.Metadata.(messageMetadata); ok {
-			if ackError == nil {
-				m.updateMetrics(1, m.mvcc, ackMsg.Key.Length()+ackMsg.Value.Length(), sinkDoesNotCompress)
-			}
-			m.alloc.Release(s.ctx)
-		}
-
 		s.mu.Lock()
 		s.mu.inflight--
+		s.mu.mem.Shrink(s.ctx, kafkaMessageBytes(ackMsg))
 		if s.mu.flushErr == nil && ackError != nil {
 			s.mu.flushErr = ackError
 		}
@@ -381,14 +378,6 @@ func (s *kafkaSink) workerLoop() {
 		}
 		s.mu.Unlock()
 	}
-}
-
-func (s *kafkaSink) Topics() []string {
-	var topics []string
-	for _, topic := range s.topics {
-		topics = append(topics, topic)
-	}
-	return topics
 }
 
 type changefeedPartitioner struct {
@@ -449,12 +438,6 @@ func (j *jsonDuration) UnmarshalJSON(b []byte) error {
 
 // Apply configures provided kafka configuration struct based on this config.
 func (c *saramaConfig) Apply(kafka *sarama.Config) error {
-	// Sarama limits the size of each message to be MaxMessageSize (1MB) bytes.
-	// This is silly;  This sink already manages its memory, and therefore, if we
-	// had enough resources to ingest and process this message, then sarama shouldn't
-	// get in a way.  Set this limit to be just a bit under maximum request size.
-	kafka.Producer.MaxMessageBytes = int(sarama.MaxRequestSize - 1)
-
 	kafka.Producer.Flush.Bytes = c.Flush.Bytes
 	kafka.Producer.Flush.Messages = c.Flush.Messages
 	kafka.Producer.Flush.Frequency = time.Duration(c.Flush.Frequency)
@@ -490,10 +473,110 @@ func parseRequiredAcks(a string) (sarama.RequiredAcks, error) {
 	}
 }
 
+func parseBucketURL(path string, scheme string) (bool, string, string, error) {
+	u, err := url.Parse(path)
+	if err != nil || u.Scheme != scheme {
+		return false, "", "", err
+	}
+	// trim the leading slash to get the object/key of the bucket
+	return true, u.Host, strings.TrimLeft(u.Path, "/"), nil
+}
+
+func getSaramaConfigFromS3(bucket string, key string, config *saramaConfig) error {
+	// load default AWS config (credentials, region) from disk
+	sess := session.Must(session.NewSessionWithOptions(session.Options{
+		SharedConfigState: session.SharedConfigEnable,
+	}))
+
+	s3Client := s3.New(sess)
+	res, err := s3Client.GetObject(&s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	configBytes, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(configBytes, config)
+}
+
+func getSaramaConfigFromGCS(bucket string, object string, config *saramaConfig) error {
+	ctx := context.Background()
+	gcsClient, err := storage.NewClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err := gcsClient.Close()
+		if err != nil {
+			log.Warningf(ctx, "error encountered while closing GCS client: %v", err)
+		}
+	}()
+
+	reader, err := gcsClient.Bucket(bucket).Object(object).NewReader(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err := reader.Close()
+		if err != nil {
+			log.Warningf(ctx, "error encountered while closing GCS reader: %v", err)
+		}
+	}()
+
+	configBytes, err := ioutil.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(configBytes, config)
+}
+
+// getSaramaConfigFromFile reads a sarama config from JSON contained at path
+// and stores it in config.
+func getSaramaConfigFromFile(path string, config *saramaConfig) error {
+	var err error
+	var configBytes []byte
+	var bucket, key, object string
+	var isS3, isGCS bool
+	if configBytes, err = ioutil.ReadFile(path); err == nil {
+		err = json.Unmarshal(configBytes, config)
+	} else if isS3, bucket, key, err = parseBucketURL(path, changefeedbase.SinkSchemeS3); isS3 {
+		if err == nil {
+			err = getSaramaConfigFromS3(bucket, key, config)
+		}
+	} else if isGCS, bucket, object, err = parseBucketURL(path, changefeedbase.SinkSchemeGCS); isGCS {
+		if err == nil {
+			err = getSaramaConfigFromGCS(bucket, object, config)
+		}
+	} else {
+		err = fmt.Errorf("'%s' could not be recognized as a valid filepath, S3 path or GCS path", path)
+	}
+	return err
+}
+
 func getSaramaConfig(opts map[string]string) (config *saramaConfig, err error) {
 	config = defaultSaramaConfig()
-	if configStr, haveOverride := opts[changefeedbase.OptKafkaSinkConfig]; haveOverride {
+	configStr, haveOverride := opts[changefeedbase.OptKafkaSinkConfig]
+	configStrFile, haveOverrideFile := opts[changefeedbase.OptKafkaSinkConfigFile]
+	if haveOverride && haveOverrideFile {
+		err = fmt.Errorf("cannot specify both %s and %s", changefeedbase.OptKafkaSinkConfig, changefeedbase.OptKafkaSinkConfigFile)
+	} else if haveOverride {
 		err = json.Unmarshal([]byte(configStr), config)
+		if err != nil {
+			err = errors.Wrapf(err,
+				"failed to parse sarama config; check %s option", changefeedbase.OptKafkaSinkConfig)
+		}
+	} else if haveOverrideFile {
+		err = getSaramaConfigFromFile(configStrFile, config)
+		if err != nil {
+			err = errors.Wrapf(err,
+				"failed to parse sarama config; check %s option", changefeedbase.OptKafkaSinkConfigFile)
+		}
 	}
 	return
 }
@@ -602,7 +685,7 @@ func buildKafkaConfig(u sinkURL, opts map[string]string) (*sarama.Config, error)
 		if dialConfig.clientCert != nil && dialConfig.clientKey != nil {
 			cert, err := tls.X509KeyPair(dialConfig.clientCert, dialConfig.clientKey)
 			if err != nil {
-				return nil, errors.Wrap(err, `invalid client certificate data provided`)
+				return nil, errors.Errorf(`invalid client certificate data provided: %s`, err)
 			}
 			config.Net.TLS.Config.Certificates = []tls.Certificate{cert}
 		}
@@ -632,8 +715,7 @@ func buildKafkaConfig(u sinkURL, opts map[string]string) (*sarama.Config, error)
 	// Apply statement level overrides.
 	saramaCfg, err := getSaramaConfig(opts)
 	if err != nil {
-		return nil, errors.Wrapf(err,
-			"failed to parse sarama config; check %s option", changefeedbase.OptKafkaSinkConfig)
+		return nil, err
 	}
 
 	if err := saramaCfg.Validate(); err != nil {
@@ -651,7 +733,7 @@ func makeKafkaSink(
 	u sinkURL,
 	targets jobspb.ChangefeedTargets,
 	opts map[string]string,
-	m *sliMetrics,
+	acc mon.BoundAccount,
 ) (Sink, error) {
 	kafkaTopicPrefix := u.consumeParam(changefeedbase.SinkParamTopicPrefix)
 	kafkaTopicName := u.consumeParam(changefeedbase.SinkParamTopicName)
@@ -669,8 +751,8 @@ func makeKafkaSink(
 		kafkaCfg:       config,
 		bootstrapAddrs: u.Host,
 		topics:         makeTopicsMap(kafkaTopicPrefix, kafkaTopicName, targets),
-		metrics:        m,
 	}
+	sink.mu.mem = acc
 
 	if unknownParams := u.remainingQueryParams(); len(unknownParams) > 0 {
 		return nil, errors.Errorf(
