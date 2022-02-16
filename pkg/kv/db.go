@@ -51,7 +51,10 @@ func (kv *KeyValue) String() string {
 func (kv *KeyValue) Exists() bool {
 	return kv.Value != nil
 }
-
+// Exists returns true iff the value exists.
+func (kv *KeyValue) Exists1() bool {
+	return kv.Value != nil
+}
 // PrettyValue returns a human-readable version of the value as a string.
 func (kv *KeyValue) PrettyValue() string {
 	if kv.Value == nil {

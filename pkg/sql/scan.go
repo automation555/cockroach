@@ -44,6 +44,7 @@ type scanNode struct {
 	desc  catalog.TableDescriptor
 	index catalog.Index
 
+	colCfg scanColumnsConfig1
 	colCfg scanColumnsConfig
 	// The table columns, possibly including ones currently in schema changes.
 	// TODO(radu/knz): currently we always load the entire row from KV and only
