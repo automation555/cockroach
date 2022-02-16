@@ -23,23 +23,7 @@ import (
 // value expressions can often be inlined into referencing expressions. Only
 // Project and Values operators synthesize constant value expressions.
 func (c *CustomFuncs) FindInlinableConstants(input memo.RelExpr) opt.ColSet {
-	var cols opt.ColSet
-	if project, ok := input.(*memo.ProjectExpr); ok {
-		for i := range project.Projections {
-			item := &project.Projections[i]
-			if opt.IsConstValueOp(item.Element) {
-				cols.Add(item.Col)
-			}
-		}
-	} else if values, ok := input.(*memo.ValuesExpr); ok && len(values.Rows) == 1 {
-		tup := values.Rows[0].(*memo.TupleExpr)
-		for i, scalar := range tup.Elems {
-			if opt.IsConstValueOp(scalar) {
-				cols.Add(values.Cols[i])
-			}
-		}
-	}
-	return cols
+	return memo.FindInlinableConstants(input)
 }
 
 // InlineProjectionConstants recursively searches each projection expression and
@@ -86,34 +70,13 @@ func (c *CustomFuncs) inlineConstants(
 		switch t := e.(type) {
 		case *memo.VariableExpr:
 			if constCols.Contains(t.Col) {
-				return c.extractColumn(input, t.Col)
+				return memo.ExtractColumnFromProjectOrValues(input, t.Col)
 			}
 			return t
 		}
 		return c.f.Replace(e, replace)
 	}
 	return replace(e)
-}
-
-// extractColumn searches a Project or Values input expression for the column
-// having the given id. It returns the expression for that column.
-func (c *CustomFuncs) extractColumn(input memo.RelExpr, col opt.ColumnID) opt.ScalarExpr {
-	if project, ok := input.(*memo.ProjectExpr); ok {
-		for i := range project.Projections {
-			item := &project.Projections[i]
-			if item.Col == col {
-				return item.Element
-			}
-		}
-	} else if values, ok := input.(*memo.ValuesExpr); ok && len(values.Rows) == 1 {
-		tup := values.Rows[0].(*memo.TupleExpr)
-		for i, scalar := range tup.Elems {
-			if values.Cols[i] == col {
-				return scalar
-			}
-		}
-	}
-	panic(errors.AssertionFailedf("could not find column to extract"))
 }
 
 // HasDuplicateRefs returns true if the target projection expressions or
@@ -359,7 +322,7 @@ func (c *CustomFuncs) CanInlineConstVar(f memo.FiltersExpr) bool {
 	for i := range f {
 		if ok, l, _ := c.extractVarEqualsConst(f[i].Condition); ok {
 			colType := c.mem.Metadata().ColumnMeta(l.Col).Type
-			if colinfo.CanHaveCompositeKeyEncoding(colType) {
+			if colinfo.HasCompositeKeyEncoding(colType) {
 				// TODO(justin): allow inlining if the check we're doing is oblivious
 				// to composite-ness.
 				continue
@@ -395,7 +358,7 @@ func (c *CustomFuncs) InlineConstVar(f memo.FiltersExpr) memo.FiltersExpr {
 	for i := range f {
 		if ok, v, e := c.extractVarEqualsConst(f[i].Condition); ok {
 			colType := c.mem.Metadata().ColumnMeta(v.Col).Type
-			if colinfo.CanHaveCompositeKeyEncoding(colType) {
+			if colinfo.HasCompositeKeyEncoding(colType) {
 				continue
 			}
 			if _, ok := vals[v.Col]; !ok {

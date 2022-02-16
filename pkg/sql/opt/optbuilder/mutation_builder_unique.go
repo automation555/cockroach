@@ -25,7 +25,6 @@ import (
 // UniquenessChecksForGenRandomUUIDClusterMode controls the cluster setting for
 // enabling uniqueness checks for UUID columns set to gen_random_uuid().
 var UniquenessChecksForGenRandomUUIDClusterMode = settings.RegisterBoolSetting(
-	settings.TenantWritable,
 	"sql.optimizer.uniqueness_checks_for_gen_random_uuid.enabled",
 	"if enabled, uniqueness checks may be planned for mutations of UUID columns updated with"+
 		" gen_random_uuid(); otherwise, uniqueness is assumed due to near-zero collision probability",
@@ -41,7 +40,6 @@ func (mb *mutationBuilder) buildUniqueChecksForInsert() {
 		return
 	}
 
-	mb.ensureWithID()
 	h := &mb.uniqueCheckHelper
 
 	for i, n := 0, mb.tab.UniqueCount(); i < n; i++ {
@@ -401,7 +399,7 @@ func (h *uniqueCheckHelper) buildTableScan() (outScope *scope, ordinals []int) {
 	ordinals = tableOrdinals(tabMeta.Table, columnKinds{
 		includeMutations:       false,
 		includeSystem:          false,
-		includeInverted:        false,
+		includeVirtualInverted: false,
 		includeVirtualComputed: true,
 	})
 	return h.mb.b.buildScan(
