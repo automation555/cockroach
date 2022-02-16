@@ -31,56 +31,27 @@ apt-get update --yes
 apt-get install --yes sudo
 
 apt-get install --yes \
-  autoconf \
-  bison \
   build-essential \
   curl \
   docker-ce \
   docker-compose \
-  flex \
   gnome-keyring \
   gnupg2 \
   git \
-  jq \
   openjdk-11-jre-headless \
   pass \
   unzip
 
-curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.20.3/cmake-3.20.3-linux-x86_64.tar.gz -o /tmp/cmake.tar.gz
+curl -fsSL https://dl.google.com/go/go1.15.11.linux-arm64.tar.gz > /tmp/go.tgz
 sha256sum -c - <<EOF
-97bf730372f9900b2dfb9206fccbcf92f5c7f3b502148b832e77451aa0f9e0e6 /tmp/cmake.tar.gz
-EOF
-tar --strip-components=1 -C /usr -xzf /tmp/cmake.tar.gz
-rm -f /tmp/cmake.tar.gz
-
-curl -fsSL https://dl.google.com/go/go1.17.6.linux-amd64.tar.gz > /tmp/go.tgz
-sha256sum -c - <<EOF
-231654bbf2dab3d86c1619ce799e77b03d96f9b50770297c8f4dff8836fc8ca2 /tmp/go.tgz
+bfc8f07945296e97c6d28c7999d86b5cab51c7a87eb2b22ca6781c41a6bb6f2d /tmp/go.tgz
 EOF
 tar -C /usr/local -zxf /tmp/go.tgz && rm /tmp/go.tgz
-
-# Install the older version in parallel in order to run the acceptance test on older branches
-# TODO: Remove this when 21.1 is EOL
-curl -fsSL https://dl.google.com/go/go1.15.14.linux-amd64.tar.gz > /tmp/go_old.tgz
-sha256sum -c - <<EOF
-6f5410c113b803f437d7a1ee6f8f124100e536cc7361920f7e640fedf7add72d /tmp/go_old.tgz
-EOF
-mkdir -p /usr/local/go1.15
-tar -C /usr/local/go1.15 --strip-components=1 -zxf /tmp/go_old.tgz && rm /tmp/go_old.tgz
 
 # Explicitly symlink the pinned version to /usr/bin.
 for f in `ls /usr/local/go/bin`; do
     ln -s /usr/local/go/bin/$f /usr/bin
 done
-
-# Install Bazelisk.
-# Keep this in sync with `build/bazelbuilder/Dockerfile` and `build/bootstrap/bootstrap-debian.sh`.
-curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.10.1/bazelisk-linux-amd64 > /tmp/bazelisk
-sha256sum -c - <<EOF
-4cb534c52cdd47a6223d4596d530e7c9c785438ab3b0a49ff347e991c210b2cd /tmp/bazelisk
-EOF
-chmod +x /tmp/bazelisk
-mv /tmp/bazelisk /usr/bin/bazel
 
 # Installing gnome-keyring prevents the error described in
 # https://github.com/moby/moby/issues/34048
@@ -128,20 +99,6 @@ cd "$repo"
 # which would corrupt the submodule defs. Probably good to remove once the
 # builder uses Ubuntu 18.04 or higher.
 git submodule update --init --recursive
-for branch in $(git branch --all --list --sort=-committerdate 'origin/release-*' | head -n1) master
-do
-  # Clean out all non-checked-in files. This is because of the check-in of
-  # the generated execgen files. Once we are no longer building 20.1 builds,
-  # the `git clean -dxf` line can be removed.
-  git clean -dxf
-
-  git checkout "$branch"
-  # Stupid submodules.
-  rm -rf vendor; git checkout vendor; git submodule update --init --recursive
-  COCKROACH_BUILDER_CCACHE=1 build/builder.sh make test testrace TESTTIMEOUT=45m TESTS=-
-  # TODO(benesch): store the acceptanceversion somewhere more accessible.
-  docker pull $(git grep cockroachdb/acceptance -- '*.go' | sed -E 's/.*"([^"]*).*"/\1/') || true
-done
 cd -
 EOF
 write_teamcity_config
