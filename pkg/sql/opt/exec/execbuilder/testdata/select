@@ -20,35 +20,39 @@ FROM [SHOW TRACE FOR SESSION]
 WHERE message LIKE '%SPAN START%' OR message LIKE '%pos%executing%';
 ----
 0   === SPAN START: session recording ===                session recording
-0   [NoTxn pos:?] executing ExecStmt: BEGIN TRANSACTION  session recording
-1   === SPAN START: sql txn ===                          sql txn
-1   [Open pos:?] executing ExecStmt: SELECT 1            sql txn
-2   === SPAN START: sql query ===                        sql query
-3   === SPAN START: consuming rows ===                   consuming rows
-4   === SPAN START: flow ===                             flow
-1   [Open pos:?] executing ExecStmt: COMMIT TRANSACTION  sql txn
-5   === SPAN START: sql query ===                        sql query
-6   === SPAN START: commit sql txn ===                   commit sql txn
-0   [NoTxn pos:?] executing ExecStmt: SELECT 2           session recording
-7   === SPAN START: sql txn ===                          sql txn
-7   [Open pos:?] executing ExecStmt: SELECT 2            sql txn
-8   === SPAN START: sql query ===                        sql query
-9   === SPAN START: consuming rows ===                   consuming rows
-10  === SPAN START: flow ===                             flow
-11  === SPAN START: commit sql txn ===                   commit sql txn
-0   [NoTxn pos:?] executing ExecStmt: SET TRACING = off  session recording
+1   === SPAN START: exec stmt ===                        exec stmt
+1   [NoTxn pos:?] executing ExecStmt: BEGIN TRANSACTION  exec stmt
+2   === SPAN START: sql txn ===                          sql txn
+3   === SPAN START: exec stmt ===                        exec stmt
+3   [Open pos:?] executing ExecStmt: SELECT 1            exec stmt
+4   === SPAN START: consuming rows ===                   consuming rows
+5   === SPAN START: flow ===                             flow
+6   === SPAN START: exec stmt ===                        exec stmt
+6   [Open pos:?] executing ExecStmt: COMMIT TRANSACTION  exec stmt
+7   === SPAN START: exec stmt ===                        exec stmt
+7   [NoTxn pos:?] executing ExecStmt: SELECT 2           exec stmt
+8   === SPAN START: sql txn ===                          sql txn
+9   === SPAN START: exec stmt ===                        exec stmt
+9   [Open pos:?] executing ExecStmt: SELECT 2            exec stmt
+10  === SPAN START: consuming rows ===                   consuming rows
+11  === SPAN START: flow ===                             flow
+12  === SPAN START: exec stmt ===                        exec stmt
+12  [NoTxn pos:?] executing ExecStmt: SET TRACING = off  exec stmt
 
+# ------------------------------------------------------------------------------
+# Numeric References Tests.
+# These are put at the beginning of the file to ensure the numeric table
+# reference is 53 (the numeric reference of the first table).
+# If the numbering scheme in cockroach changes, this test will break.
+# These tests replicate the tests at sql/table_ref_test.go. The reason
+# for duplication is to include tests within the opt testing framework
+# TODO(madhavsuresh): get the numeric reference ID in a less brittle fashion
+# ------------------------------------------------------------------------------
 statement ok
 CREATE TABLE num_ref (a INT PRIMARY KEY, xx INT, b INT, c INT, INDEX bc (b,c))
 
-let $t_id 
-SELECT id FROM system.namespace WHERE name='num_ref'
-
 statement ok
 CREATE TABLE num_ref_hidden (a INT, b INT)
-
-let $t_id2
-SELECT id FROM system.namespace WHERE name='num_ref_hidden'
 
 statement ok
 ALTER TABLE num_ref RENAME COLUMN b TO d
@@ -60,7 +64,7 @@ statement ok
 ALTER TABLE num_ref DROP COLUMN xx
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [53 AS num_ref_alias]
 ----
 distribution: local
 vectorized: true
@@ -68,11 +72,11 @@ vectorized: true
 • scan
   columns: (p, d, c)
   estimated row count: 1,000 (missing stats)
-  table: num_ref@num_ref_pkey
+  table: num_ref@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [53(4) AS num_ref_alias]
 ----
 distribution: local
 vectorized: true
@@ -80,11 +84,11 @@ vectorized: true
 • scan
   columns: (c)
   estimated row count: 1,000 (missing stats)
-  table: num_ref@num_ref_pkey
+  table: num_ref@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1,4) AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [53(1,4) AS num_ref_alias]
 ----
 distribution: local
 vectorized: true
@@ -92,11 +96,11 @@ vectorized: true
 • scan
   columns: (p, c)
   estimated row count: 1,000 (missing stats)
-  table: num_ref@num_ref_pkey
+  table: num_ref@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1,3,4) AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [53(1,3,4) AS num_ref_alias]
 ----
 distribution: local
 vectorized: true
@@ -104,11 +108,11 @@ vectorized: true
 • scan
   columns: (p, d, c)
   estimated row count: 1,000 (missing stats)
-  table: num_ref@num_ref_pkey
+  table: num_ref@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4,3,1) AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [53(4,3,1) AS num_ref_alias]
 ----
 distribution: local
 vectorized: true
@@ -116,11 +120,11 @@ vectorized: true
 • scan
   columns: (c, d, p)
   estimated row count: 1,000 (missing stats)
-  table: num_ref@num_ref_pkey
+  table: num_ref@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4,3,1) AS num_ref_alias(col1,col2,col3)]
+EXPLAIN (VERBOSE) SELECT * FROM [53(4,3,1) AS num_ref_alias(col1,col2,col3)]
 ----
 distribution: local
 vectorized: true
@@ -128,11 +132,11 @@ vectorized: true
 • scan
   columns: (col1, col2, col3)
   estimated row count: 1,000 (missing stats)
-  table: num_ref@num_ref_pkey
+  table: num_ref@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4,3,1) AS num_ref_alias]@bc
+EXPLAIN (VERBOSE) SELECT * FROM [53(4,3,1) AS num_ref_alias]@bc
 ----
 distribution: local
 vectorized: true
@@ -144,7 +148,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@bc
+EXPLAIN (VERBOSE) SELECT * FROM [53(4) AS num_ref_alias]@bc
 ----
 distribution: local
 vectorized: true
@@ -156,7 +160,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@bc
+EXPLAIN (VERBOSE) SELECT * FROM [53(3) AS num_ref_alias]@bc
 ----
 distribution: local
 vectorized: true
@@ -168,7 +172,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@bc
+EXPLAIN (VERBOSE) SELECT * FROM [53(1) AS num_ref_alias]@bc
 ----
 distribution: local
 vectorized: true
@@ -180,7 +184,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[1]
+EXPLAIN (VERBOSE) SELECT * FROM [53(1) AS num_ref_alias]@[1]
 ----
 distribution: local
 vectorized: true
@@ -188,11 +192,11 @@ vectorized: true
 • scan
   columns: (p)
   estimated row count: 1,000 (missing stats)
-  table: num_ref@num_ref_pkey
+  table: num_ref@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[2]
+EXPLAIN (VERBOSE) SELECT * FROM [53(1) AS num_ref_alias]@[2]
 ----
 distribution: local
 vectorized: true
@@ -204,7 +208,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[1]
+EXPLAIN (VERBOSE) SELECT * FROM [53(3) AS num_ref_alias]@[1]
 ----
 distribution: local
 vectorized: true
@@ -212,11 +216,11 @@ vectorized: true
 • scan
   columns: (d)
   estimated row count: 1,000 (missing stats)
-  table: num_ref@num_ref_pkey
+  table: num_ref@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[2]
+EXPLAIN (VERBOSE) SELECT * FROM [53(3) AS num_ref_alias]@[2]
 ----
 distribution: local
 vectorized: true
@@ -228,7 +232,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[1]
+EXPLAIN (VERBOSE) SELECT * FROM [53(4) AS num_ref_alias]@[1]
 ----
 distribution: local
 vectorized: true
@@ -236,11 +240,11 @@ vectorized: true
 • scan
   columns: (c)
   estimated row count: 1,000 (missing stats)
-  table: num_ref@num_ref_pkey
+  table: num_ref@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[2]
+EXPLAIN (VERBOSE) SELECT * FROM [53(4) AS num_ref_alias]@[2]
 ----
 distribution: local
 vectorized: true
@@ -252,7 +256,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id2(1,3) AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [54(1,3) AS num_ref_alias]
 ----
 distribution: local
 vectorized: true
@@ -260,11 +264,11 @@ vectorized: true
 • scan
   columns: (a)
   estimated row count: 1,000 (missing stats)
-  table: num_ref_hidden@num_ref_hidden_pkey
+  table: num_ref_hidden@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id2(3) AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [54(3) AS num_ref_alias]
 ----
 distribution: local
 vectorized: true
@@ -272,11 +276,11 @@ vectorized: true
 • scan
   columns: ()
   estimated row count: 1,000 (missing stats)
-  table: num_ref_hidden@num_ref_hidden_pkey
+  table: num_ref_hidden@primary
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT rowid FROM [$t_id2(3) AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT rowid FROM [54(3) AS num_ref_alias]
 ----
 distribution: local
 vectorized: true
@@ -284,29 +288,29 @@ vectorized: true
 • scan
   columns: (rowid)
   estimated row count: 1,000 (missing stats)
-  table: num_ref_hidden@num_ref_hidden_pkey
+  table: num_ref_hidden@primary
   spans: FULL SCAN
 
 query error pq: \[666\(1\) AS num_ref_alias\]: relation \"\[666\]\" does not exist
 EXPLAIN (VERBOSE) SELECT * FROM [666(1) AS num_ref_alias]
 
 query error pq: column \[666\] does not exist
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(666) AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [53(666) AS num_ref_alias]
 
 query error pq: column \[2\] does not exist
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(2) AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [53(2) AS num_ref_alias]
 
 query error pq: an explicit list of column IDs must include at least one column
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id() AS num_ref_alias]
+EXPLAIN (VERBOSE) SELECT * FROM [53() AS num_ref_alias]
 
 query error pq: an explicit list of column IDs must include at least one column
-EXPLAIN (VERBOSE) SELECT 1 FROM [$t_id() as num_ref_alias]
+EXPLAIN (VERBOSE) SELECT 1 FROM [53() as num_ref_alias]
 
 statement ok
 DROP TABLE num_ref
 
-query error pq: \[\d+\(1\) AS num_ref_alias\]: descriptor is being dropped
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]
+query error pq: \[53\(1\) AS num_ref_alias\]: descriptor is being dropped
+EXPLAIN (VERBOSE) SELECT * FROM [53(1) AS num_ref_alias]
 
 # ------------------------------------------------------------------------------
 # Basic filter combinations.
@@ -323,7 +327,7 @@ vectorized: true
 • scan
   columns: (x, y)
   estimated row count: 333 (missing stats)
-  table: a@a_pkey
+  table: a@primary
   spans: /2-
 
 query T
@@ -340,7 +344,7 @@ vectorized: true
 └── • scan
       columns: (x, y)
       estimated row count: 1,000 (missing stats)
-      table: a@a_pkey
+      table: a@primary
       spans: FULL SCAN
 
 query T
@@ -352,7 +356,7 @@ vectorized: true
 • scan
   columns: (x, y)
   estimated row count: 1 (missing stats)
-  table: a@a_pkey
+  table: a@primary
   spans: /2/0
 
 query T
@@ -369,7 +373,7 @@ vectorized: true
 └── • scan
       columns: (x, y)
       estimated row count: 333 (missing stats)
-      table: a@a_pkey
+      table: a@primary
       spans: /2-
 
 query T
@@ -386,7 +390,7 @@ vectorized: true
 └── • scan
       columns: (x)
       estimated row count: 1,000 (missing stats)
-      table: a@a_pkey
+      table: a@primary
       spans: FULL SCAN
 
 query T
@@ -407,7 +411,7 @@ vectorized: true
 └── • scan
       columns: (x, y)
       estimated row count: 1,000 (missing stats)
-      table: a@a_pkey
+      table: a@primary
       spans: FULL SCAN
 
 query T
@@ -430,7 +434,7 @@ vectorized: true
     └── • scan
           columns: (x, y)
           estimated row count: 1,000 (missing stats)
-          table: a@a_pkey
+          table: a@primary
           spans: FULL SCAN
 
 query T
@@ -445,7 +449,7 @@ vectorized: true
 └── • scan
       columns: (x, y)
       estimated row count: 1,000 (missing stats)
-      table: a@a_pkey
+      table: a@primary
       spans: FULL SCAN
 
 query T
@@ -468,7 +472,7 @@ vectorized: true
     └── • scan
           columns: (x, y)
           estimated row count: 1,000 (missing stats)
-          table: a@a_pkey
+          table: a@primary
           spans: FULL SCAN
 
 statement ok
@@ -489,7 +493,7 @@ vectorized: true
 • scan
   columns: (x, y)
   estimated row count: 1,000 (missing stats)
-  table: b@b_pkey
+  table: b@primary
   spans: FULL SCAN
 
 query T
@@ -501,7 +505,7 @@ vectorized: true
 • scan
   columns: (x, y, rowid)
   estimated row count: 333 (missing stats)
-  table: b@b_pkey
+  table: b@primary
   spans: /1-
 
 statement ok
@@ -533,10 +537,7 @@ t           c_idx       false       1             c            ASC        false 
 t           c_idx       false       2             b            N/A        true     false
 t           c_idx       false       3             d            N/A        true     false
 t           c_idx       false       4             a            ASC        false    true
-t           t_pkey      false       1             a            ASC        false    false
-t           t_pkey      false       2             b            N/A        true     false
-t           t_pkey      false       3             c            N/A        true     false
-t           t_pkey      false       4             d            N/A        true     false
+t           primary     false       1             a            ASC        false    false
 
 statement ok
 INSERT INTO t VALUES (1, 2, 3, 4)
@@ -608,8 +609,8 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /t/b_idx/NULL/2 -> <undecoded>
-fetched: /t/b_idx/NULL/3 -> <undecoded>
+fetched: /t/b_idx/NULL/2 -> NULL
+fetched: /t/b_idx/NULL/3 -> NULL
 fetched: /t/b_idx/2/1/c/d -> /3/4
 output row: [2 NULL NULL NULL]
 output row: [3 NULL NULL NULL]
@@ -721,7 +722,7 @@ vectorized: true
 └── • scan
       columns: ()
       estimated row count: 1,000 (missing stats)
-      table: nocols@nocols_pkey
+      table: nocols@primary
       spans: FULL SCAN
 
 statement ok
@@ -749,7 +750,7 @@ vectorized: true
   columns: (a collatedstring{da}, b int)
   ordering: +a,+b
   estimated row count: 1,000 (missing stats)
-  table: coll@coll_pkey
+  table: coll@primary
   spans: FULL SCAN
 
 query T
@@ -825,9 +826,9 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /dt/dt_pkey/'2015-08-25 04:45:45.53453' -> <undecoded>
-fetched: /dt/dt_pkey/'2015-08-25 04:45:45.53453'/b -> '2015-08-25'
-fetched: /dt/dt_pkey/'2015-08-25 04:45:45.53453'/c -> '02:45:02.234'
+fetched: /dt/primary/'2015-08-25 04:45:45.53453' -> NULL
+fetched: /dt/primary/'2015-08-25 04:45:45.53453'/b -> '2015-08-25'
+fetched: /dt/primary/'2015-08-25 04:45:45.53453'/c -> '02:45:02.234'
 output row: ['2015-08-25 04:45:45.53453' '2015-08-25' '02:45:02.234']
 
 statement ok
@@ -838,7 +839,7 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /dt/dt_b_key/'2015-08-25' -> /?
+fetched: /dt/dt_b_key/'2015-08-25' -> /'2015-08-25 04:45:45.53453'
 output row: ['2015-08-25']
 
 statement ok
@@ -849,8 +850,8 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /dt/dt_c_key/'02:45:02.234' -> /?
-fetched: /dt/dt_c_key/'34:00:02' -> /?
+fetched: /dt/dt_c_key/'02:45:02.234' -> /'2015-08-25 04:45:45.53453'
+fetched: /dt/dt_c_key/'34:00:02' -> /'2015-08-30 03:34:45.34567'
 output row: ['02:45:02.234']
 output row: ['34:00:02']
 
@@ -872,7 +873,7 @@ vectorized: true
 • scan
   columns: (d decimal, v decimal)
   estimated row count: 1 (missing stats)
-  table: dec@dec_pkey
+  table: dec@primary
   spans: /NaN/NaN/0
 
 # Test again with separate column families.
@@ -889,8 +890,8 @@ vectorized: true
 • scan
   columns: (d decimal, v decimal)
   estimated row count: 1 (missing stats)
-  table: decfam@decfam_pkey
-  spans: /NaN/NaN-/NaN/-Infinity
+  table: decfam@primary
+  spans: /NaN/NaN-/NaN/NaN/#
 
 # The NaN suffix is decimalNaNDesc, not decimalNaN(Asc).
 query T
@@ -902,7 +903,7 @@ vectorized: true
 • scan
   columns: (d decimal, v decimal)
   estimated row count: 1 (missing stats)
-  table: dec@dec_pkey
+  table: dec@primary
   spans: /Infinity/Infinity/0
 
 query T
@@ -914,7 +915,7 @@ vectorized: true
 • scan
   columns: (d decimal, v decimal)
   estimated row count: 1 (missing stats)
-  table: dec@dec_pkey
+  table: dec@primary
   spans: /-Infinity/-Infinity/0
 
 statement ok
@@ -946,8 +947,8 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /c/b_idx/NULL/2 -> <undecoded>
-fetched: /c/b_idx/NULL/3 -> <undecoded>
+fetched: /c/b_idx/NULL/2 -> NULL
+fetched: /c/b_idx/NULL/3 -> NULL
 fetched: /c/b_idx/0.4/1/b -> /0.40
 output row: [2 NULL]
 output row: [3 NULL]
@@ -1000,7 +1001,7 @@ vectorized: true
 └── • scan
       columns: (d decimal)
       estimated row count: 1,000 (missing stats)
-      table: dec2@dec2_pkey
+      table: dec2@primary
       spans: FULL SCAN
 
 statement ok
@@ -1025,7 +1026,7 @@ vectorized: true
   columns: (f float)
   estimated row count: 1 (missing stats)
   table: flt@flt_f_key
-  spans: /NaN/0
+  spans: /NaN-/NaN/PrefixEnd
 
 query T
 EXPLAIN (TYPES) SELECT * FROM flt WHERE f = 'NaN'
@@ -1037,7 +1038,7 @@ vectorized: true
   columns: (f float)
   estimated row count: 1 (missing stats)
   table: flt@flt_f_key
-  spans: /NaN/0
+  spans: /NaN-/NaN/PrefixEnd
 
 query T
 EXPLAIN (TYPES) SELECT * FROM flt WHERE isnan(f)
@@ -1053,7 +1054,7 @@ vectorized: true
 └── • scan
       columns: (f float)
       estimated row count: 1,000 (missing stats)
-      table: flt@flt_pkey
+      table: flt@primary
       spans: FULL SCAN
 
 statement ok
@@ -1086,7 +1087,7 @@ vectorized: true
   columns: (i int)
   estimated row count: 1 (missing stats)
   table: num@num_i_key
-  spans: /-1/0
+  spans: /-1-/0
 
 query T
 EXPLAIN (TYPES) SELECT f FROM num WHERE f = -1:::FLOAT
@@ -1098,7 +1099,7 @@ vectorized: true
   columns: (f float)
   estimated row count: 1 (missing stats)
   table: num@num_f_key
-  spans: /-1/0
+  spans: /-1-/-1/PrefixEnd
 
 query T
 EXPLAIN (TYPES) SELECT d FROM num WHERE d = -1:::DECIMAL
@@ -1110,7 +1111,7 @@ vectorized: true
   columns: (d decimal)
   estimated row count: 1 (missing stats)
   table: num@num_d_key
-  spans: /-1/0
+  spans: /-1-/-1/PrefixEnd
 
 query T
 EXPLAIN (TYPES) SELECT n FROM num WHERE n = -'1h':::INTERVAL
@@ -1122,7 +1123,7 @@ vectorized: true
   columns: (n interval)
   estimated row count: 1 (missing stats)
   table: num@num_n_key
-  spans: /-01:00:00/0
+  spans: /-01:00:00-/1 day -25:00:00
 
 statement ok
 DROP TABLE num
@@ -1340,7 +1341,7 @@ vectorized: true
           columns: (a, b, c)
           ordering: +a
           estimated row count: 1,000 (missing stats)
-          table: abcd@abcd_pkey
+          table: abcd@primary
           spans: FULL SCAN
 
 query T
@@ -1367,7 +1368,7 @@ vectorized: true
         └── • scan
               columns: (a, b, c)
               estimated row count: 1,000 (missing stats)
-              table: abcd@abcd_pkey
+              table: abcd@primary
               spans: FULL SCAN
 
 
@@ -1392,7 +1393,7 @@ vectorized: true
           columns: (a, b, c)
           ordering: -a,-b
           estimated row count: 1,000 (missing stats)
-          table: abcd@abcd_pkey
+          table: abcd@primary
           spans: FULL SCAN
 
 # Ensure that filter nodes (and filtered scan nodes) get populated with the correct ordering.
@@ -1412,7 +1413,7 @@ vectorized: true
       columns: (a, b, c, d)
       ordering: +a
       estimated row count: 1,000 (missing stats)
-      table: abcd@abcd_pkey
+      table: abcd@primary
       spans: FULL SCAN
 
 query T
@@ -1435,7 +1436,7 @@ vectorized: true
     └── • scan
           columns: (a, b, c, d)
           estimated row count: 1,000 (missing stats)
-          table: abcd@abcd_pkey
+          table: abcd@primary
           spans: FULL SCAN
 
 query T
@@ -1454,7 +1455,7 @@ vectorized: true
       columns: (a, b)
       ordering: +a
       estimated row count: 10 (missing stats)
-      table: abcd@abcd_pkey
+      table: abcd@primary
       spans: LIMITED SCAN
       limit: 10
 
@@ -1481,7 +1482,7 @@ vectorized: true
           columns: (a, b, c)
           ordering: +a
           estimated row count: 10 (missing stats)
-          table: abcd@abcd_pkey
+          table: abcd@primary
           spans: LIMITED SCAN
           limit: 10
 
@@ -1527,7 +1528,7 @@ vectorized: true
 ·
 • scan
   missing stats
-  table: a@a_pkey
+  table: a@primary
   spans: [/10 - /10]
 
 query T
@@ -1538,7 +1539,7 @@ vectorized: true
 ·
 • scan
   missing stats
-  table: a@a_pkey
+  table: a@primary
   spans: [/10 - /10] [/20 - /20]
 
 query T
@@ -1549,7 +1550,7 @@ vectorized: true
 ·
 • scan
   missing stats
-  table: a@a_pkey
+  table: a@primary
   spans: [/10 - /10] [/20 - /20]
 
 # Verify that consolidated point spans are still parallelized.
@@ -1561,7 +1562,7 @@ vectorized: true
 ·
 • scan
   missing stats
-  table: a@a_pkey
+  table: a@primary
   spans: [/10 - /11]
 
 query T
@@ -1572,7 +1573,7 @@ vectorized: true
 ·
 • scan
   missing stats
-  table: a@a_pkey
+  table: a@primary
   spans: [/11 - /19]
 
 # This ticks all the boxes for parallelization apart from the fact that there
@@ -1585,7 +1586,7 @@ vectorized: true
 ·
 • scan
   missing stats
-  table: a@a_pkey
+  table: a@primary
   spans: [/11 - ]
 
 # Test non-int types.
@@ -1598,7 +1599,7 @@ distribution: local
 vectorized: true
 ·
 • index join
-│ table: a@a_pkey
+│ table: a@primary
 │
 └── • scan
       missing stats
@@ -1614,7 +1615,7 @@ distribution: local
 vectorized: true
 ·
 • index join
-│ table: a@a_pkey
+│ table: a@primary
 │
 └── • scan
       missing stats
@@ -1629,7 +1630,7 @@ vectorized: true
 ·
 • scan
   missing stats
-  table: b@b_pkey
+  table: b@primary
   spans: [/10/10 - /10/10] [/20/20 - /20/20]
 
 # This one isn't parallelizable because it's not a point lookup - only part of
@@ -1642,7 +1643,7 @@ vectorized: true
 ·
 • scan
   missing stats
-  table: b@b_pkey
+  table: b@primary
   spans: [/10 - /10] [/20 - /20]
 
 # This one isn't parallelizable because it has a LIMIT clause.
@@ -1654,7 +1655,7 @@ vectorized: true
 ·
 • scan
   missing stats
-  table: a@a_pkey
+  table: a@primary
   spans: [/10 - /10] [/20 - /20]
   limit: 1
 
@@ -1761,27 +1762,18 @@ SELECT * FROM a
 statement ok
 SET tracing = on; SELECT * FROM a WHERE a = 0 OR a = 10; SET tracing = off
 
-let $t_id3
-SELECT id FROM system.namespace WHERE name='a'
-
-# The span "sending partial batch" means that the scan was parallelized. We're
-# seeing duplicate "querying next range" entries because we first use the range
-# cache to try to partition the spans in order to have parallel TableReaders (we
-# end up with a single partition though), and then we have a single TableReader
-# performing the scan of two spans in parallel.
+# The span "sending partial batch" means that the scan was parallelized.
 # If this test is failing and doesn't have that span, it means that the scanNode
 # was improperly configured to add a limit to the ScanRequest batch.
 # See #30943 for more details.
 query T
 SELECT message FROM [SHOW TRACE FOR SESSION]
-WHERE message LIKE 'querying next range at /Table/$t_id3/1%' OR
+WHERE message LIKE 'querying next range at /Table/74/1%' OR
       message = '=== SPAN START: kv.DistSender: sending partial batch ==='
 ----
-querying next range at /Table/127/1/0/0
-querying next range at /Table/127/1/10/0
-querying next range at /Table/127/1/0/0
+querying next range at /Table/74/1/0/0
 === SPAN START: kv.DistSender: sending partial batch ===
-querying next range at /Table/127/1/10/0
+querying next range at /Table/74/1/10/0
 
 # Test for 42202 -- ensure filters can get pushed down through project-set.
 statement ok
@@ -1794,116 +1786,23 @@ EXPLAIN SELECT e.z, s.z, n FROM e, s, generate_series(0, s.z, 1000) as n WHERE e
 distribution: local
 vectorized: true
 ·
-• top-k
-│ order: +z
-│ k: 10
+• limit
+│ count: 10
 │
-└── • project set
+└── • sort
+    │ order: +z
     │
-    └── • hash join
-        │ equality: (y) = (y)
+    └── • project set
         │
-        ├── • scan
-        │     missing stats
-        │     table: e@e_pkey
-        │     spans: FULL SCAN
-        │
-        └── • scan
-              missing stats
-              table: s@s_pkey
-              spans: FULL SCAN
-
-# Check that we have a sane row count estimate when there are a lot of null
-# values.
-statement ok
-CREATE TABLE nulls (x INT, y INT);
-ALTER TABLE nulls INJECT STATISTICS '[
-    {
-        "columns": [
-            "x"
-        ],
-        "created_at": "2021-06-15 02:06:48.036389",
-        "distinct_count": 3000,
-        "histo_buckets": [
-            {
-                "distinct_range": 0,
-                "num_eq": 5000,
-                "num_range": 0,
-                "upper_bound": "0"
-            },
-            {
-                "distinct_range": 0,
-                "num_eq": 5000,
-                "num_range": 0,
-                "upper_bound": "1"
-            }
-        ],
-        "histo_col_type": "INT8",
-        "name": "__auto__",
-        "null_count": 11100000,
-        "row_count": 11110000
-    }
-]'
-
-query T
-EXPLAIN (VERBOSE) SELECT * FROM nulls WHERE x IS NULL
-----
-distribution: local
-vectorized: true
-·
-• filter
-│ columns: (x, y)
-│ estimated row count: 11,100,000
-│ filter: x IS NULL
-│
-└── • scan
-      columns: (x, y)
-      estimated row count: 11,110,000 (100% of the table; stats collected <hidden> ago)
-      table: nulls@nulls_pkey
-      spans: FULL SCAN
-
-# Test resolution of @primary index hint.
-statement ok
-CREATE TABLE tbl_with_no_primary_constraint (
-  id INT PRIMARY KEY,
-  b INT
-)
-
-statement ok
-CREATE TABLE tbl_with_primary_named_index (
-  id INT PRIMARY KEY,
-  b INT,
-  INDEX "primary" (b)
-)
-
-query T
-EXPLAIN (VERBOSE) SELECT * FROM tbl_with_no_primary_constraint@primary ORDER BY id
-----
-distribution: local
-vectorized: true
-·
-• scan
-  columns: (id, b)
-  ordering: +id
-  estimated row count: 1,000 (missing stats)
-  table: tbl_with_no_primary_constraint@tbl_with_no_primary_constraint_pkey
-  spans: FULL SCAN
-
-statement ok
-SHOW PARTITIONS FROM INDEX tbl_with_no_primary_constraint@primary
-
-query T
-EXPLAIN (VERBOSE) SELECT b FROM tbl_with_primary_named_index@primary ORDER BY b
-----
-distribution: local
-vectorized: true
-·
-• scan
-  columns: (b)
-  ordering: +b
-  estimated row count: 1,000 (missing stats)
-  table: tbl_with_primary_named_index@primary
-  spans: FULL SCAN
-
-statement ok
-SELECT index_name FROM [SHOW PARTITIONS FROM INDEX tbl_with_primary_named_index@primary]
+        └── • hash join
+            │ equality: (y) = (y)
+            │
+            ├── • scan
+            │     missing stats
+            │     table: e@primary
+            │     spans: FULL SCAN
+            │
+            └── • scan
+                  missing stats
+                  table: s@primary
+                  spans: FULL SCAN

@@ -18,11 +18,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -79,7 +77,7 @@ func TestTrace(t *testing.T) {
 						"WHERE operation IS NOT NULL ORDER BY op")
 			},
 			expSpans: []string{
-				"sql query",
+				"exec stmt",
 				"flow",
 				"session recording",
 				"sql txn",
@@ -88,7 +86,6 @@ func TestTrace(t *testing.T) {
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
-				"commit sql txn",
 			},
 		},
 		{
@@ -140,14 +137,13 @@ func TestTrace(t *testing.T) {
 			expSpans: []string{
 				"session recording",
 				"sql txn",
-				"sql query",
+				"exec stmt",
 				"flow",
 				"table reader",
 				"consuming rows",
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
-				"commit sql txn",
 			},
 			// Depending on whether the data is local or not, we may not see these
 			// spans.
@@ -176,7 +172,7 @@ func TestTrace(t *testing.T) {
 						"WHERE operation IS NOT NULL ORDER BY op")
 			},
 			expSpans: []string{
-				"sql query",
+				"exec stmt",
 				"flow",
 				"session recording",
 				"sql txn",
@@ -185,7 +181,6 @@ func TestTrace(t *testing.T) {
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
-				"commit sql txn",
 			},
 		},
 		{
@@ -210,14 +205,13 @@ func TestTrace(t *testing.T) {
 			expSpans: []string{
 				"session recording",
 				"sql txn",
-				"sql query",
+				"exec stmt",
 				"flow",
 				"table reader",
 				"consuming rows",
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
-				"commit sql txn",
 			},
 			// Depending on whether the data is local or not, we may not see these
 			// spans.
@@ -245,7 +239,7 @@ func TestTrace(t *testing.T) {
 			expSpans: []string{
 				"session recording",
 				"sql txn",
-				"sql query",
+				"exec stmt",
 				"flow",
 				"batch flow coordinator",
 				"colbatchscan",
@@ -253,7 +247,6 @@ func TestTrace(t *testing.T) {
 				"txn coordinator send",
 				"dist sender send",
 				"/cockroach.roachpb.Internal/Batch",
-				"commit sql txn",
 			},
 		},
 	}
@@ -634,23 +627,4 @@ func TestTraceDistSQL(t *testing.T) {
 	require.Empty(t, rec.OrphanSpans())
 	// Check that the table reader indeed came from a remote note.
 	require.Equal(t, "2", sp.Tags["node"])
-}
-
-// Test the sql.trace.stmt.enable_threshold cluster setting.
-func TestStatementThreshold(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	settings := cluster.MakeTestingClusterSettings()
-	sql.TraceStmtThreshold.Override(ctx, &settings.SV, 1*time.Nanosecond)
-	args := base.TestServerArgs{
-		Settings: settings,
-	}
-	// Check that the server starts (no crash).
-	s, db, _ := serverutils.StartServer(t, args)
-	defer s.Stopper().Stop(ctx)
-	r := sqlutils.MakeSQLRunner(db)
-	r.Exec(t, "select 1")
-	// TODO(andrei): check the logs for traces somehow.
 }
