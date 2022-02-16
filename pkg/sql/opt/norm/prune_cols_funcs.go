@@ -163,6 +163,11 @@ func (c *CustomFuncs) NeededMutationFetchCols(
 
 		// Make sure to consider indexes that are being added or dropped.
 		for i, n := 0, tabMeta.Table.DeletableIndexCount(); i < n; i++ {
+			index := tabMeta.Table.Index(i)
+			if index.Hypothetical() {
+				continue
+			}
+
 			// If the columns being updated are not part of the index, then the
 			// update does not require changes to the index. Partial indexes may
 			// be updated (even when a column in the index is not changing) when
@@ -175,7 +180,7 @@ func (c *CustomFuncs) NeededMutationFetchCols(
 			// columns have been mapped to their source columns. Virtual columns
 			// are never part of the updated columns. Updates to source columns
 			// trigger index changes.
-			indexCols := tabMeta.IndexColumnsMapInverted(i)
+			indexCols := tabMeta.IndexColumnsMapVirtual(i)
 			pred, isPartialIndex := tabMeta.PartialIndexPredicate(i)
 			indexAndPredCols := indexCols.Copy()
 			if isPartialIndex {
@@ -188,7 +193,7 @@ func (c *CustomFuncs) NeededMutationFetchCols(
 
 			// Always add index strict key columns, since these are needed to fetch
 			// existing rows from the store.
-			keyCols := tabMeta.IndexKeyColumnsMapInverted(i)
+			keyCols := tabMeta.IndexKeyColumnsMapVirtual(i)
 			cols.UnionWith(keyCols)
 
 			// Add all columns in any family that includes an update column.
@@ -228,7 +233,7 @@ func (c *CustomFuncs) NeededMutationFetchCols(
 		// it is necessary to delete rows even from indexes that are being added
 		// or dropped.
 		for i, n := 0, tabMeta.Table.DeletableIndexCount(); i < n; i++ {
-			cols.UnionWith(tabMeta.IndexKeyColumnsMapInverted(i))
+			cols.UnionWith(tabMeta.IndexKeyColumnsMapVirtual(i))
 		}
 
 		// Add inbound foreign keys that may require a check or cascade.
@@ -681,11 +686,11 @@ func (c *CustomFuncs) MutationTable(private *memo.MutationPrivate) opt.TableID {
 // NeededColMapLeft returns the subset of a SetPrivate's LeftCols that corresponds to the
 // needed subset of OutCols. This is useful for pruning columns in set operations.
 func (c *CustomFuncs) NeededColMapLeft(needed opt.ColSet, set *memo.SetPrivate) opt.ColSet {
-	return opt.TranslateColSetStrict(needed, set.OutCols, set.LeftCols)
+	return opt.TranslateColSet(needed, set.OutCols, set.LeftCols)
 }
 
 // NeededColMapRight returns the subset of a SetPrivate's RightCols that corresponds to the
 // needed subset of OutCols. This is useful for pruning columns in set operations.
 func (c *CustomFuncs) NeededColMapRight(needed opt.ColSet, set *memo.SetPrivate) opt.ColSet {
-	return opt.TranslateColSetStrict(needed, set.OutCols, set.RightCols)
+	return opt.TranslateColSet(needed, set.OutCols, set.RightCols)
 }

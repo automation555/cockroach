@@ -28,6 +28,12 @@ func (b *Builder) buildExplain(explain *tree.Explain, inScope *scope) (outScope 
 		))
 	}
 
+	// Allow the optimzer to generate plans involving hypothetical indexes
+	// if the HYPOTHETICAL option was included in the EXPLAIN statement.
+	if explain.ExplainOptions.Flags[tree.ExplainFlagHypothetical] {
+		b.factory.Memo().AllowHypotheticalIndexes()
+	}
+
 	stmtScope := b.buildStmtAtRoot(explain.Statement, nil /* desiredTypes */)
 
 	outScope = inScope.push()
@@ -55,15 +61,12 @@ func (b *Builder) buildExplain(explain *tree.Explain, inScope *scope) (outScope 
 			telemetry.Inc(sqltelemetry.ExplainDDLStages)
 		}
 
-	case tree.ExplainGist:
-		telemetry.Inc(sqltelemetry.ExplainGist)
-
 	default:
 		panic(errors.Errorf("EXPLAIN mode %s not supported", explain.Mode))
 	}
 	b.synthesizeResultColumns(outScope, colinfo.ExplainPlanColumns)
 
-	input := stmtScope.expr
+	input := stmtScope.expr.(memo.RelExpr)
 	private := memo.ExplainPrivate{
 		Options:  explain.ExplainOptions,
 		ColList:  colsToColList(outScope.cols),

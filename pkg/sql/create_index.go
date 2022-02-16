@@ -12,13 +12,12 @@ package sql
 
 import (
 	"context"
-	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/docs"
+	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
@@ -29,10 +28,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
@@ -54,7 +53,7 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 	); err != nil {
 		return nil, err
 	}
-	_, tableDesc, err := p.ResolveMutableTableDescriptor(
+	tableDesc, err := p.ResolveMutableTableDescriptor(
 		ctx, &n.Table, true /*required*/, tree.ResolveRequireTableOrViewDesc,
 	)
 	if err != nil {
@@ -66,6 +65,10 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 	}
 
 	if tableDesc.MaterializedView() {
+		if n.Interleave != nil {
+			return nil, pgerror.New(pgcode.InvalidObjectDefinition,
+				"cannot create interleaved index on materialized view")
+		}
 		if n.Sharded != nil {
 			return nil, pgerror.New(pgcode.InvalidObjectDefinition,
 				"cannot create hash sharded index on materialized view")
@@ -89,17 +92,30 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 	return &createIndexNode{tableDesc: tableDesc, n: n}, nil
 }
 
-// maybeSetupConstraintForShard adds a check constraint ensuring that the shard
-// column's value is within [0..ShardBuckets-1]. This method is called when a
-// `CREATE INDEX`/`ALTER PRIMARY KEY` statement is issued for the creation of a
-// sharded index that *does not* re-use a pre-existing shard column.
-func (p *planner) maybeSetupConstraintForShard(
-	ctx context.Context, tableDesc *tabledesc.Mutable, shardCol catalog.Column, buckets int32,
+// setupFamilyAndConstraintForShard adds a newly-created shard column into its appropriate
+// family (see comment above GetColumnFamilyForShard) and adds a check constraint ensuring
+// that the shard column's value is within [0..ShardBuckets-1]. This method is called when
+// a `CREATE INDEX` statement is issued for the creation of a sharded index that *does
+// not* re-use a pre-existing shard column.
+func (p *planner) setupFamilyAndConstraintForShard(
+	ctx context.Context,
+	tableDesc *tabledesc.Mutable,
+	shardCol catalog.Column,
+	idxColumns []string,
+	buckets int32,
 ) error {
+	family := tabledesc.GetColumnFamilyForShard(tableDesc, idxColumns)
+	if family == "" {
+		return errors.AssertionFailedf("could not find column family for the first column in the index column set")
+	}
+	// Assign shard column to the family of the first column in its index set, and do it
+	// before `AllocateIDs()` assigns it to the primary column family.
+	if err := tableDesc.AddColumnToFamilyMaybeCreate(shardCol.GetName(), family, false, false); err != nil {
+		return err
+	}
 	// Assign an ID to the newly-added shard column, which is needed for the creation
 	// of a valid check constraint.
-	version := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
-	if err := tableDesc.AllocateIDs(ctx, version); err != nil {
+	if err := tableDesc.AllocateIDs(ctx); err != nil {
 		return err
 	}
 
@@ -107,99 +123,70 @@ func (p *planner) maybeSetupConstraintForShard(
 	if err != nil {
 		return err
 	}
-	ckBuilder := schemaexpr.MakeCheckConstraintBuilder(ctx, p.tableName, tableDesc, &p.semaCtx)
-	ckDesc, err := ckBuilder.Build(ckDef)
+	info, err := tableDesc.GetConstraintInfo()
 	if err != nil {
 		return err
 	}
 
-	curConstraintInfos, err := tableDesc.GetConstraintInfo()
+	inuseNames := make(map[string]struct{}, len(info))
+	for k := range info {
+		inuseNames[k] = struct{}{}
+	}
+
+	ckBuilder := schemaexpr.MakeCheckConstraintBuilder(ctx, p.tableName, tableDesc, &p.semaCtx)
+	ckName, err := ckBuilder.DefaultName(ckDef.Expr)
 	if err != nil {
 		return err
 	}
 
 	// Avoid creating duplicate check constraints.
-	for _, info := range curConstraintInfos {
-		if info.CheckConstraint != nil && info.CheckConstraint.Expr == ckDesc.Expr {
-			return nil
+	if _, ok := inuseNames[ckName]; !ok {
+		ck, err := ckBuilder.Build(ckDef)
+		if err != nil {
+			return err
 		}
+		ck.Validity = descpb.ConstraintValidity_Validating
+		tableDesc.AddCheckMutation(ck, descpb.DescriptorMutation_ADD)
 	}
-
-	ckDesc.Validity = descpb.ConstraintValidity_Validating
-	tableDesc.AddCheckMutation(ckDesc, descpb.DescriptorMutation_ADD)
 	return nil
 }
 
-// makeIndexDescriptor creates an index descriptor from a CreateIndex node and optionally
+// MakeIndexDescriptor creates an index descriptor from a CreateIndex node and optionally
 // adds a hidden computed shard column (along with its check constraint) in case the index
 // is hash sharded. Note that `tableDesc` will be modified when this method is called for
 // a hash sharded index.
-func makeIndexDescriptor(
+func MakeIndexDescriptor(
 	params runParams, n tree.CreateIndex, tableDesc *tabledesc.Mutable,
 ) (*descpb.IndexDescriptor, error) {
-	if n.Sharded == nil && n.StorageParams.GetVal(`bucket_count`) != nil {
-		return nil, pgerror.New(
-			pgcode.InvalidParameterValue,
-			`"bucket_count" storage param should only be set with "USING HASH" for hash sharded index`,
-		)
-	}
-	// Since we mutate the columns below, we make copies of them
-	// here so that on retry we do not attempt to validate the
-	// mutated columns.
-	columns := make(tree.IndexElemList, len(n.Columns))
-	copy(columns, n.Columns)
-
-	// Ensure that the columns we want to index are accessible before trying to
-	// create the index. This must be checked before inaccessible columns are
-	// created for expression indexes in replaceExpressionElemsWithVirtualCols.
-	if err := validateColumnsAreAccessible(tableDesc, columns); err != nil {
-		return nil, err
-	}
-
-	tn, err := params.p.getQualifiedTableName(params.ctx, tableDesc)
-	if err != nil {
-		return nil, err
-	}
-
 	// Replace expression index elements with hidden virtual computed columns.
 	// The virtual columns are added as mutation columns to tableDesc.
-	if err := replaceExpressionElemsWithVirtualCols(
-		params.ctx,
-		tableDesc,
-		tn,
-		columns,
-		n.Inverted,
-		false, /* isNewTable */
-		params.p.SemaCtx(),
-		params.EvalContext(),
-		params.SessionData(),
-	); err != nil {
+	if err := replaceExpressionElemsWithVirtualCols(params, tableDesc, &n); err != nil {
 		return nil, err
 	}
 
 	// Ensure that the columns we want to index exist before trying to create the
 	// index.
-	if err := validateIndexColumnsExist(tableDesc, columns); err != nil {
+	if err := validateIndexColumnsExist(tableDesc, n.Columns); err != nil {
 		return nil, err
 	}
 
 	// Ensure that the index name does not exist before trying to create the index.
-	if idx, _ := tableDesc.FindIndexWithName(string(n.Name)); idx != nil {
-		if idx.Dropped() {
-			return nil, pgerror.Newf(pgcode.DuplicateRelation, "index with name %q already exists and is being dropped, try again later", n.Name)
-		}
-		return nil, pgerror.Newf(pgcode.DuplicateRelation, "index with name %q already exists", n.Name)
+	if err := tableDesc.ValidateIndexNameIsUnique(string(n.Name)); err != nil {
+		return nil, err
 	}
-
 	indexDesc := descpb.IndexDescriptor{
 		Name:              string(n.Name),
 		Unique:            n.Unique,
 		StoreColumnNames:  n.Storing.ToStrings(),
 		CreatedExplicitly: true,
-		CreatedAtNanos:    params.EvalContext().GetTxnTimestamp(time.Microsecond).UnixNano(),
+		Hypothetical:      n.Hypothetical,
 	}
 
 	if n.Inverted {
+		if n.Interleave != nil {
+			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support interleaved tables")
+		}
+
 		if n.Sharded != nil {
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support hash sharding")
 		}
@@ -213,7 +200,7 @@ func makeIndexDescriptor(
 		}
 
 		indexDesc.Type = descpb.IndexDescriptor_INVERTED
-		column, err := tableDesc.FindColumnWithName(columns[len(columns)-1].Column)
+		column, err := tableDesc.FindColumnWithName(n.Columns[len(n.Columns)-1].Column)
 		if err != nil {
 			return nil, err
 		}
@@ -228,7 +215,7 @@ func makeIndexDescriptor(
 			indexDesc.GeoConfig = *geoindex.DefaultGeographyIndexConfig()
 		}
 	}
-
+	columns := n.Columns
 	if n.Sharded != nil {
 		if n.PartitionByIndex.ContainsPartitions() {
 			return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
@@ -236,25 +223,28 @@ func makeIndexDescriptor(
 		if tableDesc.IsLocalityRegionalByRow() {
 			return nil, hashShardedIndexesOnRegionalByRowError()
 		}
-		shardCol, newColumns, err := setupShardedIndex(
+		if n.Interleave != nil {
+			return nil, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
+		}
+		shardCol, newColumns, newColumn, err := setupShardedIndex(
 			params.ctx,
 			params.EvalContext(),
 			&params.p.semaCtx,
 			params.SessionData().HashShardedIndexesEnabled,
-			columns,
+			n.Columns,
 			n.Sharded.ShardBuckets,
 			tableDesc,
 			&indexDesc,
-			n.StorageParams,
 			false /* isNewTable */)
 		if err != nil {
 			return nil, err
 		}
 		columns = newColumns
-		if err := params.p.maybeSetupConstraintForShard(
-			params.ctx, tableDesc, shardCol, indexDesc.Sharded.ShardBuckets,
-		); err != nil {
-			return nil, err
+		if newColumn {
+			if err := params.p.setupFamilyAndConstraintForShard(params.ctx, tableDesc, shardCol,
+				indexDesc.Sharded.ColumnNames, indexDesc.Sharded.ShardBuckets); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -272,7 +262,7 @@ func makeIndexDescriptor(
 		return nil, err
 	}
 
-	if err := paramparse.SetStorageParameters(
+	if err := paramparse.ApplyStorageParameters(
 		params.ctx,
 		params.p.SemaCtx(),
 		params.EvalContext(),
@@ -308,30 +298,6 @@ func makeIndexDescriptor(
 	return &indexDesc, nil
 }
 
-// validateColumnsAreAccessible validates that the columns for an index are
-// accessible. This check must be performed before creating inaccessible columns
-// for expression indexes with replaceExpressionElemsWithVirtualCols.
-func validateColumnsAreAccessible(desc *tabledesc.Mutable, columns tree.IndexElemList) error {
-	for _, column := range columns {
-		// Skip expression elements.
-		if column.Expr != nil {
-			continue
-		}
-		foundColumn, err := desc.FindColumnWithName(column.Column)
-		if err != nil {
-			return err
-		}
-		if foundColumn.IsInaccessible() {
-			return pgerror.Newf(
-				pgcode.UndefinedColumn,
-				"column %q is inaccessible and cannot be referenced",
-				foundColumn.GetName(),
-			)
-		}
-	}
-	return nil
-}
-
 // validateIndexColumnsExists validates that the columns for an index exist
 // in the table and are not being dropped prior to attempting to add the index.
 func validateIndexColumnsExist(desc *tabledesc.Mutable, columns tree.IndexElemList) error {
@@ -350,133 +316,81 @@ func validateIndexColumnsExist(desc *tabledesc.Mutable, columns tree.IndexElemLi
 	return nil
 }
 
-// replaceExpressionElemsWithVirtualCols replaces each non-nil expression in
-// elems with an inaccessible virtual column with the same expression. If
-// isNewTable is true, the column is added directly to desc. Otherwise, the
-// virtual column is added to desc as a mutation column.
+// replaceExpressionElemsWithVirtualCols replaces each IndexElem in n with a
+// non-nil Expr with a virtual column with the same expression. The virtual
+// column is added to desc as a mutation column.
 func replaceExpressionElemsWithVirtualCols(
-	ctx context.Context,
-	desc *tabledesc.Mutable,
-	tn *tree.TableName,
-	elems tree.IndexElemList,
-	isInverted bool,
-	isNewTable bool,
-	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
-	sessionData *sessiondata.SessionData,
+	params runParams, desc *tabledesc.Mutable, n *tree.CreateIndex,
 ) error {
-	lastColumnIdx := len(elems) - 1
-	for i := range elems {
-		elem := &elems[i]
-		if elem.Expr != nil {
-			// Create a dummy ColumnTableDef to use for validating the
-			// expression. The type is Any because it is unknown until
-			// validation is performed.
-			colDef := &tree.ColumnTableDef{
-				Type: types.Any,
-			}
-			colDef.Computed.Computed = true
-			colDef.Computed.Expr = elem.Expr
-			colDef.Computed.Virtual = true
+	tn, err := params.p.getQualifiedTableName(params.ctx, desc)
+	if err != nil {
+		return err
+	}
 
-			// Validate the expression and resolve its type.
-			expr, typ, err := schemaexpr.ValidateComputedColumnExpression(
-				ctx,
+	for i := range n.Columns {
+		elem := &n.Columns[i]
+		if elem.Expr != nil {
+			if !params.SessionData().EnableExpressionBasedIndexes {
+				return unimplemented.NewWithIssuef(9682, "only simple columns are supported as index elements")
+			}
+
+			if !params.EvalContext().Settings.Version.IsActive(params.ctx, clusterversion.ExpressionBasedIndexes) {
+				return pgerror.Newf(pgcode.FeatureNotSupported,
+					"version %v must be finalized to use expression-based indexes",
+					clusterversion.ExpressionBasedIndexes)
+			}
+
+			expr, typ, _, err := schemaexpr.DequalifyAndValidateExpr(
+				params.ctx,
 				desc,
-				colDef,
+				elem.Expr,
+				types.Any,
+				"index expression",
+				params.p.SemaCtx(),
+				tree.VolatilityImmutable,
 				tn,
-				"index element",
-				semaCtx,
 			)
 			if err != nil {
 				return err
 			}
 
-			// The expression type cannot be ambiguous.
-			if typ.IsAmbiguous() {
-				return errors.WithHint(
-					pgerror.Newf(
-						pgcode.InvalidTableDefinition,
-						"type of index element %s is ambiguous",
-						elem.Expr.String(),
-					),
-					"consider adding a type cast to the expression",
-				)
+			// If a virtual column with the same expression already exists, use
+			// it instead of creating a new virtual column.
+			if col, ok := desc.FindVirtualColumnWithExpr(expr); ok {
+				elem.Column = col.ColName()
+				elem.Expr = nil
+				continue
 			}
 
-			if !isInverted && !colinfo.ColumnTypeIsIndexable(typ) {
-				if colinfo.ColumnTypeIsInvertedIndexable(typ) {
-					return errors.WithHint(
-						pgerror.Newf(
-							pgcode.InvalidTableDefinition,
-							"index element %s of type %s is not indexable in a non-inverted index",
-							elem.Expr.String(),
-							typ.Name(),
-						),
-						"you may want to create an inverted index instead. See the documentation for inverted indexes: "+docs.URL("inverted-indexes.html"),
-					)
-				}
-				return pgerror.Newf(
-					pgcode.InvalidTableDefinition,
-					"index element %s of type %s is not indexable",
-					elem.Expr.String(),
-					typ.Name(),
-				)
-			}
-
-			if isInverted {
-				if i < lastColumnIdx && !colinfo.ColumnTypeIsIndexable(typ) {
-					return errors.WithHint(
-						pgerror.Newf(
-							pgcode.InvalidTableDefinition,
-							"index element %s of type %s is not allowed as a prefix column in an inverted index",
-							elem.Expr.String(),
-							typ.Name(),
-						),
-						"see the documentation for more information about inverted indexes: "+docs.URL("inverted-indexes.html"),
-					)
-				}
-				if i == lastColumnIdx && !colinfo.ColumnTypeIsInvertedIndexable(typ) {
-					return errors.WithHint(
-						pgerror.Newf(
-							pgcode.InvalidTableDefinition,
-							"index element %s of type %s is not allowed as the last column in an inverted index",
-							elem.Expr.String(),
-							typ.Name(),
-						),
-						"see the documentation for more information about inverted indexes: "+docs.URL("inverted-indexes.html"),
-					)
-				}
-			}
-
-			// Create a new virtual column and add it to the table descriptor.
-			colName := tabledesc.GenerateUniqueName("crdb_internal_idx_expr", func(name string) bool {
+			// Otherwise, create a new virtual column and add it to the table
+			// descriptor.
+			colName := tabledesc.GenerateUniqueName("crdb_idx_expr", func(name string) bool {
 				_, err := desc.FindColumnWithName(tree.Name(name))
 				return err == nil
 			})
-			col := &descpb.ColumnDescriptor{
-				Name:         colName,
-				Inaccessible: true,
-				Type:         typ,
-				ComputeExpr:  &expr,
-				Virtual:      true,
-				Nullable:     true,
+			addCol := &tree.AlterTableAddColumn{
+				ColumnDef: makeExpressionBasedIndexVirtualColumn(colName, typ, elem.Expr),
 			}
 
-			// Add the column to the table descriptor. If the table already
-			// exists, add it as a mutation column.
-			if isNewTable {
-				desc.AddColumn(col)
-			} else {
-				desc.AddColumnMutation(col, descpb.DescriptorMutation_ADD)
+			// Add the virtual column to desc as a mutation column.
+			if err := params.p.addColumnImpl(
+				params,
+				&alterTableNode{
+					tableDesc: desc,
+					n: &tree.AlterTable{
+						Cmds: []tree.AlterTableCmd{addCol},
+					},
+				},
+				tn,
+				desc,
+				addCol,
+			); err != nil {
+				return err
 			}
 
 			// Set the column name and unset the expression.
 			elem.Column = tree.Name(colName)
 			elem.Expr = nil
-
-			// Increment expression index telemetry.
-			telemetry.Inc(sqltelemetry.ExpressionIndexCounter)
 		}
 	}
 
@@ -492,10 +406,9 @@ var hashShardedIndexesDisabledError = pgerror.Newf(pgcode.FeatureNotSupported,
 	"hash sharded indexes require the experimental_enable_hash_sharded_indexes session variable")
 
 // setupShardedIndex creates a shard column for the given index descriptor. It
-// returns the shard column and the new column list for the index. If the shard
-// column is new, either of the following happens:
-// (1) the column is added to tableDesc if it's a new table;
-// (2) a column mutation is added to tableDesc if the table is not new.
+// returns the shard column, the new column list for the index, and a boolean
+// which is true if the shard column was newly created. If the shard column is
+// new, it is added to tableDesc.
 func setupShardedIndex(
 	ctx context.Context,
 	evalCtx *tree.EvalContext,
@@ -505,39 +418,37 @@ func setupShardedIndex(
 	bucketsExpr tree.Expr,
 	tableDesc *tabledesc.Mutable,
 	indexDesc *descpb.IndexDescriptor,
-	storageParams tree.StorageParams,
 	isNewTable bool,
-) (shard catalog.Column, newColumns tree.IndexElemList, err error) {
+) (shard catalog.Column, newColumns tree.IndexElemList, newColumn bool, err error) {
 	if !shardedIndexEnabled {
-		return nil, nil, hashShardedIndexesDisabledError
+		return nil, nil, false, hashShardedIndexesDisabledError
 	}
 
 	colNames := make([]string, 0, len(columns))
 	for _, c := range columns {
 		colNames = append(colNames, string(c.Column))
 	}
-	buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, bucketsExpr, storageParams)
+	buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, bucketsExpr)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	shardCol, err := maybeCreateAndAddShardCol(int(buckets), tableDesc,
+	shardCol, newColumn, err := maybeCreateAndAddShardCol(int(buckets), tableDesc,
 		colNames, isNewTable)
-
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	shardIdxElem := tree.IndexElem{
 		Column:    tree.Name(shardCol.GetName()),
 		Direction: tree.Ascending,
 	}
 	newColumns = append(tree.IndexElemList{shardIdxElem}, columns...)
-	indexDesc.Sharded = catpb.ShardedDescriptor{
+	indexDesc.Sharded = descpb.ShardedDescriptor{
 		IsSharded:    true,
 		Name:         shardCol.GetName(),
 		ShardBuckets: buckets,
 		ColumnNames:  colNames,
 	}
-	return shardCol, newColumns, nil
+	return shardCol, newColumns, newColumn, nil
 }
 
 // maybeCreateAndAddShardCol adds a new hidden computed shard column (or its mutation) to
@@ -545,10 +456,10 @@ func setupShardedIndex(
 // buckets.
 func maybeCreateAndAddShardCol(
 	shardBuckets int, desc *tabledesc.Mutable, colNames []string, isNewTable bool,
-) (col catalog.Column, err error) {
+) (col catalog.Column, created bool, err error) {
 	shardColDesc, err := makeShardColumnDesc(colNames, shardBuckets)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	existingShardCol, err := desc.FindColumnWithName(tree.Name(shardColDesc.Name))
 	if err == nil && !existingShardCol.Dropped() {
@@ -558,14 +469,14 @@ func maybeCreateAndAddShardCol(
 		if !existingShardCol.IsHidden() {
 			// The user managed to reverse-engineer our crazy shard column name, so
 			// we'll return an error here rather than try to be tricky.
-			return nil, pgerror.Newf(pgcode.DuplicateColumn,
+			return nil, false, pgerror.Newf(pgcode.DuplicateColumn,
 				"column %s already specified; can't be used for sharding", shardColDesc.Name)
 		}
-		return existingShardCol, nil
+		return existingShardCol, false, nil
 	}
 	columnIsUndefined := sqlerrors.IsUndefinedColumnError(err)
 	if err != nil && !columnIsUndefined {
-		return nil, err
+		return nil, false, err
 	}
 	if columnIsUndefined || existingShardCol.Dropped() {
 		if isNewTable {
@@ -573,9 +484,36 @@ func maybeCreateAndAddShardCol(
 		} else {
 			desc.AddColumnMutation(shardColDesc, descpb.DescriptorMutation_ADD)
 		}
+		created = true
 	}
 	shardCol, err := desc.FindColumnWithName(tree.Name(shardColDesc.Name))
-	return shardCol, err
+	return shardCol, created, err
+}
+
+var interleavedTableDeprecationError = errors.WithIssueLink(
+	pgnotice.Newf("interleaved tables and interleaved indexes are deprecated in 20.2 and will be removed in 21.2"),
+	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
+)
+
+var interleavedTableDisabledError = errors.WithIssueLink(
+	pgerror.New(pgcode.WarningDeprecatedFeature,
+		"interleaved tables and interleaved indexes are disabled due to the sql.defaults."+
+			"interleaved_tables.enabled cluster setting. Note that interleaved tables and interleaved indexes will be "+
+			"removed in a future release. For details, see https://www.cockroachlabs.com/docs/releases/v20.2.0#deprecations"),
+	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
+)
+
+// interleavedTableDeprecationAction either returns an error, if interleaved
+// tables are disabled, or sends a notice, if they're not.
+func interleavedTableDeprecationAction(params runParams) error {
+	if !InterleavedTablesEnabled.Get(params.p.execCfg.SV()) {
+		return interleavedTableDisabledError
+	}
+	params.p.BufferClientNotice(
+		params.ctx,
+		interleavedTableDeprecationError,
+	)
+	return nil
 }
 
 func (n *createIndexNode) startExec(params runParams) error {
@@ -614,7 +552,17 @@ func (n *createIndexNode) startExec(params runParams) error {
 		)
 	}
 
-	indexDesc, err := makeIndexDescriptor(params, *n.n, n.tableDesc)
+	if n.n.Interleave != nil {
+		if n.n.PartitionByIndex != nil {
+			return pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot be partitioned")
+		}
+
+		if err := interleavedTableDeprecationAction(params); err != nil {
+			return err
+		}
+	}
+
+	indexDesc, err := MakeIndexDescriptor(params, *n.n, n.tableDesc)
 	if err != nil {
 		return err
 	}
@@ -624,7 +572,14 @@ func (n *createIndexNode) startExec(params runParams) error {
 		telemetry.Inc(sqltelemetry.SecondaryIndexColumnFamiliesCounter)
 	}
 
-	indexDesc.Version = descpb.PrimaryIndexWithStoredColumnsVersion
+	encodingVersion := descpb.SecondaryIndexFamilyFormatVersion
+	if params.p.EvalContext().Settings.Version.IsActive(params.ctx, clusterversion.EmptyArraysInInvertedIndexes) {
+		// descpb.StrictIndexColumnIDGuaranteesVersion is like
+		// descpb.EmptyArraysInInvertedIndexesVersion but allows a stronger level of
+		// descriptor validation checks.
+		encodingVersion = descpb.StrictIndexColumnIDGuaranteesVersion
+	}
+	indexDesc.Version = encodingVersion
 
 	if n.n.PartitionByIndex != nil && n.tableDesc.GetLocalityConfig() != nil {
 		return pgerror.New(
@@ -651,8 +606,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 	if err := n.tableDesc.AddIndexMutation(indexDesc, descpb.DescriptorMutation_ADD); err != nil {
 		return err
 	}
-	version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
-	if err := n.tableDesc.AllocateIDs(params.ctx, version); err != nil {
+	if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
 		return err
 	}
 	if err := params.p.configureZoneConfigForNewIndexPartitioning(
@@ -667,6 +621,15 @@ func (n *createIndexNode) startExec(params runParams) error {
 	// AllocateIDs(). Retrieve it for the event log below.
 	index := n.tableDesc.Mutations[mutationIdx].GetIndex()
 	indexName := index.Name
+
+	if n.n.Interleave != nil {
+		if err := params.p.addInterleave(params.ctx, n.tableDesc, index, n.n.Interleave); err != nil {
+			return err
+		}
+		if err := params.p.finalizeInterleave(params.ctx, n.tableDesc, index); err != nil {
+			return err
+		}
+	}
 
 	mutationID := n.tableDesc.ClusterVersion.NextMutationID
 	if err := params.p.writeSchemaChange(
@@ -722,7 +685,7 @@ func (p *planner) configureIndexDescForNewIndexPartitioning(
 				return indexDesc, err
 			}
 		}
-		allowImplicitPartitioning := p.EvalContext().SessionData().ImplicitColumnPartitioningEnabled ||
+		allowImplicitPartitioning := p.EvalContext().SessionData.ImplicitColumnPartitioningEnabled ||
 			tableDesc.IsLocalityRegionalByRow()
 		if partitionBy != nil {
 			newImplicitCols, newPartitioning, err := CreatePartitioning(
@@ -738,7 +701,7 @@ func (p *planner) configureIndexDescForNewIndexPartitioning(
 			if err != nil {
 				return indexDesc, err
 			}
-			tabledesc.UpdateIndexPartitioning(&indexDesc, false /* isIndexPrimary */, newImplicitCols, newPartitioning)
+			tabledesc.UpdateIndexPartitioning(&indexDesc, newImplicitCols, newPartitioning)
 		}
 	}
 	return indexDesc, nil

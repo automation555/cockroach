@@ -52,6 +52,7 @@ const (
 // of a Scan operator table.
 type scanIndexIter struct {
 	evalCtx *tree.EvalContext
+	mem     *memo.Memo
 	f       *norm.Factory
 	im      *partialidx.Implicator
 	tabMeta *opt.TableMeta
@@ -98,6 +99,7 @@ func (it *scanIndexIter) Init(
 	// reused. Field reuse must be explicit.
 	*it = scanIndexIter{
 		evalCtx:     evalCtx,
+		mem:         mem,
 		f:           f,
 		im:          im,
 		tabMeta:     mem.Metadata().TableMeta(scanPrivate.Table),
@@ -226,6 +228,11 @@ func (it *scanIndexIter) ForEachStartingAfter(ord int, f enumerateIndexFunc) {
 
 		index := it.tabMeta.Table.Index(ord)
 
+		// Skip hypothetical indexes if they are not allowed.
+		if index.Hypothetical() && !it.mem.IsHypotheticalIndexAllowed() {
+			continue
+		}
+
 		// Skip over inverted indexes if rejectInvertedIndexes is set.
 		if it.hasRejectFlags(rejectInvertedIndexes) && index.IsInverted() {
 			continue
@@ -343,7 +350,7 @@ func (it *scanIndexIter) extractConstNonCompositeColumns(f memo.FiltersExpr) opt
 	for col, ok := constCols.Next(0); ok; col, ok = constCols.Next(col + 1) {
 		ord := it.tabMeta.MetaID.ColumnOrdinal(col)
 		typ := it.tabMeta.Table.Column(ord).DatumType()
-		if !colinfo.CanHaveCompositeKeyEncoding(typ) {
+		if !colinfo.HasCompositeKeyEncoding(typ) {
 			constNonCompositeCols.Add(col)
 		}
 	}

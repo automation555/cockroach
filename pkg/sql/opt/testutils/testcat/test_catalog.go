@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -45,9 +44,9 @@ const (
 
 // Catalog implements the cat.Catalog interface for testing purposes.
 type Catalog struct {
+	tree.TypeReferenceResolver
 	testSchema Schema
 	counter    int
-	enumTypes  map[string]*types.T
 }
 
 type dataSource interface {
@@ -175,6 +174,11 @@ func (tc *Catalog) ResolveDataSourceByID(
 		"relation [%d] does not exist", id)
 }
 
+// ResolveTypeByOID is part of the cat.Catalog interface.
+func (tc *Catalog) ResolveTypeByOID(context.Context, oid.Oid) (*types.T, error) {
+	return nil, errors.Newf("test catalog cannot handle user defined types")
+}
+
 // CheckPrivilege is part of the cat.Catalog interface.
 func (tc *Catalog) CheckPrivilege(ctx context.Context, o cat.Object, priv privilege.Kind) error {
 	return tc.CheckAnyPrivilege(ctx, o)
@@ -225,11 +229,6 @@ func (tc *Catalog) FullyQualifiedName(
 	ctx context.Context, ds cat.DataSource,
 ) (cat.DataSourceName, error) {
 	return ds.(dataSource).fqName(), nil
-}
-
-// RoleExists is part of the cat.Catalog interface.
-func (tc *Catalog) RoleExists(ctx context.Context, role security.SQLUsername) (bool, error) {
-	return true, nil
 }
 
 func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.SchemaName, error) {
@@ -350,7 +349,7 @@ func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
 // catalog. This is used to test without spinning up a cluster.
 func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
-	return tc.ExecuteDDLWithIndexVersion(sql, descpb.PrimaryIndexWithStoredColumnsVersion)
+	return tc.ExecuteDDLWithIndexVersion(sql, descpb.StrictIndexColumnIDGuaranteesVersion)
 }
 
 // ExecuteDDLWithIndexVersion parses the given DDL SQL statement and creates
@@ -395,10 +394,6 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 
 	case *tree.CreateSequence:
 		tc.CreateSequence(stmt)
-		return "", nil
-
-	case *tree.CreateType:
-		tc.CreateType(stmt)
 		return "", nil
 
 	case *tree.SetZoneConfig:
@@ -594,13 +589,17 @@ type Table struct {
 	Checks     []cat.CheckConstraint
 	Families   []*Family
 	IsVirtual  bool
-	Catalog    *Catalog
+	Catalog    cat.Catalog
 
 	// If Revoked is true, then the user has had privileges on the table revoked.
 	Revoked bool
 
 	writeOnlyIdxCount  int
 	deleteOnlyIdxCount int
+
+	// interleaved is true if the table's rows are interleaved with rows from
+	// other table(s).
+	interleaved bool
 
 	outboundFKs []ForeignKeyConstraint
 	inboundFKs  []ForeignKeyConstraint
@@ -749,12 +748,6 @@ func (tt *Table) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 	return &tt.uniqueConstraints[i]
 }
 
-// Zone is part of the cat.Table interface.
-func (tt *Table) Zone() cat.Zone {
-	zone := zonepb.DefaultZoneConfig()
-	return &zone
-}
-
 // FindOrdinal returns the ordinal of the column with the given name.
 func (tt *Table) FindOrdinal(name string) int {
 	for i, col := range tt.Columns {
@@ -783,16 +776,10 @@ func (tt *Table) CollectTypes(ord int) (descpb.IDs, error) {
 		return nil
 	}
 
-	// Collect UDTs in default expression, ON UPDATE expression, computed column
-	// and the column type itself.
+	// Collect UDTs in default expression, computed column and the column type itself.
 	col := tt.Columns[ord]
 	if col.HasDefault() {
 		if err := addOIDsInExpr(col.DefaultExprStr()); err != nil {
-			return nil, err
-		}
-	}
-	if col.HasOnUpdate() {
-		if err := addOIDsInExpr(col.OnUpdateExprStr()); err != nil {
 			return nil, err
 		}
 	}
@@ -819,10 +806,6 @@ func (tt *Table) CollectTypes(ord int) (descpb.IDs, error) {
 // Index implements the cat.Index interface for testing purposes.
 type Index struct {
 	IdxName string
-
-	// ExplicitColCount is the number of columns that are explicitly specified in
-	// the index definition.
-	ExplicitColCount int
 
 	// KeyCount is the number of columns that make up the unique key for the
 	// index. See the cat.Index.KeyColumnCount for more details.
@@ -858,7 +841,7 @@ type Index struct {
 	// predicate is the partial index predicate expression, if it exists.
 	predicate string
 
-	// invertedOrd is the ordinal of the Inverted column, if the index is
+	// invertedOrd is the ordinal of the VirtualInverted column, if the index is
 	// an inverted index.
 	invertedOrd int
 
@@ -868,6 +851,10 @@ type Index struct {
 
 	// version is the index descriptor version of the index.
 	version descpb.IndexDescriptorVersion
+
+	// hypothetical is true if the index is a hypothetical index that cannot be
+	// written to or read from.
+	hypothetical bool
 }
 
 // ID is part of the cat.Index interface.
@@ -905,11 +892,6 @@ func (ti *Index) ColumnCount() int {
 	return len(ti.Columns)
 }
 
-// ExplicitColumnCount is part of the cat.Index interface.
-func (ti *Index) ExplicitColumnCount() int {
-	return ti.ExplicitColCount
-}
-
 // KeyColumnCount is part of the cat.Index interface.
 func (ti *Index) KeyColumnCount() int {
 	return ti.KeyCount
@@ -933,10 +915,10 @@ func (ti *Index) Column(i int) cat.IndexColumn {
 	return ti.Columns[i]
 }
 
-// InvertedColumn is part of the cat.Index interface.
-func (ti *Index) InvertedColumn() cat.IndexColumn {
+// VirtualInvertedColumn is part of the cat.Index interface.
+func (ti *Index) VirtualInvertedColumn() cat.IndexColumn {
 	if !ti.IsInverted() {
-		panic("non-inverted indexes do not have inverted columns")
+		panic("non-inverted indexes do not have inverted virtual columns")
 	}
 	return ti.Column(ti.invertedOrd)
 }
@@ -958,9 +940,34 @@ func (ti *Index) Predicate() (string, bool) {
 	return ti.predicate, ti.predicate != ""
 }
 
+// Hypothetical is part of the cat.Index interface.
+func (ti *Index) Hypothetical() bool {
+	return ti.hypothetical
+}
+
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (ti *Index) ImplicitPartitioningColumnCount() int {
 	return 0
+}
+
+// InterleaveAncestorCount is part of the cat.Index interface.
+func (ti *Index) InterleaveAncestorCount() int {
+	return 0
+}
+
+// InterleaveAncestor is part of the cat.Index interface.
+func (ti *Index) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
+	panic("no interleavings")
+}
+
+// InterleavedByCount is part of the cat.Index interface.
+func (ti *Index) InterleavedByCount() int {
+	return 0
+}
+
+// InterleavedBy is part of the cat.Index interface.
+func (ti *Index) InterleavedBy(i int) (table, index cat.StableID) {
+	panic("no interleavings")
 }
 
 // GeoConfig is part of the cat.Index interface.
@@ -1049,11 +1056,6 @@ func (ts *TableStat) NullCount() uint64 {
 	return ts.js.NullCount
 }
 
-// AvgSize is part of the cat.TableStatistic interface.
-func (ts *TableStat) AvgSize() uint64 {
-	return ts.js.AvgSize
-}
-
 // Histogram is part of the cat.TableStatistic interface.
 func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
@@ -1065,29 +1067,9 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 		panic(err)
 	}
 	colType := tree.MustBeStaticallyKnownType(colTypeRef)
-
-	var histogram []cat.HistogramBucket
-	var offset int
-	if ts.js.NullCount > 0 {
-		// A bucket for NULL is not persisted, but we create a fake one to
-		// make histograms easier to work with. The length of histogram
-		// is therefore 1 greater than the length of ts.js.HistogramBuckets.
-		// NOTE: This matches the logic in the TableStatisticsCache.
-		histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets)+1)
-		histogram[0] = cat.HistogramBucket{
-			NumEq:         float64(ts.js.NullCount),
-			NumRange:      0,
-			DistinctRange: 0,
-			UpperBound:    tree.DNull,
-		}
-		offset = 1
-	} else {
-		histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
-		offset = 0
-	}
-
-	for i := offset; i < len(histogram); i++ {
-		bucket := &ts.js.HistogramBuckets[i-offset]
+	histogram := make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
+	for i := range histogram {
+		bucket := &ts.js.HistogramBuckets[i]
 		datum, err := rowenc.ParseDatumStringAs(colType, bucket.UpperBound, &evalCtx)
 		if err != nil {
 			panic(err)
@@ -1252,12 +1234,6 @@ func (u *UniqueConstraint) WithoutIndex() bool {
 // Validated is part of the cat.UniqueConstraint interface.
 func (u *UniqueConstraint) Validated() bool {
 	return u.validated
-}
-
-// UniquenessGuaranteedByAnotherIndex is part of the cat.UniqueConstraint
-// interface.
-func (u *UniqueConstraint) UniquenessGuaranteedByAnotherIndex() bool {
-	return false
 }
 
 // Sequence implements the cat.Sequence interface for testing purposes.
