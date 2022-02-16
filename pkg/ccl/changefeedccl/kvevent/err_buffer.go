@@ -12,6 +12,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 type errorWrapperEventBuffer struct {
@@ -24,9 +27,24 @@ func NewErrorWrapperEventBuffer(b Buffer) Buffer {
 	return &errorWrapperEventBuffer{b}
 }
 
-// Add implements Writer interface.
-func (e errorWrapperEventBuffer) Add(ctx context.Context, event Event) error {
-	if err := e.Buffer.Add(ctx, event); err != nil {
+// AddKV implements kvevent.Writer interface.
+func (e errorWrapperEventBuffer) AddKV(
+	ctx context.Context, kv roachpb.KeyValue, prevVal roachpb.Value, backfillTimestamp hlc.Timestamp,
+) error {
+	if err := e.Buffer.AddKV(ctx, kv, prevVal, backfillTimestamp); err != nil {
+		return changefeedbase.MarkRetryableError(err)
+	}
+	return nil
+}
+
+// AddResolved implements kvevent.Writer interface.
+func (e errorWrapperEventBuffer) AddResolved(
+	ctx context.Context,
+	span roachpb.Span,
+	ts hlc.Timestamp,
+	boundaryType jobspb.ResolvedSpan_BoundaryType,
+) error {
+	if err := e.Buffer.AddResolved(ctx, span, ts, boundaryType); err != nil {
 		return changefeedbase.MarkRetryableError(err)
 	}
 	return nil
