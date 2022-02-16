@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -90,21 +89,21 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 
 	// Configure the fetcher, which is only used to decode the returned keys from
 	// the DeleteRange, and is never used to actually fetch kvs.
-	var spec descpb.IndexFetchSpec
-	if err := rowenc.InitIndexFetchSpec(
-		&spec, params.ExecCfg().Codec, d.desc, d.desc.GetPrimaryIndex(), nil, /* columnIDs */
-	); err != nil {
-		return err
+	table := row.FetcherTableArgs{
+		Desc:  d.desc,
+		Index: d.desc.GetPrimaryIndex(),
 	}
 	if err := d.fetcher.Init(
 		params.ctx,
+		params.ExecCfg().Codec,
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
-		0, /* lockTimeout */
+		0,     /* lockTimeout */
+		false, /* isCheck */
 		params.p.alloc,
 		nil, /* memMonitor */
-		&spec,
+		table,
 	); err != nil {
 		return err
 	}
@@ -188,9 +187,12 @@ func (d *deleteRangeNode) processResults(
 				continue
 			}
 
-			after, _, err := d.fetcher.DecodeIndexKey(keyBytes)
+			after, ok, _, err := d.fetcher.ReadIndexKey(keyBytes)
 			if err != nil {
 				return nil, err
+			}
+			if !ok {
+				return nil, errors.AssertionFailedf("key did not match descriptor")
 			}
 			k := keyBytes[:len(keyBytes)-len(after)]
 			if !bytes.Equal(k, prev) {

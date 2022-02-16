@@ -138,10 +138,6 @@ define GroupBy {
     # If set, the output must have this ordering, but it is guaranteed that
     # ReqOrdering is a prefix of GroupColOrdering.
     ReqOrdering exec.OutputOrdering
-
-    # The grouping column order type (Streaming, PartialStreaming, or
-    # NoStreaming).
-    groupingOrderType exec.GroupingOrderType
 }
 
 # ScalarGroupBy runs a scalar aggregation, i.e.  one which performs a set of
@@ -280,7 +276,6 @@ define LookupJoin {
     RemoteLookupExpr tree.TypedExpr
     LookupCols exec.TableColumnOrdinalSet
     OnCond tree.TypedExpr
-    IsFirstJoinInPairedJoiner bool
     IsSecondJoinInPairedJoiner bool
     ReqOrdering exec.OutputOrdering
     Locking *tree.LockingItem
@@ -659,7 +654,8 @@ define AlterTableUnsplitAll {
 define AlterTableRelocate {
     Index cat.Index
     input exec.Node
-    subjectReplicas tree.RelocateSubject
+    relocateLease bool
+    relocateNonVoters bool
 }
 
 # Buffer passes through the input rows but also saves them in a buffer, which
@@ -685,13 +681,11 @@ define ScanBuffer {
 #       function. The returned plan uses this reference with a
 #       ConstructScanBuffer call.
 #     - the plan is executed; the results are emitted and also saved in a new
-#       buffer for the next iteration. If Deduplicate is true, only rows that
-#       haven't been returned yet are emitted and saved.
+#       buffer for the next iteration.
 define RecursiveCTE {
     Initial exec.Node
     Fn exec.RecursiveCTEIterationFn
     Label string
-    Deduplicate bool
 }
 
 # ControlJobs implements PAUSE/CANCEL/RESUME JOBS.
@@ -730,13 +724,4 @@ define Export {
     FileName tree.TypedExpr
     FileFormat string
     Options []exec.KVOption
-    NotNullCols exec.NodeColumnOrdinalSet
-}
-
-# AlterTableRelocate implements ALTER RANGE RELOCATE.
-define AlterRangeRelocate {
-    input exec.Node
-    subjectReplicas tree.RelocateSubject
-    toStoreID tree.TypedExpr
-    fromStoreID tree.TypedExpr
 }

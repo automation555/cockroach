@@ -19,9 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -45,7 +46,7 @@ func slurpUserDataKVs(t testing.TB, e storage.Engine) []roachpb.KeyValue {
 		kvs = nil
 		it := e.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
 		defer it.Close()
-		for it.SeekGE(storage.MVCCKey{Key: bootstrap.TestingUserTableDataMin()}); ; it.NextKey() {
+		for it.SeekGE(storage.MVCCKey{Key: keys.UserTableDataMin}); ; it.NextKey() {
 			ok, err := it.Valid()
 			if err != nil {
 				t.Fatal(err)
@@ -81,23 +82,33 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		a STRING PRIMARY KEY, b STRING, c STRING, d STRING,
 		FAMILY (a, b, c), FAMILY (d)
 	)`)
-	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `parent`)
-	var spec descpb.IndexFetchSpec
-	if err := rowenc.InitIndexFetchSpec(
-		&spec, keys.SystemSQLCodec, desc, desc.GetPrimaryIndex(), desc.PublicColumnIDs(),
-	); err != nil {
-		t.Fatal(err)
+	desc := catalogkv.TestingGetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `parent`)
+	var colIdxMap catalog.TableColMap
+	var valNeededForCol util.FastIntSet
+	for i, col := range desc.PublicColumns() {
+		colIdxMap.Set(col.GetID(), i)
+		valNeededForCol.Add(i)
+	}
+	table := row.FetcherTableArgs{
+		Desc:             desc,
+		Index:            desc.GetPrimaryIndex(),
+		ColIdxMap:        colIdxMap,
+		IsSecondaryIndex: false,
+		Cols:             desc.PublicColumns(),
+		ValNeededForCol:  valNeededForCol,
 	}
 	var rf row.Fetcher
 	if err := rf.Init(
 		ctx,
+		keys.SystemSQLCodec,
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
-		0, /* lockTimeout */
-		&tree.DatumAlloc{},
+		0,    /* lockTimeout */
+		true, /* isCheck */
+		&rowenc.DatumAlloc{},
 		nil, /* memMonitor */
-		&spec,
+		table,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -112,12 +123,12 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 			log.Infof(ctx, "%v %v %v", kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
 		}
 
-		if err := rf.StartScanFrom(ctx, &row.SpanKVFetcher{KVs: kvs}, false /* traceKV */); err != nil {
+		if err := rf.StartScanFrom(ctx, &row.SpanKVFetcher{KVs: kvs}); err != nil {
 			t.Fatal(err)
 		}
 		var rows []rowWithMVCCMetadata
 		for {
-			datums, err := rf.NextRowDecoded(ctx)
+			datums, _, _, err := rf.NextRowDecoded(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}

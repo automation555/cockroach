@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -230,11 +231,10 @@ INSERT INTO foo VALUES (1, 2), (2, 3), (3, 4);
 			},
 			setupDesc: func(t *testing.T, mut *tabledesc.Mutable) {
 				indexToBackfill := descpb.IndexDescriptor{
-					Name:         "virtual_column_backed_index",
-					ID:           mut.NextIndexID,
-					ConstraintID: mut.NextConstraintID,
-					Unique:       true,
-					Version:      descpb.PrimaryIndexWithStoredColumnsVersion,
+					Name:    "virtual_column_backed_index",
+					ID:      mut.NextIndexID,
+					Unique:  true,
+					Version: descpb.StrictIndexColumnIDGuaranteesVersion,
 					KeyColumnNames: []string{
 						mut.Columns[2].Name,
 					},
@@ -251,7 +251,6 @@ INSERT INTO foo VALUES (1, 2), (2, 3), (3, 4);
 					EncodingType: descpb.SecondaryIndexEncoding,
 				}
 				mut.NextIndexID++
-				mut.NextConstraintID++
 				require.NoError(t, mut.AddIndexMutation(
 					&indexToBackfill, descpb.DescriptorMutation_ADD,
 				))
@@ -309,11 +308,10 @@ INSERT INTO foo VALUES (1), (10), (100);
 					computedColumnNotInPrimaryIndex.Name)
 
 				indexToBackfill := descpb.IndexDescriptor{
-					Name:         "new_primary_index",
-					ID:           mut.NextIndexID,
-					ConstraintID: mut.NextConstraintID,
-					Unique:       true,
-					Version:      descpb.PrimaryIndexWithStoredColumnsVersion,
+					Name:    "new_primary_index",
+					ID:      mut.NextIndexID,
+					Unique:  true,
+					Version: descpb.StrictIndexColumnIDGuaranteesVersion,
 					KeyColumnNames: []string{
 						mut.Columns[0].Name,
 					},
@@ -336,7 +334,6 @@ INSERT INTO foo VALUES (1), (10), (100);
 					EncodingType: descpb.PrimaryIndexEncoding,
 				}
 				mut.NextIndexID++
-				mut.NextConstraintID++
 				require.NoError(t, mut.AddIndexMutation(
 					&indexToBackfill, descpb.DescriptorMutation_ADD,
 				))
@@ -355,49 +352,51 @@ INSERT INTO foo VALUES (1), (10), (100);
 		ctx context.Context, t *testing.T, txn *kv.Txn, table *tabledesc.Mutable, indexID descpb.IndexID,
 	) []tree.Datums {
 		t.Helper()
+		var fetcher row.Fetcher
+		var alloc rowenc.DatumAlloc
 
 		mm := mon.MakeStandaloneBudget(1 << 30)
 		idx, err := table.FindIndexWithID(indexID)
-		colIDsNeeded := idx.CollectKeyColumnIDs()
-		if idx.Primary() {
-			for _, column := range table.PublicColumns() {
-				if !column.IsVirtual() {
-					colIDsNeeded.Add(column.GetID())
+		colIdxMap := catalog.ColumnIDToOrdinalMap(table.PublicColumns())
+		var valsNeeded util.FastIntSet
+		{
+			colIDsNeeded := idx.CollectKeyColumnIDs()
+			if idx.Primary() {
+				for _, column := range table.PublicColumns() {
+					if !column.IsVirtual() {
+						colIDsNeeded.Add(column.GetID())
+					}
 				}
+			} else {
+				colIDsNeeded.UnionWith(idx.CollectSecondaryStoredColumnIDs())
+				colIDsNeeded.UnionWith(idx.CollectKeySuffixColumnIDs())
 			}
-		} else {
-			colIDsNeeded.UnionWith(idx.CollectSecondaryStoredColumnIDs())
-			colIDsNeeded.UnionWith(idx.CollectKeySuffixColumnIDs())
-		}
 
+			colIDsNeeded.ForEach(func(colID descpb.ColumnID) {
+				valsNeeded.Add(colIdxMap.GetDefault(colID))
+			})
+		}
 		require.NoError(t, err)
 		spans := []roachpb.Span{table.IndexSpan(keys.SystemSQLCodec, indexID)}
 		const reverse = false
-		var fetcherCols []descpb.ColumnID
-		for _, col := range table.PublicColumns() {
-			if colIDsNeeded.Contains(col.GetID()) {
-				fetcherCols = append(fetcherCols, col.GetID())
-			}
-		}
-		var alloc tree.DatumAlloc
-		var spec descpb.IndexFetchSpec
-		require.NoError(t, rowenc.InitIndexFetchSpec(
-			&spec,
-			keys.SystemSQLCodec,
-			table,
-			idx,
-			fetcherCols,
-		))
-		var fetcher row.Fetcher
 		require.NoError(t, fetcher.Init(
 			ctx,
+			keys.SystemSQLCodec,
 			reverse,
 			descpb.ScanLockingStrength_FOR_NONE,
 			descpb.ScanLockingWaitPolicy_BLOCK,
 			0,
+			false,
 			&alloc,
 			mm.Monitor(),
-			&spec,
+			row.FetcherTableArgs{
+				Desc:             table,
+				Index:            idx,
+				ColIdxMap:        colIdxMap,
+				Cols:             table.PublicColumns(),
+				ValNeededForCol:  valsNeeded,
+				IsSecondaryIndex: !idx.Primary(),
+			},
 		))
 
 		require.NoError(t, fetcher.StartScan(
@@ -405,13 +404,18 @@ INSERT INTO foo VALUES (1), (10), (100);
 		))
 		var rows []tree.Datums
 		for {
-			datums, err := fetcher.NextRowDecoded(ctx)
+			datums, _, _, err := fetcher.NextRowDecoded(ctx)
 			require.NoError(t, err)
 			if datums == nil {
 				break
 			}
 			// Copy the datums out as the slice is reused internally.
-			row := append(tree.Datums(nil), datums...)
+			row := make(tree.Datums, 0, valsNeeded.Len())
+			for i := range datums {
+				if valsNeeded.Contains(i) {
+					row = append(row, datums[i])
+				}
+			}
 			rows = append(rows, row)
 		}
 		return rows
@@ -506,7 +510,7 @@ INSERT INTO foo VALUES (1), (10), (100);
 				return err
 			}
 			mut.MutationJobs = append(mut.MutationJobs, descpb.TableDescriptor_MutationJob{
-				JobID:      jobID,
+				JobID:      int64(jobID),
 				MutationID: 1,
 			})
 			jobToBlock.Store(jobID)

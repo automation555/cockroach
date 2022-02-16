@@ -21,15 +21,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -47,22 +46,35 @@ const DebugRowFetch = false
 // part of the output.
 const noOutputColumn = -1
 
-// KVBatchFetcher abstracts the logic of fetching KVs in batches.
-type KVBatchFetcher interface {
+type kvBatchFetcher interface {
 	// nextBatch returns the next batch of rows. Returns false in the first
-	// parameter if there are no more keys in the scan. May return either a slice
-	// of KeyValues or a batchResponse, numKvs pair, depending on the server
-	// version - both must be handled by calling code.
-	nextBatch(ctx context.Context) (ok bool, kvs []roachpb.KeyValue, batchResponse []byte, err error)
+	// parameter if there are no more keys in the scan. May return either a
+	// slice of KeyValues or a batchResponse, depending on the server version -
+	// both must be handled by calling code. newSpan when non-empty indicates
+	// that this batch belongs to a new key span (which is returned).
+	nextBatch(ctx context.Context) (ok bool, kvs []roachpb.KeyValue, batchResponse []byte, newSpan roachpb.Span, err error)
 
 	close(ctx context.Context)
 }
 
 type tableInfo struct {
 	// -- Fields initialized once --
-	spec descpb.IndexFetchSpec
 
-	// The set of indexes into spec.FetchedColumns that are required for columns
+	// Used to determine whether a key retrieved belongs to the span we
+	// want to scan.
+	desc             catalog.TableDescriptor
+	index            catalog.Index
+	isSecondaryIndex bool
+	indexColumnDirs  []descpb.IndexDescriptor_Direction
+
+	// The table columns to use for fetching, possibly including ones currently in
+	// schema changes.
+	cols []catalog.Column
+
+	// The set of ColumnIDs that are required.
+	neededCols util.FastIntSet
+
+	// The set of indexes into the cols array that are required for columns
 	// in the value part.
 	neededValueColsByIdx util.FastIntSet
 
@@ -71,19 +83,26 @@ type tableInfo struct {
 	// decoding values in that row.
 	neededValueCols int
 
-	// Map used to get the index for columns in spec.FetchedColumns.
+	// Map used to get the index for columns in cols.
 	colIdxMap catalog.TableColMap
 
-	// One value per column that is part of the key; each value is a column index
-	// (into spec.FetchedColumns); -1 if we don't need the value for that column.
+	// One value per column that is part of the key; each value is a column
+	// index (into cols); -1 if we don't need the value for that column.
 	indexColIdx []int
+
+	// knownPrefixLength is the number of bytes in the index key prefix this
+	// Fetcher is configured for. The index key prefix is the table id, index
+	// id pair at the start of the key.
+	knownPrefixLength int
 
 	// -- Fields updated during a scan --
 
-	keyVals    []rowenc.EncDatum
-	extraVals  []rowenc.EncDatum
-	row        rowenc.EncDatumRow
-	decodedRow tree.Datums
+	keyValTypes []*types.T
+	extraTypes  []*types.T
+	keyVals     []rowenc.EncDatum
+	extraVals   []rowenc.EncDatum
+	row         rowenc.EncDatumRow
+	decodedRow  tree.Datums
 
 	// The following fields contain MVCC metadata for each row and may be
 	// returned to users of Fetcher immediately after NextRow returns.
@@ -99,11 +118,65 @@ type tableInfo struct {
 	oidOutputIdx int
 
 	// rowIsDeleted is true when the row has been deleted. This is only
-	// meaningful when kv deletion tombstones are returned by the KVBatchFetcher,
+	// meaningful when kv deletion tombstones are returned by the kvBatchFetcher,
 	// which the one used by `StartScan` (the common case) doesnt. Notably,
 	// changefeeds use this by providing raw kvs with tombstones unfiltered via
 	// `StartScanFrom`.
 	rowIsDeleted bool
+
+	// hasLast indicates whether there was a previously scanned k/v.
+	hasLast bool
+	// lastDatums is a buffer for the current key. It is only present when
+	// doing a physical check in order to verify round-trip encoding.
+	// It is required because Fetcher.kv is overwritten before NextRow
+	// returns.
+	lastKV roachpb.KeyValue
+	// lastDatums is a buffer for the previously scanned k/v datums. It is
+	// only present when doing a physical check in order to verify
+	// ordering.
+	lastDatums tree.Datums
+}
+
+// FetcherTableArgs are the arguments passed to Fetcher.Init
+// for a given table that includes descriptors and row information.
+type FetcherTableArgs struct {
+	Desc             catalog.TableDescriptor
+	Index            catalog.Index
+	ColIdxMap        catalog.TableColMap
+	IsSecondaryIndex bool
+	Cols             []catalog.Column
+	// The indexes (0 to # of columns - 1) of the columns to return.
+	ValNeededForCol util.FastIntSet
+}
+
+// InitCols initializes the columns in FetcherTableArgs.
+func (fta *FetcherTableArgs) InitCols(
+	desc catalog.TableDescriptor,
+	scanVisibility execinfrapb.ScanVisibility,
+	withSystemColumns bool,
+	virtualColumn catalog.Column,
+) {
+	cols := make([]catalog.Column, 0, len(desc.AllColumns()))
+	if scanVisibility == execinfrapb.ScanVisibility_PUBLIC_AND_NOT_PUBLIC {
+		cols = append(cols, desc.ReadableColumns()...)
+	} else {
+		cols = append(cols, desc.PublicColumns()...)
+	}
+	if virtualColumn != nil {
+		for i, col := range cols {
+			if col.GetID() == virtualColumn.GetID() {
+				cols[i] = virtualColumn
+				break
+			}
+		}
+	}
+	if withSystemColumns {
+		cols = append(cols, desc.SystemColumns()...)
+	}
+	fta.Cols = make([]catalog.Column, len(cols))
+	for i, col := range cols {
+		fta.Cols[i] = col
+	}
 }
 
 // Fetcher handles fetching kvs and forming table rows for a single table.
@@ -123,11 +196,18 @@ type tableInfo struct {
 //      // Process res.row
 //   }
 type Fetcher struct {
+	// codec is used to encode and decode sql keys.
+	codec keys.SQLCodec
+
 	table tableInfo
 
 	// reverse denotes whether or not the spans should be read in reverse
 	// or not when StartScan is invoked.
 	reverse bool
+
+	// numKeysPerRow is the number of keys per row of the table used to
+	// calculate the kvBatchFetcher's firstBatchLimit.
+	numKeysPerRow int
 
 	// True if the index key must be decoded. This is only false if there are no
 	// needed columns.
@@ -156,10 +236,8 @@ type Fetcher struct {
 
 	// -- Fields updated during a scan --
 
-	kvFetcher *KVFetcher
-	// indexKey stores the index key of the current row, up to (and not including)
-	// any family ID.
-	indexKey       []byte
+	kvFetcher      *KVFetcher
+	indexKey       []byte // the index key of the current row
 	prettyValueBuf *bytes.Buffer
 
 	valueColsFound int // how many needed cols we've found so far in the value
@@ -169,16 +247,19 @@ type Fetcher struct {
 	keyRemainingBytes []byte
 	kvEnd             bool
 
+	// isCheck indicates whether or not we are running checks for k/v
+	// correctness. It is set only during SCRUB commands.
+	isCheck bool
+
 	// IgnoreUnexpectedNulls allows Fetcher to return null values for non-nullable
 	// columns and is only used for decoding for error messages or debugging.
 	IgnoreUnexpectedNulls bool
 
 	// Buffered allocation of decoded datums.
-	alloc *tree.DatumAlloc
+	alloc *rowenc.DatumAlloc
 
-	// Memory monitor and memory account for the bytes fetched by this fetcher.
-	mon             *mon.BytesMonitor
-	kvFetcherMemAcc *mon.BoundAccount
+	// Memory monitor for the bytes fetched by this fetcher.
+	mon *mon.BytesMonitor
 }
 
 // Reset resets this Fetcher, preserving the memory capacity that was used
@@ -197,7 +278,6 @@ func (rf *Fetcher) Close(ctx context.Context) {
 		rf.kvFetcher.Close(ctx)
 	}
 	if rf.mon != nil {
-		rf.kvFetcherMemAcc.Close(ctx)
 		rf.mon.Stop(ctx)
 	}
 }
@@ -207,35 +287,38 @@ func (rf *Fetcher) Close(ctx context.Context) {
 // index.
 func (rf *Fetcher) Init(
 	ctx context.Context,
+	codec keys.SQLCodec,
 	reverse bool,
 	lockStrength descpb.ScanLockingStrength,
 	lockWaitPolicy descpb.ScanLockingWaitPolicy,
 	lockTimeout time.Duration,
-	alloc *tree.DatumAlloc,
+	isCheck bool,
+	alloc *rowenc.DatumAlloc,
 	memMonitor *mon.BytesMonitor,
-	spec *descpb.IndexFetchSpec,
+	tableArgs FetcherTableArgs,
 ) error {
-	if spec.Version != descpb.IndexFetchSpecVersionInitial {
-		return errors.Newf("unsupported IndexFetchSpec version %d", spec.Version)
-	}
+	rf.codec = codec
 	rf.reverse = reverse
 	rf.lockStrength = lockStrength
 	rf.lockWaitPolicy = lockWaitPolicy
 	rf.lockTimeout = lockTimeout
 	rf.alloc = alloc
+	rf.isCheck = isCheck
 
 	if memMonitor != nil {
 		rf.mon = mon.NewMonitorInheritWithLimit("fetcher-mem", 0 /* limit */, memMonitor)
 		rf.mon.Start(ctx, memMonitor, mon.BoundAccount{})
-		memAcc := rf.mon.MakeBoundAccount()
-		rf.kvFetcherMemAcc = &memAcc
 	}
 
 	table := &rf.table
 	*table = tableInfo{
-		spec:       *spec,
-		row:        make(rowenc.EncDatumRow, len(spec.FetchedColumns)),
-		decodedRow: make(tree.Datums, len(spec.FetchedColumns)),
+		desc:             tableArgs.Desc,
+		colIdxMap:        tableArgs.ColIdxMap,
+		index:            tableArgs.Index,
+		isSecondaryIndex: tableArgs.IsSecondaryIndex,
+		cols:             tableArgs.Cols,
+		row:              make(rowenc.EncDatumRow, len(tableArgs.Cols)),
+		decodedRow:       make(tree.Datums, len(tableArgs.Cols)),
 
 		// These slice fields might get re-allocated below, so reslice them from
 		// the old table here in case they've got enough capacity already.
@@ -246,53 +329,68 @@ func (rf *Fetcher) Init(
 		oidOutputIdx:       noOutputColumn,
 	}
 
-	for idx := range spec.FetchedColumns {
-		colID := spec.FetchedColumns[idx].ColumnID
-		table.colIdxMap.Set(colID, idx)
-		if colinfo.IsColIDSystemColumn(colID) {
-			switch colinfo.GetSystemColumnKindFromColumnID(colID) {
-			case catpb.SystemColumnKind_MVCCTIMESTAMP:
+	var err error
+
+	// Scan through the entire columns map to see which columns are
+	// required.
+	for _, col := range table.cols {
+		idx := table.colIdxMap.GetDefault(col.GetID())
+		if tableArgs.ValNeededForCol.Contains(idx) {
+			// The idx-th column is required.
+			table.neededCols.Add(int(col.GetID()))
+
+			// Set up any system column metadata, if this column is a system column.
+			switch colinfo.GetSystemColumnKindFromColumnID(col.GetID()) {
+			case descpb.SystemColumnKind_MVCCTIMESTAMP:
 				table.timestampOutputIdx = idx
 				rf.mvccDecodeStrategy = MVCCDecodingRequired
-
-			case catpb.SystemColumnKind_TABLEOID:
+			case descpb.SystemColumnKind_TABLEOID:
 				table.oidOutputIdx = idx
-				table.tableOid = tree.NewDOid(tree.DInt(spec.TableID))
+				table.tableOid = tree.NewDOid(tree.DInt(tableArgs.Desc.GetID()))
 			}
 		}
 	}
 
-	if len(spec.FetchedColumns) > 0 {
-		table.neededValueColsByIdx.AddRange(0, len(spec.FetchedColumns)-1)
-	}
+	table.knownPrefixLength = len(
+		rowenc.MakeIndexKeyPrefix(codec, table.desc, table.index.GetID()),
+	)
 
-	nExtraCols := 0
-	// Unique secondary indexes have extra columns to decode from the value (namely
-	// the primary index columns).
-	if table.spec.IsSecondaryIndex && table.spec.IsUniqueIndex {
-		nExtraCols = int(table.spec.NumKeySuffixColumns)
-	}
-	nIndexCols := len(spec.KeyAndSuffixColumns) - nExtraCols
+	var indexColumnIDs []descpb.ColumnID
+	indexColumnIDs, table.indexColumnDirs = catalog.FullIndexColumnIDs(table.index)
 
+	table.neededValueColsByIdx = tableArgs.ValNeededForCol.Copy()
 	neededIndexCols := 0
-	compositeIndexCols := 0
+	nIndexCols := len(indexColumnIDs)
 	if cap(table.indexColIdx) >= nIndexCols {
 		table.indexColIdx = table.indexColIdx[:nIndexCols]
 	} else {
 		table.indexColIdx = make([]int, nIndexCols)
 	}
-	for i := 0; i < nIndexCols; i++ {
-		id := spec.KeyAndSuffixColumns[i].ColumnID
+	for i, id := range indexColumnIDs {
 		colIdx, ok := table.colIdxMap.Get(id)
 		if ok {
 			table.indexColIdx[i] = colIdx
-			neededIndexCols++
-			table.neededValueColsByIdx.Remove(colIdx)
+			if table.neededCols.Contains(int(id)) {
+				neededIndexCols++
+				table.neededValueColsByIdx.Remove(colIdx)
+			}
 		} else {
 			table.indexColIdx[i] = -1
+			if table.neededCols.Contains(int(id)) {
+				return errors.AssertionFailedf("needed column %d not in colIdxMap", id)
+			}
 		}
-		if spec.KeyAndSuffixColumns[i].IsComposite {
-			compositeIndexCols++
+	}
+
+	// In order to track #40410 more effectively, check that the contents of
+	// table.neededValueColsByIdx are valid.
+	for idx, ok := table.neededValueColsByIdx.Next(0); ok; idx, ok = table.neededValueColsByIdx.Next(idx + 1) {
+		if idx >= len(table.row) || idx < 0 {
+			return errors.AssertionFailedf(
+				"neededValueColsByIdx contains an invalid index. column %d requested, but table has %d columns",
+				idx,
+				len(table.row),
+			)
 		}
 	}
 
@@ -303,28 +401,55 @@ func (rf *Fetcher) Init(
 	// The number of columns we need to read from the value part of the key.
 	// It's the total number of needed columns minus the ones we read from the
 	// index key, except for composite columns.
-	table.neededValueCols = len(spec.FetchedColumns) - neededIndexCols + compositeIndexCols
+	table.neededValueCols = table.neededCols.Len() - neededIndexCols + table.index.NumCompositeColumns()
 
+	if table.isSecondaryIndex {
+		colIDs := table.index.CollectKeyColumnIDs()
+		colIDs.UnionWith(table.index.CollectSecondaryStoredColumnIDs())
+		colIDs.UnionWith(table.index.CollectKeySuffixColumnIDs())
+		for i := range table.cols {
+			if table.neededCols.Contains(int(table.cols[i].GetID())) && !colIDs.Contains(table.cols[i].GetID()) {
+				return errors.Errorf("requested column %s not in index", table.cols[i].GetName())
+			}
+		}
+	}
+
+	// Prepare our index key vals slice.
+	table.keyValTypes, err = colinfo.GetColumnTypes(table.desc, indexColumnIDs, table.keyValTypes)
+	if err != nil {
+		return err
+	}
 	if cap(table.keyVals) >= nIndexCols {
 		table.keyVals = table.keyVals[:nIndexCols]
 	} else {
 		table.keyVals = make([]rowenc.EncDatum, nIndexCols)
 	}
 
-	if nExtraCols > 0 {
+	if hasExtraCols(table) {
 		// Unique secondary indexes have a value that is the
 		// primary index key.
 		// Primary indexes only contain ascendingly-encoded
 		// values. If this ever changes, we'll probably have to
 		// figure out the directions here too.
-		if cap(table.extraVals) >= nExtraCols {
-			table.extraVals = table.extraVals[:nExtraCols]
+		table.extraTypes, err = colinfo.GetColumnTypes(table.desc, table.index.IndexDesc().KeySuffixColumnIDs, table.extraTypes)
+		nExtraColumns := table.index.NumKeySuffixColumns()
+		if cap(table.extraVals) >= nExtraColumns {
+			table.extraVals = table.extraVals[:nExtraColumns]
 		} else {
-			table.extraVals = make([]rowenc.EncDatum, nExtraCols)
+			table.extraVals = make([]rowenc.EncDatum, nExtraColumns)
+		}
+		if err != nil {
+			return err
 		}
 	}
 
-	return nil
+	rf.numKeysPerRow, err = table.desc.KeysPerRow(table.index.GetID())
+	return err
+}
+
+// GetTable returns the table that this Fetcher was initialized with.
+func (rf *Fetcher) GetTable() catalog.Descriptor {
+	return rf.table.desc
 }
 
 // StartScan initializes and starts the key-value scan. Can be used multiple
@@ -357,8 +482,8 @@ func (rf *Fetcher) StartScan(
 		return errors.AssertionFailedf("no spans")
 	}
 
+	rf.traceKV = traceKV
 	f, err := makeKVBatchFetcher(
-		ctx,
 		makeKVBatchFetcherDefaultSendFunc(txn),
 		spans,
 		rf.reverse,
@@ -367,7 +492,7 @@ func (rf *Fetcher) StartScan(
 		rf.lockStrength,
 		rf.lockWaitPolicy,
 		rf.lockTimeout,
-		rf.kvFetcherMemAcc,
+		rf.mon,
 		forceProductionKVBatchSize,
 		txn.AdmissionHeader(),
 		txn.DB().SQLKVResponseAdmissionQ,
@@ -375,7 +500,7 @@ func (rf *Fetcher) StartScan(
 	if err != nil {
 		return err
 	}
-	return rf.StartScanFrom(ctx, &f, traceKV)
+	return rf.StartScanFrom(ctx, &f)
 }
 
 // TestingInconsistentScanSleep introduces a sleep inside the fetcher after
@@ -457,8 +582,8 @@ func (rf *Fetcher) StartInconsistentScan(
 	// TODO(radu): we should commit the last txn. Right now the commit is a no-op
 	// on read transactions, but perhaps one day it will release some resources.
 
+	rf.traceKV = traceKV
 	f, err := makeKVBatchFetcher(
-		ctx,
 		sendFunc(sendFn),
 		spans,
 		rf.reverse,
@@ -467,7 +592,7 @@ func (rf *Fetcher) StartInconsistentScan(
 		rf.lockStrength,
 		rf.lockWaitPolicy,
 		rf.lockTimeout,
-		rf.kvFetcherMemAcc,
+		rf.mon,
 		forceProductionKVBatchSize,
 		txn.AdmissionHeader(),
 		txn.DB().SQLKVResponseAdmissionQ,
@@ -475,7 +600,7 @@ func (rf *Fetcher) StartInconsistentScan(
 	if err != nil {
 		return err
 	}
-	return rf.StartScanFrom(ctx, &f, traceKV)
+	return rf.StartScanFrom(ctx, &f)
 }
 
 func (rf *Fetcher) rowLimitToKeyLimit(rowLimitHint rowinfra.RowLimit) rowinfra.KeyLimit {
@@ -490,21 +615,19 @@ func (rf *Fetcher) rowLimitToKeyLimit(rowLimitHint rowinfra.RowLimit) rowinfra.K
 	// rows we could potentially scan over.
 	//
 	// We add an extra key to make sure we form the last row.
-	return rowinfra.KeyLimit(int64(rowLimitHint)*int64(rf.table.spec.MaxKeysPerRow) + 1)
+	return rowinfra.KeyLimit(int64(rowLimitHint)*int64(rf.numKeysPerRow) + 1)
 }
 
-// StartScanFrom initializes and starts a scan from the given KVBatchFetcher. Can be
+// StartScanFrom initializes and starts a scan from the given kvBatchFetcher. Can be
 // used multiple times.
-func (rf *Fetcher) StartScanFrom(ctx context.Context, f KVBatchFetcher, traceKV bool) error {
-	rf.traceKV = traceKV
+func (rf *Fetcher) StartScanFrom(ctx context.Context, f kvBatchFetcher) error {
 	rf.indexKey = nil
 	if rf.kvFetcher != nil {
 		rf.kvFetcher.Close(ctx)
 	}
 	rf.kvFetcher = newKVFetcher(f)
-	rf.kvEnd = false
 	// Retrieve the first key.
-	_, err := rf.nextKey(ctx)
+	_, err := rf.NextKey(ctx)
 	return err
 }
 
@@ -531,64 +654,48 @@ func (rf *Fetcher) setNextKV(kv roachpb.KeyValue, needsCopy bool) {
 	rf.kv = kvCopy
 }
 
-// nextKey retrieves the next key/value and sets kv/kvEnd. Returns whether the
-// key indicates a new row (as opposed to another family for the current row).
-func (rf *Fetcher) nextKey(ctx context.Context) (newRow bool, _ error) {
-	ok, kv, finalReferenceToBatch, err := rf.kvFetcher.NextKV(ctx, rf.mvccDecodeStrategy)
+// NextKey retrieves the next key/value and sets kv/kvEnd. Returns whether a row
+// has been completed.
+func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, _ error) {
+	moreKVs, kv, finalReferenceToBatch, _, err := rf.kvFetcher.NextKV(ctx, rf.mvccDecodeStrategy)
 	if err != nil {
-		return false, ConvertFetchError(&rf.table.spec, err)
+		return false, ConvertFetchError(ctx, rf, err)
 	}
 	rf.setNextKV(kv, finalReferenceToBatch)
 
-	if !ok {
+	rf.kvEnd = !moreKVs
+	if rf.kvEnd {
 		// No more keys in the scan.
-		rf.kvEnd = true
+		//
+		// NB: this assumes that the KV layer will never split a range
+		// between column families, which is a brittle assumption.
+		// See:
+		// https://github.com/cockroachdb/cockroach/pull/42056
 		return true, nil
 	}
 
-	// unchangedPrefix will be set to true if the current KV belongs to the same
-	// row as the previous KV (i.e. the last and current keys have identical
-	// prefix). In this case, we can skip decoding the index key completely.
-	unchangedPrefix := rf.table.spec.MaxKeysPerRow > 1 && rf.indexKey != nil && bytes.HasPrefix(rf.kv.Key, rf.indexKey)
+	// foundNull is set when decoding a new index key for a row finds a NULL value
+	// in the index key. This is used when decoding unique secondary indexes in order
+	// to tell whether they have extra columns appended to the key.
+	var foundNull bool
+
+	// unchangedPrefix will be set to true if we can skip decoding the index key
+	// completely, because the last key we saw has identical prefix to the
+	// current key.
+	//
+	// See Init() for a detailed description of when we can get away with not
+	// reading the index key.
+	unchangedPrefix := rf.indexKey != nil && bytes.HasPrefix(rf.kv.Key, rf.indexKey)
 	if unchangedPrefix {
 		// Skip decoding!
 		rf.keyRemainingBytes = rf.kv.Key[len(rf.indexKey):]
-		return false, nil
-	}
-
-	// The current key belongs to a new row.
-	if rf.mustDecodeIndexKey {
-		var foundNull bool
-		rf.keyRemainingBytes, foundNull, err = rf.DecodeIndexKey(rf.kv.Key)
+	} else if rf.mustDecodeIndexKey || rf.traceKV {
+		rf.keyRemainingBytes, moreKVs, foundNull, err = rf.ReadIndexKey(rf.kv.Key)
 		if err != nil {
 			return false, err
 		}
-		// For unique secondary indexes, the index-key does not distinguish one row
-		// from the next if both rows contain identical values along with a NULL.
-		// Consider the keys:
-		//
-		//   /test/unique_idx/NULL/0
-		//   /test/unique_idx/NULL/1
-		//
-		// The index-key extracted from the above keys is /test/unique_idx/NULL. The
-		// trailing /0 and /1 are the primary key used to unique-ify the keys when a
-		// NULL is present. When a null is present in the index key, we cut off more
-		// of the index key so that the prefix includes the primary key columns.
-		//
-		// Note that we do not need to do this for non-unique secondary indexes because
-		// the extra columns in the primary key will _always_ be there, so we can decode
-		// them when processing the index. The difference with unique secondary indexes
-		// is that the extra columns are not always there, and are used to unique-ify
-		// the index key, rather than provide the primary key column values.
-		if foundNull && rf.table.spec.IsSecondaryIndex && rf.table.spec.IsUniqueIndex && rf.table.spec.MaxKeysPerRow > 1 {
-			for i := 0; i < int(rf.table.spec.NumKeySuffixColumns); i++ {
-				var err error
-				// Slice off an extra encoded column from rf.keyRemainingBytes.
-				rf.keyRemainingBytes, err = keyside.Skip(rf.keyRemainingBytes)
-				if err != nil {
-					return false, err
-				}
-			}
+		if !moreKVs {
+			return false, errors.AssertionFailedf("key did not match any of the table descriptors")
 		}
 	} else {
 		// We still need to consume the key until the family
@@ -602,30 +709,98 @@ func (rf *Fetcher) nextKey(ctx context.Context) (newRow bool, _ error) {
 		rf.keyRemainingBytes = rf.kv.Key[prefixLen:]
 	}
 
-	rf.indexKey = nil
-	return true, nil
+	// For unique secondary indexes, the index-key does not distinguish one row
+	// from the next if both rows contain identical values along with a NULL.
+	// Consider the keys:
+	//
+	//   /test/unique_idx/NULL/0
+	//   /test/unique_idx/NULL/1
+	//
+	// The index-key extracted from the above keys is /test/unique_idx/NULL. The
+	// trailing /0 and /1 are the primary key used to unique-ify the keys when a
+	// NULL is present. When a null is present in the index key, we cut off more
+	// of the index key so that the prefix includes the primary key columns.
+	//
+	// Note that we do not need to do this for non-unique secondary indexes because
+	// the extra columns in the primary key will _always_ be there, so we can decode
+	// them when processing the index. The difference with unique secondary indexes
+	// is that the extra columns are not always there, and are used to unique-ify
+	// the index key, rather than provide the primary key column values.
+	if foundNull && rf.table.isSecondaryIndex && rf.table.index.IsUnique() && len(rf.table.desc.GetFamilies()) != 1 {
+		for i := 0; i < rf.table.index.NumKeySuffixColumns(); i++ {
+			var err error
+			// Slice off an extra encoded column from rf.keyRemainingBytes.
+			rf.keyRemainingBytes, err = rowenc.SkipTableKey(rf.keyRemainingBytes)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+
+	switch {
+	case len(rf.table.desc.GetFamilies()) == 1:
+		// If we only have one family, we know that there is only 1 k/v pair per row.
+		rowDone = true
+	case !unchangedPrefix:
+		// If the prefix of the key has changed, current key is from a different
+		// row than the previous one.
+		rowDone = true
+	default:
+		rowDone = false
+	}
+
+	if rf.indexKey != nil && rowDone {
+		// The current key belongs to a new row. Output the
+		// current row.
+		rf.indexKey = nil
+		return true, nil
+	}
+
+	return false, nil
 }
 
-func (rf *Fetcher) prettyKeyDatums(
-	cols []descpb.IndexFetchSpec_KeyColumn, vals []rowenc.EncDatum,
-) string {
+func (rf *Fetcher) prettyEncDatums(types []*types.T, vals []rowenc.EncDatum) string {
 	var buf strings.Builder
 	for i, v := range vals {
-		buf.WriteByte('/')
-		if err := v.EnsureDecoded(cols[i].Type, rf.alloc); err != nil {
-			buf.WriteByte('?')
-		} else {
-			buf.WriteString(v.Datum.String())
+		if err := v.EnsureDecoded(types[i], rf.alloc); err != nil {
+			buf.WriteString("/{error decoding: ")
+			buf.WriteString(err.Error())
+			buf.WriteByte('}')
+			continue
 		}
+		buf.WriteByte('/')
+		buf.WriteString(v.Datum.String())
 	}
 	return buf.String()
 }
 
-// DecodeIndexKey decodes an index key and returns the remaining key and whether
-// it encountered a null while decoding.
-func (rf *Fetcher) DecodeIndexKey(key roachpb.Key) (remaining []byte, foundNull bool, err error) {
-	key = key[rf.table.spec.KeyPrefixLength:]
-	return rowenc.DecodeKeyValsUsingSpec(rf.table.spec.KeyAndSuffixColumns, key, rf.table.keyVals)
+// ReadIndexKey decodes an index key for a given table.
+// It returns whether or not the key is for any of the tables initialized
+// in Fetcher, and the remaining part of the key if it is.
+// ReadIndexKey additionally returns whether or not it encountered a null while decoding.
+func (rf *Fetcher) ReadIndexKey(
+	key roachpb.Key,
+) (remaining []byte, ok bool, foundNull bool, err error) {
+	return rowenc.DecodeIndexKeyWithoutTableIDIndexIDPrefix(
+		rf.table.desc,
+		rf.table.index,
+		rf.table.keyValTypes,
+		rf.table.keyVals,
+		rf.table.indexColumnDirs,
+		key[rf.table.knownPrefixLength:],
+	)
+}
+
+// KeyToDesc implements the KeyToDescTranslator interface. The implementation is
+// used by ConvertFetchError.
+func (rf *Fetcher) KeyToDesc(key roachpb.Key) (catalog.TableDescriptor, bool) {
+	if len(key) < rf.table.knownPrefixLength {
+		return nil, false
+	}
+	if _, ok, _, err := rf.ReadIndexKey(key); !ok || err != nil {
+		return nil, false
+	}
+	return rf.table.desc, true
 }
 
 // processKV processes the given key/value, setting values in the row
@@ -639,9 +814,9 @@ func (rf *Fetcher) processKV(
 	if rf.traceKV {
 		prettyKey = fmt.Sprintf(
 			"/%s/%s%s",
-			table.spec.TableName,
-			table.spec.IndexName,
-			rf.prettyKeyDatums(table.spec.KeyAndSuffixColumns, table.keyVals),
+			table.desc.GetName(),
+			table.index.GetName(),
+			rf.prettyEncDatums(table.keyValTypes, table.keyVals),
 		)
 	}
 
@@ -686,16 +861,16 @@ func (rf *Fetcher) processKV(
 		table.rowLastModified = kv.Value.Timestamp
 	}
 
-	if len(table.spec.FetchedColumns) == 0 {
+	if table.neededCols.Empty() {
 		// We don't need to decode any values.
 		if rf.traceKV {
-			prettyValue = "<undecoded>"
+			prettyValue = tree.DNull.String()
 		}
 		return prettyKey, prettyValue, nil
 	}
 
 	// For covering secondary indexes, allow for decoding as a primary key.
-	if table.spec.EncodingType == descpb.PrimaryIndexEncoding &&
+	if table.index.GetEncodingType() == descpb.PrimaryIndexEncoding &&
 		len(rf.keyRemainingBytes) > 0 {
 		// If familyID is 0, kv.Value contains values for composite key columns.
 		// These columns already have a table.row value assigned above, but that value
@@ -725,23 +900,13 @@ func (rf *Fetcher) processKV(
 				return "", "", scrub.WrapError(scrub.IndexKeyDecodingError, err)
 			}
 
-			// If familyID is 0, this is the row sentinel (in the legacy pre-family format),
-			// and a value is not expected, so we're done.
-			if familyID != 0 {
-				// Find the default column ID for the family.
-				var defaultColumnID descpb.ColumnID
-				for _, f := range table.spec.FamilyDefaultColumns {
-					if f.FamilyID == descpb.FamilyID(familyID) {
-						defaultColumnID = f.DefaultColumnID
-						break
-					}
-				}
-				if defaultColumnID == 0 {
-					return "", "", errors.Errorf("single entry value with no default column id")
-				}
-
-				prettyKey, prettyValue, err = rf.processValueSingle(ctx, table, defaultColumnID, kv, prettyKey)
+			var family *descpb.ColumnFamilyDescriptor
+			family, err = table.desc.FindFamilyByID(descpb.FamilyID(familyID))
+			if err != nil {
+				return "", "", scrub.WrapError(scrub.IndexKeyDecodingError, err)
 			}
+
+			prettyKey, prettyValue, err = rf.processValueSingle(ctx, table, family, kv, prettyKey)
 		}
 		if err != nil {
 			return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
@@ -758,32 +923,41 @@ func (rf *Fetcher) processKV(
 			if err != nil {
 				return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
 			}
-			if len(table.extraVals) > 0 {
-				extraCols := table.spec.KeySuffixColumns()
+			if hasExtraCols(table) {
 				// This is a unique secondary index; decode the extra
 				// column values from the value.
 				var err error
-				valueBytes, _, err = rowenc.DecodeKeyValsUsingSpec(
-					extraCols,
-					valueBytes,
+				valueBytes, _, err = rowenc.DecodeKeyVals(
+					table.extraTypes,
 					table.extraVals,
+					nil,
+					valueBytes,
 				)
 				if err != nil {
 					return "", "", scrub.WrapError(scrub.SecondaryIndexKeyExtraValueDecodingError, err)
 				}
-				for i := range extraCols {
-					if idx, ok := table.colIdxMap.Get(extraCols[i].ColumnID); ok {
-						table.row[idx] = table.extraVals[i]
+				for i := 0; i < table.index.NumKeySuffixColumns(); i++ {
+					id := table.index.GetKeySuffixColumnID(i)
+					if table.neededCols.Contains(int(id)) {
+						table.row[table.colIdxMap.GetDefault(id)] = table.extraVals[i]
 					}
 				}
 				if rf.traceKV {
-					prettyValue = rf.prettyKeyDatums(extraCols, table.extraVals)
+					prettyValue = rf.prettyEncDatums(table.extraTypes, table.extraVals)
 				}
 			}
 		case roachpb.ValueType_TUPLE:
 			valueBytes, err = kv.Value.GetTuple()
 			if err != nil {
 				return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
+			}
+		}
+
+		if DebugRowFetch {
+			if hasExtraCols(table) && tag == roachpb.ValueType_BYTES {
+				log.Infof(ctx, "Scan %s -> %s", kv.Key, rf.prettyEncDatums(table.extraTypes, table.extraVals))
+			} else {
+				log.Infof(ctx, "Scan %s", kv.Key)
 			}
 		}
 
@@ -798,54 +972,68 @@ func (rf *Fetcher) processKV(
 	}
 
 	if rf.traceKV && prettyValue == "" {
-		prettyValue = "<undecoded>"
+		prettyValue = tree.DNull.String()
 	}
 
 	return prettyKey, prettyValue, nil
 }
 
-// processValueSingle processes the given value (of column colID), setting
-// values in table.row accordingly. The key is only used for logging.
+// processValueSingle processes the given value (of column
+// family.DefaultColumnID), setting values in table.row accordingly. The key is
+// only used for logging.
 func (rf *Fetcher) processValueSingle(
 	ctx context.Context,
 	table *tableInfo,
-	colID descpb.ColumnID,
+	family *descpb.ColumnFamilyDescriptor,
 	kv roachpb.KeyValue,
 	prettyKeyPrefix string,
 ) (prettyKey string, prettyValue string, err error) {
 	prettyKey = prettyKeyPrefix
-	idx, ok := table.colIdxMap.Get(colID)
-	if !ok {
-		// No need to unmarshal the column value. Either the column was part of
-		// the index key or it isn't needed.
-		if DebugRowFetch {
-			log.Infof(ctx, "Scan %s -> [%d] (skipped)", kv.Key, colID)
-		}
-		return prettyKey, "", nil
+
+	// If this is the row sentinel (in the legacy pre-family format),
+	// a value is not expected, so we're done.
+	if family.ID == 0 {
+		return "", "", nil
 	}
 
-	if rf.traceKV {
-		prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.spec.FetchedColumns[idx].Name)
+	colID := family.DefaultColumnID
+	if colID == 0 {
+		return "", "", errors.Errorf("single entry value with no default column id")
 	}
-	if len(kv.Value.RawBytes) == 0 {
-		return prettyKey, "", nil
+
+	if rf.traceKV || table.neededCols.Contains(int(colID)) {
+		if idx, ok := table.colIdxMap.Get(colID); ok {
+			if rf.traceKV {
+				prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].GetName())
+			}
+			if len(kv.Value.RawBytes) == 0 {
+				return prettyKey, "", nil
+			}
+			typ := table.cols[idx].GetType()
+			// TODO(arjun): The value is a directly marshaled single value, so we
+			// unmarshal it eagerly here. This can potentially be optimized out,
+			// although that would require changing UnmarshalColumnValue to operate
+			// on bytes, and for Encode/DecodeTableValue to operate on marshaled
+			// single values.
+			value, err := rowenc.UnmarshalColumnValue(rf.alloc, typ, kv.Value)
+			if err != nil {
+				return "", "", err
+			}
+			if rf.traceKV {
+				prettyValue = value.String()
+			}
+			table.row[idx] = rowenc.DatumToEncDatum(typ, value)
+			if DebugRowFetch {
+				log.Infof(ctx, "Scan %s -> %v", kv.Key, value)
+			}
+			return prettyKey, prettyValue, nil
+		}
 	}
-	typ := table.spec.FetchedColumns[idx].Type
-	// TODO(arjun): The value is a directly marshaled single value, so we
-	// unmarshal it eagerly here. This can potentially be optimized out,
-	// although that would require changing UnmarshalColumnValue to operate
-	// on bytes, and for Encode/DecodeTableValue to operate on marshaled
-	// single values.
-	value, err := valueside.UnmarshalLegacy(rf.alloc, typ, kv.Value)
-	if err != nil {
-		return "", "", err
-	}
-	if rf.traceKV {
-		prettyValue = value.String()
-	}
-	table.row[idx] = rowenc.DatumToEncDatum(typ, value)
+
+	// No need to unmarshal the column value. Either the column was part of
+	// the index key or it isn't needed.
 	if DebugRowFetch {
-		log.Infof(ctx, "Scan %s -> %v", kv.Key, value)
+		log.Infof(ctx, "Scan %s -> [%d] (skipped)", kv.Key, colID)
 	}
 	return prettyKey, prettyValue, nil
 }
@@ -876,22 +1064,22 @@ func (rf *Fetcher) processValueBytes(
 		}
 		colID := lastColID + descpb.ColumnID(colIDDiff)
 		lastColID = colID
-		idx, ok := table.colIdxMap.Get(colID)
-		if !ok {
+		if !table.neededCols.Contains(int(colID)) {
 			// This column wasn't requested, so read its length and skip it.
-			numBytes, err := encoding.PeekValueLengthWithOffsetsAndType(valueBytes, dataOffset, typ)
+			len, err := encoding.PeekValueLengthWithOffsetsAndType(valueBytes, dataOffset, typ)
 			if err != nil {
 				return "", "", err
 			}
-			valueBytes = valueBytes[numBytes:]
+			valueBytes = valueBytes[len:]
 			if DebugRowFetch {
 				log.Infof(ctx, "Scan %s -> [%d] (skipped)", kv.Key, colID)
 			}
 			continue
 		}
+		idx := table.colIdxMap.GetDefault(colID)
 
 		if rf.traceKV {
-			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.spec.FetchedColumns[idx].Name)
+			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].GetName())
 		}
 
 		var encValue rowenc.EncDatum
@@ -901,7 +1089,7 @@ func (rf *Fetcher) processValueBytes(
 			return "", "", err
 		}
 		if rf.traceKV {
-			err := encValue.EnsureDecoded(table.spec.FetchedColumns[idx].Type, rf.alloc)
+			err := encValue.EnsureDecoded(table.cols[idx].GetType(), rf.alloc)
 			if err != nil {
 				return "", "", err
 			}
@@ -920,14 +1108,18 @@ func (rf *Fetcher) processValueBytes(
 }
 
 // NextRow processes keys until we complete one row, which is returned as an
-// EncDatumRow. The row contains one value per IndexFetchSpec.FetchedColumns.
-//
-// The EncDatumRow should not be modified and is only valid until the next call.
-//
-// When there are no more rows, the EncDatumRow is nil.
-func (rf *Fetcher) NextRow(ctx context.Context) (row rowenc.EncDatumRow, err error) {
+// EncDatumRow. The row contains one value per table column, regardless of the
+// index used; values that are not needed (as per neededCols) are nil. The
+// EncDatumRow should not be modified and is only valid until the next call.
+// When there are no more rows, the EncDatumRow is nil. The error returned may
+// be a scrub.ScrubError, which the caller is responsible for unwrapping.
+// It also returns the table and index descriptor associated with the row
+// (relevant when more than one table is specified during initialization).
+func (rf *Fetcher) NextRow(
+	ctx context.Context,
+) (row rowenc.EncDatumRow, table catalog.TableDescriptor, index catalog.Index, err error) {
 	if rf.kvEnd {
-		return nil, nil
+		return nil, nil, nil, nil
 	}
 
 	// All of the columns for a particular row will be grouped together. We
@@ -939,59 +1131,41 @@ func (rf *Fetcher) NextRow(ctx context.Context) (row rowenc.EncDatumRow, err err
 	for {
 		prettyKey, prettyVal, err := rf.processKV(ctx, rf.kv)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		if rf.traceKV {
 			log.VEventf(ctx, 2, "fetched: %s -> %s", prettyKey, prettyVal)
 		}
 
-		rowDone, err := rf.nextKey(ctx)
+		if rf.isCheck {
+			rf.table.lastKV = rf.kv
+		}
+		rowDone, err := rf.NextKey(ctx)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		if rowDone {
 			err := rf.finalizeRow()
-			return rf.table.row, err
+			return rf.table.row, rf.table.desc, rf.table.index, err
 		}
 	}
-}
-
-// NextRowInto calls NextRow and copies the results into the given EncDatumRow
-// slice according to the given column map.
-//
-// Values for columns that are not in the map are ignored. EncDatums in
-// destination that don't correspond to a fetcher column are not modified.
-//
-// If there are no more rows, returns ok=false.
-func (rf *Fetcher) NextRowInto(
-	ctx context.Context, destination rowenc.EncDatumRow, colIdxMap catalog.TableColMap,
-) (ok bool, err error) {
-	row, err := rf.NextRow(ctx)
-	if err != nil {
-		return false, err
-	}
-	if row == nil {
-		return false, nil
-	}
-
-	for i := range rf.table.spec.FetchedColumns {
-		if ord, ok := colIdxMap.Get(rf.table.spec.FetchedColumns[i].ColumnID); ok {
-			destination[ord] = row[i]
-		}
-	}
-	return true, nil
 }
 
 // NextRowDecoded calls NextRow and decodes the EncDatumRow into a Datums.
 // The Datums should not be modified and is only valid until the next call.
 // When there are no more rows, the Datums is nil.
-func (rf *Fetcher) NextRowDecoded(ctx context.Context) (datums tree.Datums, err error) {
-	row, err := rf.NextRow(ctx)
+// It also returns the table and index descriptor associated with the row
+// (relevant when more than one table is specified during initialization).
+func (rf *Fetcher) NextRowDecoded(
+	ctx context.Context,
+) (datums tree.Datums, table catalog.TableDescriptor, index catalog.Index, err error) {
+	row, table, index, err := rf.NextRow(ctx)
 	if err != nil {
-		return nil, err
+		err = scrub.UnwrapScrubError(err)
+		return nil, nil, nil, err
 	}
 	if row == nil {
-		return nil, nil
+		return nil, nil, nil, nil
 	}
 
 	for i, encDatum := range row {
@@ -999,53 +1173,13 @@ func (rf *Fetcher) NextRowDecoded(ctx context.Context) (datums tree.Datums, err 
 			rf.table.decodedRow[i] = tree.DNull
 			continue
 		}
-		if err := encDatum.EnsureDecoded(rf.table.spec.FetchedColumns[i].Type, rf.alloc); err != nil {
-			return nil, err
+		if err := encDatum.EnsureDecoded(rf.table.cols[i].GetType(), rf.alloc); err != nil {
+			return nil, nil, nil, err
 		}
 		rf.table.decodedRow[i] = encDatum.Datum
 	}
 
-	return rf.table.decodedRow, nil
-}
-
-// NextRowDecodedInto calls NextRow and decodes the EncDatumRow into Datums,
-// storing the results in the given destination slice according to the column
-// mapping.
-//
-// Values for columns that are not in the map are ignored. Datums in
-// destination that don't correspond to a fetcher column are not modified.
-//
-// If there are no more rows, returns ok=false.
-func (rf *Fetcher) NextRowDecodedInto(
-	ctx context.Context, destination tree.Datums, colIdxMap catalog.TableColMap,
-) (ok bool, err error) {
-	row, err := rf.NextRow(ctx)
-	if err != nil {
-		return false, err
-	}
-	if row == nil {
-		return false, nil
-	}
-
-	for i := range rf.table.spec.FetchedColumns {
-		col := &rf.table.spec.FetchedColumns[i]
-		ord, ok := colIdxMap.Get(col.ColumnID)
-		if !ok {
-			// Column not in map, ignore.
-			continue
-		}
-		encDatum := row[i]
-		if encDatum.IsUnset() {
-			destination[ord] = tree.DNull
-			continue
-		}
-		if err := encDatum.EnsureDecoded(col.Type, rf.alloc); err != nil {
-			return false, err
-		}
-		destination[ord] = encDatum.Datum
-	}
-
-	return true, nil
+	return rf.table.decodedRow, table, index, nil
 }
 
 // RowLastModified may only be called after NextRow has returned a non-nil row
@@ -1056,10 +1190,198 @@ func (rf *Fetcher) RowLastModified() hlc.Timestamp {
 
 // RowIsDeleted may only be called after NextRow has returned a non-nil row and
 // returns true if that row was most recently deleted. This method is only
-// meaningful when the configured KVBatchFetcher returns deletion tombstones, which
+// meaningful when the configured kvBatchFetcher returns deletion tombstones, which
 // the normal one (via `StartScan`) does not.
 func (rf *Fetcher) RowIsDeleted() bool {
 	return rf.table.rowIsDeleted
+}
+
+// NextRowWithErrors calls NextRow to fetch the next row and also run
+// additional additional logic for physical checks. The Datums should
+// not be modified and are only valid until the next call. When there
+// are no more rows, the Datums is nil. The checks executed include:
+//  - k/v data round-trips, i.e. it decodes and re-encodes to the same
+//    value.
+//  - There is no extra unexpected or incorrect data encoded in the k/v
+//    pair.
+//  - Decoded keys follow the same ordering as their encoding.
+func (rf *Fetcher) NextRowWithErrors(ctx context.Context) (rowenc.EncDatumRow, error) {
+	row, table, index, err := rf.NextRow(ctx)
+	if row == nil {
+		return nil, nil
+	} else if err != nil {
+		// If this is not already a wrapped error, we will consider it to be
+		// a generic physical error.
+		// FIXME(joey): This may not be needed if we capture all the errors
+		// encountered. This is a TBD when this change is polished.
+		if !scrub.IsScrubError(err) {
+			err = scrub.WrapError(scrub.PhysicalError, err)
+		}
+		return row, err
+	}
+
+	// Decode the row in-place. The following check datum encoding
+	// functions require that the table.row datums are decoded.
+	for i := range row {
+		if row[i].IsUnset() {
+			rf.table.decodedRow[i] = tree.DNull
+			continue
+		}
+		if err := row[i].EnsureDecoded(rf.table.cols[i].GetType(), rf.alloc); err != nil {
+			return nil, err
+		}
+		rf.table.decodedRow[i] = row[i].Datum
+	}
+
+	if index.GetID() == table.GetPrimaryIndexID() {
+		err = rf.checkPrimaryIndexDatumEncodings(ctx)
+	} else {
+		err = rf.checkSecondaryIndexDatumEncodings(ctx)
+	}
+	if err != nil {
+		return row, err
+	}
+
+	err = rf.checkKeyOrdering(ctx)
+
+	return row, err
+}
+
+// checkPrimaryIndexDatumEncodings will run a round-trip encoding check
+// on all values in the buffered row. This check is specific to primary
+// index datums.
+func (rf *Fetcher) checkPrimaryIndexDatumEncodings(ctx context.Context) error {
+	table := &rf.table
+	scratch := make([]byte, 1024)
+	colIDToColumn := make(map[descpb.ColumnID]catalog.Column)
+	for _, col := range table.desc.PublicColumns() {
+		colIDToColumn[col.GetID()] = col
+	}
+
+	rh := rowHelper{TableDesc: table.desc, Indexes: table.desc.PublicNonPrimaryIndexes()}
+
+	return table.desc.ForeachFamily(func(family *descpb.ColumnFamilyDescriptor) error {
+		var lastColID descpb.ColumnID
+		familyID := family.ID
+		familySortedColumnIDs, ok := rh.sortedColumnFamily(familyID)
+		if !ok {
+			return errors.AssertionFailedf("invalid family sorted column id map for family %d", familyID)
+		}
+
+		for _, colID := range familySortedColumnIDs {
+			rowVal := table.row[table.colIdxMap.GetDefault(colID)]
+			if rowVal.IsNull() {
+				// Column is not present.
+				continue
+			}
+
+			if skip, err := rh.skipColumnNotInPrimaryIndexValue(colID, rowVal.Datum); err != nil {
+				return errors.NewAssertionErrorWithWrappedErrf(err, "unable to determine skip")
+			} else if skip {
+				continue
+			}
+
+			col := colIDToColumn[colID]
+			if col == nil {
+				return errors.AssertionFailedf("column mapping not found for column %d", colID)
+			}
+
+			if lastColID > col.GetID() {
+				return errors.AssertionFailedf("cannot write column id %d after %d", col.GetID(), lastColID)
+			}
+			colIDDiff := col.GetID() - lastColID
+			lastColID = col.GetID()
+
+			if result, err := rowenc.EncodeTableValue([]byte(nil), colIDDiff, rowVal.Datum,
+				scratch); err != nil {
+				return errors.NewAssertionErrorWithWrappedErrf(err, "could not re-encode column %s, value was %#v",
+					col.GetName(), rowVal.Datum)
+			} else if !rowVal.BytesEqual(result) {
+				return scrub.WrapError(scrub.IndexValueDecodingError, errors.Errorf(
+					"value failed to round-trip encode. Column=%s colIDDiff=%d Key=%s expected %#v, got: %#v",
+					col.GetName(), colIDDiff, rf.kv.Key, rowVal.EncodedString(), result))
+			}
+		}
+		return nil
+	})
+}
+
+// checkSecondaryIndexDatumEncodings will run a round-trip encoding
+// check on all values in the buffered row. This check is specific to
+// secondary index datums.
+func (rf *Fetcher) checkSecondaryIndexDatumEncodings(ctx context.Context) error {
+	table := &rf.table
+	colToEncDatum := make(map[descpb.ColumnID]rowenc.EncDatum, len(table.row))
+	values := make(tree.Datums, len(table.row))
+	for i, col := range table.cols {
+		colToEncDatum[col.GetID()] = table.row[i]
+		values[i] = table.row[i].Datum
+	}
+
+	// The below code makes incorrect checks (#45256).
+	indexEntries, err := rowenc.EncodeSecondaryIndex(
+		rf.codec, table.desc, table.index, table.colIdxMap, values, false /* includeEmpty */)
+	if err != nil {
+		return err
+	}
+
+	for _, indexEntry := range indexEntries {
+		// We ignore the first 4 bytes of the values. These bytes are a
+		// checksum which are not set by EncodeSecondaryIndex.
+		if !indexEntry.Key.Equal(rf.table.lastKV.Key) {
+			return scrub.WrapError(scrub.IndexKeyDecodingError, errors.Errorf(
+				"secondary index key failed to round-trip encode. expected %#v, got: %#v",
+				rf.table.lastKV.Key, indexEntry.Key))
+		} else if !indexEntry.Value.EqualTagAndData(table.lastKV.Value) {
+			return scrub.WrapError(scrub.IndexValueDecodingError, errors.Errorf(
+				"secondary index value failed to round-trip encode. expected %#v, got: %#v",
+				rf.table.lastKV.Value, indexEntry.Value))
+		}
+	}
+	return nil
+}
+
+// checkKeyOrdering verifies that the datums decoded for the current key
+// have the same ordering as the encoded key.
+func (rf *Fetcher) checkKeyOrdering(ctx context.Context) error {
+	defer func() {
+		rf.table.lastDatums = append(tree.Datums(nil), rf.table.decodedRow...)
+	}()
+
+	if !rf.table.hasLast {
+		rf.table.hasLast = true
+		return nil
+	}
+
+	evalCtx := tree.EvalContext{}
+	// Iterate through columns in order, comparing each value to the value in the
+	// previous row in that column. When the first column with a differing value
+	// is found, compare the values to ensure the ordering matches the column
+	// ordering.
+	for i := 0; i < rf.table.index.NumKeyColumns(); i++ {
+		id := rf.table.index.GetKeyColumnID(i)
+		idx := rf.table.colIdxMap.GetDefault(id)
+		result := rf.table.decodedRow[idx].Compare(&evalCtx, rf.table.lastDatums[idx])
+		expectedDirection := rf.table.index.GetKeyColumnDirection(i)
+		if rf.reverse && expectedDirection == descpb.IndexDescriptor_ASC {
+			expectedDirection = descpb.IndexDescriptor_DESC
+		} else if rf.reverse && expectedDirection == descpb.IndexDescriptor_DESC {
+			expectedDirection = descpb.IndexDescriptor_ASC
+		}
+
+		if result != 0 {
+			if expectedDirection == descpb.IndexDescriptor_ASC && result < 0 ||
+				expectedDirection == descpb.IndexDescriptor_DESC && result > 0 {
+				return scrub.WrapError(scrub.IndexKeyDecodingError,
+					errors.Errorf("key ordering did not match datum ordering. IndexDescriptor=%s",
+						expectedDirection))
+			}
+			// After the first column with a differing value is found, the remaining
+			// columns are skipped (see #32874).
+			break
+		}
+	}
+	return nil
 }
 
 func (rf *Fetcher) finalizeRow() error {
@@ -1078,33 +1400,32 @@ func (rf *Fetcher) finalizeRow() error {
 	}
 
 	// Fill in any missing values with NULLs
-	for i := range table.spec.FetchedColumns {
-		col := &table.spec.FetchedColumns[i]
+	for i := range table.cols {
 		if rf.valueColsFound == table.neededValueCols {
 			// Found all cols - done!
 			return nil
 		}
-		if table.row[i].IsUnset() {
+		if table.neededCols.Contains(int(table.cols[i].GetID())) && table.row[i].IsUnset() {
 			// If the row was deleted, we'll be missing any non-primary key
-			// columns, including nullable ones, but this is expected. If the column
-			// is not yet active, we can also expect NULLs.
-			if col.IsNonNullable && !table.rowIsDeleted && !rf.IgnoreUnexpectedNulls {
+			// columns, including nullable ones, but this is expected.
+			if !table.cols[i].IsNullable() && !table.rowIsDeleted && !rf.IgnoreUnexpectedNulls {
 				var indexColValues []string
 				for _, idx := range table.indexColIdx {
 					if idx != -1 {
-						indexColValues = append(indexColValues, table.row[idx].String(table.spec.FetchedColumns[idx].Type))
+						indexColValues = append(indexColValues, table.row[idx].String(table.cols[idx].GetType()))
 					} else {
 						indexColValues = append(indexColValues, "?")
 					}
 				}
-				var indexColNames []string
-				for i := range table.spec.KeyFullColumns() {
-					indexColNames = append(indexColNames, table.spec.KeyAndSuffixColumns[i].Name)
-				}
-				return errors.AssertionFailedf(
+				err := errors.AssertionFailedf(
 					"Non-nullable column \"%s:%s\" with no value! Index scanned was %q with the index key columns (%s) and the values (%s)",
-					table.spec.TableName, col.Name, table.spec.IndexName,
-					strings.Join(indexColNames, ","), strings.Join(indexColValues, ","))
+					table.desc.GetName(), table.cols[i].GetName(), table.index.GetName(),
+					strings.Join(table.index.IndexDesc().KeyColumnNames, ","), strings.Join(indexColValues, ","))
+
+				if rf.isCheck {
+					return scrub.WrapError(scrub.UnexpectedNullValueError, err)
+				}
+				return err
 			}
 			table.row[i] = rowenc.EncDatum{
 				Datum: tree.DNull,
@@ -1132,7 +1453,7 @@ func (rf *Fetcher) PartialKey(nCols int) (roachpb.Key, error) {
 	if rf.kv.Key == nil {
 		return nil, nil
 	}
-	partialKeyLength := int(rf.table.spec.KeyPrefixLength)
+	partialKeyLength := rf.table.knownPrefixLength
 	for consumedCols := 0; consumedCols < nCols; consumedCols++ {
 		l, err := encoding.PeekLength(rf.kv.Key[partialKeyLength:])
 		if err != nil {
@@ -1146,4 +1467,10 @@ func (rf *Fetcher) PartialKey(nCols int) (roachpb.Key, error) {
 // GetBytesRead returns total number of bytes read by the underlying KVFetcher.
 func (rf *Fetcher) GetBytesRead() int64 {
 	return rf.kvFetcher.GetBytesRead()
+}
+
+// Only unique secondary indexes have extra columns to decode (namely the
+// primary index columns).
+func hasExtraCols(table *tableInfo) bool {
+	return table.isSecondaryIndex && table.index.IsUnique()
 }

@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/cache"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
@@ -35,25 +35,12 @@ import (
 type rowFetcherCache struct {
 	codec    keys.SQLCodec
 	leaseMgr *lease.Manager
-	fetchers *cache.UnorderedCache
+	fetchers map[idVersion]*row.Fetcher
 
 	collection *descs.Collection
 	db         *kv.DB
 
-	a tree.DatumAlloc
-}
-
-type cachedFetcher struct {
-	tableDesc catalog.TableDescriptor
-	fetcher   row.Fetcher
-}
-
-var rfCacheConfig = cache.Config{
-	Policy: cache.CacheFIFO,
-	// TODO: If we find ourselves thrashing here in changefeeds on many tables,
-	// we can improve performance by eagerly evicting versions using Resolved notifications.
-	// A old version with a timestamp entirely before a notification can be safely evicted.
-	ShouldEvict: func(size int, _ interface{}, _ interface{}) bool { return size > 1024 },
+	a rowenc.DatumAlloc
 }
 
 type idVersion struct {
@@ -71,9 +58,9 @@ func newRowFetcherCache(
 	return &rowFetcherCache{
 		codec:      codec,
 		leaseMgr:   leaseMgr,
-		collection: cf.NewCollection(ctx, nil /* TemporarySchemaProvider */),
+		collection: cf.NewCollection(nil /* TemporarySchemaProvider */),
 		db:         db,
-		fetchers:   cache.NewUnorderedCache(rfCacheConfig),
+		fetchers:   make(map[idVersion]*row.Fetcher),
 	}
 }
 
@@ -85,58 +72,65 @@ func (c *rowFetcherCache) TableDescForKey(
 	if err != nil {
 		return nil, err
 	}
-	remaining, tableID, _, err := rowenc.DecodePartialTableIDIndexID(key)
-	if err != nil {
-		return nil, err
-	}
+	for skippedCols := 0; ; {
+		remaining, tableID, _, err := rowenc.DecodePartialTableIDIndexID(key)
+		if err != nil {
+			return nil, err
+		}
 
-	// Retrieve the target TableDescriptor from the lease manager. No caching
-	// is attempted because the lease manager does its own caching.
-	desc, err := c.leaseMgr.Acquire(ctx, ts, tableID)
-	if err != nil {
-		// Manager can return all kinds of errors during chaos, but based on
-		// its usage, none of them should ever be terminal.
-		return nil, changefeedbase.MarkRetryableError(err)
-	}
-	tableDesc = desc.Underlying().(catalog.TableDescriptor)
-	// Immediately release the lease, since we only need it for the exact
-	// timestamp requested.
-	desc.Release(ctx)
-	if tableDesc.ContainsUserDefinedTypes() {
-		// If the table contains user defined types, then use the
-		// descs.Collection to retrieve a TableDescriptor with type metadata
-		// hydrated. We open a transaction here only because the
-		// descs.Collection needs one to get a read timestamp. We do this lookup
-		// again behind a conditional to avoid allocating any transaction
-		// metadata if the table has user defined types. This can be bypassed
-		// once (#53751) is fixed. Once the descs.Collection can take in a read
-		// timestamp rather than a whole transaction, we can use the
-		// descs.Collection directly here.
-		// TODO (SQL Schema): #53751.
-		if err := c.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			err := txn.SetFixedTimestamp(ctx, ts)
-			if err != nil {
-				return err
-			}
-			tableDesc, err = c.collection.GetImmutableTableByID(ctx, txn, tableID, tree.ObjectLookupFlags{})
-			return err
-		}); err != nil {
+		// Retrieve the target TableDescriptor from the lease manager. No caching
+		// is attempted because the lease manager does its own caching.
+		desc, err := c.leaseMgr.Acquire(ctx, ts, tableID)
+		if err != nil {
 			// Manager can return all kinds of errors during chaos, but based on
 			// its usage, none of them should ever be terminal.
 			return nil, changefeedbase.MarkRetryableError(err)
 		}
+		tableDesc = desc.Underlying().(catalog.TableDescriptor)
 		// Immediately release the lease, since we only need it for the exact
 		// timestamp requested.
-		c.collection.ReleaseAll(ctx)
-	}
-
-	// Skip over the column data.
-	for skippedCols := 0; skippedCols < tableDesc.GetPrimaryIndex().NumKeyColumns(); skippedCols++ {
-		l, err := encoding.PeekLength(remaining)
-		if err != nil {
-			return nil, err
+		desc.Release(ctx)
+		if tableDesc.ContainsUserDefinedTypes() {
+			// If the table contains user defined types, then use the descs.Collection
+			// to retrieve a TableDescriptor with type metadata hydrated. We open a
+			// transaction here only because the descs.Collection needs one to get
+			// a read timestamp. We do this lookup again behind a conditional to avoid
+			// allocating any transaction metadata if the table has user defined types.
+			// This can be bypassed once (#53751) is fixed. Once the descs.Collection can
+			// take in a read timestamp rather than a whole transaction, we can use the
+			// descs.Collection directly here.
+			// TODO (SQL Schema): #53751.
+			if err := c.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				err := txn.SetFixedTimestamp(ctx, ts)
+				if err != nil {
+					return err
+				}
+				tableDesc, err = c.collection.GetImmutableTableByID(ctx, txn, tableID, tree.ObjectLookupFlags{})
+				return err
+			}); err != nil {
+				// Manager can return all kinds of errors during chaos, but based on
+				// its usage, none of them should ever be terminal.
+				return nil, changefeedbase.MarkRetryableError(err)
+			}
+			// Immediately release the lease, since we only need it for the exact
+			// timestamp requested.
+			c.collection.ReleaseAll(ctx)
 		}
-		remaining = remaining[l:]
+
+		// Skip over the column data.
+		for ; skippedCols < tableDesc.GetPrimaryIndex().NumKeyColumns(); skippedCols++ {
+			l, err := encoding.PeekLength(remaining)
+			if err != nil {
+				return nil, err
+			}
+			remaining = remaining[l:]
+		}
+		var interleaved bool
+		remaining, interleaved = encoding.DecodeIfInterleavedSentinel(remaining)
+		if !interleaved {
+			break
+		}
+		key = remaining
 	}
 
 	return tableDesc, nil
@@ -151,43 +145,44 @@ func (c *rowFetcherCache) RowFetcherForTableDesc(
 	// UserDefinedTypeColsHaveSameVersion if we have a hit because we are
 	// guaranteed that the tables have the same version. Additionally, these
 	// fetchers are always initialized with a single tabledesc.Immutable.
-	if v, ok := c.fetchers.Get(idVer); ok {
-		f := v.(*cachedFetcher)
-		if catalog.UserDefinedTypeColsHaveSameVersion(tableDesc, f.tableDesc) {
-			return &f.fetcher, nil
-		}
+	if rf, ok := c.fetchers[idVer]; ok &&
+		catalog.UserDefinedTypeColsHaveSameVersion(tableDesc, rf.GetTable().(catalog.TableDescriptor)) {
+		return rf, nil
 	}
-
-	f := &cachedFetcher{
-		tableDesc: tableDesc,
-	}
-	rf := &f.fetcher
-
 	// TODO(dan): Allow for decoding a subset of the columns.
-	var spec descpb.IndexFetchSpec
-	if err := rowenc.InitIndexFetchSpec(
-		&spec, c.codec, tableDesc, tableDesc.GetPrimaryIndex(), tableDesc.PublicColumnIDs(),
-	); err != nil {
-		return nil, err
+	var colIdxMap catalog.TableColMap
+	var valNeededForCol util.FastIntSet
+	for _, col := range tableDesc.PublicColumns() {
+		colIdxMap.Set(col.GetID(), col.Ordinal())
+		valNeededForCol.Add(col.Ordinal())
 	}
 
+	var rf row.Fetcher
+	rfArgs := row.FetcherTableArgs{
+		Desc:             tableDesc,
+		Index:            tableDesc.GetPrimaryIndex(),
+		ColIdxMap:        colIdxMap,
+		IsSecondaryIndex: false,
+		Cols:             tableDesc.PublicColumns(),
+		ValNeededForCol:  valNeededForCol,
+	}
 	if err := rf.Init(
 		context.TODO(),
+		c.codec,
 		false, /* reverse */
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
-		0, /* lockTimeout */
+		0,     /* lockTimeout */
+		false, /* isCheck */
 		&c.a,
 		nil, /* memMonitor */
-		&spec,
+		rfArgs,
 	); err != nil {
 		return nil, err
 	}
-
-	// Necessary because virtual columns are not populated.
-	// TODO(radu): should we stop requesting those columns from the fetcher?
-	rf.IgnoreUnexpectedNulls = true
-
-	c.fetchers.Add(idVer, f)
-	return rf, nil
+	// TODO(dan): Bound the size of the cache. Resolved notifications will let
+	// us evict anything for timestamps entirely before the notification. Then
+	// probably an LRU just in case?
+	c.fetchers[idVer] = &rf
+	return &rf, nil
 }

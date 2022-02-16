@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
+	apd "github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -46,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -179,8 +181,9 @@ func init() {
 		Use:   "backup [command]",
 		Short: "debug backups",
 		Long:  "Shows information about a SQL backup.",
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return cli.UsageAndErr(cmd, args)
+			return cmd.Usage()
 		},
 	}
 
@@ -293,7 +296,7 @@ func getManifestFromURI(ctx context.Context, path string) (backupccl.BackupManif
 	// upgraded from the old FK representation, or even older formats). If more
 	// fields are added to the output, the table descriptors may need to be
 	// upgraded.
-	backupManifest, _, err := backupccl.ReadBackupManifestFromURI(ctx, nil /* mem */, path, security.RootUserName(),
+	backupManifest, err := backupccl.ReadBackupManifestFromURI(ctx, path, security.RootUserName(),
 		externalStorageFromURIFactory, nil)
 	if err != nil {
 		return backupccl.BackupManifest{}, err
@@ -388,7 +391,7 @@ func runListIncrementalCmd(cmd *cobra.Command, args []string) error {
 			defer stores[i].Close()
 		}
 
-		manifest, _, err := backupccl.ReadBackupManifestFromStore(ctx, nil /* mem */, stores[i], nil)
+		manifest, err := backupccl.ReadBackupManifestFromStore(ctx, stores[i], nil)
 		if err != nil {
 			return err
 		}
@@ -563,26 +566,47 @@ func makeIters(
 func makeRowFetcher(
 	ctx context.Context, entry backupccl.BackupTableEntry, codec keys.SQLCodec,
 ) (row.Fetcher, error) {
-	colIDs := entry.Desc.PublicColumnIDs()
-	if debugBackupArgs.withRevisions {
-		colIDs = append(colIDs, colinfo.MVCCTimestampColumnID)
+	var colIdxMap catalog.TableColMap
+	var valNeededForCol util.FastIntSet
+	colDescs := make([]catalog.Column, len(entry.Desc.PublicColumns()))
+	for i, col := range entry.Desc.PublicColumns() {
+		colIdxMap.Set(col.GetID(), i)
+		valNeededForCol.Add(i)
+		colDescs[i] = col
 	}
 
-	var spec descpb.IndexFetchSpec
-	if err := rowenc.InitIndexFetchSpec(&spec, codec, entry.Desc, entry.Desc.GetPrimaryIndex(), colIDs); err != nil {
-		return row.Fetcher{}, err
+	if debugBackupArgs.withRevisions {
+		newIndex := len(entry.Desc.PublicColumns())
+		newCol, err := entry.Desc.FindColumnWithName(colinfo.MVCCTimestampColumnName)
+		if err != nil {
+			return row.Fetcher{}, errors.Wrapf(err, "get mvcc timestamp column")
+		}
+		colIdxMap.Set(newCol.GetID(), newIndex)
+		valNeededForCol.Add(newIndex)
+		colDescs = append(colDescs, newCol)
+	}
+
+	table := row.FetcherTableArgs{
+		Desc:             entry.Desc,
+		Index:            entry.Desc.GetPrimaryIndex(),
+		ColIdxMap:        colIdxMap,
+		IsSecondaryIndex: false,
+		Cols:             colDescs,
+		ValNeededForCol:  valNeededForCol,
 	}
 
 	var rf row.Fetcher
 	if err := rf.Init(
 		ctx,
+		codec,
 		false, /*reverse*/
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
-		0, /* lockTimeout */
-		&tree.DatumAlloc{},
+		0,     /* lockTimeout */
+		false, /*isCheck*/
+		&rowenc.DatumAlloc{},
 		nil, /*mon.BytesMonitor*/
-		&spec,
+		table,
 	); err != nil {
 		return rf, err
 	}
@@ -622,12 +646,12 @@ func processEntryFiles(
 	}
 	kvFetcher := row.MakeBackupSSTKVFetcher(startKeyMVCC, endKeyMVCC, iter, startTime, endTime, debugBackupArgs.withRevisions)
 
-	if err := rf.StartScanFrom(ctx, &kvFetcher, false /* traceKV */); err != nil {
+	if err := rf.StartScanFrom(ctx, &kvFetcher); err != nil {
 		return errors.Wrapf(err, "row fetcher starts scan")
 	}
 
 	for {
-		datums, err := rf.NextRowDecoded(ctx)
+		datums, _, _, err := rf.NextRowDecoded(ctx)
 		if err != nil {
 			return errors.Wrapf(err, "decode row")
 		}
@@ -680,7 +704,7 @@ func (f backupFileDisplayMsg) MarshalJSON() ([]byte, error) {
 	}{
 		Path:         f.Path,
 		Span:         fmt.Sprint(f.Span),
-		DataSize:     string(humanizeutil.IBytes(f.EntryCounts.DataSize)),
+		DataSize:     humanizeutil.IBytes(f.EntryCounts.DataSize),
 		IndexEntries: f.EntryCounts.IndexEntries,
 		Rows:         f.EntryCounts.Rows,
 	}
@@ -713,7 +737,7 @@ func (b backupMetaDisplayMsg) MarshalJSON() ([]byte, error) {
 	}{
 		StartTime:           timeutil.Unix(0, b.StartTime.WallTime).Format(time.RFC3339),
 		EndTime:             timeutil.Unix(0, b.EndTime.WallTime).Format(time.RFC3339),
-		DataSize:            string(humanizeutil.IBytes(b.EntryCounts.DataSize)),
+		DataSize:            humanizeutil.IBytes(b.EntryCounts.DataSize),
 		Rows:                b.EntryCounts.Rows,
 		IndexEntries:        b.EntryCounts.IndexEntries,
 		FormatVersion:       b.FormatVersion,
@@ -730,7 +754,7 @@ func (b backupMetaDisplayMsg) MarshalJSON() ([]byte, error) {
 
 	dbIDToName := make(map[descpb.ID]string)
 	schemaIDToFullyQualifiedName := make(map[descpb.ID]string)
-	schemaIDToFullyQualifiedName[keys.PublicSchemaIDForBackup] = catconstants.PublicSchemaName
+	schemaIDToFullyQualifiedName[keys.PublicSchemaID] = catconstants.PublicSchemaName
 	typeIDToFullyQualifiedName := make(map[descpb.ID]string)
 	tableIDToFullyQualifiedName := make(map[descpb.ID]string)
 
