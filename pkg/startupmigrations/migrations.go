@@ -22,10 +22,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/migration/migrationutils"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -283,7 +285,7 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 		// 21.1 version keys are deprecated and we are certainly not adding any new
 		// ones in those ranges. Until these deprecated version keys are all deleted
 		// we tie this migration to the last 20.2 version key.
-		includedInBootstrap: roachpb.Version{Major: 20, Minor: 2},
+		includedInBootstrap: clusterversion.ByKey(clusterversion.V20_2),
 		newDescriptorIDs:    staticIDs(keys.TenantsTableID),
 	},
 	{
@@ -303,14 +305,16 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 
 func staticIDs(
 	ids ...descpb.ID,
-) func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) {
-	return func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) { return ids, nil }
+) func(ctx context.Context, db migrationutils.DB, codec keys.SQLCodec) ([]descpb.ID, error) {
+	return func(ctx context.Context, db migrationutils.DB, codec keys.SQLCodec) ([]descpb.ID, error) {
+		return ids, nil
+	}
 }
 
 func databaseIDs(
 	names ...string,
-) func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) {
-	return func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) {
+) func(ctx context.Context, db migrationutils.DB, codec keys.SQLCodec) ([]descpb.ID, error) {
+	return func(ctx context.Context, db migrationutils.DB, codec keys.SQLCodec) ([]descpb.ID, error) {
 		var ids []descpb.ID
 		for _, name := range names {
 			kv, err := db.Get(ctx, catalogkeys.MakeDatabaseNameKey(codec, name))
@@ -358,7 +362,7 @@ type migrationDescriptor struct {
 	// descriptors that were added by this migration. This is needed to automate
 	// certain tests, which check the number of ranges/descriptors present on
 	// server bootup.
-	newDescriptorIDs func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error)
+	newDescriptorIDs func(ctx context.Context, db migrationutils.DB, codec keys.SQLCodec) ([]descpb.ID, error)
 }
 
 func init() {
@@ -374,7 +378,7 @@ func init() {
 }
 
 type runner struct {
-	db          DB
+	db          migrationutils.DB
 	codec       keys.SQLCodec
 	sqlExecutor *sql.InternalExecutor
 	settings    *cluster.Settings
@@ -415,21 +419,12 @@ type leaseManager interface {
 	TimeRemaining(l *leasemanager.Lease) time.Duration
 }
 
-// DB is defined just to allow us to use a fake client.DB when testing this
-// package.
-type DB interface {
-	Scan(ctx context.Context, begin, end interface{}, maxRows int64) ([]kv.KeyValue, error)
-	Get(ctx context.Context, key interface{}) (kv.KeyValue, error)
-	Put(ctx context.Context, key, value interface{}) error
-	Txn(ctx context.Context, retryable func(ctx context.Context, txn *kv.Txn) error) error
-}
-
 // Manager encapsulates the necessary functionality for handling migrations
 // of data in the cluster.
 type Manager struct {
 	stopper      *stop.Stopper
 	leaseManager leaseManager
-	db           DB
+	db           migrationutils.DB
 	codec        keys.SQLCodec
 	sqlExecutor  *sql.InternalExecutor
 	testingKnobs MigrationManagerTestingKnobs
@@ -474,7 +469,7 @@ func NewManager(
 // lifecycle is tightly controlled.
 func ExpectedDescriptorIDs(
 	ctx context.Context,
-	db DB,
+	db migrationutils.DB,
 	codec keys.SQLCodec,
 	defaultZoneConfig *zonepb.ZoneConfig,
 	defaultSystemZoneConfig *zonepb.ZoneConfig,
@@ -663,7 +658,7 @@ func (m *Manager) shouldRunMigration(
 }
 
 func getCompletedMigrations(
-	ctx context.Context, db DB, codec keys.SQLCodec,
+	ctx context.Context, db migrationutils.DB, codec keys.SQLCodec,
 ) (map[string]struct{}, error) {
 	if log.V(1) {
 		log.Info(ctx, "trying to get the list of completed migrations")
@@ -682,6 +677,10 @@ func getCompletedMigrations(
 
 func migrationKey(codec keys.SQLCodec, migration migrationDescriptor) roachpb.Key {
 	return append(codec.MigrationKeyPrefix(), roachpb.RKey(migration.name)...)
+}
+
+func createSystemTable(ctx context.Context, r runner, desc catalog.TableDescriptor) error {
+	return migrationutils.CreateSystemTable(ctx, r.db, r.codec, desc)
 }
 
 func extendCreateRoleWithCreateLogin(ctx context.Context, r runner) error {
