@@ -16,8 +16,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx"
 )
 
 // SQLRunner is a helper for issuing SQL statements; it supports multiple
@@ -48,22 +47,36 @@ type SQLRunner struct {
 
 	// The fields below are set by Init.
 	initialized bool
-	method      method
+	method      Method
 	mcp         *MultiConnPool
 }
 
-type method int
+// Method represents the protocol method used by the sql runner.
+// This is used mainly to enable / disabled prepared statements.
+type Method int
 
 const (
-	prepare method = iota
-	noprepare
-	simple
+	// Prepare: we prepare the query once during Init, then we reuse it for
+	// each execution. This results in a Bind and Execute on the server each time
+	// we run a query (on the given connection). Note that it's important to
+	// prepare on separate connections if there are many parallel workers; this
+	// avoids lock contention in the sql.Rows objects they produce. See #30811.
+	Prepare Method = iota
+	// NoPrepare: each query is issued separately (on the given connection).
+	// This results in Parse, Bind, Execute on the server each time we run a
+	// query.
+	NoPrepare
+	// Simple: each query is issued in a single string; parameters are
+	// rendered inside the string. This results in a single SimpleExecute
+	// request to the server for each query. Note that only a few parameter types
+	// are supported.
+	Simple
 )
 
-var stringToMethod = map[string]method{
-	"prepare":   prepare,
-	"noprepare": noprepare,
-	"simple":    simple,
+var stringToMethod = map[string]Method{
+	"prepare":   Prepare,
+	"noprepare": NoPrepare,
+	"simple":    Simple,
 }
 
 // Define creates a handle for the given statement. The handle can be used after
@@ -83,25 +96,7 @@ func (sr *SQLRunner) Define(sql string) StmtHandle {
 // The name is used for naming prepared statements. Multiple workers that use
 // the same set of defined queries can and should use the same name.
 //
-// The way we issue queries is set by flags.Method:
-//
-//  - "prepare": explicitly prepare the query once per connection, then we reuse
-//    it for each execution. This results in a Bind and Execute on the server
-//    each time we run a query (on the given connection). Note that it's
-//    important to prepare on separate connections if there are many parallel
-//    workers; this avoids lock contention in the sql.Rows objects they produce.
-//    See #30811.
-//
-//  - "noprepare": each query is issued separately (on the given connection).
-//    This results in Parse, Bind, Execute on the server each time we run a
-//    query. The statement is an anonymous prepared statement; that is, the
-//    name is the empty string.
-//
-//  - "simple": each query is issued in a single string; parameters are
-//    rendered inside the string. This results in a single SimpleExecute
-//    request to the server for each query. Note that only a few parameter types
-//    are supported.
-//
+// The way we issue queries is set by flags.Method.
 func (sr *SQLRunner) Init(
 	ctx context.Context, name string, mcp *MultiConnPool, flags *ConnFlags,
 ) error {
@@ -109,19 +104,22 @@ func (sr *SQLRunner) Init(
 		panic("already initialized")
 	}
 
-	var ok bool
-	sr.method, ok = stringToMethod[strings.ToLower(flags.Method)]
-	if !ok {
-		return errors.Errorf("unknown method %s", flags.Method)
+	var err error
+	sr.method, err = StringToMethod(flags.Method)
+	if err != nil {
+		return err
 	}
 
-	if sr.method == prepare {
+	if sr.method == Prepare {
 		for i, s := range sr.stmts {
 			stmtName := fmt.Sprintf("%s-%d", name, i+1)
-			s.preparedName = stmtName
-			mcp.AddPreparedStatement(stmtName, s.sql)
+			s.prepared, err = mcp.PrepareEx(ctx, stmtName, s.sql, nil /* opts */)
+			if err != nil {
+				return errors.Wrapf(err, "preparing %s", s.sql)
+			}
 		}
 	}
+
 	sr.mcp = mcp
 	sr.initialized = true
 	return nil
@@ -133,11 +131,13 @@ func (h StmtHandle) check() {
 	}
 }
 
+var simpleProtocolOpt = &pgx.QueryExOptions{SimpleProtocol: true}
+
 type stmt struct {
 	sr  *SQLRunner
 	sql string
-	// preparedName is only used for the prepare method.
-	preparedName string
+	// prepared is only used for the prepare method.
+	prepared *pgx.PreparedStatement
 }
 
 // StmtHandle is associated with a (possibly prepared) statement; created by
@@ -150,18 +150,18 @@ type StmtHandle struct {
 // connection that was passed to SQLRunner.Init.
 //
 // See pgx.Conn.Exec.
-func (h StmtHandle) Exec(ctx context.Context, args ...interface{}) (pgconn.CommandTag, error) {
+func (h StmtHandle) Exec(ctx context.Context, args ...interface{}) (pgx.CommandTag, error) {
 	h.check()
 	p := h.s.sr.mcp.Get()
 	switch h.s.sr.method {
-	case prepare:
-		return p.Exec(ctx, h.s.preparedName, args...)
+	case Prepare:
+		return p.ExecEx(ctx, h.s.prepared.Name, nil /* options */, args...)
 
-	case noprepare:
-		return p.Exec(ctx, h.s.sql, args...)
+	case NoPrepare:
+		return p.ExecEx(ctx, h.s.sql, nil /* options */, args...)
 
-	case simple:
-		return p.Exec(ctx, h.s.sql, prependQuerySimpleProtocol(args)...)
+	case Simple:
+		return p.ExecEx(ctx, h.s.sql, simpleProtocolOpt, args...)
 
 	default:
 		panic("invalid method")
@@ -172,18 +172,18 @@ func (h StmtHandle) Exec(ctx context.Context, args ...interface{}) (pgconn.Comma
 //
 // See pgx.Conn.Exec.
 func (h StmtHandle) ExecTx(
-	ctx context.Context, tx pgx.Tx, args ...interface{},
-) (pgconn.CommandTag, error) {
+	ctx context.Context, tx *pgx.Tx, args ...interface{},
+) (pgx.CommandTag, error) {
 	h.check()
 	switch h.s.sr.method {
-	case prepare:
-		return tx.Exec(ctx, h.s.preparedName, args...)
+	case Prepare:
+		return tx.ExecEx(ctx, h.s.prepared.Name, nil /* options */, args...)
 
-	case noprepare:
-		return tx.Exec(ctx, h.s.sql, args...)
+	case NoPrepare:
+		return tx.ExecEx(ctx, h.s.sql, nil /* options */, args...)
 
-	case simple:
-		return tx.Exec(ctx, h.s.sql, prependQuerySimpleProtocol(args)...)
+	case Simple:
+		return tx.ExecEx(ctx, h.s.sql, simpleProtocolOpt, args...)
 
 	default:
 		panic("invalid method")
@@ -193,18 +193,18 @@ func (h StmtHandle) ExecTx(
 // Query executes a query that returns rows.
 //
 // See pgx.Conn.Query.
-func (h StmtHandle) Query(ctx context.Context, args ...interface{}) (pgx.Rows, error) {
+func (h StmtHandle) Query(ctx context.Context, args ...interface{}) (*pgx.Rows, error) {
 	h.check()
 	p := h.s.sr.mcp.Get()
 	switch h.s.sr.method {
-	case prepare:
-		return p.Query(ctx, h.s.preparedName, args...)
+	case Prepare:
+		return p.QueryEx(ctx, h.s.prepared.Name, nil /* options */, args...)
 
-	case noprepare:
-		return p.Query(ctx, h.s.sql, args...)
+	case NoPrepare:
+		return p.QueryEx(ctx, h.s.sql, nil /* options */, args...)
 
-	case simple:
-		return p.Query(ctx, h.s.sql, prependQuerySimpleProtocol(args)...)
+	case Simple:
+		return p.QueryEx(ctx, h.s.sql, simpleProtocolOpt, args...)
 
 	default:
 		panic("invalid method")
@@ -214,17 +214,19 @@ func (h StmtHandle) Query(ctx context.Context, args ...interface{}) (pgx.Rows, e
 // QueryTx executes a query that returns rows, inside a transaction.
 //
 // See pgx.Tx.Query.
-func (h StmtHandle) QueryTx(ctx context.Context, tx pgx.Tx, args ...interface{}) (pgx.Rows, error) {
+func (h StmtHandle) QueryTx(
+	ctx context.Context, tx *pgx.Tx, args ...interface{},
+) (*pgx.Rows, error) {
 	h.check()
 	switch h.s.sr.method {
-	case prepare:
-		return tx.Query(ctx, h.s.preparedName, args...)
+	case Prepare:
+		return tx.QueryEx(ctx, h.s.prepared.Name, nil /* options */, args...)
 
-	case noprepare:
-		return tx.Query(ctx, h.s.sql, args...)
+	case NoPrepare:
+		return tx.QueryEx(ctx, h.s.sql, nil /* options */, args...)
 
-	case simple:
-		return tx.Query(ctx, h.s.sql, prependQuerySimpleProtocol(args)...)
+	case Simple:
+		return tx.QueryEx(ctx, h.s.sql, simpleProtocolOpt, args...)
 
 	default:
 		panic("invalid method")
@@ -234,18 +236,18 @@ func (h StmtHandle) QueryTx(ctx context.Context, tx pgx.Tx, args ...interface{})
 // QueryRow executes a query that is expected to return at most one row.
 //
 // See pgx.Conn.QueryRow.
-func (h StmtHandle) QueryRow(ctx context.Context, args ...interface{}) pgx.Row {
+func (h StmtHandle) QueryRow(ctx context.Context, args ...interface{}) *pgx.Row {
 	h.check()
 	p := h.s.sr.mcp.Get()
 	switch h.s.sr.method {
-	case prepare:
-		return p.QueryRow(ctx, h.s.preparedName, args...)
+	case Prepare:
+		return p.QueryRowEx(ctx, h.s.prepared.Name, nil /* options */, args...)
 
-	case noprepare:
-		return p.QueryRow(ctx, h.s.sql, args...)
+	case NoPrepare:
+		return p.QueryRowEx(ctx, h.s.sql, nil /* options */, args...)
 
-	case simple:
-		return p.QueryRow(ctx, h.s.sql, prependQuerySimpleProtocol(args)...)
+	case Simple:
+		return p.QueryRowEx(ctx, h.s.sql, simpleProtocolOpt, args...)
 
 	default:
 		panic("invalid method")
@@ -256,31 +258,32 @@ func (h StmtHandle) QueryRow(ctx context.Context, args ...interface{}) pgx.Row {
 // inside a transaction.
 //
 // See pgx.Conn.QueryRow.
-func (h StmtHandle) QueryRowTx(ctx context.Context, tx pgx.Tx, args ...interface{}) pgx.Row {
+func (h StmtHandle) QueryRowTx(ctx context.Context, tx *pgx.Tx, args ...interface{}) *pgx.Row {
 	h.check()
 	switch h.s.sr.method {
-	case prepare:
-		return tx.QueryRow(ctx, h.s.preparedName, args...)
+	case Prepare:
+		return tx.QueryRowEx(ctx, h.s.prepared.Name, nil /* options */, args...)
 
-	case noprepare:
-		return tx.QueryRow(ctx, h.s.sql, args...)
+	case NoPrepare:
+		return tx.QueryRowEx(ctx, h.s.sql, nil /* options */, args...)
 
-	case simple:
-		return tx.QueryRow(ctx, h.s.sql, prependQuerySimpleProtocol(args)...)
+	case Simple:
+		return tx.QueryRowEx(ctx, h.s.sql, simpleProtocolOpt, args...)
 
 	default:
 		panic("invalid method")
 	}
 }
 
-// prependQuerySimpleProtocol inserts pgx.QuerySimpleProtocol(true) at the
-// beginning of the slice. It is based on
-// https://github.com/golang/go/wiki/SliceTricks.
-func prependQuerySimpleProtocol(args []interface{}) []interface{} {
-	args = append(args, pgx.QuerySimpleProtocol(true))
-	copy(args[1:], args)
-	args[0] = pgx.QuerySimpleProtocol(true)
-	return args
+// StringToMethod looks up a method from it's string and returns the
+// Method value if it's valid.
+func StringToMethod(methodString string) (Method, error) {
+	method, ok := stringToMethod[strings.ToLower(methodString)]
+	if !ok {
+		return Prepare, errors.Errorf("unknown method %s", methodString)
+	}
+
+	return method, nil
 }
 
 // Appease the linter.
