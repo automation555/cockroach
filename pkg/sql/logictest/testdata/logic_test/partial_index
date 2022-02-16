@@ -116,16 +116,17 @@ SHOW CREATE TABLE t6
 t6  CREATE TABLE public.t6 (
     a INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t6_pkey PRIMARY KEY (rowid ASC),
+    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
     INDEX t6_a_idx (a ASC) WHERE a > 0:::INT8,
     INDEX t6_a_idx1 (a ASC) WHERE a > 1:::INT8,
     INDEX t6_a_idx2 (a DESC) WHERE a > 2:::INT8,
-    UNIQUE INDEX t6_a_key (a ASC) WHERE a > 3:::INT8,
-    UNIQUE INDEX t6_a_key1 (a ASC) WHERE a > 4:::INT8,
-    UNIQUE INDEX t6_a_key2 (a DESC) WHERE a > 5:::INT8,
+    UNIQUE INDEX t6_a_idx3 (a ASC) WHERE a > 3:::INT8,
+    UNIQUE INDEX t6_a_idx4 (a ASC) WHERE a > 4:::INT8,
+    UNIQUE INDEX t6_a_idx5 (a DESC) WHERE a > 5:::INT8,
     INDEX t6i1 (a ASC) WHERE a > 6:::INT8,
     INDEX t6i2 (a ASC) WHERE a > 7:::INT8,
-    INDEX t6i3 (a DESC) WHERE a > 8:::INT8
+    INDEX t6i3 (a DESC) WHERE a > 8:::INT8,
+    FAMILY "primary" (a, rowid)
 )
 
 # Renaming a column updates the index predicates.
@@ -139,16 +140,17 @@ SHOW CREATE TABLE t6
 t6  CREATE TABLE public.t6 (
     b INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t6_pkey PRIMARY KEY (rowid ASC),
+    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
     INDEX t6_a_idx (b ASC) WHERE b > 0:::INT8,
     INDEX t6_a_idx1 (b ASC) WHERE b > 1:::INT8,
     INDEX t6_a_idx2 (b DESC) WHERE b > 2:::INT8,
-    UNIQUE INDEX t6_a_key (b ASC) WHERE b > 3:::INT8,
-    UNIQUE INDEX t6_a_key1 (b ASC) WHERE b > 4:::INT8,
-    UNIQUE INDEX t6_a_key2 (b DESC) WHERE b > 5:::INT8,
+    UNIQUE INDEX t6_a_idx3 (b ASC) WHERE b > 3:::INT8,
+    UNIQUE INDEX t6_a_idx4 (b ASC) WHERE b > 4:::INT8,
+    UNIQUE INDEX t6_a_idx5 (b DESC) WHERE b > 5:::INT8,
     INDEX t6i1 (b ASC) WHERE b > 6:::INT8,
     INDEX t6i2 (b ASC) WHERE b > 7:::INT8,
-    INDEX t6i3 (b DESC) WHERE b > 8:::INT8
+    INDEX t6i3 (b DESC) WHERE b > 8:::INT8,
+    FAMILY "primary" (b, rowid)
 )
 
 # Renaming a table keeps the index predicates intact.
@@ -162,16 +164,17 @@ SHOW CREATE TABLE t7
 t7  CREATE TABLE public.t7 (
     b INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t6_pkey PRIMARY KEY (rowid ASC),
+    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
     INDEX t6_a_idx (b ASC) WHERE b > 0:::INT8,
     INDEX t6_a_idx1 (b ASC) WHERE b > 1:::INT8,
     INDEX t6_a_idx2 (b DESC) WHERE b > 2:::INT8,
-    UNIQUE INDEX t6_a_key (b ASC) WHERE b > 3:::INT8,
-    UNIQUE INDEX t6_a_key1 (b ASC) WHERE b > 4:::INT8,
-    UNIQUE INDEX t6_a_key2 (b DESC) WHERE b > 5:::INT8,
+    UNIQUE INDEX t6_a_idx3 (b ASC) WHERE b > 3:::INT8,
+    UNIQUE INDEX t6_a_idx4 (b ASC) WHERE b > 4:::INT8,
+    UNIQUE INDEX t6_a_idx5 (b DESC) WHERE b > 5:::INT8,
     INDEX t6i1 (b ASC) WHERE b > 6:::INT8,
     INDEX t6i2 (b ASC) WHERE b > 7:::INT8,
-    INDEX t6i3 (b DESC) WHERE b > 8:::INT8
+    INDEX t6i3 (b DESC) WHERE b > 8:::INT8,
+    FAMILY "primary" (b, rowid)
 )
 
 # Dropping a column referenced in the predicate drops the index.
@@ -196,7 +199,7 @@ t8  CREATE TABLE public.t8 (
     a INT8 NULL,
     b INT8 NULL,
     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-    CONSTRAINT t8_pkey PRIMARY KEY (rowid ASC),
+    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
     INDEX t8_a_idx (a ASC) WHERE b > 0:::INT8,
     FAMILY fam_0_a_b_c_rowid (a, b, rowid)
 )
@@ -217,8 +220,9 @@ t10  CREATE TABLE public.t10 (
      a INT8 NULL,
      b INT8 NULL,
      rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-     CONSTRAINT t9_pkey PRIMARY KEY (rowid ASC),
-     INDEX t9_a_idx (a ASC) WHERE b > 1:::INT8
+     CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
+     INDEX t9_a_idx (a ASC) WHERE b > 1:::INT8,
+     FAMILY "primary" (a, b, rowid)
 )
 
 # SHOW CONSTRAINTS includes partial index predicate of UNIQUE partial indexes.
@@ -233,7 +237,7 @@ query TTTTB colnames
 SHOW CONSTRAINTS FROM t11
 ----
 table_name  constraint_name  constraint_type  details                       validated
-t11         t11_a_key        UNIQUE           UNIQUE (a ASC) WHERE (b > 0)  true
+t11         t11_a_idx        UNIQUE           UNIQUE (a ASC) WHERE (b > 0)  true
 t11         t11_b_key        UNIQUE           UNIQUE (b ASC) WHERE (a > 0)  true
 
 # Update a non-indexed column referenced by the predicate.
@@ -613,7 +617,7 @@ CREATE TABLE k (a INT, b INT)
 statement ok
 INSERT INTO k VALUES (1, 1), (1, 2)
 
-statement error pgcode 23505 violates unique constraint \"k_a_key\"
+statement error pgcode 23505 violates unique constraint \"k_a_idx\"
 CREATE UNIQUE INDEX ON k (a) WHERE b > 0
 
 statement ok
@@ -623,7 +627,7 @@ statement ok
 CREATE UNIQUE INDEX ON k (a) WHERE b > 0
 
 query II rowsort
-SELECT * FROM k@k_a_key WHERE b > 0
+SELECT * FROM k@k_a_idx WHERE b > 0
 ----
 1  1
 
@@ -759,7 +763,7 @@ DELETE FROM u WHERE b IN (-10, -100, -1000)
 # Inserting multiple rows that conflict with each other inserts some of the
 # rows.
 statement ok
-INSERT INTO u VALUES (2, 2), (2, 2), (2, -2) ON CONFLICT DO NOTHING
+INSERT INTO u VALUES (2, 2), (2, 20), (2, -2) ON CONFLICT DO NOTHING
 
 query II rowsort
 SELECT * FROM u
@@ -1148,7 +1152,7 @@ enum_table_show  CREATE TABLE public.enum_table_show (
                  a INT8 NULL,
                  b public.enum_type NULL,
                  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-                 CONSTRAINT enum_table_show_pkey PRIMARY KEY (rowid ASC),
+                 CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
                  INDEX i (a ASC) WHERE b IN ('foo':::public.enum_type, 'bar':::public.enum_type),
                  FAMILY fam_0_a_b_rowid (a, b, rowid)
 )
@@ -1455,7 +1459,7 @@ statement error duplicate key value violates unique constraint "idx"\nDETAIL: Ke
 INSERT INTO virt (a, b) VALUES (1, 2), (6, 6) ON CONFLICT (b) WHERE c > 10 DO UPDATE SET b = 5
 
 # Conflict with PK a=1 and no conflict with b.
-statement error duplicate key value violates unique constraint "virt_pkey"\nDETAIL: Key \(a\)=\(1\) already exists\.
+statement error duplicate key value violates unique constraint "primary"\nDETAIL: Key \(a\)=\(1\) already exists\.
 INSERT INTO virt (a, b) VALUES (1, 3), (7, 7) ON CONFLICT (b) WHERE c > 10 DO UPDATE SET b = 8
 
 statement ok
@@ -1749,7 +1753,6 @@ ALTER TABLE t58390 ALTER PRIMARY KEY USING COLUMNS (b, a)
 # Regression tests for #61414. Upsert execution should not error if partial
 # index PUT and DEL columns are not the last columns in the input of the
 # mutation.
-subtest regression_61414
 
 statement ok
 create table t61414_a (
@@ -1797,7 +1800,6 @@ UPSERT INTO t61414_c (k, a, b, d) VALUES (1, 2, 3, 4)
 # expressions, there should not be ambiguous column errors if there exists
 # columns in an UPDATE FROM clause that match column names in the partial index
 # predicate.
-subtest regression_61284
 
 statement ok
 CREATE TABLE t61284 (
@@ -1807,36 +1809,3 @@ CREATE TABLE t61284 (
 
 statement ok
 UPDATE t61284 SET a = v.a FROM (VALUES (1), (2)) AS v(a) WHERE t61284.a = v.a
-
-# Regression test for #74385. Correctly maintain multiple partial indexes with
-# the same predicate.
-subtest regression_74385
-
-statement ok
-CREATE TABLE t74385 (
-  k INT PRIMARY KEY,
-  a STRING,
-  b STRING,
-  c STRING,
-  INDEX b_idx (b) WHERE c IS NULL,
-  INDEX a_idx (a) WHERE c IS NULL
-);
-INSERT INTO t74385 (k, a, b, c) VALUES (10, 'a', 'b', NULL);
-UPDATE t74385 SET b = NULL
-
-query ITTT
-SELECT * FROM t74385@b_idx
-WHERE b = 'b' AND c IS NULL;
-----
-
-# Regression test for #75907. During a backfill, expressions of the form
-# j->'a' = '1' should not be normalized to j @> '{"a": 1}'.
-statement ok
-CREATE TABLE t75907 (k INT PRIMARY KEY, j JSONB);
-INSERT INTO t75907 VALUES (1, '{"a": 1}');
-CREATE INDEX t75907_partial_idx ON t75907 (k) WHERE (j->'b' = '1') IS NULL
-
-query IB
-SELECT k, (j->'b' = '1') IS NULL FROM t75907@t75907_partial_idx WHERE (j->'b' = '1') IS NULL
-----
-1  true
