@@ -56,12 +56,6 @@ message NotLeaseHolderError {
   optional roachpb.Lease lease = 4;
   optional int64 range_id = 3 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "RangeID", (gogoproto.casttype) = "RangeID"];
-  // The range descriptor generation of the replica the error originated from.
-  // Used by the DistSender's RangeCache to determine whether the error was
-  // returned because the replica had a stale understanding of who the
-  // leaseholder is.
-  optional int64 descriptor_generation = 6 [(gogoproto.nullable) = false,
-    (gogoproto.customname) = "DescriptorGeneration", (gogoproto.casttype) = "RangeGeneration"];
   // If set, the Error() method will return this instead of composing its
   // regular spiel. Useful because we reuse this error when rejecting a command
   // because the lease under which its application was attempted is different
@@ -96,18 +90,24 @@ message RangeKeyMismatchError {
   optional bytes request_start_key = 1 [(gogoproto.casttype) = "Key"];
   optional bytes request_end_key = 2 [(gogoproto.casttype) = "Key"];
 
-  // Ranges contains information intended for the client's range cache. The
+  // deprecated_mismatched_range is an older version of mismatched_range. Can go
+  // away in 21.1, when we don't worry about 20.1 kvservers not populating rangesInternal.
+  optional roachpb.RangeDescriptor deprecated_mismatched_range = 3 [(gogoproto.nullable) = false];
+  // deprecated_suggested_range is an older version of suggested_range. Can go
+  // away in 21.1, when we don't worry about 20.1 kvservers not populating
+  // rangesInternal.
+  optional roachpb.RangeDescriptor deprecated_suggested_range = 4;
+
+  // ranges contains information intended for the client's range cache. The
   // server populates it with info on the range with the ID addressed by the
   // client (always the first in the array) and then all other ranges
   // overlapping the requested key range, or in between the addressed range and
   // the requested key range.
   //
-  // The slice should always have a length of at least 1. However, users should
-  // call MismatchedRange instead of relying on this in cases where they require
-  // at least one entry.
-  repeated roachpb.RangeInfo ranges = 5 [(gogoproto.nullable) = false];
+  // In 21.1 the customname can be removed, together with the Ranges() accessor.
+  repeated roachpb.RangeInfo ranges = 5 [(gogoproto.customname) = "rangesInternal",
+                                 (gogoproto.nullable) = false];
 
-  reserved 3, 4;
 }
 
 // A ReadWithinUncertaintyIntervalError indicates that a read at timestamp
@@ -162,15 +162,14 @@ enum TransactionAbortedReason {
   // meantime because the transaction was aborted.
   ABORT_REASON_ABORT_SPAN = 5;
 
-	// A request attempting to create a transaction record encountered a write
-	// timestamp cache entry for the txn key, and the entry identifies this
-	// transaction. This means that the transaction already wrote a transaction
-	// record previously, which may or may not have been removed since. So, this
-	// request is either a delayed replay of some sort, or it raced with an async
-	// abort and lost. If a client gets this TransactionAbortedError (without it
-	// being wrapped in an ambiguous error), it must be the latter case, and the
-	// transaction can be retried.
-	ABORT_REASON_RECORD_ALREADY_WRITTEN_POSSIBLE_REPLAY = 6;
+  // A request attempting to create a transaction record encountered a write
+  // timestamp cache entry for the txn key, and the entry identifies this
+  // transaction. This means that the transaction definitely committed or rolled
+  // back before. So, this request is either a delayed replay of some sort, or
+  // it raced with an async abort and lost. If a client gets this
+  // TransactionAbortedError (without it being wrapped in an ambiguous error),
+  // it must be the latter case, and the transaction can be retried.
+  ABORT_REASON_ALREADY_COMMITTED_OR_ROLLED_BACK_POSSIBLE_REPLAY = 6;
 
   // A request attempting to create a transaction record is not allowed to
   // proceed by the timestamp cache because it cannot be verified that the
@@ -263,39 +262,11 @@ message TransactionStatusError {
   optional Reason reason = 2 [(gogoproto.nullable) = false];
 }
 
-// A WriteIntentError indicates that one or more write intents belonging
-// to another transaction were encountered, leading to a read/write or
-// write/write conflict. The keys at which the intents were encountered
-// are set, as are the txn metas for the intents' transactions.
-//
-// WriteIntentErrors are used at two different levels of the system. In
-// both cases, they have the same meaning — that an intent or lock (an
-// intent is a form of replicated lock) is preventing an operation from
-// completing.
-//
-// First, they are returned from MVCC during request evaluation when a
-// request finds a conflicting intent. A WriteIntentError is propagated
-// up through the Replica to the corresponding lock table and passed to
-// its AddDiscoveredLock method. This informs the lock table about the
-// intent(s) and allows the request to handle the conflicts through a
-// combination of waiting and pushing in the concurrency manager. See
-// concurrency_control.go for an explanation and diagram of the flow.
-//
-// Second, WriteIntentErrors are returned from the concurrency manager
-// for intents/locks that conflict with a request and are not handled.
-// This is typically because the request was configured with an Error
-// wait policy instead of a Block wait policy, so it is opting to fail
-// fast on conflicting locks instead of waiting for a lock to be
-// released. These errors make their way back up from KV to SQL, where
-// they are converted to a LockNotAvailable error.
-//
-// Note that the KV client is free to send more requests after a
-// WriteIntentError. This is not generally allowed after other errors
-// because of fears over the ambiguity of the side-effects of failed
-// requests (in particular, the timestamps at which intents might have
-// been written). WriteIntentError is a special case as we ensure
-// there's no ambiguity; the error carries a WriteTimestamp that's the
-// upper bound of the timestamps intents were written at.
+// A WriteIntentError indicates that one or more write intent
+// belonging to another transaction were encountered leading to a
+// read/write or write/write conflict. The keys at which the intent
+// was encountered are set, as are the txn records for the intents'
+// transactions.
 message WriteIntentError {
   repeated roachpb.Intent intents = 1 [(gogoproto.nullable) = false];
   reserved 2;
@@ -304,24 +275,6 @@ message WriteIntentError {
   // which were discovered under old leases to the lock table.
   optional int64 lease_sequence = 3 [(gogoproto.nullable) = false,
     (gogoproto.casttype) = "LeaseSequence"];
-  enum Reason {
-    // The reason for the WriteIntentError is unspecified. This will
-    // always be the case for errors returned from MVCC.
-    REASON_UNSPECIFIED = 0;
-    // The request used an Error wait policy because it did not want to
-    // wait on locks and it encountered a conflicting lock.
-    REASON_WAIT_POLICY = 1;
-    // The request used a Block wait policy and specified a lock timeout
-    // which expired while waiting for a conflicting lock.
-    REASON_LOCK_TIMEOUT = 2;
-    // The request attempted to wait in a lock wait-queue whose length was
-    // already equal to or exceeding the configured maximum.
-    REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED = 3;
-  }
-  // The reason for the error. Applies to WriteIntentErrors that are
-  // returned from the concurrency manager (the second use described
-  // above).
-  optional Reason reason = 4 [(gogoproto.nullable) = false];
 }
 
 // A WriteTooOldError indicates that a write encountered a versioned
@@ -338,13 +291,6 @@ message WriteIntentError {
 message WriteTooOldError {
   optional util.hlc.Timestamp timestamp = 1 [(gogoproto.nullable) = false];
   optional util.hlc.Timestamp actual_timestamp = 2 [(gogoproto.nullable) = false];
-  // One of the keys at which this error was encountered. There's
-  // no need to return new WriteTooOldErrors for each colliding key; the key
-  // is just present for investigation / logging purposes, and is not expected
-  // to be used in any transaction logic. As a result, it's not even necessary
-  // for this key to be at actual_timestamp; it could be at any timestamp in
-  // between timestamp and actual_timestamp.
-  optional bytes key = 3 [(gogoproto.casttype) = "Key"];
 }
 
 // An OpRequiresTxnError indicates that a command required to be
@@ -373,16 +319,11 @@ message LeaseRejectedError {
 // An AmbiguousResultError indicates that a request may have succeeded or
 // failed, but the response was not received and the final result is ambiguous.
 message AmbiguousResultError {
+  // Retained for compatibility with 21.2 nodes. Can be removed in the 22.1
+  // cycle.
   optional string message = 1 [(gogoproto.nullable) = false];
-  // This can be set to give extra information about which error was converted
-  // into an AmbiguousResultError. Useful for tests.
-  optional Error wrapped_err = 2;
-}
-
-message ReplicaUnavailableError {
-
-  optional roachpb.RangeDescriptor desc = 2 [(gogoproto.nullable) = false];
-  optional roachpb.ReplicaDescriptor replica = 4 [(gogoproto.nullable) = false];
+  // The error which caused the ambiguous result error.
+  optional errorspb.EncodedError encoded_err = 2 [(gogoproto.nullable) = false];
 }
 
 // A RaftGroupDeletedError indicates a raft group has been deleted for
@@ -472,7 +413,7 @@ message TxnAlreadyEncounteredErrorError{
 }
 
 // An IntegerOverflowError indicates that an operation was aborted because
-// it would have caused an integer overflow.
+// it would have caused an integeter overflow.
 message IntegerOverflowError {
   optional bytes key = 1 [(gogoproto.casttype) = "Key"];
   optional int64 current_value = 2 [(gogoproto.nullable) = false];
@@ -484,16 +425,6 @@ message IntegerOverflowError {
 message BatchTimestampBeforeGCError {
   optional util.hlc.Timestamp Timestamp = 1 [(gogoproto.nullable) = false];
   optional util.hlc.Timestamp Threshold = 2 [(gogoproto.nullable) = false];
-  // DataExcludedFromBackup is set to true if the request is targeting a range
-  // that has been marked as excluded from a backup via
-  // `ALTER TABLE ... SET (exclude_data_from_backup = true)`.
-  optional bool data_excluded_from_backup = 3 [(gogoproto.nullable) = false];
-}
-
-// A MVCCHistoryMutationError indicates that MVCC history was unexpectedly
-// mutated.
-message MVCCHistoryMutationError {
-  optional roachpb.Span span = 1 [(gogoproto.nullable) = false];
 }
 
 // An IntentMissingError indicates that a QueryIntent request expected
@@ -532,8 +463,6 @@ message RangeFeedRetryError {
     // The consumer was processing events too slowly to keep up with live raft
     // events.
     REASON_SLOW_CONSUMER = 5;
-    // No leaseholder exists or could be created, so closed timestamps won't be emitted.
-    REASON_NO_LEASEHOLDER = 6;
   }
   optional Reason reason = 1 [(gogoproto.nullable) = false];
 }
@@ -563,29 +492,6 @@ message InvalidLeaseError {
 // is never sent over-the-wire, and is a proto only to fit the existing
 // plumbing that passes a roachpb.Error.
 message OptimisticEvalConflictsError {
-}
-
-// MinTimestampBoundUnsatisfiableError indicates that a bounded staleness read
-// could not be satisfied because the latest timestamp at which it could have
-// been evaluated (the resolved timestamp over its key span) was below the
-// read's minimum timestamp bound.
-message MinTimestampBoundUnsatisfiableError {
-  optional util.hlc.Timestamp min_timestamp_bound = 1 [(gogoproto.nullable) = false];
-  optional util.hlc.Timestamp resolved_timestamp  = 2 [(gogoproto.nullable) = false];
-}
-
-// A RefreshFailedError indicates that a refresh or a range refresh failed because
-// of a recently written key or intent.
-message RefreshFailedError {
-  enum Reason {
-    REASON_COMMITTED_VALUE = 0;
-    REASON_INTENT = 1;
-  }
-  optional Reason reason = 1 [(gogoproto.nullable) = false];
-  optional bytes key = 2 [(gogoproto.casttype) = "Key"];
-
-  // The timestamp the key was last updated.
-  optional util.hlc.Timestamp timestamp = 3 [(gogoproto.nullable) = false];
 }
 
 // ErrorDetail is a union type containing all available errors.
@@ -627,10 +533,6 @@ message ErrorDetail {
     IndeterminateCommitError indeterminate_commit = 39;
     InvalidLeaseError invalid_lease_error = 40;
     OptimisticEvalConflictsError optimistic_eval_conflicts = 41;
-    MinTimestampBoundUnsatisfiableError min_timestamp_bound_unsatisfiable = 42;
-    RefreshFailedError refresh_failed_error = 43;
-    MVCCHistoryMutationError mvcc_history_mutation = 44
-      [(gogoproto.customname) = "MVCCHistoryMutation"];
   }
 }
 

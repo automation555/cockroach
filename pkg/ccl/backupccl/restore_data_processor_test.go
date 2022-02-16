@@ -23,8 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
-	"github.com/cockroachdb/cockroach/pkg/cloud"
-	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // register cloud storage providers
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -37,6 +35,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	_ "github.com/cockroachdb/cockroach/pkg/storage/cloudimpl" // register cloud storage providers
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -46,25 +46,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMaxIngestBatchSize(t *testing.T) {
+func TestMaxImportBatchSize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
 	testCases := []struct {
-		ingestBatchSize int64
+		importBatchSize int64
 		maxCommandSize  int64
 		expected        int64
 	}{
-		{ingestBatchSize: 2 << 20, maxCommandSize: 64 << 20, expected: 2 << 20},
-		{ingestBatchSize: 128 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
-		{ingestBatchSize: 64 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
-		{ingestBatchSize: 63 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
+		{importBatchSize: 2 << 20, maxCommandSize: 64 << 20, expected: 2 << 20},
+		{importBatchSize: 128 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
+		{importBatchSize: 64 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
+		{importBatchSize: 63 << 20, maxCommandSize: 64 << 20, expected: 63 << 20},
 	}
 	for i, testCase := range testCases {
 		st := cluster.MakeTestingClusterSettings()
-		storageccl.IngestBatchSize.Override(ctx, &st.SV, testCase.ingestBatchSize)
+		storageccl.ImportBatchSize.Override(ctx, &st.SV, testCase.importBatchSize)
 		kvserver.MaxCommandSize.Override(ctx, &st.SV, testCase.maxCommandSize)
-		if e, a := storageccl.MaxIngestBatchSize(st), testCase.expected; e != a {
+		if e, a := storageccl.MaxImportBatchSize(st), testCase.expected; e != a {
 			t.Errorf("%d: expected max batch size %d, but got %d", i, e, a)
 		}
 	}
@@ -162,23 +162,23 @@ func clientKVsToEngineKVs(kvs []kv.KeyValue) []storage.MVCCKeyValue {
 	return ret
 }
 
-func TestIngest(t *testing.T) {
+func TestImport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	t.Run("batch=default", func(t *testing.T) {
-		runTestIngest(t, func(_ *cluster.Settings) {})
+		runTestImport(t, func(_ *cluster.Settings) {})
 	})
 	t.Run("batch=1", func(t *testing.T) {
 		// The test normally doesn't trigger the batching behavior, so lower
 		// the threshold to force it.
 		init := func(st *cluster.Settings) {
-			storageccl.IngestBatchSize.Override(ctx, &st.SV, 1)
+			storageccl.ImportBatchSize.Override(ctx, &st.SV, 1)
 		}
-		runTestIngest(t, init)
+		runTestImport(t, init)
 	})
 }
 
-func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
+func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 	defer leaktest.AfterTest(t)()
 
 	dir, dirCleanupFn := testutils.TempDir(t)
@@ -226,7 +226,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 		return path
 	}
 
-	// Make the first few AddSSTable calls return
+	// Make the first few WriteBatch/AddSSTable calls return
 	// AmbiguousResultError. Import should be resilient to this.
 	const initialAmbiguousSubReqs = 3
 	remainingAmbiguousSubReqs := int64(initialAmbiguousSubReqs)
@@ -234,7 +234,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 		EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 			TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 				switch filterArgs.Req.(type) {
-				case *roachpb.AddSSTableRequest:
+				case *roachpb.WriteBatchRequest, *roachpb.AddSSTableRequest:
 				// No-op.
 				default:
 					return nil
@@ -243,7 +243,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 				if r < 0 {
 					return nil
 				}
-				return roachpb.NewError(roachpb.NewAmbiguousResultError(strconv.Itoa(int(r))))
+				return roachpb.NewError(roachpb.NewAmbiguousResultErrorf(strconv.Itoa(int(r))))
 			},
 		},
 	}}
@@ -371,7 +371,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 			atomic.StoreInt64(&remainingAmbiguousSubReqs, initialAmbiguousSubReqs)
 
 			mockRestoreDataSpec := execinfrapb.RestoreDataSpec{
-				TableRekeys: rekeys,
+				Rekeys: rekeys,
 			}
 			restoreSpanEntry := execinfrapb.RestoreSpanEntry{
 				Span: roachpb.Span{Key: first, EndKey: last.PrefixEnd()},
@@ -388,13 +388,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 			mockRestoreDataProcessor, err := newTestingRestoreDataProcessor(ctx, &evalCtx, &flowCtx,
 				mockRestoreDataSpec)
 			require.NoError(t, err)
-			ssts := make(chan mergedSST, 1)
-			require.NoError(t, mockRestoreDataProcessor.openSSTs(ctx, restoreSpanEntry, ssts))
-			close(ssts)
-			sst := <-ssts
-			rewriter, err := makeKeyRewriterFromRekeys(flowCtx.Codec(), mockRestoreDataSpec.TableRekeys, mockRestoreDataSpec.TenantRekeys)
-			require.NoError(t, err)
-			_, err = mockRestoreDataProcessor.processRestoreSpanEntry(ctx, rewriter, sst)
+			_, err = mockRestoreDataProcessor.processRestoreSpanEntry(restoreSpanEntry)
 			require.NoError(t, err)
 
 			clientKVs, err := kvDB.Scan(ctx, reqStartKey, reqEndKey, 0)
@@ -402,11 +396,6 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 				t.Fatalf("%+v", err)
 			}
 			kvs := clientKVsToEngineKVs(clientKVs)
-			for i := range kvs {
-				if i < len(expectedKVs) {
-					expectedKVs[i].Key.Timestamp = kvs[i].Key.Timestamp
-				}
-			}
 
 			if !reflect.DeepEqual(kvs, expectedKVs) {
 				for i := 0; i < len(kvs) || i < len(expectedKVs); i++ {
@@ -442,5 +431,11 @@ func newTestingRestoreDataProcessor(
 		flowCtx: flowCtx,
 		spec:    spec,
 	}
+	var err error
+	rd.kr, err = makeKeyRewriterFromRekeys(flowCtx.Codec(), rd.spec.Rekeys)
+	if err != nil {
+		return nil, err
+	}
+
 	return rd, nil
 }
