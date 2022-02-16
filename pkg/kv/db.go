@@ -43,6 +43,10 @@ func (kv *KeyValue) String() string {
 	return kv.Key.String() + "=" + kv.PrettyValue()
 }
 
+func (kv *KeyValue) String() string {
+        return kv.Key.String() + "=" + kv.PrettyValue()
+}
+
 // Exists returns true iff the value exists.
 func (kv *KeyValue) Exists() bool {
 	return kv.Value != nil
