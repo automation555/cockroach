@@ -31,19 +31,19 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv/kv_pkey/'A' -> <undecoded>
-fetched: /kv/kv_pkey/'a' -> <undecoded>
-fetched: /kv/kv_pkey/'a'/v -> 'b'
-fetched: /kv/kv_pkey/'c' -> <undecoded>
-fetched: /kv/kv_pkey/'c'/v -> 'd'
-fetched: /kv/kv_pkey/'e' -> <undecoded>
-fetched: /kv/kv_pkey/'e'/v -> 'f'
-fetched: /kv/kv_pkey/'g' -> <undecoded>
-fetched: /kv/kv_pkey/'g'/v -> ''
-fetched: /kv/kv_pkey/'nil1' -> <undecoded>
-fetched: /kv/kv_pkey/'nil2' -> <undecoded>
-fetched: /kv/kv_pkey/'nil3' -> <undecoded>
-fetched: /kv/kv_pkey/'nil4' -> <undecoded>
+fetched: /kv/primary/'A' -> NULL
+fetched: /kv/primary/'a' -> NULL
+fetched: /kv/primary/'a'/v -> 'b'
+fetched: /kv/primary/'c' -> NULL
+fetched: /kv/primary/'c'/v -> 'd'
+fetched: /kv/primary/'e' -> NULL
+fetched: /kv/primary/'e'/v -> 'f'
+fetched: /kv/primary/'g' -> NULL
+fetched: /kv/primary/'g'/v -> ''
+fetched: /kv/primary/'nil1' -> NULL
+fetched: /kv/primary/'nil2' -> NULL
+fetched: /kv/primary/'nil3' -> NULL
+fetched: /kv/primary/'nil4' -> NULL
 output row: ['A' NULL]
 output row: ['a' 'b']
 output row: ['c' 'd']
@@ -92,19 +92,19 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv/kv_pkey/'A' -> <undecoded>
-fetched: /kv/kv_pkey/'a' -> <undecoded>
-fetched: /kv/kv_pkey/'a'/v -> 'b'
-fetched: /kv/kv_pkey/'c' -> <undecoded>
-fetched: /kv/kv_pkey/'c'/v -> 'd'
-fetched: /kv/kv_pkey/'e' -> <undecoded>
-fetched: /kv/kv_pkey/'e'/v -> 'f'
-fetched: /kv/kv_pkey/'g' -> <undecoded>
-fetched: /kv/kv_pkey/'g'/v -> ''
-fetched: /kv/kv_pkey/'nil1' -> <undecoded>
-fetched: /kv/kv_pkey/'nil2' -> <undecoded>
-fetched: /kv/kv_pkey/'nil3' -> <undecoded>
-fetched: /kv/kv_pkey/'nil4' -> <undecoded>
+fetched: /kv/primary/'A' -> NULL
+fetched: /kv/primary/'a' -> NULL
+fetched: /kv/primary/'a'/v -> 'b'
+fetched: /kv/primary/'c' -> NULL
+fetched: /kv/primary/'c'/v -> 'd'
+fetched: /kv/primary/'e' -> NULL
+fetched: /kv/primary/'e'/v -> 'f'
+fetched: /kv/primary/'g' -> NULL
+fetched: /kv/primary/'g'/v -> ''
+fetched: /kv/primary/'nil1' -> NULL
+fetched: /kv/primary/'nil2' -> NULL
+fetched: /kv/primary/'nil3' -> NULL
+fetched: /kv/primary/'nil4' -> NULL
 output row: ['A' NULL]
 output row: ['a' 'b']
 output row: ['c' 'd']
@@ -153,21 +153,21 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv/kv_pkey/'A' -> <undecoded>
-fetched: /kv/kv_pkey/'a' -> <undecoded>
-fetched: /kv/kv_pkey/'a'/v -> 'b'
-fetched: /kv/kv_pkey/'c' -> <undecoded>
-fetched: /kv/kv_pkey/'c'/v -> 'd'
-fetched: /kv/kv_pkey/'e' -> <undecoded>
-fetched: /kv/kv_pkey/'e'/v -> 'f'
-fetched: /kv/kv_pkey/'f' -> <undecoded>
-fetched: /kv/kv_pkey/'f'/v -> 'g'
-fetched: /kv/kv_pkey/'g' -> <undecoded>
-fetched: /kv/kv_pkey/'g'/v -> ''
-fetched: /kv/kv_pkey/'nil1' -> <undecoded>
-fetched: /kv/kv_pkey/'nil2' -> <undecoded>
-fetched: /kv/kv_pkey/'nil3' -> <undecoded>
-fetched: /kv/kv_pkey/'nil4' -> <undecoded>
+fetched: /kv/primary/'A' -> NULL
+fetched: /kv/primary/'a' -> NULL
+fetched: /kv/primary/'a'/v -> 'b'
+fetched: /kv/primary/'c' -> NULL
+fetched: /kv/primary/'c'/v -> 'd'
+fetched: /kv/primary/'e' -> NULL
+fetched: /kv/primary/'e'/v -> 'f'
+fetched: /kv/primary/'f' -> NULL
+fetched: /kv/primary/'f'/v -> 'g'
+fetched: /kv/primary/'g' -> NULL
+fetched: /kv/primary/'g'/v -> ''
+fetched: /kv/primary/'nil1' -> NULL
+fetched: /kv/primary/'nil2' -> NULL
+fetched: /kv/primary/'nil3' -> NULL
+fetched: /kv/primary/'nil4' -> NULL
 output row: ['A' NULL]
 output row: ['a' 'b']
 output row: ['c' 'd']
@@ -219,21 +219,21 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv/kv_pkey/'A' -> <undecoded>
-fetched: /kv/kv_pkey/'a' -> <undecoded>
-fetched: /kv/kv_pkey/'a'/v -> 'b'
-fetched: /kv/kv_pkey/'c' -> <undecoded>
-fetched: /kv/kv_pkey/'c'/v -> 'd'
-fetched: /kv/kv_pkey/'e' -> <undecoded>
-fetched: /kv/kv_pkey/'e'/v -> 'f'
-fetched: /kv/kv_pkey/'f' -> <undecoded>
-fetched: /kv/kv_pkey/'f'/v -> 'g'
-fetched: /kv/kv_pkey/'g' -> <undecoded>
-fetched: /kv/kv_pkey/'g'/v -> ''
-fetched: /kv/kv_pkey/'nil1' -> <undecoded>
-fetched: /kv/kv_pkey/'nil2' -> <undecoded>
-fetched: /kv/kv_pkey/'nil3' -> <undecoded>
-fetched: /kv/kv_pkey/'nil4' -> <undecoded>
+fetched: /kv/primary/'A' -> NULL
+fetched: /kv/primary/'a' -> NULL
+fetched: /kv/primary/'a'/v -> 'b'
+fetched: /kv/primary/'c' -> NULL
+fetched: /kv/primary/'c'/v -> 'd'
+fetched: /kv/primary/'e' -> NULL
+fetched: /kv/primary/'e'/v -> 'f'
+fetched: /kv/primary/'f' -> NULL
+fetched: /kv/primary/'f'/v -> 'g'
+fetched: /kv/primary/'g' -> NULL
+fetched: /kv/primary/'g'/v -> ''
+fetched: /kv/primary/'nil1' -> NULL
+fetched: /kv/primary/'nil2' -> NULL
+fetched: /kv/primary/'nil3' -> NULL
+fetched: /kv/primary/'nil4' -> NULL
 output row: ['A' NULL]
 output row: ['a' 'b']
 output row: ['c' 'd']
@@ -292,7 +292,7 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /kv5/a/NULL/'a' -> <undecoded>
+fetched: /kv5/a/NULL/'a' -> NULL
 output row: ['a' NULL]
 
 statement ok
@@ -321,18 +321,22 @@ vectorized: true
     │ render x: x
     │ render v: v
     │
-    └── • top-k
+    └── • limit
         │ columns: (x, v)
-        │ ordering: -v
         │ estimated row count: 10 (missing stats)
-        │ order: -v
-        │ k: 10
+        │ count: 10
         │
-        └── • scan
-              columns: (x, v)
-              estimated row count: 1,000 (missing stats)
-              table: select_t@select_t_pkey
-              spans: FULL SCAN
+        └── • sort
+            │ columns: (x, v)
+            │ ordering: -v
+            │ estimated row count: 1,000 (missing stats)
+            │ order: -v
+            │
+            └── • scan
+                  columns: (x, v)
+                  estimated row count: 1,000 (missing stats)
+                  table: select_t@primary
+                  spans: FULL SCAN
 
 # Check that INSERT supports LIMIT (MySQL extension)
 query T
@@ -357,7 +361,7 @@ vectorized: true
     └── • scan
           columns: (x, v)
           estimated row count: 1 (missing stats)
-          table: select_t@select_t_pkey
+          table: select_t@primary
           spans: LIMITED SCAN
           limit: 1
 
@@ -395,13 +399,16 @@ vectorized: true
 └── • render
     │ estimated row count: 1
     │
-    └── • top-k
+    └── • limit
         │ estimated row count: 1
-        │ order: +column2
-        │ k: 1
+        │ count: 1
         │
-        └── • values
-              size: 2 columns, 2 rows
+        └── • sort
+            │ estimated row count: 2
+            │ order: +column2
+            │
+            └── • values
+                  size: 2 columns, 2 rows
 
 query T
 EXPLAIN (PLAN) INSERT INTO insert_t (VALUES (1,1), (2,2) ORDER BY 2) LIMIT 1
@@ -416,13 +423,16 @@ vectorized: true
 └── • render
     │ estimated row count: 1
     │
-    └── • top-k
+    └── • limit
         │ estimated row count: 1
-        │ order: +column2
-        │ k: 1
+        │ count: 1
         │
-        └── • values
-              size: 2 columns, 2 rows
+        └── • sort
+            │ estimated row count: 2
+            │ order: +column2
+            │
+            └── • values
+                  size: 2 columns, 2 rows
 
 query T
 EXPLAIN (PLAN) INSERT INTO insert_t (VALUES (1,1), (2,2) ORDER BY 2 LIMIT 1)
@@ -437,13 +447,16 @@ vectorized: true
 └── • render
     │ estimated row count: 1
     │
-    └── • top-k
+    └── • limit
         │ estimated row count: 1
-        │ order: +column2
-        │ k: 1
+        │ count: 1
         │
-        └── • values
-              size: 2 columns, 2 rows
+        └── • sort
+            │ estimated row count: 2
+            │ order: +column2
+            │
+            └── • values
+                  size: 2 columns, 2 rows
 
 # ORDER BY expression that's not inserted into table.
 query T
@@ -470,25 +483,29 @@ vectorized: true
         │ render length: length
         │ render ?column?: "?column?"
         │
-        └── • top-k
+        └── • limit
             │ columns: (length, "?column?", column12)
-            │ ordering: +column12
             │ estimated row count: 10 (missing stats)
-            │ order: +column12
-            │ k: 10
+            │ count: 10
             │
-            └── • render
+            └── • sort
                 │ columns: (length, "?column?", column12)
+                │ ordering: +column12
                 │ estimated row count: 1,000 (missing stats)
-                │ render length: length(k)
-                │ render ?column?: 2
-                │ render column12: k::STRING || v::STRING
+                │ order: +column12
                 │
-                └── • scan
-                      columns: (k, v)
-                      estimated row count: 1,000 (missing stats)
-                      table: kv@kv_pkey
-                      spans: FULL SCAN
+                └── • render
+                    │ columns: (length, "?column?", column12)
+                    │ estimated row count: 1,000 (missing stats)
+                    │ render length: length(k)
+                    │ render ?column?: 2
+                    │ render column12: k::STRING || v::STRING
+                    │
+                    └── • scan
+                          columns: (k, v)
+                          estimated row count: 1,000 (missing stats)
+                          table: kv@primary
+                          spans: FULL SCAN
 
 # ------------------------------------------------------------------------------
 # Insert rows into table during schema changes.
@@ -603,7 +620,7 @@ vectorized: true
                     └── • scan
                           columns: (a, b, c)
                           estimated row count: 1,000 (missing stats)
-                          table: abc@abc_pkey
+                          table: abc@primary
                           spans: FULL SCAN
 
 # ------------------------------------------------------------------------------
@@ -630,19 +647,46 @@ statement ok
 CREATE TABLE t62270_parent (id INT PRIMARY KEY);
 CREATE TABLE t62270_child (c UUID DEFAULT (gen_random_uuid()), p INT REFERENCES t62270_parent (id));
 
+# TODO(mgartner/radu): This query should use the insert fast path. Inlining the
+# values removes the lookup join in the FK check  that the insert fast path
+# relies on.
 query T
 EXPLAIN (VERBOSE) INSERT INTO t62270_child (p) VALUES (1)
 ----
 distribution: local
 vectorized: true
 ·
-• insert fast path
-  columns: ()
-  estimated row count: 0 (missing stats)
-  into: t62270_child(c, p, rowid)
-  auto commit
-  FK check: t62270_parent@t62270_parent_pkey
-  size: 3 columns, 1 row
-  row 0, expr 0: gen_random_uuid()
-  row 0, expr 1: 1
-  row 0, expr 2: unique_rowid()
+• root
+│ columns: ()
+│
+├── • insert
+│   │ columns: ()
+│   │ estimated row count: 0 (missing stats)
+│   │ into: t62270_child(c, p, rowid)
+│   │
+│   └── • values
+│         columns: (c_default, column1, rowid_default)
+│         size: 3 columns, 1 row
+│         row 0, expr 0: 1
+│         row 0, expr 1: gen_random_uuid()
+│         row 0, expr 2: unique_rowid()
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │ columns: ()
+        │
+        └── • cross join (anti)
+            │ columns: (p)
+            │ estimated row count: 0 (missing stats)
+            │
+            ├── • values
+            │     columns: (p)
+            │     size: 1 column, 1 row
+            │     row 0, expr 0: 1
+            │
+            └── • scan
+                  columns: (id)
+                  estimated row count: 1 (missing stats)
+                  table: t62270_parent@primary
+                  spans: /1/0
