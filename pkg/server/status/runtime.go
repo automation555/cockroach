@@ -24,9 +24,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/elastic/gosigar"
-	"github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/net"
 )
 
 var (
@@ -119,12 +120,6 @@ var (
 		Help:        "Current user+system cpu percentage, normalized 0-1 by number of cores",
 		Measurement: "CPU Time",
 		Unit:        metric.Unit_PERCENT,
-	}
-	metaCPUNowNS = metric.Metadata{
-		Name:        "sys.cpu.now.ns",
-		Help:        "Number of nanoseconds elapsed since January 1, 1970 UTC",
-		Measurement: "CPU Time",
-		Unit:        metric.Unit_NANOSECONDS,
 	}
 	metaRSSBytes = metric.Metadata{
 		Name:        "sys.rss",
@@ -289,7 +284,6 @@ type RuntimeStatSampler struct {
 	CPUSysNS               *metric.Gauge
 	CPUSysPercent          *metric.GaugeFloat64
 	CPUCombinedPercentNorm *metric.GaugeFloat64
-	CPUNowNS               *metric.Gauge
 	// Memory stats.
 	RSSBytes *metric.Gauge
 	// File descriptor stats.
@@ -367,7 +361,6 @@ func NewRuntimeStatSampler(ctx context.Context, clock *hlc.Clock) *RuntimeStatSa
 		CPUSysNS:                 metric.NewGauge(metaCPUSysNS),
 		CPUSysPercent:            metric.NewGaugeFloat64(metaCPUSysPercent),
 		CPUCombinedPercentNorm:   metric.NewGaugeFloat64(metaCPUCombinedPercentNorm),
-		CPUNowNS:                 metric.NewGauge(metaCPUNowNS),
 		RSSBytes:                 metric.NewGauge(metaRSSBytes),
 		HostDiskReadBytes:        metric.NewGauge(metaHostDiskReadBytes),
 		HostDiskReadCount:        metric.NewGauge(metaHostDiskReadCount),
@@ -453,15 +446,15 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	if err := mem.Get(pid); err != nil {
 		log.Ops.Errorf(ctx, "unable to get mem usage: %v", err)
 	}
-	userTimeMillis, sysTimeMillis, err := GetCPUTime(ctx)
-	if err != nil {
+	cpuTime := gosigar.ProcTime{}
+	if err := cpuTime.Get(pid); err != nil {
 		log.Ops.Errorf(ctx, "unable to get cpu usage: %v", err)
 	}
 	cgroupCPU, _ := cgroups.GetCgroupCPU()
 	cpuShare := cgroupCPU.CPUShares()
 
-	fds := gosigar.ProcFDUsage{}
-	if err := fds.Get(pid); err != nil {
+	fds := sysutil.ProcFDUsage{}
+	if err := fds.Get(); err != nil {
 		if gosigar.IsNotImplemented(err) {
 			if !rsr.fdUsageNotImplemented {
 				rsr.fdUsageNotImplemented = true
@@ -515,8 +508,8 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	now := rsr.clock.PhysicalNow()
 	dur := float64(now - rsr.last.now)
 	// cpuTime.{User,Sys} are in milliseconds, convert to nanoseconds.
-	utime := userTimeMillis * 1e6
-	stime := sysTimeMillis * 1e6
+	utime := int64(cpuTime.User) * 1e6
+	stime := int64(cpuTime.Sys) * 1e6
 	urate := float64(utime-rsr.last.utime) / dur
 	srate := float64(stime-rsr.last.stime) / dur
 	combinedNormalizedPerc := (srate + urate) / cpuShare
@@ -534,10 +527,10 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 
 	// Log summary of statistics to console.
 	cgoRate := float64((numCgoCall-rsr.last.cgoCall)*int64(time.Second)) / dur
-	goStatsStaleness := float32(timeutil.Since(ms.Collected)) / float32(time.Second)
+	goStatsStaleness := float32(timeutil.Now().Sub(ms.Collected)) / float32(time.Second)
 	goTotal := ms.Sys - ms.HeapReleased
 
-	stats := &eventpb.RuntimeStats{
+	log.StructuredEvent(ctx, &eventpb.RuntimeStats{
 		MemRSSBytes:       mem.Resident,
 		GoroutineCount:    uint64(numGoroutine),
 		MemStackSysBytes:  ms.StackSys,
@@ -556,9 +549,7 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 		GCRunCount:        uint64(gc.NumGC),
 		NetHostRecvBytes:  deltaNet.BytesRecv,
 		NetHostSendBytes:  deltaNet.BytesSent,
-	}
-
-	logStats(ctx, stats)
+	})
 
 	rsr.last.cgoCall = numCgoCall
 	rsr.last.gcCount = gc.NumGC
@@ -578,7 +569,6 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	rsr.CPUSysNS.Update(stime)
 	rsr.CPUSysPercent.Update(srate)
 	rsr.CPUCombinedPercentNorm.Update(combinedNormalizedPerc)
-	rsr.CPUNowNS.Update(now)
 	rsr.FDOpen.Update(int64(fds.Open))
 	rsr.FDSoftLimit.Update(int64(fds.SoftLimit))
 	rsr.RSSBytes.Update(int64(mem.Resident))
@@ -697,14 +687,4 @@ func subtractNetworkCounters(from *net.IOCountersStat, sub net.IOCountersStat) {
 	from.BytesSent -= sub.BytesSent
 	from.PacketsRecv -= sub.PacketsRecv
 	from.PacketsSent -= sub.PacketsSent
-}
-
-// GetCPUTime returns the cumulative user/system time (in ms) since the process start.
-func GetCPUTime(ctx context.Context) (userTimeMillis, sysTimeMillis int64, err error) {
-	pid := os.Getpid()
-	cpuTime := gosigar.ProcTime{}
-	if err := cpuTime.Get(pid); err != nil {
-		return 0, 0, err
-	}
-	return int64(cpuTime.User), int64(cpuTime.Sys), nil
 }
