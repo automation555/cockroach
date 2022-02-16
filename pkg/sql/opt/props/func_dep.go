@@ -628,19 +628,7 @@ func (f *FuncDepSet) ConstantCols() opt.ColSet {
 // so, then the column is redundant. This algorithm has decent running time, but
 // will not necessarily find the candidate key with the fewest columns.
 func (f *FuncDepSet) ReduceCols(cols opt.ColSet) opt.ColSet {
-	var removed opt.ColSet
-	cols = cols.Copy()
-	for i, ok := cols.Next(0); ok; i, ok = cols.Next(i + 1) {
-		cols.Remove(i)
-		removed.Add(i)
-		if !f.inClosureOf(removed, cols, true /* strict */) {
-			// The column is not functionally determined by the other columns, so
-			// retain it in the set.
-			cols.Add(i)
-		}
-		removed.Remove(i)
-	}
-	return cols
+	return f.reduceCols(cols, true /* strict */)
 }
 
 // InClosureOf returns true if the given columns are functionally determined by
@@ -677,9 +665,6 @@ func (f *FuncDepSet) ComputeClosure(cols opt.ColSet) opt.ColSet {
 
 // AreColsEquiv returns true if the two given columns are equivalent.
 func (f *FuncDepSet) AreColsEquiv(col1, col2 opt.ColumnID) bool {
-	if col1 == col2 {
-		return true
-	}
 	for i := range f.deps {
 		fd := &f.deps[i]
 
@@ -700,12 +685,11 @@ func (f *FuncDepSet) AreColsEquiv(col1, col2 opt.ColumnID) bool {
 //   (a)==(b)
 //   (b)==(c)
 //   (a)==(d)
-//   (e)==(f)
 //
-// The equivalence closure for (a,e) is (a,b,c,d,e,f) because all these columns
-// are transitively equal to either a or e. Therefore, all columns must have
-// equal non-NULL values, or else all must be NULL (see definition for NULL= in
-// the comment for FuncDepSet).
+// The equivalence closure for (a) is (a,b,c,d) because (a) is transitively
+// equivalent to all other columns. Therefore, all columns must have equal
+// non-NULL values, or else all must be NULL (see definition for NULL= in the
+// comment for FuncDepSet).
 func (f *FuncDepSet) ComputeEquivClosure(cols opt.ColSet) opt.ColSet {
 	// Don't need to get transitive closure, because equivalence closures are
 	// already maintained for every column.
@@ -891,8 +875,8 @@ func (f *FuncDepSet) AddEquivalency(a, b opt.ColumnID) {
 	f.addEquivalency(equiv)
 }
 
-// AddConstants adds a strict FD to the set that declares each given column as
-// having the same constant value for all rows. If a column is nullable, then
+// AddConstants adds a strict FD to the set that declares the given column as
+// having the same constant value for all rows. If the column is nullable, then
 // its value may be NULL, but then the column must be NULL for all rows. For
 // column "a", the FD looks like this:
 //
@@ -991,7 +975,8 @@ func (f *FuncDepSet) ProjectCols(cols opt.ColSet) {
 			f.setKey(cols, strictKey)
 			f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
 		} else if f.ColsAreLaxKey(cols) {
-			f.setKey(cols, laxKey)
+			newLaxKey := f.reduceCols(cols, false /* strict */)
+			f.setKey(newLaxKey, laxKey)
 			f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
 		} else {
 			f.clearKey()
@@ -1377,26 +1362,6 @@ func (f *FuncDepSet) MakeLeftOuter(
 	// leftKey because nullExtendRightRows can remove FDs, such that the closure
 	// of oldKey ends up missing some columns from the right.
 	f.ensureKeyClosure(leftCols.Union(rightCols))
-
-	// If the left input has at most one row, any columns that - when the join
-	// filters hold - are functionally dependent on the left columns are constant
-	// in the left join output:
-	//  - either the one left row has a match, and all output rows have the same
-	//    values for the left columns
-	//  - or the left row has no match, and there is a single output row (where
-	//    any functional dependencies hold trivially).
-	//
-	// This does not hold in general when the left equality column is
-	// constant but the left input has more than one row, for example:
-	//   ab contains (1, 1), (1, 2)
-	//   cd contains (1, 1)
-	//   ab JOIN cd ON (a=c AND b=d) contains (1, 1, 1, 1), (1, 2, NULL, NULL)
-	// Here a is constant in ab but c is not constant in the result.
-	if leftFDs.HasMax1Row() {
-		constCols := filtersFDs.ComputeClosure(leftCols)
-		constCols.IntersectionWith(rightCols)
-		f.AddConstants(constCols)
-	}
 }
 
 // MakeFullOuter modifies the cartesian product FD set to reflect the impact of
@@ -1719,6 +1684,33 @@ func (f *FuncDepSet) colsAreKey(cols opt.ColSet, typ keyType) bool {
 	default:
 		return false
 	}
+}
+
+// reduceCols removes redundant columns from the given set. Redundant columns
+// can be functionally determined from the remaining columns. If strict is true
+// and the columns contain a strict key for the relation, then the reduced
+// columns will form a candidate strict key for the relation. If strict is false
+// and the columns contain a lax key for the relation, then the reduced columns
+// will form a candidate lax key for the relation.
+//
+// The reduction algorithm removes one column at a time (in an arbitrary order),
+// and then tests to see if the closure still includes the removed column. If
+// so, then the column is redundant. This algorithm has decent running time, but
+// will not necessarily find the candidate key with the fewest columns.
+func (f *FuncDepSet) reduceCols(cols opt.ColSet, strict bool) opt.ColSet {
+	var removed opt.ColSet
+	cols = cols.Copy()
+	for i, ok := cols.Next(0); ok; i, ok = cols.Next(i + 1) {
+		cols.Remove(i)
+		removed.Add(i)
+		// The column is not functionally determined by the other columns, so
+		// retain it in the set.
+		if !f.inClosureOf(removed, cols, strict) {
+			cols.Add(i)
+		}
+		removed.Remove(i)
+	}
+	return cols
 }
 
 // inClosureOf computes the strict or lax closure of the "in" column set, and
