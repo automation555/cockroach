@@ -24,7 +24,7 @@ import (
 // SSTWriter writes SSTables.
 type SSTWriter struct {
 	fw *sstable.Writer
-	f  io.Writer
+	f  writeCloseSyncer
 	// DataSize tracks the total key and value bytes added so far.
 	DataSize int64
 	scratch  []byte
@@ -38,48 +38,33 @@ type writeCloseSyncer interface {
 	Sync() error
 }
 
-// noopSyncCloser is used to wrap io.Writers for sstable.Writer so that callers
-// can decide when to close/sync.
-type noopSyncCloser struct {
-	io.Writer
+type noopSync struct {
+	io.WriteCloser
 }
 
-func (noopSyncCloser) Sync() error {
+func (noopSync) Sync() error {
 	return nil
 }
 
-func (noopSyncCloser) Close() error {
-	return nil
-}
+// MakeBackupSSTWriter creates a new SSTWriter tailored for backup SSTs. These
+// SSTs have bloom filters disabled and format set to LevelDB.
+func MakeBackupSSTWriter(f writeCloseSyncer) SSTWriter {
+	opts := DefaultPebbleOptions().MakeWriterOptions(0)
+	opts.TableFormat = sstable.TableFormatRocksDBv2
 
-// MakeIngestionWriterOptions returns writer options suitable for writing SSTs
-// that will subsequently be ingested (e.g. with AddSSTable).
-func MakeIngestionWriterOptions() sstable.WriterOptions {
-	opts := DefaultPebbleOptions().MakeWriterOptions(0, sstable.TableFormatRocksDBv2)
-	// TODO(sumeer): we should use BlockPropertyCollectors here if the cluster
-	// version permits (which is also reflected in the store's roachpb.Version
-	// and pebble.FormatMajorVersion).
-	opts.BlockPropertyCollectors = nil
-	opts.MergerName = "nullptr"
-	return opts
-}
-
-// MakeBackupSSTWriter creates a new SSTWriter tailored for backup SSTs which
-// are typically only ever iterated in their entirety.
-func MakeBackupSSTWriter(f io.Writer) SSTWriter {
-	opts := DefaultPebbleOptions().MakeWriterOptions(0, sstable.TableFormatRocksDBv2)
-	// Don't need BlockPropertyCollectors for backups.
-	opts.BlockPropertyCollectors = nil
-
-	// Disable bloom filters since we only ever iterate backups.
+	// Disable bloom filters and bump up the restart interval since we never do
+	// searches/seeks on backup SSTs.
 	opts.FilterPolicy = nil
-	// Bump up block size, since we almost never seek or do point lookups, so more
-	// block checksums and more index entries are just overhead and smaller blocks
-	// reduce compression ratio.
+	opts.BlockRestartInterval = 2048
+
+	// Bump up block size since smaller blocks reduce compression ratio and add
+	// index entry/checksum overhead. We don't bump it up to megabytes+ however as
+	// during RESTORE a merging iterator may need to open and merge ~100 SSTs at
+	// a time and we don't want to blow up its memory footprint.
 	opts.BlockSize = 128 << 10
 
 	opts.MergerName = "nullptr"
-	sst := sstable.NewWriter(noopSyncCloser{f}, opts)
+	sst := sstable.NewWriter(f, opts)
 	return SSTWriter{fw: sst, f: f}
 }
 
@@ -87,7 +72,11 @@ func MakeBackupSSTWriter(f io.Writer) SSTWriter {
 // These SSTs have bloom filters enabled (as set in DefaultPebbleOptions) and
 // format set to RocksDBv2.
 func MakeIngestionSSTWriter(f writeCloseSyncer) SSTWriter {
-	return SSTWriter{fw: sstable.NewWriter(f, MakeIngestionWriterOptions()), f: f}
+	opts := DefaultPebbleOptions().MakeWriterOptions(0)
+	opts.TableFormat = sstable.TableFormatRocksDBv2
+	opts.MergerName = "nullptr"
+	sst := sstable.NewWriter(f, opts)
+	return SSTWriter{fw: sst, f: f}
 }
 
 // Finish finalizes the writer and returns the constructed file's contents,
@@ -123,8 +112,8 @@ func (fw *SSTWriter) clearRange(start, end MVCCKey) error {
 		return errors.New("cannot call ClearRange on a closed writer")
 	}
 	fw.DataSize += int64(len(start.Key)) + int64(len(end.Key))
-	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], start)
-	return fw.fw.DeleteRange(fw.scratch, EncodeMVCCKey(end))
+	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], start)
+	return fw.fw.DeleteRange(fw.scratch, EncodeKey(end))
 }
 
 // Put puts a kv entry into the sstable being built. An error is returned if it
@@ -138,7 +127,7 @@ func (fw *SSTWriter) Put(key MVCCKey, value []byte) error {
 		return errors.New("cannot call Put on a closed writer")
 	}
 	fw.DataSize += int64(len(key.Key)) + int64(len(value))
-	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], key)
+	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], key)
 	return fw.fw.Set(fw.scratch, value)
 }
 
@@ -166,9 +155,14 @@ func (fw *SSTWriter) PutUnversioned(key roachpb.Key, value []byte) error {
 // (according to the comparator configured during writer creation). `Close`
 // cannot have been called.
 func (fw *SSTWriter) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
-) error {
-	return fw.put(MVCCKey{Key: key}, value)
+	ctx context.Context,
+	key roachpb.Key,
+	value []byte,
+	state PrecedingIntentState,
+	txnDidNotUpdateMeta bool,
+	txnUUID uuid.UUID,
+) (int, error) {
+	return 0, fw.put(MVCCKey{Key: key}, value)
 }
 
 // PutEngineKey implements the Writer interface.
@@ -184,6 +178,11 @@ func (fw *SSTWriter) PutEngineKey(key EngineKey, value []byte) error {
 	return fw.fw.Set(fw.scratch, value)
 }
 
+// SafeToWriteSeparatedIntents implements the Writer interface.
+func (fw *SSTWriter) SafeToWriteSeparatedIntents(context.Context) (bool, error) {
+	return false, errors.Errorf("SSTWriter does not support SafeToWriteSeparatedIntents")
+}
+
 // put puts a kv entry into the sstable being built. An error is returned if it
 // is not greater than any previously added entry (according to the comparator
 // configured during writer creation). `Close` cannot have been called.
@@ -192,7 +191,7 @@ func (fw *SSTWriter) put(key MVCCKey, value []byte) error {
 		return errors.New("cannot call Put on a closed writer")
 	}
 	fw.DataSize += int64(len(key.Key)) + int64(len(value))
-	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], key)
+	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], key)
 	return fw.fw.Set(fw.scratch, value)
 }
 
@@ -225,8 +224,8 @@ func (fw *SSTWriter) ClearUnversioned(key roachpb.Key) error {
 // the comparator configured during writer creation). `Close` cannot have been
 // called.
 func (fw *SSTWriter) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) error {
+	key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+) (int, error) {
 	panic("ClearIntent is unsupported")
 }
 
@@ -250,7 +249,7 @@ func (fw *SSTWriter) clear(key MVCCKey) error {
 	if fw.fw == nil {
 		return errors.New("cannot call Clear on a closed writer")
 	}
-	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], key)
+	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], key)
 	fw.DataSize += int64(len(key.Key))
 	return fw.fw.Delete(fw.scratch)
 }
@@ -271,7 +270,7 @@ func (fw *SSTWriter) Merge(key MVCCKey, value []byte) error {
 		return errors.New("cannot call Merge on a closed writer")
 	}
 	fw.DataSize += int64(len(key.Key)) + int64(len(value))
-	fw.scratch = EncodeMVCCKeyToBuf(fw.scratch[:0], key)
+	fw.scratch = EncodeKeyToBuf(fw.scratch[:0], key)
 	return fw.fw.Merge(fw.scratch, value)
 }
 
@@ -309,15 +308,6 @@ type MemFile struct {
 
 // Close implements the writeCloseSyncer interface.
 func (*MemFile) Close() error {
-	return nil
-}
-
-// Flush implements the same interface as the standard library's *bufio.Writer's
-// Flush method. The Pebble sstable Writer tests whether files implement a Flush
-// method. If not, it wraps the file with a bufio.Writer to buffer writes to the
-// underlying file. This buffering is not necessary for an in-memory file. We
-// signal this by implementing Flush as a noop.
-func (*MemFile) Flush() error {
 	return nil
 }
 
