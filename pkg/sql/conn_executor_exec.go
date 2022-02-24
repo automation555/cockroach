@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"runtime/pprof"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -26,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/contention/txnidcache"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
@@ -53,7 +51,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 	"go.opentelemetry.io/otel/attribute"
@@ -81,7 +78,6 @@ func (ex *connExecutor) execStmt(
 	prepared *PreparedStatement,
 	pinfo *tree.PlaceholderInfo,
 	res RestrictedCommandResult,
-	canAutoCommit bool,
 ) (fsm.Event, fsm.EventPayload, error) {
 	ast := parserStmt.AST
 	if log.V(2) || logStatementsExecuteEnabled.Get(&ex.server.cfg.Settings.SV) ||
@@ -134,10 +130,10 @@ func (ex *connExecutor) execStmt(
 				"stmt.no.constants", stmtNoConstants,
 			)
 			pprof.Do(ctx, labels, func(ctx context.Context) {
-				ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res, canAutoCommit)
+				ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res)
 			})
 		} else {
-			ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res, canAutoCommit)
+			ev, payload, err = ex.execStmtInOpenState(ctx, parserStmt, prepared, pinfo, res)
 		}
 		switch ev.(type) {
 		case eventNonRetriableErr:
@@ -202,7 +198,6 @@ func (ex *connExecutor) execPortal(
 	portalName string,
 	stmtRes CommandResult,
 	pinfo *tree.PlaceholderInfo,
-	canAutoCommit bool,
 ) (ev fsm.Event, payload fsm.EventPayload, err error) {
 	switch ex.machine.CurState().(type) {
 	case stateOpen:
@@ -225,7 +220,7 @@ func (ex *connExecutor) execPortal(
 		if portal.exhausted {
 			return nil, nil, nil
 		}
-		ev, payload, err = ex.execStmt(ctx, portal.Stmt.Statement, portal.Stmt, pinfo, stmtRes, canAutoCommit)
+		ev, payload, err = ex.execStmt(ctx, portal.Stmt.Statement, portal.Stmt, pinfo, stmtRes)
 		// Portal suspension is supported via a "side" state machine
 		// (see pgwire.limitedCommandResult for details), so when
 		// execStmt returns, we know for sure that the portal has been
@@ -241,7 +236,7 @@ func (ex *connExecutor) execPortal(
 		return ev, payload, err
 
 	default:
-		return ex.execStmt(ctx, portal.Stmt.Statement, portal.Stmt, pinfo, stmtRes, canAutoCommit)
+		return ex.execStmt(ctx, portal.Stmt.Statement, portal.Stmt, pinfo, stmtRes)
 	}
 }
 
@@ -264,12 +259,11 @@ func (ex *connExecutor) execStmtInOpenState(
 	prepared *PreparedStatement,
 	pinfo *tree.PlaceholderInfo,
 	res RestrictedCommandResult,
-	canAutoCommit bool,
 ) (retEv fsm.Event, retPayload fsm.EventPayload, retErr error) {
 	ctx, sp := tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "sql query")
-	// TODO(andrei): Consider adding the placeholders as tags too.
 	sp.SetTag("statement", attribute.StringValue(parserStmt.SQL))
 	defer sp.Finish()
+
 	ast := parserStmt.AST
 	ctx = withStatement(ctx, ast)
 
@@ -287,12 +281,27 @@ func (ex *connExecutor) execStmtInOpenState(
 	}
 	os := ex.machine.CurState().(stateOpen)
 
+	isNextCmdSync := false
 	isExtendedProtocol := prepared != nil
 	if isExtendedProtocol {
 		stmt = makeStatementFromPrepared(prepared, queryID)
+		// Only check for Sync in the extended protocol. In the simple protocol,
+		// Sync is meaningless, so it's OK to let isNextCmdSync default to false.
+		isNextCmdSync, err = ex.stmtBuf.isNextCmdSync()
+		if err != nil {
+			return makeErrEvent(err)
+		}
 	} else {
 		stmt = makeStatement(parserStmt, queryID)
 	}
+
+	// In some cases, we need to turn off autocommit behavior here. The postgres
+	// docs say that commands in the extended protocol are all treated as an
+	// implicit transaction that does not get committed until a Sync message is
+	// received. However, if we are executing a statement that is immediately
+	// followed by Sync (which is the common case), then we still can auto-commit,
+	// which allows the "insert fast path" (1PC optimization) to be used.
+	canAutoCommit := os.ImplicitTxn.Get() && (!isExtendedProtocol || isNextCmdSync)
 
 	ex.incrementStartedStmtCounter(ast)
 	defer func() {
@@ -317,9 +326,6 @@ func (ex *connExecutor) execStmtInOpenState(
 	}
 
 	ex.addActiveQuery(ast, formatWithPlaceholders(ast, ex.planner.EvalContext()), queryID, ex.state.cancel)
-	if ex.executorType != executorTypeInternal {
-		ex.metrics.EngineMetrics.SQLActiveStatements.Inc(1)
-	}
 
 	// Make sure that we always unregister the query. It also deals with
 	// overwriting res.Error to a more user-friendly message in case of query
@@ -333,9 +339,6 @@ func (ex *connExecutor) execStmtInOpenState(
 			}
 		}
 		ex.removeActiveQuery(queryID, ast)
-		if ex.executorType != executorTypeInternal {
-			ex.metrics.EngineMetrics.SQLActiveStatements.Dec(1)
-		}
 
 		// Detect context cancelation and overwrite whatever error might have been
 		// set on the result before. The idea is that once the query's context is
@@ -499,7 +502,7 @@ func (ex *connExecutor) execStmtInOpenState(
 			})
 	}
 
-	defer func(ctx context.Context) {
+	defer func() {
 		if filter := ex.server.cfg.TestingKnobs.StatementFilter; retErr == nil && filter != nil {
 			var execErr error
 			if perr, ok := retPayload.(payloadWithError); ok {
@@ -508,15 +511,15 @@ func (ex *connExecutor) execStmtInOpenState(
 			filter(ctx, ex.sessionData(), ast.String(), execErr)
 		}
 
-		// Do the auto-commit, if necessary. In the extended protocol, the
-		// auto-commit happens when the Sync message is handled.
+		// Do the auto-commit, if necessary.
 		if retEv != nil || retErr != nil {
 			return
 		}
-		if canAutoCommit && !isExtendedProtocol {
+		if canAutoCommit {
 			retEv, retPayload = ex.handleAutoCommit(ctx, ast)
+			return
 		}
-	}(ctx)
+	}()
 
 	switch s := ast.(type) {
 	case *tree.BeginTransaction:
@@ -711,41 +714,29 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.stmt = stmt
 	p.cancelChecker.Reset(ctx)
 
-	p.autoCommit = canAutoCommit && !ex.server.cfg.TestingKnobs.DisableAutoCommitDuringExec
+	p.autoCommit = canAutoCommit && !ex.server.cfg.TestingKnobs.DisableAutoCommit
 
 	var stmtThresholdSpan *tracing.Span
 	alreadyRecording := ex.transitionCtx.sessionTracing.Enabled()
-	stmtTraceThreshold := TraceStmtThreshold.Get(&ex.planner.execCfg.Settings.SV)
-	var stmtCtx context.Context
-	// TODO(andrei): I think we should do this even if alreadyRecording == true.
+	stmtTraceThreshold := traceStmtThreshold.Get(&ex.planner.execCfg.Settings.SV)
 	if !alreadyRecording && stmtTraceThreshold > 0 {
-		stmtCtx, stmtThresholdSpan = tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "trace-stmt-threshold", tracing.WithRecording(tracing.RecordingVerbose))
-	} else {
-		stmtCtx = ctx
+		ctx, stmtThresholdSpan = createRootOrChildSpan(ctx, "trace-stmt-threshold", ex.transitionCtx.tracer, tracing.WithRecording(tracing.RecordingVerbose))
 	}
 
-	if err := ex.dispatchToExecutionEngine(stmtCtx, p, res); err != nil {
+	if err := ex.dispatchToExecutionEngine(ctx, p, res); err != nil {
 		stmtThresholdSpan.Finish()
 		return nil, nil, err
 	}
 
 	if stmtThresholdSpan != nil {
-		stmtDur := timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived))
-		needRecording := stmtTraceThreshold < stmtDur
-		if needRecording {
-			rec := stmtThresholdSpan.FinishAndGetRecording(tracing.RecordingVerbose)
-			// NB: This recording does not include the commit for implicit
-			// transactions if the statement didn't auto-commit.
-			logTraceAboveThreshold(
-				ctx,
-				rec,
-				fmt.Sprintf("SQL stmt %s", stmt.AST.String()),
-				stmtTraceThreshold,
-				stmtDur,
-			)
-		} else {
-			stmtThresholdSpan.Finish()
-		}
+		stmtThresholdSpan.Finish()
+		logTraceAboveThreshold(
+			ctx,
+			stmtThresholdSpan.GetRecording(tracing.RecordingVerbose),
+			fmt.Sprintf("SQL stmt %s", stmt.AST.String()),
+			stmtTraceThreshold,
+			timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived)),
+		)
 	}
 
 	if err := res.Err(); err != nil {
@@ -838,10 +829,12 @@ func (ex *connExecutor) checkDescriptorTwoVersionInvariant(ctx context.Context) 
 // transaction. commitFn is passed as a separate function, so that we avoid
 // executing transactional logic when handling COMMIT in the CommitWait state.
 func (ex *connExecutor) commitSQLTransaction(
-	ctx context.Context, ast tree.Statement, commitFn func(ctx context.Context) error,
+	ctx context.Context,
+	ast tree.Statement,
+	commitFn func(ctx context.Context, ast tree.Statement) error,
 ) (fsm.Event, fsm.EventPayload) {
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartTransactionCommit, timeutil.Now())
-	if err := commitFn(ctx); err != nil {
+	if err := commitFn(ctx, ast); err != nil {
 		return ex.makeErrEvent(err, ast)
 	}
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndTransactionCommit, timeutil.Now())
@@ -891,10 +884,9 @@ func (ex *connExecutor) reportSessionDataChanges(fn func() error) error {
 	return nil
 }
 
-func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) error {
-	ctx, sp := tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "commit sql txn")
-	defer sp.Finish()
-
+func (ex *connExecutor) commitSQLTransactionInternal(
+	ctx context.Context, ast tree.Statement,
+) error {
 	if err := ex.createJobs(ctx); err != nil {
 		return err
 	}
@@ -1013,7 +1005,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		planner.maybeLogStatement(
 			ctx,
 			ex.executorType,
-			int(atomic.LoadInt32(ex.extraTxnState.atomicAutoRetryCounter)),
+			ex.extraTxnState.autoRetryCounter,
 			ex.extraTxnState.txnCounter,
 			res.RowsAffected(),
 			res.Err(),
@@ -1089,7 +1081,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		planner.curPlan.flags.Set(planFlagNotDistributed)
 	}
 
-	ex.sessionTracing.TraceRetryInformation(ctx, int(atomic.LoadInt32(ex.extraTxnState.atomicAutoRetryCounter)), ex.extraTxnState.autoRetryReason)
+	ex.sessionTracing.TraceRetryInformation(ctx, ex.extraTxnState.autoRetryCounter, ex.extraTxnState.autoRetryReason)
 	if ex.server.cfg.TestingKnobs.OnTxnRetry != nil && ex.extraTxnState.autoRetryReason != nil {
 		ex.server.cfg.TestingKnobs.OnTxnRetry(ex.extraTxnState.autoRetryReason, planner.EvalContext())
 	}
@@ -1122,7 +1114,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	// plan has not been closed earlier.
 	ex.recordStatementSummary(
 		ctx, planner,
-		int(atomic.LoadInt32(ex.extraTxnState.atomicAutoRetryCounter)), res.RowsAffected(), res.Err(), stats,
+		ex.extraTxnState.autoRetryCounter, res.RowsAffected(), res.Err(), stats,
 	)
 	if ex.server.cfg.TestingKnobs.AfterExecute != nil {
 		ex.server.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), res.Err())
@@ -1627,7 +1619,7 @@ func (ex *connExecutor) execStmtInCommitWaitState(
 		return ex.commitSQLTransaction(
 			ctx,
 			ast,
-			func(ctx context.Context) error {
+			func(ctx context.Context, ast tree.Statement) error {
 				// COMMIT while in the CommitWait state is a no-op.
 				return nil
 			},
@@ -1904,65 +1896,8 @@ func payloadHasError(payload fsm.EventPayload) bool {
 	return hasErr
 }
 
-func (ex *connExecutor) onTxnFinish(ctx context.Context, ev txnEvent) {
-	if ex.extraTxnState.shouldExecuteOnTxnFinish {
-		ex.extraTxnState.shouldExecuteOnTxnFinish = false
-		txnStart := ex.extraTxnState.txnFinishClosure.txnStartTime
-		implicit := ex.extraTxnState.txnFinishClosure.implicit
-		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndExecTransaction, timeutil.Now())
-		transactionFingerprintID :=
-			roachpb.TransactionFingerprintID(ex.extraTxnState.transactionStatementsHash.Sum())
-		if !implicit {
-			ex.statsCollector.EndExplicitTransaction(
-				ctx,
-				transactionFingerprintID,
-			)
-		}
-		if ex.server.cfg.TestingKnobs.BeforeTxnStatsRecorded != nil {
-			ex.server.cfg.TestingKnobs.BeforeTxnStatsRecorded(
-				ex.sessionData(),
-				ev.txnID,
-				transactionFingerprintID,
-			)
-		}
-		err := ex.recordTransactionFinish(ctx, transactionFingerprintID, ev, implicit, txnStart)
-		if err != nil {
-			if log.V(1) {
-				log.Warningf(ctx, "failed to record transaction stats: %s", err)
-			}
-			ex.server.ServerMetrics.StatsMetrics.DiscardedStatsCount.Inc(1)
-		}
-	}
-}
-
-func (ex *connExecutor) onTxnRestart(ctx context.Context) {
-	if ex.extraTxnState.shouldExecuteOnTxnRestart {
-		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionMostRecentStartExecTransaction, timeutil.Now())
-		ex.extraTxnState.transactionStatementFingerprintIDs = nil
-		ex.extraTxnState.transactionStatementsHash = util.MakeFNV64()
-		ex.extraTxnState.numRows = 0
-		// accumulatedStats are cleared, but shouldCollectTxnExecutionStats is
-		// unchanged.
-		ex.extraTxnState.accumulatedStats = execstats.QueryLevelStats{}
-		ex.extraTxnState.rowsRead = 0
-		ex.extraTxnState.bytesRead = 0
-		ex.extraTxnState.rowsWritten = 0
-
-		if ex.server.cfg.TestingKnobs.BeforeRestart != nil {
-			ex.server.cfg.TestingKnobs.BeforeRestart(ctx, ex.extraTxnState.autoRetryReason)
-		}
-	}
-}
-
 // recordTransactionStart records the start of the transaction.
-func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
-	// Transaction fingerprint ID will be available once transaction finishes
-	// execution.
-	ex.txnIDCacheWriter.Record(txnidcache.ResolvedTxnID{
-		TxnID:            txnID,
-		TxnFingerprintID: roachpb.InvalidTransactionFingerprintID,
-	})
-
+func (ex *connExecutor) recordTransactionStart() {
 	ex.state.mu.RLock()
 	txnStart := ex.state.mu.txnStart
 	ex.state.mu.RUnlock()
@@ -1989,9 +1924,7 @@ func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
 		ex.extraTxnState.shouldCollectTxnExecutionStats = txnExecStatsSampleRate > ex.rng.Float64()
 	}
 
-	if ex.executorType != executorTypeInternal {
-		ex.metrics.EngineMetrics.SQLTxnsOpen.Inc(1)
-	}
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Inc(1)
 
 	ex.extraTxnState.shouldExecuteOnTxnFinish = true
 	ex.extraTxnState.txnFinishClosure.txnStartTime = txnStart
@@ -2003,7 +1936,50 @@ func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
 	}
 }
 
-func (ex *connExecutor) recordTransactionFinish(
+func (ex *connExecutor) onTxnFinish(ctx context.Context, ev txnEvent) {
+	if ex.extraTxnState.shouldExecuteOnTxnFinish {
+		ex.extraTxnState.shouldExecuteOnTxnFinish = false
+		txnStart := ex.extraTxnState.txnFinishClosure.txnStartTime
+		implicit := ex.extraTxnState.txnFinishClosure.implicit
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndExecTransaction, timeutil.Now())
+		transactionFingerprintID :=
+			roachpb.TransactionFingerprintID(ex.extraTxnState.transactionStatementsHash.Sum())
+		if !implicit {
+			ex.statsCollector.EndExplicitTransaction(
+				ctx,
+				transactionFingerprintID,
+			)
+		}
+		err := ex.recordTransaction(ctx, transactionFingerprintID, ev, implicit, txnStart)
+		if err != nil {
+			if log.V(1) {
+				log.Warningf(ctx, "failed to record transaction stats: %s", err)
+			}
+			ex.server.ServerMetrics.StatsMetrics.DiscardedStatsCount.Inc(1)
+		}
+	}
+}
+
+func (ex *connExecutor) onTxnRestart() {
+	if ex.extraTxnState.shouldExecuteOnTxnRestart {
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionMostRecentStartExecTransaction, timeutil.Now())
+		ex.extraTxnState.transactionStatementFingerprintIDs = nil
+		ex.extraTxnState.transactionStatementsHash = util.MakeFNV64()
+		ex.extraTxnState.numRows = 0
+		// accumulatedStats are cleared, but shouldCollectTxnExecutionStats is
+		// unchanged.
+		ex.extraTxnState.accumulatedStats = execstats.QueryLevelStats{}
+		ex.extraTxnState.rowsRead = 0
+		ex.extraTxnState.bytesRead = 0
+		ex.extraTxnState.rowsWritten = 0
+
+		if ex.server.cfg.TestingKnobs.BeforeRestart != nil {
+			ex.server.cfg.TestingKnobs.BeforeRestart(ex.Ctx(), ex.extraTxnState.autoRetryReason)
+		}
+	}
+}
+
+func (ex *connExecutor) recordTransaction(
 	ctx context.Context,
 	transactionFingerprintID roachpb.TransactionFingerprintID,
 	ev txnEvent,
@@ -2028,15 +2004,8 @@ func (ex *connExecutor) recordTransactionFinish(
 
 	txnEnd := timeutil.Now()
 	txnTime := txnEnd.Sub(txnStart)
-	if ex.executorType != executorTypeInternal {
-		ex.metrics.EngineMetrics.SQLTxnsOpen.Dec(1)
-	}
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Dec(1)
 	ex.metrics.EngineMetrics.SQLTxnLatency.RecordValue(txnTime.Nanoseconds())
-
-	ex.txnIDCacheWriter.Record(txnidcache.ResolvedTxnID{
-		TxnID:            ev.txnID,
-		TxnFingerprintID: transactionFingerprintID,
-	})
 
 	txnServiceLat := ex.phaseTimes.GetTransactionServiceLatency()
 	txnRetryLat := ex.phaseTimes.GetTransactionRetryLatency()
@@ -2044,9 +2013,9 @@ func (ex *connExecutor) recordTransactionFinish(
 
 	recordedTxnStats := sqlstats.RecordedTxnStats{
 		TransactionTimeSec:      txnTime.Seconds(),
-		Committed:               ev.eventType == txnCommit,
+		Committed:               ev == txnCommit,
 		ImplicitTxn:             implicit,
-		RetryCount:              int64(atomic.LoadInt32(ex.extraTxnState.atomicAutoRetryCounter)),
+		RetryCount:              int64(ex.extraTxnState.autoRetryCounter),
 		StatementFingerprintIDs: ex.extraTxnState.transactionStatementFingerprintIDs,
 		ServiceLatency:          txnServiceLat,
 		RetryLatency:            txnRetryLat,
@@ -2064,6 +2033,16 @@ func (ex *connExecutor) recordTransactionFinish(
 		transactionFingerprintID,
 		recordedTxnStats,
 	)
+}
+
+// createRootOrChildSpan is used to create spans for txns and stmts. It inspects
+// parentCtx for an existing span and creates a root span if none is found, or a
+// child span if one is found. A context derived from parentCtx which
+// additionally contains the new span is also returned.
+func createRootOrChildSpan(
+	parentCtx context.Context, opName string, tr *tracing.Tracer, os ...tracing.SpanOption,
+) (context.Context, *tracing.Span) {
+	return tracing.EnsureChildSpan(parentCtx, tr, opName, os...)
 }
 
 // logTraceAboveThreshold logs a span's recording if the duration is above a

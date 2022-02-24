@@ -15,6 +15,7 @@
       padding-left: 3px
     }
 
+    /* Buttons that look like links */
     .link-button {
       background: none!important;
       border: none;
@@ -25,6 +26,15 @@
       cursor: pointer;
     }
 
+    button {
+      cursor: pointer;
+    }
+    .tag-link {
+      border: none;
+    }
+    .tags {
+      color: lightslategrey;
+    }
   </style>
 </head>
 
@@ -53,7 +63,7 @@ Stored snapshots (ID: capture time):
 <div id="spans-list">
   <table>
     <thead>
-    <input class="search" placeholder="Search" />
+    <input type="search" id="searchBox" class="search" placeholder="Search" />
     <tr>
       <th>
         <button class="sort link-button" data-sort="operation"> Operation </button>
@@ -81,10 +91,12 @@ var values = [
   {{range .SpansList.Spans}}
     {
       operation: {{.Operation}},
+      tags: {{tags .}},
+      hiddenTags: {{hiddenTags .}},
       spanID: "{{.SpanID}}",
-      startTime: {{formatTime .StartTime}},
-      relativeTime: {{since .StartTime $capturedAt}},
-      startTimeMicros: {{timeRaw .StartTime}},
+      startTime: {{formatTime .Start}},
+      relativeTime: {{since .Start $capturedAt}},
+      startTimeMicros: {{timeRaw .Start}},
       goroutineID: {{.GoroutineID}},
       traceID: "{{.TraceID}}",
       stack: {{index $stacks .GoroutineID}}
@@ -101,6 +113,48 @@ function toggleStackVisibility(spanID) {
   }
 };
 
+// !!!
+// function toggleVisibility(elementID) {
+//   var elem = document.getElementById(elementID);
+//   if (elem.style.display === "none") {
+//     elem.style.display = "block";
+//   } else {
+//     elem.style.display = "none";
+//   }
+// };
+
+function toggleVisibility(event) {
+  // !!!
+  console.log(event.target);
+  console.log(event.target.dataset.toggleTarget);
+  btn = event.target;
+  var target = document.getElementById(btn.dataset.toggleTarget);
+  if (target.style.display === "none") {
+    target.style.display = "block";
+    btn.innerText = btn.dataset.hide;
+  } else {
+    target.style.display = "none";
+    btn.innerText = btn.dataset.show;
+  }
+};
+
+function toggleVerbosity(event) {
+  // !!!
+  console.log(event.target);
+  var traceID = event.target.dataset.traceid;
+  console.log("toggling visibility for trace: " + traceID);
+  var xhttp = new XMLHttpRequest();
+  xhttp.open("POST", "toggle-trace");
+  xhttp.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+  xhttp.send("traceID=" + traceID);
+};
+
+function search(s) {
+    var searchBox = document.getElementById("searchBox");
+    searchBox.value = s;
+    // !!! searchBox.dispatchEvent(new Event('change', {'bubbles': true}));
+    spansList.search(s);
+};
 
 // openTrace opens the requested trace in a new window.
 function openTrace(traceID) {
@@ -116,6 +170,11 @@ var options = {
         <tr>
           <td>
             ${values.operation} <a href="javascript:openTrace('${values.traceID}')">[+]</a>
+            <button data-traceid='${values.traceID}' onclick="toggleVerbosity(event)">Record</button>
+            <br>
+            <span class="tags">${values.tags}</span>
+            <button data-toggle-target='hiddenTags-${values.spanID}' data-show="more" data-hide="less" onclick="toggleVisibility(event)">more</button>
+            <div style="display:none;" class="tags" id="hiddenTags-${values.spanID}">${values.hiddenTags}</div>
           </td>
           <td>
             <div style="min-width:12em">
@@ -133,8 +192,21 @@ var options = {
 
 // Create the list of spans.
 var spansList = new List('spans-list', options, values);
-// Start with spans sorted newest first.
-spansList.sort('startTimeMicros', {order: "desc"});
+// Horrible hack for working around a bug in list.js and allowing searches that
+// contain characters like '-'. See https://github.com/javve/list.js/issues/699.
+// We monkey-patch Strings.replace(), recognize a broken escape that list.js
+// does in [1], and turn it into a no-op.
+// [1] https://github.com/javve/list.js/blob/d32c85d396c961e079ecf5c21ebffe53a9a73d80/src/search.js#L31
+oldReplace = String.prototype.replace
+String.prototype.replace = function(...args) {
+  let expRegEx = /[-[\]{}()*+?.,\\^$|#]/g;
+  let expReplacement = '\\$&';
+  if (args[0].toString() == expRegEx.toString() && args[1] == expReplacement) {
+    // Return a copy of the input.
+    return this.slice();
+  }
+  return oldReplace.call(this,...args) ;
+};
 
 </script>
 </html>

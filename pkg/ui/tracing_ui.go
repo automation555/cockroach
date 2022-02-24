@@ -17,20 +17,20 @@ import (
 
 // This file deals with embedding assets used by /debug/tracez.
 
-//go:embed dist_vendor/*
-var vendorFiles embed.FS
-
-// VendorFS exposes the list.js package.
-var VendorFS fs.FS
+//go:embed node_modules/list.js/dist/list.min.js
+var listJS embed.FS
 
 //go:embed templates/tracing/html_template.html
 // SpansTableTemplateSrc contains a template used by /debug/tracez
 var SpansTableTemplateSrc string
 
+// ListJS exposes list.js package
+var ListJS fs.FS
+
 func init() {
-	var err error
-	VendorFS, err = fs.Sub(vendorFiles, "dist_vendor")
+	f, err := fs.Sub(listJS, "node_modules/list.js/dist")
 	if err != nil {
 		panic(err)
 	}
+	ListJS = f
 }

@@ -12,14 +12,17 @@ package tracingui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
-	"net/url"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ui"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -36,7 +39,7 @@ const timeFormat = "15:04:05.000"
 
 // RegisterHTTPHandlers registers the /debug/tracez handlers, and helpers.
 func RegisterHTTPHandlers(ambientCtx log.AmbientContext, mux *http.ServeMux, tr *tracing.Tracer) {
-	fileServer := http.StripPrefix("/debug/assets/", http.FileServer(http.FS(ui.VendorFS)))
+	fileServer := http.StripPrefix("/debug/assets/", http.FileServer(http.FS(ui.ListJS)))
 	mux.HandleFunc("/debug/tracez",
 		func(w http.ResponseWriter, req *http.Request) {
 			serveHTTP(ambientCtx.AnnotateCtx(context.Background()), w, req, tr)
@@ -45,28 +48,203 @@ func RegisterHTTPHandlers(ambientCtx log.AmbientContext, mux *http.ServeMux, tr 
 		func(w http.ResponseWriter, req *http.Request) {
 			serveHTTPTrace(ambientCtx.AnnotateCtx(req.Context()), w, req, tr)
 		})
+	mux.HandleFunc("/debug/toggle-trace",
+		func(w http.ResponseWriter, req *http.Request) {
+			serveHTTPToggleTrace(ambientCtx.AnnotateCtx(req.Context()), w, req, tr)
+		})
+	mux.HandleFunc("/debug/tracez/snapshot", snapshotHandler(ambientCtx.AnnotateCtx(context.Background()), tr))
 	mux.HandleFunc("/debug/assets/list.min.js", fileServer.ServeHTTP)
 }
 
+func snapshotHandler(ctx context.Context, tr *tracing.Tracer) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == "POST" {
+			// Creates a new snapshot and returns the ID.
+			snapshotID := tr.SaveSnapshot()
+			sc := snapshotCreated{SnapshotID: snapshotID}
+			returnJSON(w, sc)
+			return
+		}
+
+		if err := req.ParseForm(); err != nil {
+			log.Warningf(ctx, "error parsing /tracez form: %s", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		snapID := req.Form.Get("snap")
+
+		// List snapshots if we don't have an ID to retrieve.
+		if snapID == "" {
+			pd := pageData{AllSnapshots: tr.GetSnapshots()}
+			returnJSON(w, pd)
+			return
+		}
+
+		// Otherwise, get the snapshot identified by `snapID`
+		getSnapshotHandler(snapID, tr, w)
+	}
+}
+
+type snapshotCreated struct {
+	SnapshotID tracing.SnapshotID `json:"snapshot_id"`
+}
+
+func returnJSON(w http.ResponseWriter, obj interface{}) {
+	w.Header().Set("content-type", "application/json")
+	err := json.NewEncoder(w).Encode(obj)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func getSnapshotHandler(snapID string, tr *tracing.Tracer, w http.ResponseWriter) {
+	var pageErr error
+
+	id, err := strconv.Atoi(snapID)
+	if err != nil {
+		pageErr = errors.Errorf("invalid snapshot ID: %s", snapID)
+	}
+	snapshotID := tracing.SnapshotID(id)
+	snapshot, err := tr.GetSnapshot(snapshotID)
+	if err != nil {
+		pageErr = err
+	}
+
+	// Flatten the recordings.
+	spans := make([]tracingpb.RecordedSpan, 0, len(snapshot.Traces)*3)
+	for _, r := range snapshot.Traces {
+		spans = append(spans, r...)
+	}
+
+	spansMap := make(map[uint64]*processedSpan)
+	childrenMap := make(map[uint64][]*processedSpan)
+	processedSpans := make([]processedSpan, len(spans))
+	for i, s := range spans {
+		p := processSpan(s, snapshot)
+		ptr := &processedSpans[i]
+		*ptr = p
+		spansMap[p.SpanID] = &processedSpans[i]
+		if _, ok := childrenMap[p.ParentSpanID]; !ok {
+			childrenMap[p.ParentSpanID] = []*processedSpan{&processedSpans[i]}
+		} else {
+			childrenMap[p.ParentSpanID] = append(childrenMap[p.ParentSpanID], &processedSpans[i])
+		}
+	}
+	// Propagate tags up.
+	for _, s := range processedSpans {
+		for _, t := range s.Tags {
+			if !t.propagateUp || t.copiedFromChild {
+				continue
+			}
+			propagateTagUpwards(t, &s, spansMap)
+		}
+	}
+	// Propagate tags down.
+	for _, s := range processedSpans {
+		for _, t := range s.Tags {
+			if !t.inherit || t.inherited {
+				continue
+			}
+			propagateInheritTagDownwards(t, &s, childrenMap)
+		}
+	}
+
+	// Copy the stack traces and augment the map.
+	stacks := make(map[int]string, len(snapshot.Stacks))
+	for k, v := range snapshot.Stacks {
+		stacks[k] = v
+	}
+	// Fill in messages for the goroutines for which we don't have a stack trace.
+	for _, s := range spans {
+		gid := int(s.GoroutineID)
+		if _, ok := stacks[gid]; !ok {
+			stacks[gid] = "Goroutine not found. Goroutine must have finished since the span was created."
+		}
+	}
+
+	if pageErr != nil {
+		snapshot.Err = pageErr
+	}
+	pd := pageData{
+		Now:          timeutil.Now(),
+		CapturedAt:   snapshot.CapturedAt,
+		SnapshotID:   snapshotID,
+		AllSnapshots: tr.GetSnapshots(),
+		Err:          snapshot.Err,
+		SpansList: spansList{
+			Spans:  processedSpans,
+			Stacks: stacks,
+		},
+	}
+	returnJSON(w, pd)
+}
+
 type pageData struct {
-	SnapshotID   tracing.SnapshotID
-	Now          time.Time
-	CapturedAt   time.Time
-	Err          error
-	AllSnapshots []tracing.SnapshotInfo
-	SpansList    spansList
+	SnapshotID   tracing.SnapshotID     `json:"snapshot_id"`
+	Now          time.Time              `json:"now"`
+	CapturedAt   time.Time              `json:"captured_at"`
+	Err          error                  `json:"err"`
+	AllSnapshots []tracing.SnapshotInfo `json:"all_snapshots"`
+	SpansList    spansList              `json:"spans_list"`
 }
 
 type spansList struct {
-	Spans []tracingpb.RecordedSpan
+	Spans []processedSpan `json:"spans"`
 	// Stacks contains stack traces for the goroutines referenced by the Spans
 	// through their GoroutineID field.
-	Stacks map[int]string // GoroutineID to stack trace
+	Stacks map[int]string `json:"stacks"` // GoroutineID to stack trace
 }
 
 var spansTableTemplate *template.Template
 
+var hiddenTags = map[string]struct{}{
+	"_unfinished": {},
+	"_verbose":    {},
+	"_dropped":    {},
+	"node":        {},
+	"store":       {},
+}
+
+func generateTagValue(t processedTag) string {
+	val := t.val
+	if t.link != "" {
+		val = fmt.Sprintf("<button onclick=\"search('%s')\" class='tag-link'>%s</button>", t.link, t.val)
+	}
+	if t.caption == "" {
+		return val
+	}
+	return fmt.Sprintf("<span title='%s'>%s</span>", t.caption, val)
+}
+
 func init() {
+	// concatTags takes in a span's tags and stringiefies the ones that pass filter.
+	concatTags := func(tags []processedTag, filter func(tag processedTag) bool) string {
+		tagsArr := make([]string, 0, len(tags))
+		for _, t := range tags {
+			icon := ""
+			if t.highlight {
+				icon = "<img style='width:16px;height:16px;' src='https://icons.iconarchive.com/icons/google/noto-emoji-symbols/256/73028-warning-icon.png'/>"
+			}
+			keyAnnotation := ""
+			if t.inherited {
+				keyAnnotation = "<span title='from parent'>(↓)</span>"
+			}
+			if t.copiedFromChild {
+				keyAnnotation = "<span title='from child'>(↑)</span>"
+			}
+
+			k, v := t.key, t.val
+			if !filter(t) {
+				continue
+			}
+			if v != "" {
+				tagsArr = append(tagsArr, fmt.Sprintf("%s%s%s:%s", icon, k, keyAnnotation, generateTagValue(t)))
+			} else {
+				tagsArr = append(tagsArr, k)
+			}
+		}
+		return strings.Join(tagsArr, ", ")
+	}
+
 	spansTableTemplate = template.Must(template.New("spans-list").Funcs(
 		template.FuncMap{
 			"formatTime":         formatTime,
@@ -75,6 +253,16 @@ func init() {
 				return fmt.Sprintf("(%s ago)", formatDuration(capturedAt.Sub(t)))
 			},
 			"timeRaw": func(t time.Time) int64 { return t.UnixMicro() },
+			"tags": func(sp processedSpan) string {
+				return concatTags(sp.Tags, func(t processedTag) bool {
+					return !t.hidden
+				})
+			},
+			"hiddenTags": func(sp processedSpan) string {
+				return concatTags(sp.Tags, func(t processedTag) bool {
+					return t.hidden
+				})
+			},
 		},
 	).Parse(ui.SpansTableTemplateSrc))
 }
@@ -170,6 +358,39 @@ func serveHTTP(ctx context.Context, w http.ResponseWriter, r *http.Request, tr *
 		spans = append(spans, r...)
 	}
 
+	spansMap := make(map[uint64]*processedSpan)
+	childrenMap := make(map[uint64][]*processedSpan)
+	processedSpans := make([]processedSpan, len(spans))
+	for i, s := range spans {
+		p := processSpan(s, snapshot)
+		ptr := &processedSpans[i]
+		*ptr = p
+		spansMap[p.SpanID] = &processedSpans[i]
+		if _, ok := childrenMap[p.ParentSpanID]; !ok {
+			childrenMap[p.ParentSpanID] = []*processedSpan{&processedSpans[i]}
+		} else {
+			childrenMap[p.ParentSpanID] = append(childrenMap[p.ParentSpanID], &processedSpans[i])
+		}
+	}
+	// Propagate tags up.
+	for _, s := range processedSpans {
+		for _, t := range s.Tags {
+			if !t.propagateUp || t.copiedFromChild {
+				continue
+			}
+			propagateTagUpwards(t, &s, spansMap)
+		}
+	}
+	// Propagate tags down.
+	for _, s := range processedSpans {
+		for _, t := range s.Tags {
+			if !t.inherit || t.inherited {
+				continue
+			}
+			propagateInheritTagDownwards(t, &s, childrenMap)
+		}
+	}
+
 	// Copy the stack traces and augment the map.
 	stacks := make(map[int]string, len(snapshot.Stacks))
 	for k, v := range snapshot.Stacks {
@@ -193,7 +414,7 @@ func serveHTTP(ctx context.Context, w http.ResponseWriter, r *http.Request, tr *
 		AllSnapshots: tr.GetSnapshots(),
 		Err:          snapshot.Err,
 		SpansList: spansList{
-			Spans:  spans,
+			Spans:  processedSpans,
 			Stacks: stacks,
 		},
 	})
@@ -202,10 +423,168 @@ func serveHTTP(ctx context.Context, w http.ResponseWriter, r *http.Request, tr *
 		// the page has gone away.
 		if !sysutil.IsErrConnectionReset(err) {
 			log.Warningf(ctx, "error executing tracez template: %s", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			_, _ = w.Write([]byte(err.Error()))
 		}
 	}
 }
+
+type processedSpan struct {
+	Operation                     string
+	TraceID, SpanID, ParentSpanID uint64
+	Start                         time.Time
+	GoroutineID                   uint64
+	Tags                          []processedTag
+}
+
+type processedTag struct {
+	key, val string
+	caption  string
+	link     string
+	hidden   bool
+	// highlight is set if the tag should be rendered with a little exclamation
+	// mark.
+	highlight bool
+
+	// inherit is set if this tag should be passed down to children, and
+	// recursively.
+	inherit bool
+	// inherited is set if this tag was passed over from an ancestor.
+	inherited bool
+
+	propagateUp bool
+	// copiedFromChild is set if this tag did not originate on the owner span, but
+	// instead was propagated upwards from a child span.
+	copiedFromChild bool
+}
+
+// propagateTagUpwards copies tag from sp to all of sp's ancestors.
+func propagateTagUpwards(tag processedTag, sp *processedSpan, spans map[uint64]*processedSpan) {
+	tag.copiedFromChild = true
+	tag.inherit = false
+	parentID := sp.ParentSpanID
+	for {
+		p, ok := spans[parentID]
+		if !ok {
+			return
+		}
+		p.Tags = append(p.Tags, tag)
+		parentID = p.ParentSpanID
+	}
+}
+
+func propagateInheritTagDownwards(
+	tag processedTag, sp *processedSpan, children map[uint64][]*processedSpan,
+) {
+	tag.propagateUp = false
+	tag.inherited = true
+	tag.hidden = true
+	for _, child := range children[sp.SpanID] {
+		child.Tags = append(child.Tags, tag)
+		propagateInheritTagDownwards(tag, child, children)
+	}
+}
+
+func processSpan(s tracingpb.RecordedSpan, snap tracing.SpansSnapshot) processedSpan {
+	p := processedSpan{
+		Operation:    s.Operation,
+		TraceID:      uint64(s.TraceID),
+		SpanID:       uint64(s.SpanID),
+		ParentSpanID: uint64(s.ParentSpanID),
+		Start:        s.StartTime,
+		GoroutineID:  s.GoroutineID,
+	}
+
+	// Sort the tags.
+	tagKeys := make([]string, 0, len(s.Tags))
+	for k := range s.Tags {
+		tagKeys = append(tagKeys, k)
+	}
+	sort.Strings(tagKeys)
+
+	p.Tags = make([]processedTag, len(s.Tags))
+	for i, k := range tagKeys {
+		p.Tags[i] = processTag(k, s.Tags[k], snap)
+	}
+	return p
+}
+
+func processTag(k, v string, snap tracing.SpansSnapshot) processedTag {
+	p := processedTag{
+		key: k,
+		val: v,
+	}
+	_, hidden := hiddenTags[k]
+	p.hidden = hidden
+
+	switch k {
+	case "lock_holder_txn":
+		txnID := v
+		// Take only the first 8 bytes, to keep the text shorter.
+		txnIDShort := v[:8]
+		p.val = txnIDShort
+		p.propagateUp = true
+		p.highlight = true
+		p.link = txnIDShort
+		txnState := findTxnState(txnID, snap)
+		if !txnState.found {
+			p.caption = "blocked on unknown transaction"
+		} else if txnState.curQuery != "" {
+			p.caption = "blocked on txn currently running query: " + txnState.curQuery
+		} else {
+			p.caption = "blocked on idle txn"
+		}
+	case "statement":
+		p.inherit = true
+		p.propagateUp = true
+	}
+
+	return p
+}
+
+type txnState struct {
+	found    bool
+	curQuery string
+}
+
+func findTxnState(txnID string, snap tracing.SpansSnapshot) txnState {
+	// Iterate through all the traces and look for a "sql txn" span for the
+	// respective transaction.
+	for _, t := range snap.Traces {
+		for _, s := range t {
+			if s.Operation != "sql txn" || s.Tags["txn"] != txnID {
+				continue
+			}
+			// I've found the transaction. Look through its children and find a SQL query.
+			// !!! The search here is a bit brutal.
+			for _, s2 := range t {
+				if s2.Operation == "sql query" {
+					return txnState{
+						found:    true,
+						curQuery: s2.Tags["statement"],
+					}
+				}
+			}
+			return txnState{
+				found: true,
+			}
+		}
+	}
+	return txnState{
+		found: false,
+	}
+}
+
+const tracePageScripts = `
+<script>
+// reloadWithoutSnapshotArg reloads the page without the "snap" query argument,
+// thus showing the latest recording.
+function reloadWithoutSnapshotArg() {
+	let url = new URL(window.location);
+	url.searchParams.delete('snap');
+	window.location.href = url.href;
+}
+</script>
+`
 
 func serveHTTPTrace(
 	ctx context.Context, w http.ResponseWriter, r *http.Request, tr *tracing.Tracer,
@@ -215,6 +594,8 @@ func serveHTTPTrace(
 	if err = r.ParseForm(); err != nil {
 		goto Error
 	}
+
+	w.Write([]byte(tracePageScripts))
 
 	{
 		var traceID tracingpb.TraceID
@@ -226,19 +607,25 @@ func serveHTTPTrace(
 		var id int
 		id, err = strconv.Atoi(tid)
 		if err != nil {
-			err = errors.Errorf("invalid trace ID: %s", tid)
+			err = errors.Errorf("invalid trace ID: %s", id)
 			goto Error
 		}
 		traceID = tracingpb.TraceID(id)
 
+		var recording tracing.Recording
 		var snapshotID tracing.SnapshotID
 		var snapshot tracing.SpansSnapshot
 		snapID := r.Form.Get("snap")
 		if snapID != "" {
+
+			w.Write([]byte(`
+				<div><button onclick="reloadWithoutSnapshotArg()">Switch to latest</button></div>
+			`))
+
 			var id int
 			id, err = strconv.Atoi(snapID)
 			if err != nil {
-				err = errors.Errorf("invalid snapshot ID: %s", snapID)
+				err = errors.Errorf("invalid snapshot ID: %d", snapID)
 				goto Error
 			}
 			snapshotID = tracing.SnapshotID(id)
@@ -246,32 +633,66 @@ func serveHTTPTrace(
 			if err != nil {
 				goto Error
 			}
+
+			for _, r := range snapshot.Traces {
+				if r[0].TraceID == traceID {
+					recording = r
+					break
+				}
+			}
 		} else {
-			// If no snapshot is specified, we'll take a new one now and redirect to
-			// it.
-			snapshotID = tr.SaveSnapshot()
-			var newURL *url.URL
-			newURL, err = r.URL.Parse(fmt.Sprintf("?trace=%d&snap=%d", traceID, snapshotID))
+			tr.SpanRegistry().VisitSpans(func(sp tracing.RegistrySpan) error {
+				if sp.TraceID() == traceID {
+					recording = sp.GetFullRecording(tracing.RecordingVerbose)
+					return iterutil.StopIteration()
+				}
+				return nil
+			})
+		}
+
+		if recording != nil {
+			_, err = w.Write([]byte("<pre>" + recording.String() + "\n</pre>"))
 			if err != nil {
 				goto Error
 			}
-			http.Redirect(w, r, newURL.String(), http.StatusFound)
 			return
 		}
-
-		for _, r := range snapshot.Traces {
-			if r[0].TraceID == traceID {
-				_, err = w.Write([]byte("<pre>" + r.String() + "\n</pre>"))
-				if err != nil {
-					goto Error
-				}
-				return
-			}
-		}
-		err = errors.Errorf("trace %d not found in snapshot", traceID)
+		err = errors.Errorf("trace %d not found", traceID)
 		goto Error
 	}
 
 Error:
-	http.Error(w, err.Error(), http.StatusInternalServerError)
+	_, _ = w.Write([]byte(err.Error()))
+}
+
+func serveHTTPToggleTrace(
+	ctx context.Context, w http.ResponseWriter, r *http.Request, tr *tracing.Tracer,
+) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := r.ParseForm(); err != nil {
+		panic(err)
+	}
+	for k, v := range r.Form {
+		log.Infof(ctx, "!!! form: %s : %v", k, v)
+	}
+	traceIDs, ok := r.Form["traceID"]
+	if !ok {
+		panic("!!!")
+	}
+	if len(traceIDs) != 1 {
+		panic("!!!")
+	}
+	traceIDi, err := strconv.Atoi(traceIDs[0])
+	if err != nil {
+		panic(err) // !!!
+	}
+	traceID := tracingpb.TraceID(traceIDi)
+
+	tr.SpanRegistry().VisitSpans(func(sp tracing.RegistrySpan) error {
+		if sp.TraceID() != traceID {
+			return nil
+		}
+		sp.SetVerbose(true) // NB: SetVerbose propagates to the children, recursively.
+		return nil
+	})
 }
