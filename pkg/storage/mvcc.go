@@ -57,6 +57,14 @@ const (
 	maxIntentsPerWriteIntentErrorDefault = 5000
 )
 
+var (
+	// MVCCKeyMax is a maximum mvcc-encoded key value which sorts after
+	// all other keys.
+	MVCCKeyMax = MakeMVCCMetadataKey(roachpb.KeyMax)
+	// NilKey is the nil MVCCKey.
+	NilKey = MVCCKey{}
+)
+
 var minWALSyncInterval = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"rocksdb.min_wal_sync_interval",
@@ -91,6 +99,107 @@ func MakeValue(meta enginepb.MVCCMetadata) roachpb.Value {
 
 func emptyKeyError() error {
 	return errors.Errorf("attempted access to empty key")
+}
+
+// MVCCKey is a versioned key, distinguished from roachpb.Key with the addition
+// of a timestamp.
+type MVCCKey struct {
+	Key       roachpb.Key
+	Timestamp hlc.Timestamp
+}
+
+// MakeMVCCMetadataKey creates an MVCCKey from a roachpb.Key.
+func MakeMVCCMetadataKey(key roachpb.Key) MVCCKey {
+	return MVCCKey{Key: key}
+}
+
+// Next returns the next key.
+func (k MVCCKey) Next() MVCCKey {
+	ts := k.Timestamp.Prev()
+	if ts.IsEmpty() {
+		return MVCCKey{
+			Key: k.Key.Next(),
+		}
+	}
+	return MVCCKey{
+		Key:       k.Key,
+		Timestamp: ts,
+	}
+}
+
+// Less compares two keys.
+func (k MVCCKey) Less(l MVCCKey) bool {
+	if c := k.Key.Compare(l.Key); c != 0 {
+		return c < 0
+	}
+	if !k.IsValue() {
+		return l.IsValue()
+	} else if !l.IsValue() {
+		return false
+	}
+	return l.Timestamp.Less(k.Timestamp)
+}
+
+// Equal returns whether two keys are identical.
+func (k MVCCKey) Equal(l MVCCKey) bool {
+	return k.Key.Compare(l.Key) == 0 && k.Timestamp.EqOrdering(l.Timestamp)
+}
+
+// IsValue returns true iff the timestamp is non-zero.
+func (k MVCCKey) IsValue() bool {
+	return !k.Timestamp.IsEmpty()
+}
+
+// EncodedSize returns the size of the MVCCKey when encoded.
+func (k MVCCKey) EncodedSize() int {
+	n := len(k.Key) + 1
+	if k.IsValue() {
+		// Note that this isn't quite accurate: timestamps consume between 8-13
+		// bytes. Fixing this only adjusts the accounting for timestamps, not the
+		// actual on disk storage.
+		n += int(MVCCVersionTimestampSize)
+	}
+	return n
+}
+
+// String returns a string-formatted version of the key.
+func (k MVCCKey) String() string {
+	if !k.IsValue() {
+		return k.Key.String()
+	}
+	return fmt.Sprintf("%s/%s", k.Key, k.Timestamp)
+}
+
+// Format implements the fmt.Formatter interface.
+func (k MVCCKey) Format(f fmt.State, c rune) {
+	fmt.Fprintf(f, "%s/%s", k.Key, k.Timestamp)
+}
+
+// Len returns the size of the MVCCKey when encoded. Implements the
+// pebble.Encodeable interface.
+//
+// TODO(itsbilal): Reconcile this with EncodedSize. Would require updating MVCC
+// stats tests to reflect the more accurate lengths provided by this function.
+func (k MVCCKey) Len() int {
+	const (
+		timestampSentinelLen      = 1
+		walltimeEncodedLen        = 8
+		logicalEncodedLen         = 4
+		syntheticEncodedLen       = 1
+		timestampEncodedLengthLen = 1
+	)
+
+	n := len(k.Key) + timestampEncodedLengthLen
+	if !k.Timestamp.IsEmpty() {
+		n += timestampSentinelLen + walltimeEncodedLen
+		if k.Timestamp.Logical != 0 || k.Timestamp.Synthetic {
+			n += logicalEncodedLen
+		}
+		if k.Timestamp.Synthetic {
+			n += syntheticEncodedLen
+		}
+	}
+	return n
 }
 
 // MVCCKeyValue contains the raw bytes of the value for a key.
@@ -765,7 +874,7 @@ func mvccGet(
 		keyBuf:           mvccScanner.keyBuf,
 	}
 
-	mvccScanner.init(opts.Txn, opts.Uncertainty, 0)
+	mvccScanner.init(opts.Txn, opts.Uncertainty)
 	mvccScanner.get(ctx)
 
 	// If we have a trace, emit the scan stats that we produced.
@@ -1531,7 +1640,7 @@ func mvccPutInternal(
 			// instead of allowing their transactions to continue and be retried
 			// before committing.
 			writeTimestamp.Forward(metaTimestamp.Next())
-			maybeTooOldErr = roachpb.NewWriteTooOldError(readTimestamp, writeTimestamp, key)
+			maybeTooOldErr = roachpb.NewWriteTooOldError(readTimestamp, writeTimestamp)
 			// If we're in a transaction, always get the value at the orig
 			// timestamp. Outside of a transaction, the read timestamp advances
 			// to the the latest value's timestamp + 1 as well. The new
@@ -2202,19 +2311,20 @@ func MVCCDeleteRange(
 	return keys, res.ResumeSpan, res.NumKeys, nil
 }
 
+var scanStatsPool = sync.Pool{
+	New: func() interface{} { return &roachpb.ScanStats{} },
+}
+
 func recordIteratorStats(traceSpan *tracing.Span, iteratorStats IteratorStats) {
 	stats := iteratorStats.Stats
 	if traceSpan != nil {
-		steps := stats.ReverseStepCount[pebble.InterfaceCall] + stats.ForwardStepCount[pebble.InterfaceCall]
-		seeks := stats.ReverseSeekCount[pebble.InterfaceCall] + stats.ForwardSeekCount[pebble.InterfaceCall]
-		internalSteps := stats.ReverseStepCount[pebble.InternalIterCall] + stats.ForwardStepCount[pebble.InternalIterCall]
-		internalSeeks := stats.ReverseSeekCount[pebble.InternalIterCall] + stats.ForwardSeekCount[pebble.InternalIterCall]
-		traceSpan.RecordStructured(&roachpb.ScanStats{
-			NumInterfaceSeeks: uint64(seeks),
-			NumInternalSeeks:  uint64(internalSeeks),
-			NumInterfaceSteps: uint64(steps),
-			NumInternalSteps:  uint64(internalSteps),
-		})
+		ss := scanStatsPool.Get().(*roachpb.ScanStats)
+		defer scanStatsPool.Put(ss)
+		ss.NumInterfaceSteps = uint64(stats.ReverseStepCount[pebble.InterfaceCall] + stats.ForwardStepCount[pebble.InterfaceCall])
+		ss.NumInternalSeeks = uint64(stats.ReverseSeekCount[pebble.InterfaceCall] + stats.ForwardSeekCount[pebble.InterfaceCall])
+		ss.NumInterfaceSteps = uint64(stats.ReverseStepCount[pebble.InternalIterCall] + stats.ForwardStepCount[pebble.InternalIterCall])
+		ss.NumInternalSteps = uint64(stats.ReverseSeekCount[pebble.InternalIterCall] + stats.ForwardSeekCount[pebble.InternalIterCall])
+		traceSpan.RecordStructured(ss)
 	}
 }
 
@@ -2257,8 +2367,7 @@ func mvccScanToBytes(
 		maxKeys:                opts.MaxKeys,
 		targetBytes:            opts.TargetBytes,
 		targetBytesAvoidExcess: opts.TargetBytesAvoidExcess,
-		allowEmpty:             opts.AllowEmpty,
-		wholeRows:              opts.WholeRowsOfSize > 1, // single-KV rows don't need processing
+		targetBytesAllowEmpty:  opts.TargetBytesAllowEmpty,
 		maxIntents:             opts.MaxIntents,
 		inconsistent:           opts.Inconsistent,
 		tombstones:             opts.Tombstones,
@@ -2266,11 +2375,7 @@ func mvccScanToBytes(
 		keyBuf:                 mvccScanner.keyBuf,
 	}
 
-	var trackLastOffsets int
-	if opts.WholeRowsOfSize > 1 {
-		trackLastOffsets = int(opts.WholeRowsOfSize)
-	}
-	mvccScanner.init(opts.Txn, opts.Uncertainty, trackLastOffsets)
+	mvccScanner.init(opts.Txn, opts.Uncertainty)
 
 	var res MVCCScanResult
 	var err error
@@ -2378,7 +2483,7 @@ type MVCCScanOptions struct {
 	// memory during a Scan operation. Once the target is satisfied (i.e. met or
 	// exceeded) by the emitted KV pairs, iteration stops (with a ResumeSpan as
 	// appropriate). In particular, at least one kv pair is returned (when one
-	// exists), unless AllowEmpty is set.
+	// exists), unless TargetBytesAllowEmpty is set.
 	//
 	// The number of bytes a particular kv pair accrues depends on internal data
 	// structures, but it is guaranteed to exceed that of the bytes stored in
@@ -2392,16 +2497,9 @@ type MVCCScanOptions struct {
 	// TODO(erikgrinaker): This option exists for backwards compatibility with
 	// 21.2 RPC clients, in 22.2 it should always be enabled.
 	TargetBytesAvoidExcess bool
-	// AllowEmpty will return an empty result if the first kv pair exceeds the
-	// TargetBytes limit and TargetBytesAvoidExcess is set.
-	AllowEmpty bool
-	// WholeRowsOfSize will prevent returning partial rows when limits (MaxKeys or
-	// TargetBytes) are set. The value indicates the max number of keys per row.
-	// If the last KV pair(s) belong to a partial row, they will be removed from
-	// the result -- except if the result only consists of a single partial row
-	// and AllowEmpty is false, in which case the remaining KV pairs of the row
-	// will be fetched and returned too.
-	WholeRowsOfSize int32
+	// TargetBytesAllowEmpty will return an empty result if the first kv pair
+	// exceeds the TargetBytes limit and TargetBytesAvoidExcess is set.
+	TargetBytesAllowEmpty bool
 	// MaxIntents is a maximum number of intents collected by scanner in
 	// consistent mode before returning WriteIntentError.
 	//
