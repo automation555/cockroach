@@ -223,53 +223,15 @@ const (
 	// This version comes with a migration to populate the same seed data
 	// for existing tenants.
 	SeedTenantSpanConfigs
-	// PublicSchemasWithDescriptors backs public schemas with descriptors.
+	// Public schema is backed by a descriptor.
 	PublicSchemasWithDescriptors
-	// EnsureSpanConfigReconciliation ensures that the host tenant has run its
-	// reconciliation process at least once.
-	EnsureSpanConfigReconciliation
-	// EnsureSpanConfigSubscription ensures that all KV nodes are subscribed to
-	// the global span configuration state, observing the entries installed as
-	// in EnsureSpanConfigReconciliation.
-	EnsureSpanConfigSubscription
-	// EnableSpanConfigStore enables the use of the span configs infrastructure
-	// in KV.
-	EnableSpanConfigStore
-	// ScanWholeRows is the version at which the Header.WholeRowsOfSize parameter
-	// was introduced, preventing limited scans from returning partial rows.
-	ScanWholeRows
-	// SCRAM authentication is available.
-	SCRAMAuthentication
-	// UnsafeLossOfQuorumRecoveryRangeLog adds a new value to RangeLogEventReason
-	// that correspond to range descriptor changes resulting from recovery
-	// procedures.
-	UnsafeLossOfQuorumRecoveryRangeLog
 	// AlterSystemProtectedTimestampAddColumn adds a target column to the
 	// system.protected_ts_records table that describes what is protected by the
 	// record.
 	AlterSystemProtectedTimestampAddColumn
-	// EnableProtectedTimestampsForTenant enables the use of protected timestamps
-	// in secondary tenants.
-	EnableProtectedTimestampsForTenant
-	// DeleteCommentsWithDroppedIndexes cleans up left over comments that belong
-	// to dropped indexes.
-	DeleteCommentsWithDroppedIndexes
-	// RemoveIncompatibleDatabasePrivileges adds the migration which guarantees that
-	// databases do not have incompatible privileges
-	RemoveIncompatibleDatabasePrivileges
-	// AddRaftAppliedIndexTermMigration is a migration that causes each range
-	// replica to start populating RangeAppliedState.RaftAppliedIndexTerm field.
-	AddRaftAppliedIndexTermMigration
-	// PostAddRaftAppliedIndexTermMigration is used for asserting that
-	// RaftAppliedIndexTerm is populated.
-	PostAddRaftAppliedIndexTermMigration
-	// DontProposeWriteTimestampForLeaseTransfers stops setting the WriteTimestamp
-	// on lease transfer Raft proposals. New leaseholders now forward their clock
-	// directly to the new lease start time.
-	DontProposeWriteTimestampForLeaseTransfers
-	// TenantSettingsTable adds the system table for tracking tenant usage.
-	TenantSettingsTable
-
+	// SingleVersionDescriptorLeaseTable adds the single_version_descriptor_lease
+	// table.
+	SingleVersionDescriptorLeaseTable
 	// *************************************************
 	// Step (1): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -374,60 +336,13 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 34},
 	},
 	{
-		Key:     EnsureSpanConfigReconciliation,
+		Key:     AlterSystemProtectedTimestampAddColumn,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 36},
 	},
+
 	{
-		Key:     EnsureSpanConfigSubscription,
+		Key:     SingleVersionDescriptorLeaseTable,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 38},
-	},
-	{
-		Key:     EnableSpanConfigStore,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 40},
-	},
-	{
-		Key:     ScanWholeRows,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 42},
-	},
-	{
-		Key:     SCRAMAuthentication,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 44},
-	},
-	{
-		Key:     UnsafeLossOfQuorumRecoveryRangeLog,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 46},
-	},
-	{
-		Key:     AlterSystemProtectedTimestampAddColumn,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 48},
-	},
-	{
-		Key:     EnableProtectedTimestampsForTenant,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 50},
-	},
-	{
-		Key:     DeleteCommentsWithDroppedIndexes,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 52},
-	},
-	{
-		Key:     RemoveIncompatibleDatabasePrivileges,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 54},
-	},
-	{
-		Key:     AddRaftAppliedIndexTermMigration,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 56},
-	},
-	{
-		Key:     PostAddRaftAppliedIndexTermMigration,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 58},
-	},
-	{
-		Key:     DontProposeWriteTimestampForLeaseTransfers,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 60},
-	},
-	{
-		Key:     TenantSettingsTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 62},
 	},
 
 	// *************************************************

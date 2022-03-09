@@ -15,10 +15,12 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/singleversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -60,11 +62,17 @@ func (cf *CollectionFactory) Txn(
 ) error {
 	// Waits for descriptors that were modified, skipping
 	// over ones that had their descriptor wiped.
-	waitForDescriptors := func(modifiedDescriptors []lease.IDVersion, deletedDescs catalog.DescriptorIDSet) error {
+	waitForDescriptors := func(modifiedDescriptors []lease.IDVersion, deletedDescs []catalog.Descriptor) error {
 		// Wait for a single version on leased descriptors.
 		for _, ld := range modifiedDescriptors {
-			waitForNoVersion := deletedDescs.Contains(ld.ID)
+			waitForNoVersion := false
 			// Detect unpublished ones.
+			for _, deletedDesc := range deletedDescs {
+				if deletedDesc.GetID() == ld.ID {
+					waitForNoVersion = true
+					break
+				}
+			}
 			if waitForNoVersion {
 				err := cf.leaseMgr.WaitForNoVersion(ctx, ld.ID, retry.Options{})
 				if err != nil {
@@ -81,12 +89,12 @@ func (cf *CollectionFactory) Txn(
 	}
 	for {
 		var modifiedDescriptors []lease.IDVersion
-		var deletedDescs catalog.DescriptorIDSet
+		var deletedDescs []catalog.Descriptor
 		var descsCol Collection
 		if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			modifiedDescriptors = nil
-			deletedDescs = catalog.DescriptorIDSet{}
-			descsCol = cf.MakeCollection(ctx, nil /* temporarySchemaProvider */)
+			deletedDescs = nil
+			descsCol = cf.MakeCollection(nil)
 			defer descsCol.ReleaseAll(ctx)
 			if !UnsafeSkipSystemConfigTrigger.Get(&cf.settings.SV) {
 				if err := txn.SetSystemConfigTrigger(cf.leaseMgr.Codec().ForSystemTenant()); err != nil {
@@ -102,7 +110,7 @@ func (cf *CollectionFactory) Txn(
 			}
 			modifiedDescriptors = descsCol.GetDescriptorsWithNewVersion()
 			retryErr, err := CheckTwoVersionInvariant(
-				ctx, db.Clock(), ie, &descsCol, txn, nil /* onRetryBackoff */)
+				ctx, db.Clock(), ie, &descsCol, txn, cf.preemptor, nil /* onRetryBackoff */)
 			if retryErr {
 				return errTwoVersionInvariantViolated
 			}
@@ -150,6 +158,7 @@ func CheckTwoVersionInvariant(
 	ie sqlutil.InternalExecutor,
 	descsCol *Collection,
 	txn *kv.Txn,
+	preemptor singleversion.Preemptor,
 	onRetryBackoff func(),
 ) (retryDueToViolation bool, _ error) {
 	descs := descsCol.GetDescriptorsWithNewVersion()
@@ -176,6 +185,18 @@ func CheckTwoVersionInvariant(
 	// not modified to ensure that our writes to those other descriptors in this
 	// transaction remain valid.
 	descsCol.ReleaseSpecifiedLeases(ctx, descs)
+
+	// Ensure that no singleversion leases exist by the time that the transaction
+	// commits.
+	if descsCol.settings.Version.IsActive(ctx, clusterversion.SingleVersionDescriptorLeaseTable) {
+		var toPreempt catalog.DescriptorIDSet
+		for _, idv := range descs {
+			toPreempt.Add(idv.ID)
+		}
+		if err := preemptor.EnsureNoSingleVersionLeases(ctx, txn, toPreempt); err != nil {
+			return false, err
+		}
+	}
 
 	// We know that so long as there are no leases on the updated descriptors as of
 	// the current provisional commit timestamp for this transaction then if this

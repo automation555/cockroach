@@ -54,9 +54,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/singleversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -68,7 +70,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -85,7 +86,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -186,20 +186,17 @@ var allowCrossDatabaseSeqReferences = settings.RegisterBoolSetting(
 	false,
 ).WithPublic()
 
-const secondaryTenantsZoneConfigsEnabledSettingName = "sql.zone_configs.allow_for_secondary_tenant.enabled"
+const secondaryTenantsZoneConfigsEnabledSettingName = "sql.zone_configs.experimental_allow_for_secondary_tenant.enabled"
 
 // secondaryTenantZoneConfigsEnabled controls if secondary tenants are allowed
 // to set zone configurations. It has no effect for the system tenant.
 //
 // This setting has no effect on zone configurations that have already been set.
-//
-// TODO(irfansharif): This should be a tenant-readonly setting, possible after
-// the work for #73349 is completed.
 var secondaryTenantZoneConfigsEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	secondaryTenantsZoneConfigsEnabledSettingName,
 	"allow secondary tenants to set zone configurations; does not affect the system tenant",
-	true,
+	false,
 )
 
 // traceTxnThreshold can be used to log SQL transactions that take
@@ -218,11 +215,11 @@ var traceTxnThreshold = settings.RegisterDurationSetting(
 		"within a transaction as well as client communication (e.g. retries).", 0,
 ).WithPublic()
 
-// TraceStmtThreshold is identical to traceTxnThreshold except it applies to
+// traceStmtThreshold is identical to traceTxnThreshold except it applies to
 // individual statements in a transaction. The motivation for this setting is
 // to be able to reduce the noise associated with a larger transaction (e.g.
 // round trips to client).
-var TraceStmtThreshold = settings.RegisterDurationSetting(
+var traceStmtThreshold = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"sql.trace.stmt.enable_threshold",
 	"duration beyond which all statements are traced (set to 0 to disable). "+
@@ -324,14 +321,6 @@ var hashShardedIndexesEnabledClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.experimental_hash_sharded_indexes.enabled",
 	"default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default",
 	false,
-).WithPublic()
-
-var maxHashShardedIndexRangePreSplit = settings.RegisterIntSetting(
-	settings.SystemOnly,
-	"sql.hash_sharded_range_pre_split.max",
-	"max pre-split ranges to have when adding hash sharded index to an existing table",
-	16,
-	settings.PositiveInt,
 ).WithPublic()
 
 var zigzagJoinClusterMode = settings.RegisterBoolSetting(
@@ -707,13 +696,6 @@ var largeFullScanRows = settings.RegisterFloatSetting(
 	1000.0,
 ).WithPublic()
 
-var costScansWithDefaultColSize = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	`sql.defaults.cost_scans_with_default_col_size.enabled`,
-	"setting to true uses the same size for all columns to compute scan cost",
-	false,
-).WithPublic()
-
 var errNoTransactionInProgress = errors.New("there is no transaction in progress")
 var errTransactionInProgress = errors.New("there is already a transaction in progress")
 
@@ -790,14 +772,8 @@ var (
 	}
 	MetaSQLTxnsOpen = metric.Metadata{
 		Name:        "sql.txns.open",
-		Help:        "Number of currently open user SQL transactions",
+		Help:        "Number of currently open SQL transactions",
 		Measurement: "Open SQL Transactions",
-		Unit:        metric.Unit_COUNT,
-	}
-	MetaSQLActiveQueries = metric.Metadata{
-		Name:        "sql.statements.active",
-		Help:        "Number of currently active user SQL statements",
-		Measurement: "Active Statements",
 		Unit:        metric.Unit_COUNT,
 	}
 	MetaFullTableOrIndexScan = metric.Metadata{
@@ -1182,12 +1158,10 @@ type ExecutorConfig struct {
 	DistSQLRunTestingKnobs               *execinfra.TestingKnobs
 	EvalContextTestingKnobs              tree.EvalContextTestingKnobs
 	TenantTestingKnobs                   *TenantTestingKnobs
-	TTLTestingKnobs                      *TTLTestingKnobs
 	BackupRestoreTestingKnobs            *BackupRestoreTestingKnobs
 	StreamingTestingKnobs                *StreamingTestingKnobs
 	SQLStatsTestingKnobs                 *sqlstats.TestingKnobs
 	TelemetryLoggingTestingKnobs         *TelemetryLoggingTestingKnobs
-	SpanConfigTestingKnobs               *spanconfig.TestingKnobs
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval.
 	HistogramWindowInterval time.Duration
 
@@ -1229,8 +1203,8 @@ type ExecutorConfig struct {
 	// IndexValidator is used to validate indexes.
 	IndexValidator scexec.IndexValidator
 
-	// DescMetadaUpdaterFactory is used to issue queries for updating comments.
-	DescMetadaUpdaterFactory scexec.DescriptorMetadataUpdaterFactory
+	// CommentUpdaterFactory is used to issue queries for updating comments.
+	CommentUpdaterFactory scexec.CommentUpdaterFactory
 
 	// ContentionRegistry is a node-level registry of contention events used for
 	// contention observability.
@@ -1256,9 +1230,9 @@ type ExecutorConfig struct {
 	// CollectionFactory is used to construct a descs.Collection.
 	CollectionFactory *descs.CollectionFactory
 
-	// SpanConfigReconciler is used to drive the span config reconciliation job
-	// and related migrations.
-	SpanConfigReconciler spanconfig.Reconciler
+	// SpanConfigReconciliationJobDeps are used to drive the span config
+	// reconciliation job.
+	SpanConfigReconciliationJobDeps spanconfig.ReconciliationDependencies
 
 	// SpanConfigKVAccessor is used when creating and deleting tenant
 	// records.
@@ -1269,9 +1243,12 @@ type ExecutorConfig struct {
 	// This is currently only for builtin functions where we need to execute sql.
 	InternalExecutorFactory sqlutil.SessionBoundInternalExecutorFactory
 
-	// AllowSessionRevival is true if the cluster is allowed to create session
-	// revival tokens and use them to authenticate a session.
-	AllowSessionRevival bool
+	// SystemIDChecker is used to check whether an ID is part of the
+	// system database.
+	SystemIDChecker *catalog.SystemIDChecker
+
+	// SingleVersion is used to preempt single-version leases.
+	SingleVersion singleversion.Preemptor
 }
 
 // UpdateVersionSystemSettingHook provides a callback that allows us
@@ -1345,14 +1322,14 @@ type ExecutorTestingKnobs struct {
 	// BeforeRestart is called before a transaction restarts.
 	BeforeRestart func(ctx context.Context, reason error)
 
-	// DisableAutoCommitDuringExec, if set, disables the auto-commit functionality
-	// of some SQL statements. That functionality allows some statements to commit
+	// DisableAutoCommit, if set, disables the auto-commit functionality of some
+	// SQL statements. That functionality allows some statements to commit
 	// directly when they're executed in an implicit SQL txn, without waiting for
 	// the Executor to commit the implicit txn.
 	// This has to be set in tests that need to abort such statements using a
-	// StatementFilter; otherwise, the statement commits at the same time as
+	// StatementFilter; otherwise, the statement commits immediately after
 	// execution so there'll be nothing left to abort by the time the filter runs.
-	DisableAutoCommitDuringExec bool
+	DisableAutoCommit bool
 
 	// BeforeAutoCommit is called when the Executor is about to commit the KV
 	// transaction after running a statement in an implicit transaction, allowing
@@ -1391,7 +1368,7 @@ type ExecutorTestingKnobs struct {
 	// query (i.e. no subqueries). The physical plan is only safe for use for the
 	// lifetime of this function. Note that returning a nil function is
 	// unsupported and will lead to a panic.
-	TestingSaveFlows func(stmt string) func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execinfra.OpChains) error
+	TestingSaveFlows func(stmt string) func(map[roachpb.NodeID]*execinfrapb.FlowSpec, execinfra.OpChains) error
 
 	// DeterministicExplain, if set, will result in overriding fields in EXPLAIN
 	// and EXPLAIN ANALYZE that can vary between runs (like elapsed times).
@@ -1416,14 +1393,6 @@ type ExecutorTestingKnobs struct {
 
 	// OnTxnRetry, if set, will be called if there is a transaction retry.
 	OnTxnRetry func(autoRetryReason error, evalCtx *tree.EvalContext)
-
-	// BeforeTxnStatsRecorded, if set, will be called before the statistics
-	// of a transaction is being recorded.
-	BeforeTxnStatsRecorded func(
-		sessionData *sessiondata.SessionData,
-		txnID uuid.UUID,
-		txnFingerprintID roachpb.TransactionFingerprintID,
-	)
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -1467,16 +1436,6 @@ var _ base.ModuleTestingKnobs = &TenantTestingKnobs{}
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (*TenantTestingKnobs) ModuleTestingKnobs() {}
-
-// TTLTestingKnobs contains testing knobs for TTL deletion.
-type TTLTestingKnobs struct {
-	// AOSTDuration changes the AOST timestamp duration to add to the
-	// current time.
-	AOSTDuration *time.Duration
-}
-
-// ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
-func (*TTLTestingKnobs) ModuleTestingKnobs() {}
 
 // BackupRestoreTestingKnobs contains knobs for backup and restore behavior.
 type BackupRestoreTestingKnobs struct {
@@ -1871,50 +1830,36 @@ type SessionArgs struct {
 	// client.
 	RemoteAddr            net.Addr
 	ConnResultsBufferSize int64
-	// SessionRevivalToken may contain a token generated from a different session
-	// that can be used to authenticate this session. If it is set, all other
-	// authentication is skipped. Once the token is used to authenticate, this
-	// value should be zeroed out.
-	SessionRevivalToken []byte
 }
 
 // SessionRegistry stores a set of all sessions on this node.
 // Use register() and deregister() to modify this registry.
 type SessionRegistry struct {
 	syncutil.Mutex
-	sessions            map[ClusterWideID]registrySession
-	sessionsByCancelKey map[pgwirecancel.BackendKeyData]registrySession
+	sessions map[ClusterWideID]registrySession
 }
 
 // NewSessionRegistry creates a new SessionRegistry with an empty set
 // of sessions.
 func NewSessionRegistry() *SessionRegistry {
-	return &SessionRegistry{
-		sessions:            make(map[ClusterWideID]registrySession),
-		sessionsByCancelKey: make(map[pgwirecancel.BackendKeyData]registrySession),
-	}
+	return &SessionRegistry{sessions: make(map[ClusterWideID]registrySession)}
 }
 
-func (r *SessionRegistry) register(
-	id ClusterWideID, queryCancelKey pgwirecancel.BackendKeyData, s registrySession,
-) {
+func (r *SessionRegistry) register(id ClusterWideID, s registrySession) {
 	r.Lock()
-	defer r.Unlock()
 	r.sessions[id] = s
-	r.sessionsByCancelKey[queryCancelKey] = s
+	r.Unlock()
 }
 
-func (r *SessionRegistry) deregister(id ClusterWideID, queryCancelKey pgwirecancel.BackendKeyData) {
+func (r *SessionRegistry) deregister(id ClusterWideID) {
 	r.Lock()
-	defer r.Unlock()
 	delete(r.sessions, id)
-	delete(r.sessionsByCancelKey, queryCancelKey)
+	r.Unlock()
 }
 
 type registrySession interface {
 	user() security.SQLUsername
 	cancelQuery(queryID ClusterWideID) bool
-	cancelCurrentQueries() bool
 	cancelSession()
 	// serialize serializes a Session into a serverpb.Session
 	// that can be served over RPC.
@@ -1939,22 +1884,6 @@ func (r *SessionRegistry) CancelQuery(queryIDStr string) (bool, error) {
 	}
 
 	return false, fmt.Errorf("query ID %s not found", queryID)
-}
-
-// CancelQueryByKey looks up the associated query in the session registry and
-// cancels it.
-func (r *SessionRegistry) CancelQueryByKey(
-	queryCancelKey pgwirecancel.BackendKeyData,
-) (canceled bool, err error) {
-	r.Lock()
-	defer r.Unlock()
-	if session, ok := r.sessionsByCancelKey[queryCancelKey]; ok {
-		if session.cancelCurrentQueries() {
-			return true, nil
-		}
-		return false, nil
-	}
-	return false, fmt.Errorf("session for cancel key %d not found", queryCancelKey)
 }
 
 // CancelSession looks up the specified session in the session registry and
@@ -2937,10 +2866,6 @@ func (m *sessionDataMutator) SetSafeUpdates(val bool) {
 	m.data.SafeUpdates = val
 }
 
-func (m *sessionDataMutator) SetCheckFunctionBodies(val bool) {
-	m.data.CheckFunctionBodies = val
-}
-
 func (m *sessionDataMutator) SetPreferLookupJoinsForFKs(val bool) {
 	m.data.PreferLookupJoinsForFKs = val
 }
@@ -3134,12 +3059,6 @@ func (m *sessionDataMutator) SetParallelizeMultiKeyLookupJoinsEnabled(val bool) 
 	m.data.ParallelizeMultiKeyLookupJoinsEnabled = val
 }
 
-// TODO(harding): Remove this when costing scans based on average column size
-// is fully supported.
-func (m *sessionDataMutator) SetCostScansWithDefaultColSize(val bool) {
-	m.data.CostScansWithDefaultColSize = val
-}
-
 // Utility functions related to scrubbing sensitive information on SQL Stats.
 
 // quantizeCounts ensures that the Count field in the
@@ -3247,17 +3166,6 @@ func DescsTxn(
 	f func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error,
 ) error {
 	return execCfg.CollectionFactory.Txn(ctx, execCfg.InternalExecutor, execCfg.DB, f)
-}
-
-// TestingDescsTxn is a convenience function for running a transaction on
-// descriptors when you have a serverutils.TestServerInterface.
-func TestingDescsTxn(
-	ctx context.Context,
-	s serverutils.TestServerInterface,
-	f func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error,
-) error {
-	execCfg := s.ExecutorConfig().(ExecutorConfig)
-	return DescsTxn(ctx, &execCfg, f)
 }
 
 // NewRowMetrics creates a row.Metrics struct for either internal or user

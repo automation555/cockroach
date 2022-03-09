@@ -11,14 +11,23 @@
 package catalog
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/redact"
 )
 
 // DescriptorIDSet efficiently stores an unordered set of descriptor ids.
 type DescriptorIDSet struct {
 	set util.FastIntSet
 }
+
+// SafeValue makes the DescriptorIDSet a redact.SafeValue.
+func (d DescriptorIDSet) SafeValue() {}
+
+var _ redact.SafeValue = DescriptorIDSet{}
 
 // MakeDescriptorIDSet returns a set initialized with the given values.
 func MakeDescriptorIDSet(ids ...descpb.ID) DescriptorIDSet {
@@ -68,7 +77,18 @@ func (d DescriptorIDSet) Ordered() []descpb.ID {
 	return result
 }
 
-// Remove removes the ID from the set.
-func (d *DescriptorIDSet) Remove(id descpb.ID) {
-	d.set.Remove(int(id))
+// String formats the set to a string.
+func (d DescriptorIDSet) String() string {
+	var buf strings.Builder
+	buf.WriteString("{")
+	i := 0
+	d.ForEach(func(id descpb.ID) {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		_, _ = fmt.Fprint(&buf, id)
+		i++
+	})
+	buf.WriteString("}")
+	return buf.String()
 }
