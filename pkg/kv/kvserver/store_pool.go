@@ -41,11 +41,20 @@ const (
 	TestTimeUntilStoreDeadOff = 24 * time.Hour
 )
 
+// DeclinedReservationsTimeout specifies a duration during which the local
+// replicate queue will not consider stores which have rejected a reservation a
+// viable target.
+var DeclinedReservationsTimeout = settings.RegisterDurationSetting(
+	"server.declined_reservation_timeout",
+	"the amount of time to consider the store throttled for up-replication after a reservation was declined",
+	1*time.Second,
+	settings.NonNegativeDuration,
+)
+
 // FailedReservationsTimeout specifies a duration during which the local
 // replicate queue will not consider stores which have failed a reservation a
 // viable target.
 var FailedReservationsTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
 	"server.failed_reservation_timeout",
 	"the amount of time to consider the store throttled for up-replication after a failed reservation call",
 	5*time.Second,
@@ -57,7 +66,6 @@ const timeAfterStoreSuspectSettingName = "server.time_after_store_suspect"
 // TimeAfterStoreSuspect measures how long we consider a store suspect since
 // it's last failure.
 var TimeAfterStoreSuspect = settings.RegisterDurationSetting(
-	settings.TenantWritable,
 	timeAfterStoreSuspectSettingName,
 	"the amount of time we consider a store suspect for after it fails a node liveness heartbeat."+
 		" A suspect node would not receive any new replicas or lease transfers, but will keep the replicas it has.",
@@ -81,7 +89,6 @@ const timeUntilStoreDeadSettingName = "server.time_until_store_dead"
 // TimeUntilStoreDead wraps "server.time_until_store_dead".
 var TimeUntilStoreDead = func() *settings.DurationSetting {
 	s := settings.RegisterDurationSetting(
-		settings.TenantWritable,
 		timeUntilStoreDeadSettingName,
 		"the time after which if there is no new gossiped information about a store, it is considered dead",
 		5*time.Minute,
@@ -112,7 +119,7 @@ type NodeCountFunc func() int
 // expired by more than TimeUntilStoreDead.
 type NodeLivenessFunc func(
 	nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration,
-) livenesspb.NodeLivenessStatus
+) (NodeStatus, NodeMembershipStatus)
 
 // MakeStorePoolNodeLivenessFunc returns a function which determines
 // the status of a node based on information provided by the specified
@@ -120,16 +127,16 @@ type NodeLivenessFunc func(
 func MakeStorePoolNodeLivenessFunc(nodeLiveness *liveness.NodeLiveness) NodeLivenessFunc {
 	return func(
 		nodeID roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration,
-	) livenesspb.NodeLivenessStatus {
+	) (NodeStatus, NodeMembershipStatus) {
 		liveness, ok := nodeLiveness.GetLiveness(nodeID)
 		if !ok {
-			return livenesspb.NodeLivenessStatus_UNKNOWN
+			return NodeStatusUnknown, NodeMembershipStatusUnknown
 		}
 		return LivenessStatus(liveness.Liveness, now, timeUntilStoreDead)
 	}
 }
 
-// LivenessStatus returns a NodeLivenessStatus enumeration value for the
+// LivenessStatus returns a NodeStatus and NodeMembershipStatus values for the
 // provided Liveness based on the provided timestamp and threshold.
 //
 // See the note on IsLive() for considerations on what should be passed in as
@@ -145,37 +152,36 @@ func MakeStorePoolNodeLivenessFunc(nodeLiveness *liveness.NodeLiveness) NodeLive
 //
 //  - Let's say a node write its liveness record at tWrite. It sets the
 //    Expiration field of the record as tExp=tWrite+livenessThreshold.
-//    The node is considered LIVE (or DECOMMISSIONING or DRAINING).
+//    The node is considered LIVE.
 //  - At tExp, the IsLive() method starts returning false. The state becomes
-//    UNAVAILABLE (or stays DECOMMISSIONING or DRAINING).
-//  - Once threshold passes, the node is considered DEAD (or DECOMMISSIONED).
+//    UNAVAILABLE.
+//  - Once threshold passes, the node is considered DEAD.
 //
-// NB: There's a bit of discrepancy between what "Decommissioned" represents, as
-// seen by NodeStatusLiveness, and what "Decommissioned" represents as
-// understood by MembershipStatus. Currently it's possible for a live node, that
-// was marked as fully decommissioned, to have a NodeLivenessStatus of
-// "Decommissioning". This was kept this way for backwards compatibility, and
-// ideally we should remove usage of NodeLivenessStatus altogether. See #50707
-// for more details.
+// The membership status of the node is reported separately and is based on the
+// MembershipStatus proto.
 func LivenessStatus(
 	l livenesspb.Liveness, now time.Time, deadThreshold time.Duration,
-) livenesspb.NodeLivenessStatus {
+) (NodeStatus, NodeMembershipStatus) {
 	if l.IsDead(now, deadThreshold) {
 		if !l.Membership.Active() {
-			return livenesspb.NodeLivenessStatus_DECOMMISSIONED
+			return NodeStatusDead, NodeMembershipStatusDecommissioned
 		}
-		return livenesspb.NodeLivenessStatus_DEAD
+		return NodeStatusDead, NodeMembershipStatusActive
 	}
+	nodeStatus := NodeStatusUnavailable
 	if l.IsLive(now) {
-		if !l.Membership.Active() {
-			return livenesspb.NodeLivenessStatus_DECOMMISSIONING
-		}
-		if l.Draining {
-			return livenesspb.NodeLivenessStatus_DRAINING
-		}
-		return livenesspb.NodeLivenessStatus_LIVE
+		nodeStatus = NodeStatusLive
 	}
-	return livenesspb.NodeLivenessStatus_UNAVAILABLE
+	if l.Membership.Decommissioned() {
+		return nodeStatus, NodeMembershipStatusDecommissioned
+	}
+	if l.Membership.Decommissioning() {
+		return nodeStatus, NodeMembershipStatusDecommissioning
+	}
+	if l.Draining {
+		return nodeStatus, NodeMembershipStatusDraining
+	}
+	return nodeStatus, NodeMembershipStatusActive
 }
 
 type storeDetail struct {
@@ -209,6 +215,50 @@ func (sd storeDetail) isSuspect(now time.Time, suspectDuration time.Duration) bo
 	return sd.lastUnavailable.Add(suspectDuration).After(now)
 }
 
+// NodeStatus is the current status of a node. This measures the health of the node.
+//go:generate stringer -type=NodeStatus
+type NodeStatus int
+
+const (
+	_ NodeStatus = iota
+	// NodeStatusDead describes a node that is dead, i.e. has been unavailable for
+	// longer than `server.time_until_store_dead`.
+	NodeStatusDead
+	// NodeStatusUnavailable describes a node that has been missing liveness
+	// heartbeats, but not for long enough to be declared dead.
+	NodeStatusUnavailable
+	// NodeStatusLive describes a node that is heartbeating and thus live.
+	NodeStatusLive
+	// NodeStatusUnknown communicates that the status of the node is unknown i.e.
+	// there was never a valid heartbeat or gossip message about the node.
+	NodeStatusUnknown
+)
+
+// NodeMembershipStatus describes the status of the node in the cluster, but not
+// its health. It determines if the node is an active participant in the cluster
+// or if it's trying to leave the cluster because it's being drained or
+// decommissioned. This is thus orthogonal to NodeStatus.
+//
+// Note that a decommissioning node may also be draining at the same time, and
+// different use cases may handle this situation differently.
+//go:generate stringer -type=NodeMembershipStatus
+type NodeMembershipStatus int
+
+const (
+	_ NodeMembershipStatus = iota
+	// NodeMembershipStatusActive describes a node is an active participant in the cluster.
+	NodeMembershipStatusActive
+	// NodeMembershipStatusDecommissioning describes a node is being decommissioned.
+	NodeMembershipStatusDecommissioning
+	// NodeMembershipStatusDecommissioned describes a node has been successfully decommissioned.
+	NodeMembershipStatusDecommissioned
+	// NodeMembershipStatusDraining describes a node that is draining.
+	NodeMembershipStatusDraining
+	// NodeMembershipStatusUnknown describes a node whose membership status is
+	// unknown because we have no record of a liveness heartbeat for it.
+	NodeMembershipStatusUnknown
+)
+
 // storeStatus is the current status of a store.
 type storeStatus int
 
@@ -229,6 +279,8 @@ const (
 	storeStatusAvailable
 	// The store is decommissioning.
 	storeStatusDecommissioning
+	// The store is decommissioning, but has failed it's liveness heartbeat
+	storeStatusDecommissioningUnavailable
 	// The store failed it's liveness heartbeat recently and is considered
 	// suspect. Consequently, stores always move from `storeStatusUnknown`
 	// (indicating a node that has a non-live node liveness record) to
@@ -284,21 +336,29 @@ func (sd *storeDetail) status(
 	//
 	// Store statuses checked in the following order:
 	// dead -> decommissioning -> unknown -> draining -> suspect -> available.
-	switch nl(sd.desc.Node.NodeID, now, threshold) {
-	case livenesspb.NodeLivenessStatus_DEAD, livenesspb.NodeLivenessStatus_DECOMMISSIONED:
+	nodeStatus, nodeMembershipStatus := nl(sd.desc.Node.NodeID, now, threshold)
+	if nodeStatus == NodeStatusDead || nodeMembershipStatus == NodeMembershipStatusDecommissioned {
 		return storeStatusDead
-	case livenesspb.NodeLivenessStatus_DECOMMISSIONING:
-		return storeStatusDecommissioning
-	case livenesspb.NodeLivenessStatus_UNAVAILABLE:
+	}
+	if nodeMembershipStatus == NodeMembershipStatusDecommissioning {
+		if nodeStatus == NodeStatusLive {
+			return storeStatusDecommissioning
+		}
+		return storeStatusDecommissioningUnavailable
+	}
+	if nodeStatus == NodeStatusUnavailable {
 		// We don't want to suspect a node on startup or when it's first added to a
 		// cluster, because we dont know its liveness yet.
 		if !sd.lastAvailable.IsZero() {
 			sd.lastUnavailable = now
 		}
 		return storeStatusUnknown
-	case livenesspb.NodeLivenessStatus_UNKNOWN:
+	}
+	if nodeStatus == NodeStatusUnknown {
 		return storeStatusUnknown
-	case livenesspb.NodeLivenessStatus_DRAINING:
+	}
+
+	if nodeMembershipStatus == NodeMembershipStatusDraining {
 		// Wipe out the lastAvailable timestamp, so if this node comes back after a
 		// graceful restart it will not be considered as suspect. This is best effort
 		// and we may not see a store in this state. To help with that we perform
@@ -353,19 +413,10 @@ type StorePool struct {
 		nodeLocalities map[roachpb.NodeID]localityWithString
 	}
 
-	// isStoreReadyForRoutineReplicaTransfer returns true iff the store's node is
-	// live (as indicated by its `NodeLivenessStatus`) and thus a legal candidate
-	// to receive a replica. This is defined as a closure reference here instead
+	// isStoreReadyForRoutineReplicaTransfer returns true if the
+	// store is live and thus a good candidate to receive a replica.
+	// This is defined as a closure reference here instead
 	// of a regular method so it can be overridden in tests.
-	//
-	// NB: What this method aims to capture is distinct from "dead" nodes. Nodes
-	// are classified as "dead" if they haven't successfully heartbeat their
-	// liveness record in the last `server.time_until_store_dead` seconds.
-	//
-	// Functionally, the distinction is that we simply avoid transferring replicas
-	// to "non-ready" nodes (i.e. nodes that _currently_ have a non-live
-	// `NodeLivenessStatus`), whereas we _actively move replicas off of "dead"
-	// nodes_.
 	isStoreReadyForRoutineReplicaTransfer func(context.Context, roachpb.StoreID) bool
 }
 
@@ -591,7 +642,7 @@ func (sp *StorePool) decommissioningReplicas(
 	for _, repl := range repls {
 		detail := sp.getStoreDetailLocked(repl.StoreID)
 		switch detail.status(now, timeUntilStoreDead, sp.nodeLivenessFn, timeAfterStoreSuspect) {
-		case storeStatusDecommissioning:
+		case storeStatusDecommissioning, storeStatusDecommissioningUnavailable:
 			decommissioningReplicas = append(decommissioningReplicas, repl)
 		}
 	}
@@ -706,7 +757,7 @@ func (sp *StorePool) liveAndDeadReplicas(
 			// We count decommissioning replicas to be alive because they are readable
 			// and should be used for up-replication if necessary.
 			liveReplicas = append(liveReplicas, repl)
-		case storeStatusUnknown:
+		case storeStatusUnknown, storeStatusDecommissioningUnavailable:
 		// No-op.
 		case storeStatusSuspect, storeStatusDraining:
 			if includeSuspectAndDrainingStores {
@@ -903,7 +954,7 @@ func (sp *StorePool) getStoreListFromIDsLocked(
 			if filter != storeFilterThrottled && filter != storeFilterSuspect {
 				storeDescriptors = append(storeDescriptors, *detail.desc)
 			}
-		case storeStatusDead, storeStatusUnknown, storeStatusDecommissioning:
+		case storeStatusDead, storeStatusUnknown, storeStatusDecommissioning, storeStatusDecommissioningUnavailable:
 			// Do nothing; this store cannot be used.
 		default:
 			panic(fmt.Sprintf("unknown store status: %d", s))
@@ -916,6 +967,7 @@ type throttleReason int
 
 const (
 	_ throttleReason = iota
+	throttleDeclined
 	throttleFailed
 )
 
@@ -930,10 +982,19 @@ func (sp *StorePool) throttle(reason throttleReason, why string, storeID roachpb
 	detail := sp.getStoreDetailLocked(storeID)
 	detail.throttledBecause = why
 
-	// If a snapshot is declined, we mark the store detail as having been declined
-	// so it won't be considered as a candidate for new replicas until after the
-	// configured timeout period has passed.
+	// If a snapshot is declined, be it due to an error or because it was
+	// rejected, we mark the store detail as having been declined so it won't
+	// be considered as a candidate for new replicas until after the configured
+	// timeout period has passed.
 	switch reason {
+	case throttleDeclined:
+		timeout := DeclinedReservationsTimeout.Get(&sp.st.SV)
+		detail.throttledUntil = sp.clock.PhysicalTime().Add(timeout)
+		if log.V(2) {
+			ctx := sp.AnnotateCtx(context.TODO())
+			log.Infof(ctx, "snapshot declined (%s), s%d will be throttled for %s until %s",
+				why, storeID, timeout, detail.throttledUntil)
+		}
 	case throttleFailed:
 		timeout := FailedReservationsTimeout.Get(&sp.st.SV)
 		detail.throttledUntil = sp.clock.PhysicalTime().Add(timeout)
@@ -942,8 +1003,6 @@ func (sp *StorePool) throttle(reason throttleReason, why string, storeID roachpb
 			log.Infof(ctx, "snapshot failed (%s), s%d will be throttled for %s until %s",
 				why, storeID, timeout, detail.throttledUntil)
 		}
-	default:
-		log.Warningf(sp.AnnotateCtx(context.TODO()), "unknown throttle reason %v", reason)
 	}
 }
 
@@ -1014,7 +1073,7 @@ func (sp *StorePool) isStoreReadyForRoutineReplicaTransferInternal(
 		log.VEventf(ctx, 3,
 			"s%d is a live target, candidate for rebalancing", targetStoreID)
 		return true
-	case storeStatusDead, storeStatusUnknown, storeStatusDecommissioning, storeStatusSuspect, storeStatusDraining:
+	case storeStatusDead, storeStatusUnknown, storeStatusDecommissioning, storeStatusSuspect, storeStatusDraining, storeStatusDecommissioningUnavailable:
 		log.VEventf(ctx, 3,
 			"not considering non-live store s%d (%v)", targetStoreID, status)
 		return false

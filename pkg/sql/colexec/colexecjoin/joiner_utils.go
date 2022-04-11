@@ -21,13 +21,13 @@ import (
 
 // newJoinHelper returns an execinfra.OpNode with two Operator inputs.
 func newJoinHelper(inputOne, inputTwo colexecop.Operator) *joinHelper {
-	return &joinHelper{inputOne: inputOne, inputTwo: inputTwo}
+	return &joinHelper{InputOne: inputOne, InputTwo: inputTwo}
 }
 
 type joinHelper struct {
 	colexecop.InitHelper
-	inputOne colexecop.Operator
-	inputTwo colexecop.Operator
+	InputOne colexecop.Operator
+	InputTwo colexecop.Operator
 }
 
 // init initializes both inputs and returns true if this is the first time init
@@ -36,8 +36,8 @@ func (h *joinHelper) init(ctx context.Context) bool {
 	if !h.Init(ctx) {
 		return false
 	}
-	h.inputOne.Init(h.Ctx)
-	h.inputTwo.Init(h.Ctx)
+	h.InputOne.Init(h.Ctx)
+	h.InputTwo.Init(h.Ctx)
 	return true
 }
 
@@ -48,9 +48,9 @@ func (h *joinHelper) ChildCount(verbose bool) int {
 func (h *joinHelper) Child(nth int, verbose bool) execinfra.OpNode {
 	switch nth {
 	case 0:
-		return h.inputOne
+		return h.InputOne
 	case 1:
-		return h.inputTwo
+		return h.InputTwo
 	}
 	colexecerror.InternalError(errors.AssertionFailedf("invalid idx %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
