@@ -1279,12 +1279,6 @@
           "format": "int64",
           "x-go-name": "RangeCount"
         },
-        "stats_last_created_at": {
-          "description": "stats_last_created_at is the time at which statistics were last created.",
-          "type": "string",
-          "format": "date-time",
-          "x-go-name": "StatsLastCreatedAt"
-        },
         "zone_config": {
           "$ref": "#/definitions/ZoneConfig"
         },
@@ -1488,6 +1482,10 @@
         "priority": {
           "type": "string",
           "x-go-name": "Priority"
+        },
+        "quality_of_service": {
+          "type": "string",
+          "x-go-name": "QualityOfService"
         },
         "read_only": {
           "type": "boolean",
