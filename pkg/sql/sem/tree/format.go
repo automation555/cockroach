@@ -231,6 +231,9 @@ const (
 	// because the behavior of array_to_string() is fixed for compatibility
 	// with PostgreSQL, whereas EXPORT may evolve over time to support
 	// other things (eg. fixing #33429).
+	//
+	// TODO(mjibson): Note that this is currently not suitable for
+	// emitting arrays or tuples. See: #33429
 	FmtExport FmtFlags = FmtBareStrings | fmtRawStrings
 )
 
@@ -296,8 +299,8 @@ func FmtPlaceholderFormat(placeholderFn func(_ *FmtCtx, _ *Placeholder)) FmtCtxO
 	}
 }
 
-// FmtReformatTableNames modifies FmtCtx to to substitute the printing of table
-// naFmtParsable using the provided function.
+// FmtReformatTableNames modifies FmtCtx to to substitute the printing of
+// tableNameFmtParsable using the provided function.
 func FmtReformatTableNames(tableNameFmt func(*FmtCtx, *TableName)) FmtCtxOption {
 	return func(ctx *FmtCtx) {
 		ctx.tableNameFormatter = tableNameFmt
@@ -625,9 +628,12 @@ var fmtCtxPool = sync.Pool{
 // recommended for performance-sensitive paths.
 func (ctx *FmtCtx) Close() {
 	ctx.Buffer.Reset()
-	*ctx = FmtCtx{
-		Buffer: ctx.Buffer,
-	}
+	ctx.flags = 0
+	ctx.ann = nil
+	ctx.indexedVarFormat = nil
+	ctx.tableNameFormatter = nil
+	ctx.placeholderFormat = nil
+	ctx.dataConversionConfig = sessiondatapb.DataConversionConfig{}
 	fmtCtxPool.Put(ctx)
 }
 
