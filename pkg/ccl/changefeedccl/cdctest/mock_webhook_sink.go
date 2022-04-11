@@ -10,6 +10,7 @@ package cdctest
 
 import (
 	"crypto/tls"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -52,23 +53,6 @@ func StartMockWebhookSink(certificate *tls.Certificate) (*MockWebhookSink, error
 	return s, nil
 }
 
-// StartMockWebhookSinkSecure creates and starts a mock webhook sink server that
-// requires clients to provide client certificates for authentication
-func StartMockWebhookSinkSecure(certificate *tls.Certificate) (*MockWebhookSink, error) {
-	s := makeMockWebhookSink()
-	if certificate == nil {
-		return nil, errors.Errorf("Must pass a CA cert when creating a mock webhook sink.")
-	}
-
-	s.server.TLS = &tls.Config{
-		Certificates: []tls.Certificate{*certificate},
-		ClientAuth:   tls.RequireAnyClientCert,
-	}
-
-	s.server.StartTLS()
-	return s, nil
-}
-
 // StartMockWebhookSinkWithBasicAuth creates and starts a mock webhook sink for
 // tests with basic username/password auth.
 func StartMockWebhookSinkWithBasicAuth(
@@ -97,6 +81,12 @@ func makeMockWebhookSink() *MockWebhookSink {
 // URL returns the http address of this mock Webhook sink.
 func (s *MockWebhookSink) URL() string {
 	return s.server.URL
+}
+
+// TrustedEndpoint returns "webhook-https://" endpoint URI which skips
+// TLS verification.
+func (s *MockWebhookSink) TrustedEndpoint() string {
+	return fmt.Sprintf("webhook-%s?insecure_tls_skip_verify=true", s.URL())
 }
 
 // GetNumCalls returns how many times the sink handler has been invoked.

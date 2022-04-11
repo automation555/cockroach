@@ -9,24 +9,19 @@
 package changefeedbase
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/errors"
 )
 
-// ValidateTable validates that a table descriptor can be watched by a CHANGEFEED.
-func ValidateTable(targets jobspb.ChangefeedTargets, tableDesc catalog.TableDescriptor) error {
-	t, ok := targets[tableDesc.GetID()]
-	if !ok {
-		return errors.Errorf(`unwatched table: %s`, tableDesc.GetName())
-	}
-
+// ValidateTableDescriptor validates that a table descriptor can be watched by a CHANGEFEED.
+func ValidateTableDescriptor(tableDesc catalog.TableDescriptor) error {
 	// Technically, the only non-user table known not to work is system.jobs
 	// (which creates a cycle since the resolved timestamp high-water mark is
 	// saved in it), but there are subtle differences in the way many of them
 	// work and this will be under-tested, so disallow them all until demand
 	// dictates.
-	if catalog.IsSystemDescriptor(tableDesc) {
+	if tableDesc.GetID() < keys.MinUserDescID {
 		return errors.Errorf(`CHANGEFEEDs are not supported on system tables`)
 	}
 	if tableDesc.IsView() {
@@ -45,7 +40,7 @@ func ValidateTable(targets jobspb.ChangefeedTargets, tableDesc catalog.TableDesc
 	}
 
 	if tableDesc.Dropped() {
-		return errors.Errorf(`"%s" was dropped`, t.StatementTimeName)
+		return errors.Errorf(`"%s" was dropped`, tableDesc.GetName())
 	}
 
 	if tableDesc.Offline() {
@@ -53,21 +48,4 @@ func ValidateTable(targets jobspb.ChangefeedTargets, tableDesc catalog.TableDesc
 	}
 
 	return nil
-}
-
-// WarningsForTable returns any known nonfatal issues with running a changefeed on this kind of table.
-func WarningsForTable(
-	targets jobspb.ChangefeedTargets, tableDesc catalog.TableDescriptor, opts map[string]string,
-) []error {
-	warnings := []error{}
-	if _, ok := opts[OptVirtualColumns]; !ok {
-		for _, col := range tableDesc.AccessibleColumns() {
-			if col.IsVirtual() {
-				warnings = append(warnings,
-					errors.Errorf("Changefeeds will filter out values for virtual column %s in table %s", col.ColName(), tableDesc.GetName()),
-				)
-			}
-		}
-	}
-	return warnings
 }

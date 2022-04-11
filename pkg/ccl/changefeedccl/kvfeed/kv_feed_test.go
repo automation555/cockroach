@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -46,7 +46,7 @@ func TestKVFeed(t *testing.T) {
 
 	mkKey := func(tableID uint32, k string) roachpb.Key {
 		vDatum := tree.DString(k)
-		key, err := keyside.Encode(keys.SystemSQLCodec.TablePrefix(tableID), &vDatum, encoding.Ascending)
+		key, err := rowenc.EncodeTableKey(keys.SystemSQLCodec.TablePrefix(tableID), &vDatum, encoding.Ascending)
 		require.NoError(t, err)
 		return key
 	}
@@ -123,7 +123,8 @@ func TestKVFeed(t *testing.T) {
 			tc.needsInitialScan, tc.withDiff,
 			tc.initialHighWater,
 			keys.SystemSQLCodec,
-			tf, sf, rangefeedFactory(ref.run), bufferFactory, TestingKnobs{})
+			tf, false, /* backfillonly */
+			sf, rangefeedFactory(ref.run), bufferFactory, TestingKnobs{})
 		ctx, cancel := context.WithCancel(context.Background())
 		g := ctxgroup.WithContext(ctx)
 		g.GoCtx(func(ctx context.Context) error {
@@ -387,7 +388,7 @@ type rawEventFeed []roachpb.RangeFeedEvent
 
 func (f rawEventFeed) run(
 	ctx context.Context,
-	spans []roachpb.Span,
+	span roachpb.Span,
 	startFrom hlc.Timestamp,
 	withDiff bool,
 	eventC chan<- *roachpb.RangeFeedEvent,

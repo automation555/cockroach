@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -280,7 +280,7 @@ func (tf *schemaFeed) primeInitialTableDescs(ctx context.Context) error {
 		// Note that all targets are currently guaranteed to be tables.
 		for tableID := range tf.targets {
 			flags := tree.ObjectLookupFlagsWithRequired()
-			flags.AvoidLeased = true
+			flags.AvoidCached = true
 			tableDesc, err := descriptors.GetImmutableTableByID(ctx, txn, tableID, flags)
 			if err != nil {
 				return err
@@ -525,9 +525,14 @@ func (tf *schemaFeed) validateDescriptor(
 		// manager to acquire the freshest version of the type.
 		return tf.leaseMgr.AcquireFreshestFromStore(ctx, desc.GetID())
 	case catalog.TableDescriptor:
-		if err := changefeedbase.ValidateTable(tf.targets, desc); err != nil {
-			return err
+		if t, ok := tf.targets[desc.GetID()]; ok {
+			if err := changefeedbase.ValidateTableDescriptor(desc); err != nil {
+				return errors.WithDetailf(err, "(statement time name was %s)", t.StatementTimeName)
+			}
+		} else {
+			return errors.Errorf(`unwatched table: %s`, desc.GetName())
 		}
+
 		log.VEventf(ctx, 1, "validate %v", formatDesc(desc))
 		if lastVersion, ok := tf.mu.previousTableVersion[desc.GetID()]; ok {
 			// NB: Writes can occur to a table
@@ -613,7 +618,7 @@ func (tf *schemaFeed) fetchDescriptorVersions(
 	tf.mu.Lock()
 	defer tf.mu.Unlock()
 
-	var descriptors []catalog.Descriptor
+	var descs []catalog.Descriptor
 	for _, file := range res.(*roachpb.ExportResponse).Files {
 		if err := func() error {
 			it, err := storage.NewMemSSTIterator(file.SST, false /* verify */)
@@ -661,16 +666,16 @@ func (tf *schemaFeed) fetchDescriptorVersions(
 					return err
 				}
 
-				b := descbuilder.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
+				b := catalogkv.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
 				if b != nil && (b.DescriptorType() == catalog.Table || b.DescriptorType() == catalog.Type) {
-					descriptors = append(descriptors, b.BuildImmutable())
+					descs = append(descs, b.BuildImmutable())
 				}
 			}
 		}(); err != nil {
 			return nil, err
 		}
 	}
-	return descriptors, nil
+	return descs, nil
 }
 
 type doNothingSchemaFeed struct{}
