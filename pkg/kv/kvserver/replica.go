@@ -694,8 +694,6 @@ type Replica struct {
 	}
 }
 
-var _ batcheval.EvalContext = &Replica{}
-
 // String returns the string representation of the replica using an
 // inconsistent copy of the range descriptor. Therefore, String does not
 // require a lock and its output may not be atomic with other ongoing work in
@@ -909,18 +907,6 @@ func (r *Replica) GetGCThreshold() hlc.Timestamp {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return *r.mu.state.GCThreshold
-}
-
-// ExcludeDataFromBackup returns whether the replica is to be excluded from a
-// backup.
-func (r *Replica) ExcludeDataFromBackup() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.mu.conf.ExcludeDataFromBackup
-}
-
-func (r *Replica) exludeReplicaFromBackupRLocked() bool {
-	return r.mu.conf.ExcludeDataFromBackup
 }
 
 // Version returns the replica version.
@@ -1223,7 +1209,7 @@ func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
 	// NB: this acquires an RLock(). Reentrant RLocks are deadlock prone, so do
 	// this first before RLocking below. Performance of this extra lock
 	// acquisition is not a concern.
-	ri.ActiveClosedTimestamp = r.GetClosedTimestamp(ctx)
+	ri.ActiveClosedTimestamp = r.GetCurrentClosedTimestamp(ctx)
 
 	// NB: numRangefeedRegistrations doesn't require Replica.mu to be locked.
 	// However, it does require coordination between multiple goroutines, so
@@ -1526,9 +1512,8 @@ func (r *Replica) checkTSAboveGCThresholdRLocked(
 		return nil
 	}
 	return &roachpb.BatchTimestampBeforeGCError{
-		Timestamp:              ts,
-		Threshold:              threshold,
-		DataExcludedFromBackup: r.exludeReplicaFromBackupRLocked(),
+		Timestamp: ts,
+		Threshold: threshold,
 	}
 }
 
