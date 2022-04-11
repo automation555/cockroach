@@ -5,6 +5,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "persistedsqlstats",
     srcs = [
+        "aggregated_ts_reader.go",
         "appStats.go",
         "cluster_settings.go",
         "combined_iterator.go",
@@ -26,7 +27,7 @@ go_library(
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
         "//pkg/kv",
-        "//pkg/roachpb",
+        "//pkg/roachpb:with-mocks",
         "//pkg/scheduledjobs",
         "//pkg/security",
         "//pkg/server/serverpb",
@@ -46,13 +47,14 @@ go_library(
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_gogo_protobuf//types",
-        "@com_github_robfig_cron_v3//:cron",
+        "@com_github_gorhill_cronexpr//:cronexpr",
     ],
 )
 
 go_test(
     name = "persistedsqlstats_test",
     srcs = [
+        "aggregated_ts_reader_test.go",
         "bench_test.go",
         "compaction_test.go",
         "controller_test.go",
@@ -72,7 +74,7 @@ go_test(
         "//pkg/kv",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/kvserverbase",
-        "//pkg/roachpb",
+        "//pkg/roachpb:with-mocks",
         "//pkg/scheduledjobs",
         "//pkg/security",
         "//pkg/security/securitytest",
@@ -80,6 +82,7 @@ go_test(
         "//pkg/sql",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/systemschema",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondata",
         "//pkg/sql/sqlstats",
