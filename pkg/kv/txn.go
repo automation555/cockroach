@@ -1481,7 +1481,17 @@ func (txn *Txn) GenerateForcedRetryableError(ctx context.Context, msg string) er
 	now := txn.db.clock.NowAsClockTimestamp()
 	txn.mu.sender.ManualRestart(ctx, txn.mu.userPriority, now.ToTimestamp())
 	txn.resetDeadlineLocked()
-	return txn.mu.sender.PrepareRetryableError(ctx, msg)
+	return roachpb.NewTransactionRetryWithProtoRefreshError(
+		msg,
+		txn.mu.ID,
+		roachpb.MakeTransaction(
+			txn.debugNameLocked(),
+			nil, // baseKey
+			txn.mu.userPriority,
+			now.ToTimestamp(),
+			txn.db.clock.MaxOffset().Nanoseconds(),
+			int32(txn.db.ctx.NodeID.SQLInstanceID())),
+	)
 }
 
 // PrepareRetryableError returns a
@@ -1577,6 +1587,13 @@ func (txn *Txn) Step(ctx context.Context) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	return txn.mu.sender.Step(ctx)
+}
+
+// SetReadSeqNum sets the read sequence number for this transaction.
+func (txn *Txn) SetReadSeqNum(seq enginepb.TxnSeq) {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	txn.mu.sender.SetReadSeqNum(seq)
 }
 
 // ConfigureStepping configures step-wise execution in the
