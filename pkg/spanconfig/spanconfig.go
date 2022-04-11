@@ -24,19 +24,26 @@ import (
 // KVAccessor mediates access to KV span configurations pertaining to a given
 // tenant.
 type KVAccessor interface {
-	// GetSpanConfigRecords returns the span configurations that apply to or
-	// overlap with the supplied targets.
-	GetSpanConfigRecords(ctx context.Context, targets []Target) ([]Record, error)
+	// GetSpanConfigEntriesFor returns the span configurations that overlap with
+	// the given spans and system span configs installed by the tenant
+	// (if requested).
+	// TODO(arul): Rename this to say records.
+	GetSpanConfigEntriesFor(
+		ctx context.Context,
+		tenantID roachpb.TenantID,
+		spans []roachpb.Span,
+		includeSystemSpanConfigs bool,
+	) ([]Record, error)
 
-	// UpdateSpanConfigRecords updates configurations for the given key targets.
-	// This is a "targeted" API: the exact targets being deleted are expected to
-	// have been present; if targets are being updated with new configs, they're
-	// expected to be present exactly as well.
-	//
-	// Targets are not allowed to overlap with each other. When divvying up an
-	// existing target into multiple others with distinct configs, callers must
-	// issue deletes for the previous target and upserts for the new records.
-	UpdateSpanConfigRecords(
+	// UpdateSpanConfigEntries updates configurations for the given spans. This
+	// is a "targeted" API: the spans being deleted are expected to have been
+	// present with the exact same bounds; if spans are being updated with new
+	// configs, they're expected to have been present with the same bounds. When
+	// divvying up an existing span into multiple others with distinct configs,
+	// callers are to issue a delete for the previous span and upserts for the
+	// new ones.
+	// TODO(arul): Update the comment + rename to say records.
+	UpdateSpanConfigEntries(
 		ctx context.Context,
 		toDelete []Target,
 		toUpsert []Record,
@@ -78,7 +85,7 @@ type KVAccessor interface {
 type KVSubscriber interface {
 	StoreReader
 	LastUpdated() hlc.Timestamp
-	Subscribe(func(ctx context.Context, updated roachpb.Span))
+	Subscribe(func(updated roachpb.Span))
 }
 
 // SQLTranslator translates SQL descriptors and their corresponding zone
@@ -233,20 +240,6 @@ type StoreReader interface {
 	GetSpanConfigForKey(ctx context.Context, key roachpb.RKey) (roachpb.SpanConfig, error)
 }
 
-// Record ties a target to its corresponding config.
-type Record struct {
-	// Target specifies the target (keyspan(s)) the config applies over.
-	Target Target
-
-	// Config is the set of attributes that apply over the corresponding target.
-	Config roachpb.SpanConfig
-}
-
-// IsEmpty returns true if the receiver is an empty Record.
-func (r *Record) IsEmpty() bool {
-	return r.Target.isEmpty() && r.Config.IsEmpty()
-}
-
 // SQLUpdate captures either a descriptor or a protected timestamp update.
 // It is the unit emitted by the SQLWatcher.
 type SQLUpdate struct {
@@ -328,39 +321,4 @@ func (p *ProtectedTimestampUpdate) IsClusterUpdate() bool {
 // target.
 func (p *ProtectedTimestampUpdate) IsTenantsUpdate() bool {
 	return !p.ClusterTarget
-}
-
-// Update captures a span and the corresponding config change. It's the unit of
-// what can be applied to a StoreWriter. The embedded span captures what's being
-// updated; the config captures what it's being updated to. An empty config
-// indicates a deletion.
-type Update Record
-
-// Deletion constructs an update that represents a deletion over the given
-// target.
-func Deletion(target Target) Update {
-	return Update{
-		Target: target,
-		Config: roachpb.SpanConfig{}, // delete
-	}
-}
-
-// Addition constructs an update that represents adding the given config over
-// the given target.
-func Addition(target Target, conf roachpb.SpanConfig) Update {
-	return Update{
-		Target: target,
-		Config: conf,
-	}
-}
-
-// Deletion returns true if the update corresponds to a span config being
-// deleted.
-func (u Update) Deletion() bool {
-	return u.Config.IsEmpty()
-}
-
-// Addition returns true if the update corresponds to a span config being added.
-func (u Update) Addition() bool {
-	return !u.Deletion()
 }

@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtarget"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -36,9 +37,7 @@ func (s *Store) TestingApplyInternal(
 func (s *Store) TestingSpanConfigStoreForEachOverlapping(
 	span roachpb.Span, f func(spanConfigEntry) error,
 ) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.mu.spanConfigStore.forEachOverlapping(span, f)
+	return s.spanConfigStore.forEachOverlapping(span, f)
 }
 
 // TestDataDriven runs datadriven tests against the Store interface.
@@ -134,7 +133,7 @@ func TestDataDriven(t *testing.T) {
 					func(entry spanConfigEntry) error {
 						results = append(results,
 							spanconfigtestutils.PrintSpanConfigRecord(spanconfig.Record{
-								Target: spanconfig.MakeTargetFromSpan(entry.span),
+								Target: spanconfigtarget.NewSpanTarget(entry.span),
 								Config: entry.config,
 							}),
 						)
@@ -161,15 +160,15 @@ func TestStoreClone(t *testing.T) {
 
 	updates := []spanconfig.Update{
 		spanconfig.Addition(
-			spanconfig.MakeTargetFromSpan(spanconfigtestutils.ParseSpan(t, "[a, b)")),
+			spanconfigtarget.NewSpanTarget(spanconfigtestutils.ParseSpan(t, "[a, b)")),
 			spanconfigtestutils.ParseConfig(t, "A"),
 		),
 		spanconfig.Addition(
-			spanconfig.MakeTargetFromSpan(spanconfigtestutils.ParseSpan(t, "[c, d)")),
+			spanconfigtarget.NewSpanTarget(spanconfigtestutils.ParseSpan(t, "[c, d)")),
 			spanconfigtestutils.ParseConfig(t, "C"),
 		),
 		spanconfig.Addition(
-			spanconfig.MakeTargetFromSpan(spanconfigtestutils.ParseSpan(t, "[e, f)")),
+			spanconfigtarget.NewSpanTarget(spanconfigtestutils.ParseSpan(t, "[e, f)")),
 			spanconfigtestutils.ParseConfig(t, "E"),
 		),
 	}

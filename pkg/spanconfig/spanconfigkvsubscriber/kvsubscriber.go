@@ -167,7 +167,7 @@ func (s *KVSubscriber) Start(ctx context.Context, stopper *stop.Stopper) error {
 
 // Subscribe installs a callback that's invoked with whatever span may have seen
 // a config update.
-func (s *KVSubscriber) Subscribe(fn func(context.Context, roachpb.Span)) {
+func (s *KVSubscriber) Subscribe(fn func(roachpb.Span)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -230,7 +230,7 @@ func (s *KVSubscriber) handleCompleteUpdate(
 	handlers := s.mu.handlers
 	s.mu.Unlock()
 	for _, h := range handlers {
-		h.invoke(ctx, keys.EverythingSpan)
+		h.invoke(keys.EverythingSpan)
 	}
 }
 
@@ -250,12 +250,9 @@ func (s *KVSubscriber) handlePartialUpdate(
 
 	for _, h := range handlers {
 		for _, ev := range events {
-			// TODO(arul): In the future, once we start reacting to system span
-			// configurations, we'll want to invoke handlers with the correct span
-			// here as well.
-			target := ev.(*bufferEvent).Update.Target
-			if target.IsSpanTarget() {
-				h.invoke(ctx, target.GetSpan())
+			// TODO(arul): Hijack system span config events here.
+			if ev.(*bufferEvent).Update.IsSpanConfigUpdate() {
+				h.invoke(ev.(*bufferEvent).Update.Target.Encode())
 			}
 		}
 	}
@@ -263,12 +260,12 @@ func (s *KVSubscriber) handlePartialUpdate(
 
 type handler struct {
 	initialized bool // tracks whether we need to invoke with a [min,max) span first
-	fn          func(ctx context.Context, update roachpb.Span)
+	fn          func(update roachpb.Span)
 }
 
-func (h *handler) invoke(ctx context.Context, update roachpb.Span) {
+func (h *handler) invoke(update roachpb.Span) {
 	if !h.initialized {
-		h.fn(ctx, keys.EverythingSpan)
+		h.fn(keys.EverythingSpan)
 		h.initialized = true
 
 		if update.Equal(keys.EverythingSpan) {
@@ -276,7 +273,7 @@ func (h *handler) invoke(ctx context.Context, update roachpb.Span) {
 		}
 	}
 
-	h.fn(ctx, update)
+	h.fn(update)
 }
 
 type bufferEvent struct {

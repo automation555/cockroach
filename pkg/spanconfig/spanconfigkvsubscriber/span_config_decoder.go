@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedbuffer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtarget"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -49,7 +50,7 @@ func newSpanConfigDecoder() *spanConfigDecoder {
 // system.span_configurations table.
 func (sd *spanConfigDecoder) decode(kv roachpb.KeyValue) (spanconfig.Record, error) {
 	// First we need to decode the start_key field from the index key.
-	var rawSp roachpb.Span
+	var sp roachpb.Span
 	var conf roachpb.SpanConfig
 	{
 		types := []*types.T{sd.columns[0].GetType()}
@@ -61,11 +62,11 @@ func (sd *spanConfigDecoder) decode(kv roachpb.KeyValue) (spanconfig.Record, err
 		if err := startKeyRow[0].EnsureDecoded(types[0], &sd.alloc); err != nil {
 			return spanconfig.Record{}, err
 		}
-		rawSp.Key = []byte(tree.MustBeDBytes(startKeyRow[0].Datum))
+		sp.Key = []byte(tree.MustBeDBytes(startKeyRow[0].Datum))
 	}
 	if !kv.Value.IsPresent() {
 		return spanconfig.Record{},
-			errors.AssertionFailedf("missing value for start key: %s", rawSp.Key)
+			errors.AssertionFailedf("missing value for start key: %s", sp.Key)
 	}
 
 	// The remaining columns are stored as a family.
@@ -79,7 +80,7 @@ func (sd *spanConfigDecoder) decode(kv roachpb.KeyValue) (spanconfig.Record, err
 		return spanconfig.Record{}, err
 	}
 	if endKey := datums[1]; endKey != tree.DNull {
-		rawSp.EndKey = []byte(tree.MustBeDBytes(endKey))
+		sp.EndKey = []byte(tree.MustBeDBytes(endKey))
 	}
 	if config := datums[2]; config != tree.DNull {
 		if err := protoutil.Unmarshal([]byte(tree.MustBeDBytes(config)), &conf); err != nil {
@@ -88,11 +89,13 @@ func (sd *spanConfigDecoder) decode(kv roachpb.KeyValue) (spanconfig.Record, err
 	}
 
 	return spanconfig.Record{
-		Target: spanconfig.DecodeTarget(rawSp),
+		Target: spanconfigtarget.Decode(sp),
 		Config: conf,
 	}, nil
 }
 
+// translateEvent is intended to be used as a rangefeedcache.TranslateEventFunc.
+// The function converts a RangeFeedValue to a bufferEvent.
 func (sd *spanConfigDecoder) translateEvent(
 	ctx context.Context, ev *roachpb.RangeFeedValue,
 ) rangefeedbuffer.Event {

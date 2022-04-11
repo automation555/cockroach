@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtarget"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -149,21 +150,10 @@ func CreateTenantRecord(
 	// Does it even matter given it'll disappear as soon as tenant starts
 	// reconciling?
 	tenantSpanConfig := execCfg.DefaultZoneConfig.AsSpanConfig()
-	// Make sure to enable rangefeeds; the tenant will need them on its system
-	// tables as soon as it starts up. It's not unsafe/buggy if we didn't do this,
-	// -- the tenant's span config reconciliation process would eventually install
-	// appropriate (rangefeed.enabled = true) configs for its system tables, at
-	// which point subsystems that rely on rangefeeds are able to proceed. All of
-	// this can noticeably slow down pod startup, so we just enable things to
-	// start with.
-	tenantSpanConfig.RangefeedEnabled = true
-	// Make it behave like usual system database ranges, for good measure.
-	tenantSpanConfig.GCPolicy.IgnoreStrictEnforcement = true
-
 	tenantPrefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(tenID))
 	toUpsert := []spanconfig.Record{
 		{
-			Target: spanconfig.MakeTargetFromSpan(roachpb.Span{
+			Target: spanconfigtarget.NewSpanTarget(roachpb.Span{
 				Key:    tenantPrefix,
 				EndKey: tenantPrefix.Next(),
 			}),
@@ -171,7 +161,7 @@ func CreateTenantRecord(
 		},
 	}
 	scKVAccessor := execCfg.SpanConfigKVAccessor.WithTxn(ctx, txn)
-	return scKVAccessor.UpdateSpanConfigRecords(
+	return scKVAccessor.UpdateSpanConfigEntries(
 		ctx, nil /* toDelete */, toUpsert,
 	)
 }
@@ -452,26 +442,26 @@ func GCTenantSync(ctx context.Context, execCfg *ExecutorConfig, info *descpb.Ten
 			return nil
 		}
 
-		// Clear out all span config records left over by the tenant.
-		tenantPrefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(info.ID))
+		// Clear out all span config entries left over by the tenant.
+		tenantID := roachpb.MakeTenantID(info.ID)
+		tenantPrefix := keys.MakeTenantPrefix(tenantID)
 		tenantSpan := roachpb.Span{
 			Key:    tenantPrefix,
 			EndKey: tenantPrefix.PrefixEnd(),
 		}
 
 		scKVAccessor := execCfg.SpanConfigKVAccessor.WithTxn(ctx, txn)
-		records, err := scKVAccessor.GetSpanConfigRecords(
-			ctx, []spanconfig.Target{spanconfig.MakeTargetFromSpan(tenantSpan)},
-		)
+		entries, err := scKVAccessor.GetSpanConfigEntriesFor(ctx, tenantID, []roachpb.Span{tenantSpan}, true /* includeSystemSpanConfigs */)
 		if err != nil {
 			return err
 		}
 
-		toDelete := make([]spanconfig.Target, len(records))
-		for i, record := range records {
-			toDelete[i] = record.Target
+		// TODO(arul): account for removing system span config entries here as well.
+		toDelete := make([]spanconfig.Target, 0, len(entries)+1)
+		for i, entry := range entries {
+			toDelete[i] = entry.Target
 		}
-		return scKVAccessor.UpdateSpanConfigRecords(ctx, toDelete, nil /* toUpsert */)
+		return scKVAccessor.UpdateSpanConfigEntries(ctx, toDelete, nil /* toUpsert */)
 	})
 	return errors.Wrapf(err, "deleting tenant %d record", info.ID)
 }

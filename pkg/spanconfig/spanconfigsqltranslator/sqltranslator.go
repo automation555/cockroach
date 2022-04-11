@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtarget"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -112,8 +113,8 @@ func (s *SQLTranslator) Translate(
 		if err != nil {
 			return err
 		}
-		if !scratchRangeRecord.IsEmpty() {
-			records = append(records, scratchRangeRecord)
+		if scratchRangeRecord != nil {
+			records = append(records, *scratchRangeRecord)
 		}
 
 		// For every unique leaf ID, generate span configurations.
@@ -237,7 +238,7 @@ func (s *SQLTranslator) generateSpanConfigurationsForNamedZone(
 	var records []spanconfig.Record
 	for _, span := range spans {
 		records = append(records, spanconfig.Record{
-			Target: spanconfig.MakeTargetFromSpan(span),
+			Target: spanconfigtarget.NewSpanTarget(span),
 			Config: spanConfig,
 		})
 	}
@@ -282,10 +283,6 @@ func (s *SQLTranslator) generateSpanConfigurationsForTable(
 		ptsStateReader.getProtectionPoliciesForSchemaObject(desc.GetID()),
 		ptsStateReader.getProtectionPoliciesForSchemaObject(desc.GetParentID())...)
 
-	// Set whether the table's row data has been marked to be excluded from
-	// backups.
-	tableSpanConfig.ExcludeDataFromBackup = desc.(catalog.TableDescriptor).GetExcludeDataFromBackup()
-
 	records := make([]spanconfig.Record, 0)
 	if desc.GetID() == keys.DescriptorTableID {
 		// We have some special handling for `system.descriptor` on account of
@@ -298,7 +295,7 @@ func (s *SQLTranslator) generateSpanConfigurationsForTable(
 			// but looking at range boundaries, it's slightly less confusing
 			// this way.
 			records = append(records, spanconfig.Record{
-				Target: spanconfig.MakeTargetFromSpan(roachpb.Span{
+				Target: spanconfigtarget.NewSpanTarget(roachpb.Span{
 					Key:    s.codec.TenantPrefix(),
 					EndKey: tableEndKey,
 				}),
@@ -315,7 +312,7 @@ func (s *SQLTranslator) generateSpanConfigurationsForTable(
 			// (tiny) re-splitting costs when switching between the two
 			// subsystems.
 			records = append(records, spanconfig.Record{
-				Target: spanconfig.MakeTargetFromSpan(roachpb.Span{
+				Target: spanconfigtarget.NewSpanTarget(roachpb.Span{
 					Key:    keys.SystemConfigSpan.Key,
 					EndKey: tableEndKey,
 				}),
@@ -379,7 +376,7 @@ func (s *SQLTranslator) generateSpanConfigurationsForTable(
 		if !prevEndKey.Equal(span.Key) {
 			records = append(records,
 				spanconfig.Record{
-					Target: spanconfig.MakeTargetFromSpan(roachpb.Span{Key: prevEndKey, EndKey: span.Key}),
+					Target: spanconfigtarget.NewSpanTarget(roachpb.Span{Key: prevEndKey, EndKey: span.Key}),
 					Config: tableSpanConfig,
 				},
 			)
@@ -387,17 +384,16 @@ func (s *SQLTranslator) generateSpanConfigurationsForTable(
 
 		// Add an entry for the subzone.
 		subzoneSpanConfig := zone.Subzones[zone.SubzoneSpans[i].SubzoneIndex].Config.AsSpanConfig()
-		// Copy relevant fields that apply to the table's SpanConfig onto its
+		// Copy the ProtectionPolicies that apply to the table's SpanConfig onto its
 		// SubzoneSpanConfig.
 		subzoneSpanConfig.GCPolicy.ProtectionPolicies = tableSpanConfig.GCPolicy.ProtectionPolicies[:]
-		subzoneSpanConfig.ExcludeDataFromBackup = tableSpanConfig.ExcludeDataFromBackup
 		if isSystemDesc { // same as above
 			subzoneSpanConfig.RangefeedEnabled = true
 			subzoneSpanConfig.GCPolicy.IgnoreStrictEnforcement = true
 		}
 		records = append(records,
 			spanconfig.Record{
-				Target: spanconfig.MakeTargetFromSpan(roachpb.Span{Key: span.Key, EndKey: span.EndKey}),
+				Target: spanconfigtarget.NewSpanTarget(roachpb.Span{Key: span.Key, EndKey: span.EndKey}),
 				Config: subzoneSpanConfig,
 			},
 		)
@@ -410,7 +406,7 @@ func (s *SQLTranslator) generateSpanConfigurationsForTable(
 	if !prevEndKey.Equal(tableEndKey) {
 		records = append(records,
 			spanconfig.Record{
-				Target: spanconfig.MakeTargetFromSpan(roachpb.Span{Key: prevEndKey, EndKey: tableEndKey}),
+				Target: spanconfigtarget.NewSpanTarget(roachpb.Span{Key: prevEndKey, EndKey: tableEndKey}),
 				Config: tableSpanConfig,
 			},
 		)
@@ -581,7 +577,7 @@ func (s *SQLTranslator) maybeGeneratePseudoTableRecords(
 			tableStartKey := s.codec.TablePrefix(pseudoTableID)
 			tableEndKey := tableStartKey.PrefixEnd()
 			records = append(records, spanconfig.Record{
-				Target: spanconfig.MakeTargetFromSpan(roachpb.Span{
+				Target: spanconfigtarget.NewSpanTarget(roachpb.Span{
 					Key:    tableStartKey,
 					EndKey: tableEndKey,
 				}),
@@ -597,9 +593,9 @@ func (s *SQLTranslator) maybeGeneratePseudoTableRecords(
 
 func (s *SQLTranslator) maybeGenerateScratchRangeRecord(
 	ctx context.Context, txn *kv.Txn, ids descpb.IDs,
-) (spanconfig.Record, error) {
+) (*spanconfig.Record, error) {
 	if !s.knobs.ConfigureScratchRange || !s.codec.ForSystemTenant() {
-		return spanconfig.Record{}, nil // nothing to do
+		return nil, nil // nothing to do
 	}
 
 	for _, id := range ids {
@@ -609,11 +605,11 @@ func (s *SQLTranslator) maybeGenerateScratchRangeRecord(
 
 		zone, err := sql.GetHydratedZoneConfigForDatabase(ctx, txn, s.codec, keys.RootNamespaceID)
 		if err != nil {
-			return spanconfig.Record{}, err
+			return nil, err
 		}
 
-		return spanconfig.Record{
-			Target: spanconfig.MakeTargetFromSpan(roachpb.Span{
+		return &spanconfig.Record{
+			Target: spanconfigtarget.NewSpanTarget(roachpb.Span{
 				Key:    keys.ScratchRangeMin,
 				EndKey: keys.ScratchRangeMax,
 			}),
@@ -621,5 +617,5 @@ func (s *SQLTranslator) maybeGenerateScratchRangeRecord(
 		}, nil
 	}
 
-	return spanconfig.Record{}, nil
+	return nil, nil
 }

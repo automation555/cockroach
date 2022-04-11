@@ -325,7 +325,7 @@ var (
 	SystemSpanConfigSecondaryTenantOnEntireKeyspace = roachpb.Key(makeKey(SystemSpanConfigPrefix, roachpb.RKey("ten/")))
 	// SystemSpanConfigKeyMax is the maximum value for any system span config key.
 	SystemSpanConfigKeyMax = SystemSpanConfigPrefix.PrefixEnd()
-
+	//
 	// 3. System tenant SQL keys
 	//
 	// TODO(nvanbenschoten): Figure out what to do with all of these. At a
