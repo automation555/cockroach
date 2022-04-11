@@ -49,9 +49,7 @@ func runTLP(ctx context.Context, t test.Test, c cluster.Cluster) {
 	timeout := 10 * time.Minute
 	// Run 10 minute iterations of TLP in a loop for about the entire test,
 	// giving 5 minutes at the end to allow the test to shut down cleanly.
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithTimeout(ctx, t.Spec().(*registry.TestSpec).Timeout-5*time.Minute)
-	defer cancel()
+	until := time.After(t.Spec().(*registry.TestSpec).Timeout - 5*time.Minute)
 	done := ctx.Done()
 
 	c.Put(ctx, t.Cockroach(), "./cockroach")
@@ -62,6 +60,8 @@ func runTLP(ctx context.Context, t test.Test, c cluster.Cluster) {
 	for i := 0; ; i++ {
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 		select {
+		case <-until:
+			return
 		case <-done:
 			return
 		default:
@@ -118,6 +118,19 @@ func runOneTLP(
 		t.Fatal(err)
 	}
 	logStmt(setStmtTimeout)
+
+	if rng.Float64() < 0.5 {
+		// In 50% of cases set distsql_workmem variable to a random value in
+		// [100KB, 2.1MB] range.
+		workmem := rng.Intn(2<<20) + 100<<10
+		setDistSQLWorkmem := fmt.Sprintf("SET distsql_workem='%dB';", workmem)
+		t.Status("setting distsql_workmem")
+		t.L().Printf("%s", setDistSQLWorkmem)
+		if _, err := conn.Exec(setDistSQLWorkmem); err != nil {
+			t.Fatal(err)
+		}
+		logStmt(setDistSQLWorkmem)
+	}
 
 	// Initialize a smither that generates only INSERT, UPDATE, and DELETE
 	// statements with the MutationsOnly option. Smither.GenerateTLP always

@@ -254,7 +254,7 @@ func newHashBasedPartitioner(
 		// If memory limit is 1, we're likely in a "force disk spill"
 		// scenario, but we don't want to artificially limit batches when we
 		// have already spilled, so we'll use a larger limit.
-		memoryLimit = execinfra.DefaultMemoryLimit
+		memoryLimit = execinfra.ProductionDefaultMemoryLimit
 	}
 	maxPartitionSizeToProcessUsingMain := memoryLimit - int64(diskQueuesMemUsed)
 	if maxPartitionSizeToProcessUsingMain < hbpMinimalMaxPartitionSizeForMain {
@@ -618,7 +618,7 @@ StateChanged:
 			return b
 
 		case hbpFinished:
-			if err := op.Close(op.Ctx); err != nil {
+			if err := op.Close(); err != nil {
 				colexecerror.InternalError(err)
 			}
 			return coldata.ZeroBatch
@@ -629,10 +629,11 @@ StateChanged:
 	}
 }
 
-func (op *hashBasedPartitioner) Close(ctx context.Context) error {
+func (op *hashBasedPartitioner) Close() error {
 	if !op.CloserHelper.Close() {
 		return nil
 	}
+	ctx := op.EnsureCtx()
 	log.VEventf(ctx, 1, "%s is closed", op.name)
 	var retErr error
 	for i := range op.inputs {
@@ -643,7 +644,7 @@ func (op *hashBasedPartitioner) Close(ctx context.Context) error {
 	// The in-memory main operator might be a Closer (e.g. the in-memory hash
 	// aggregator), and we need to close it if so.
 	if c, ok := op.inMemMainOp.(colexecop.Closer); ok {
-		if err := c.Close(ctx); err != nil {
+		if err := c.Close(); err != nil {
 			retErr = err
 		}
 	}
@@ -651,7 +652,7 @@ func (op *hashBasedPartitioner) Close(ctx context.Context) error {
 	// it will still be closed appropriately because we accumulate all closers
 	// in NewColOperatorResult.
 	if c, ok := op.diskBackedFallbackOp.(colexecop.Closer); ok {
-		if err := c.Close(ctx); err != nil {
+		if err := c.Close(); err != nil {
 			retErr = err
 		}
 	}

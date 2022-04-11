@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -131,11 +132,7 @@ type ServerConfig struct {
 	// draining state.
 	Gossip gossip.OptionalGossip
 
-	// Dialer for communication between SQL and KV nodes.
 	NodeDialer *nodedialer.Dialer
-
-	// Dialer for communication between SQL nodes/pods.
-	PodNodeDialer *nodedialer.Dialer
 
 	// SessionBoundInternalExecutorFactory is used to construct session-bound
 	// executors. The idea is that a higher-layer binds some of the arguments
@@ -285,7 +282,16 @@ func (*TestingKnobs) ModuleTestingKnobs() {}
 
 // DefaultMemoryLimit is the default value of
 // sql.distsql.temp_storage.workmem cluster setting.
-const DefaultMemoryLimit = 64 << 20 /* 64 MiB */
+var DefaultMemoryLimit = int64(util.ConstantWithMetamorphicTestRange(
+	"workmem",
+	ProductionDefaultMemoryLimit,
+	2, /* min */
+	2, /* max, 8 MiB */
+))
+
+// ProductionDefaultMemoryLimit is the value used for DefaultMemoryLimit in the
+// production setting.
+const ProductionDefaultMemoryLimit = 2
 
 // GetWorkMemLimit returns the number of bytes determining the amount of RAM
 // available to a single processor or operator.

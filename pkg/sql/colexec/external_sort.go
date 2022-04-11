@@ -246,7 +246,7 @@ func NewExternalSorter(
 		// If memory limit is 1, we're likely in a "force disk spill"
 		// scenario, but we don't want to artificially limit batches when we
 		// have already spilled, so we'll use a larger limit.
-		memoryLimit = execinfra.DefaultMemoryLimit
+		memoryLimit = execinfra.ProductionDefaultMemoryLimit
 	}
 	// Each disk queue will use up to BufferSizeBytes of RAM, so we reduce the
 	// memoryLimit of the partitions to sort in memory by those cache sizes.
@@ -406,7 +406,7 @@ func (s *externalSorter) Next() coldata.Batch {
 			for b := merger.Next(); ; b = merger.Next() {
 				partitionDone := s.enqueue(b)
 				if b.Length() == 0 || partitionDone {
-					if err := merger.Close(s.Ctx); err != nil {
+					if err := merger.Close(); err != nil {
 						colexecerror.InternalError(err)
 					}
 					break
@@ -469,7 +469,7 @@ func (s *externalSorter) Next() coldata.Batch {
 			return b
 
 		case externalSorterFinished:
-			if err := s.Close(s.Ctx); err != nil {
+			if err := s.Close(); err != nil {
 				colexecerror.InternalError(err)
 			}
 			return coldata.ZeroBatch
@@ -584,7 +584,7 @@ func (s *externalSorter) Reset(ctx context.Context) {
 		r.Reset(ctx)
 	}
 	s.state = externalSorterNewPartition
-	if err := s.Close(ctx); err != nil {
+	if err := s.Close(); err != nil {
 		colexecerror.InternalError(err)
 	}
 	// Reset the CloserHelper so that the sorter may be closed again.
@@ -597,10 +597,11 @@ func (s *externalSorter) Reset(ctx context.Context) {
 	s.emitted = 0
 }
 
-func (s *externalSorter) Close(ctx context.Context) error {
+func (s *externalSorter) Close() error {
 	if !s.CloserHelper.Close() {
 		return nil
 	}
+	ctx := s.EnsureCtx()
 	log.VEvent(ctx, 1, "external sorter is closed")
 	var lastErr error
 	if s.partitioner != nil {
@@ -608,7 +609,7 @@ func (s *externalSorter) Close(ctx context.Context) error {
 		s.partitioner = nil
 	}
 	if c, ok := s.emitter.(colexecop.Closer); ok {
-		if err := c.Close(ctx); err != nil {
+		if err := c.Close(); err != nil {
 			lastErr = err
 		}
 	}
