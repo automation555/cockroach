@@ -90,9 +90,8 @@ type changeAggregator struct {
 	// boundary information.
 	frontier *schemaChangeFrontier
 
-	metrics    *Metrics
-	sliMetrics *sliMetrics
-	knobs      TestingKnobs
+	metrics *Metrics
+	knobs   TestingKnobs
 }
 
 type timestampLowerBoundOracle interface {
@@ -164,30 +163,31 @@ func newChangeAggregatorProcessor(
 		return nil, err
 	}
 
-	// MinCheckpointFrequency controls how frequently the changeAggregator flushes the sink
-	// and checkpoints the local frontier to changeFrontier. It is used as a rough
-	// approximation of how latency-sensitive the changefeed user is. For a high latency
-	// user, such as cloud storage sink where flushes can take much longer, it is often set
-	// as the sink's flush frequency so as not to negate the sink's batch config.
+	// If the resolved timestamp frequency is specified, use it as a rough
+	// approximation of how latency-sensitive the changefeed user is. If it's
+	// not, fall back to a default of 5s
 	//
-	// If a user does not specify a 'min_checkpoint_frequency' duration, we instead default
-	// to 30s, which is hopefully long enough to account for most possible sink latencies we
-	// could see without falling too behind.
+	// With timeBetweenFlushes and changefeedPollInterval both set to 1s, TPCC
+	// was seeing about 100x more time spent emitting than flushing when tested
+	// with low-latency sinks like Kafka. However when using cloud-storage
+	// sinks, flushes can take much longer and trying to flush too often can
+	// thus end up spending too much time flushing and not enough in emitting to
+	// keep up with the feed. If a user does not specify a 'resolved' time, we
+	// instead default to 5s, which is hopefully long enough to account for most
+	// possible sink latencies we could see without falling behind.
 	//
 	// NB: As long as we periodically get new span-level resolved timestamps
 	// from the poller (which should always happen, even if the watched data is
 	// not changing), then this is sufficient and we don't have to do anything
 	// fancy with timers.
-	// // TODO(casper): add test for OptMinCheckpointFrequency.
-	if r, ok := ca.spec.Feed.Opts[changefeedbase.OptMinCheckpointFrequency]; ok && r != `` {
+	if r, ok := ca.spec.Feed.Opts[changefeedbase.OptResolvedTimestamps]; ok && r != `` {
 		ca.flushFrequency, err = time.ParseDuration(r)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		ca.flushFrequency = changefeedbase.DefaultMinCheckpointFrequency
+		ca.flushFrequency = changefeedbase.DefaultFlushFrequency
 	}
-
 	return ca, nil
 }
 
@@ -206,16 +206,7 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 	ctx, ca.cancel = context.WithCancel(ctx)
 	ca.Ctx = ctx
 
-	initialHighWater, needsInitialScan := getKVFeedInitialParameters(ca.spec)
-
-	frontierHighWater := initialHighWater
-	if needsInitialScan {
-		// The frontier highwater marks the latest timestamp we don't need to emit
-		// spans for, and therefore should be 0 if an initial scan is needed
-		frontierHighWater = hlc.Timestamp{}
-	}
-	spans, err := ca.setupSpansAndFrontier(frontierHighWater)
-
+	spans, err := ca.setupSpansAndFrontier()
 	if err != nil {
 		ca.MoveToDraining(err)
 		ca.cancel()
@@ -241,19 +232,9 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 	kvFeedMemMon.Start(ctx, pool, mon.BoundAccount{})
 	ca.kvFeedMemMon = kvFeedMemMon
 
-	// The job registry has a set of metrics used to monitor the various jobs it
-	// runs. They're all stored as the `metric.Struct` interface because of
-	// dependency cycles.
-	ca.metrics = ca.flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
-	ca.sliMetrics, err = ca.metrics.getSLIMetrics(ca.spec.Feed.Opts[changefeedbase.OptMetricsScope])
-	if err != nil {
-		ca.MoveToDraining(err)
-		ca.cancel()
-		return
-	}
-
-	ca.sink, err = getSink(ctx, ca.flowCtx.Cfg, ca.spec.Feed, timestampOracle,
-		ca.spec.User(), ca.spec.JobID, ca.sliMetrics)
+	ca.sink, err = getSink(
+		ctx, ca.flowCtx.Cfg, ca.spec.Feed, timestampOracle,
+		ca.spec.User(), ca.spec.JobID)
 
 	if err != nil {
 		err = changefeedbase.MarkRetryableError(err)
@@ -269,9 +250,15 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 		ca.changedRowBuf = &b.buf
 	}
 
+	// The job registry has a set of metrics used to monitor the various jobs it
+	// runs. They're all stored as the `metric.Struct` interface because of
+	// dependency cycles.
+	ca.metrics = ca.flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
+	ca.sink = makeMetricsSink(ca.metrics, ca.sink)
 	ca.sink = &errorWrapperSink{wrapped: ca.sink}
 
-	ca.eventProducer, err = ca.startKVFeed(ctx, spans, initialHighWater, needsInitialScan, ca.sliMetrics)
+	initialHighWater, needsInitialScan := getKVFeedInitialParameters(ca.spec)
+	ca.eventProducer, err = ca.startKVFeed(ctx, spans, initialHighWater, needsInitialScan)
 	if err != nil {
 		// Early abort in the case that there is an error creating the sink.
 		ca.MoveToDraining(err)
@@ -289,20 +276,14 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 }
 
 func (ca *changeAggregator) startKVFeed(
-	ctx context.Context,
-	spans []roachpb.Span,
-	initialHighWater hlc.Timestamp,
-	needsInitialScan bool,
-	sm *sliMetrics,
+	ctx context.Context, spans []roachpb.Span, initialHighWater hlc.Timestamp, needsInitialScan bool,
 ) (kvevent.Reader, error) {
 	cfg := ca.flowCtx.Cfg
-	buf := kvevent.NewThrottlingBuffer(
-		kvevent.NewMemBuffer(ca.kvFeedMemMon.MakeBoundAccount(), &cfg.Settings.SV, &ca.metrics.KVFeedMetrics),
-		cdcutils.NodeLevelThrottler(&cfg.Settings.SV, &ca.metrics.ThrottleMetrics))
-
-	// KVFeed takes ownership of the kvevent.Writer portion of the buffer, while
-	// we return the kvevent.Reader part to the caller.
-	kvfeedCfg := ca.makeKVFeedCfg(ctx, spans, buf, initialHighWater, needsInitialScan, sm)
+	kvfeedCfg := ca.makeKVFeedCfg(ctx, spans, initialHighWater, needsInitialScan)
+	execFeed, reader, err := kvfeed.SetupFeed(ctx, kvfeedCfg)
+	if err != nil {
+		return nil, err
+	}
 
 	// Give errCh enough buffer both possible errors from supporting goroutines,
 	// but only the first one is ever used.
@@ -312,7 +293,7 @@ func (ca *changeAggregator) startKVFeed(
 		defer close(ca.kvFeedDoneCh)
 		// Trying to call MoveToDraining here is racy (`MoveToDraining called in
 		// state stateTrailingMeta`), so return the error via a channel.
-		ca.errCh <- kvfeed.Run(ctx, kvfeedCfg)
+		ca.errCh <- execFeed(ctx)
 		ca.cancel()
 	}); err != nil {
 		// If err != nil then the RunAsyncTask closure never ran, which means we
@@ -323,17 +304,11 @@ func (ca *changeAggregator) startKVFeed(
 		ca.cancel()
 		return nil, err
 	}
-
-	return buf, nil
+	return kvevent.NewThrottlingReader(reader, cdcutils.NodeLevelThrottler(&cfg.Settings.SV)), nil
 }
 
 func (ca *changeAggregator) makeKVFeedCfg(
-	ctx context.Context,
-	spans []roachpb.Span,
-	buf kvevent.Writer,
-	initialHighWater hlc.Timestamp,
-	needsInitialScan bool,
-	sm *sliMetrics,
+	ctx context.Context, spans []roachpb.Span, initialHighWater hlc.Timestamp, needsInitialScan bool,
 ) kvfeed.Config {
 	schemaChangeEvents := changefeedbase.SchemaChangeEventClass(
 		ca.spec.Feed.Opts[changefeedbase.OptSchemaChangeEvents])
@@ -351,7 +326,6 @@ func (ca *changeAggregator) makeKVFeedCfg(
 	}
 
 	return kvfeed.Config{
-		Writer:             buf,
 		Settings:           cfg.Settings,
 		DB:                 cfg.DB,
 		Codec:              cfg.Codec,
@@ -361,7 +335,6 @@ func (ca *changeAggregator) makeKVFeedCfg(
 		BackfillCheckpoint: ca.spec.Checkpoint.Spans,
 		Targets:            ca.spec.Feed.Targets,
 		Metrics:            &ca.metrics.KVFeedMetrics,
-		OnBackfillCallback: ca.sliMetrics.getBackfillCallback(),
 		MM:                 ca.kvFeedMemMon,
 		InitialHighWater:   initialHighWater,
 		WithDiff:           withDiff,
@@ -406,32 +379,18 @@ func getKVFeedInitialParameters(
 // different SpanFrontier elsewhere for the entire changefeed. This object is
 // used to filter out some previously emitted rows, and by the cloudStorageSink
 // to name its output files in lexicographically monotonic fashion.
-func (ca *changeAggregator) setupSpansAndFrontier(
-	initialHighWater hlc.Timestamp,
-) (spans []roachpb.Span, err error) {
+func (ca *changeAggregator) setupSpansAndFrontier() (spans []roachpb.Span, err error) {
 	spans = make([]roachpb.Span, 0, len(ca.spec.Watches))
 	for _, watch := range ca.spec.Watches {
 		spans = append(spans, watch.Span)
 	}
 
-	ca.frontier, err = makeSchemaChangeFrontier(initialHighWater, spans...)
+	ca.frontier, err = makeSchemaChangeFrontier(spans...)
 	if err != nil {
 		return nil, err
 	}
-
-	// Checkpointed spans are spans that were above the highwater mark, and we
-	// must preserve that information in the frontier for future checkpointing.
-	// If we don't have a highwater yet (during initial scan) they must at least
-	// be from StatementTime, and given an initial highwater they must all by
-	// definition have been at or after initialHighWater.Next()
-	var checkpointedSpanTs hlc.Timestamp
-	if initialHighWater.IsEmpty() {
-		checkpointedSpanTs = ca.spec.Feed.StatementTime
-	} else {
-		checkpointedSpanTs = initialHighWater.Next()
-	}
-	for _, checkpointedSpan := range ca.spec.Checkpoint.Spans {
-		if _, err := ca.frontier.Forward(checkpointedSpan, checkpointedSpanTs); err != nil {
+	for _, watch := range ca.spec.Watches {
+		if _, err := ca.frontier.Forward(watch.Span, watch.InitialResolved); err != nil {
 			return nil, err
 		}
 	}
@@ -444,26 +403,28 @@ func (ca *changeAggregator) setupSpansAndFrontier(
 // processor did not finish completion, there is an excessive amount of nil
 // checking.
 func (ca *changeAggregator) close() {
-	if ca.Closed {
-		return
-	}
-	ca.cancel()
-	// Wait for the poller to finish shutting down.
-	if ca.kvFeedDoneCh != nil {
-		<-ca.kvFeedDoneCh
-	}
-	if ca.sink != nil {
-		if err := ca.sink.Close(); err != nil {
-			log.Warningf(ca.Ctx, `error closing sink. goroutines may have leaked: %v`, err)
+	if ca.InternalClose() {
+		// Shut down the poller if it wasn't already. Note that it will cancel
+		// the context used by all components, but ca.Ctx has been updated by
+		// InternalClose() to the "original" context (the one passed into
+		// StartInternal()).
+		ca.cancel()
+		// Wait for the poller to finish shutting down.
+		if ca.kvFeedDoneCh != nil {
+			<-ca.kvFeedDoneCh
 		}
-	}
+		if ca.sink != nil {
+			if err := ca.sink.Close(); err != nil {
+				log.Warningf(ca.Ctx, `error closing sink. goroutines may have leaked: %v`, err)
+			}
+		}
 
-	ca.memAcc.Close(ca.Ctx)
-	if ca.kvFeedMemMon != nil {
-		ca.kvFeedMemMon.Stop(ca.Ctx)
+		ca.memAcc.Close(ca.Ctx)
+		if ca.kvFeedMemMon != nil {
+			ca.kvFeedMemMon.Stop(ca.Ctx)
+		}
+		ca.MemMonitor.Stop(ca.Ctx)
 	}
-	ca.MemMonitor.Stop(ca.Ctx)
-	ca.InternalClose()
 }
 
 // Next is part of the RowSource interface.
@@ -475,22 +436,17 @@ func (ca *changeAggregator) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMet
 			return ca.ProcessRowHelper(ca.resolvedSpanBuf.Pop()), nil
 		}
 		if err := ca.tick(); err != nil {
-			var e kvevent.ErrBufferClosed
-			if errors.As(err, &e) {
+			if errors.Is(err, kvevent.ErrBufferClosed) {
 				// ErrBufferClosed is a signal that
 				// our kvfeed has exited expectedly.
-				err = e.Unwrap()
-				if errors.Is(err, kvevent.ErrNormalRestartReason) {
-					err = nil
-				}
-			} else {
+				err = nil
+			}
 
-				select {
-				// If the poller errored first, that's the
-				// interesting one, so overwrite `err`.
-				case err = <-ca.errCh:
-				default:
-				}
+			select {
+			// If the poller errored first, that's the
+			// interesting one, so overwrite `err`.
+			case err = <-ca.errCh:
+			default:
 			}
 			// Shut down the poller if it wasn't already.
 			ca.cancel()
@@ -511,15 +467,19 @@ func (ca *changeAggregator) tick() error {
 		return err
 	}
 
-	queuedNanos := timeutil.Since(event.BufferAddTimestamp()).Nanoseconds()
-	ca.metrics.QueueTimeNanos.Inc(queuedNanos)
+	if event.BufferGetTimestamp() == (time.Time{}) {
+		// We could gracefully handle this instead of panic'ing, but
+		// we'd really like to be able to reason about this data, so
+		// instead we're defensive. If this is ever seen in prod without
+		// breaking a unit test, then we have a pretty severe test
+		// coverage issue.
+		panic(`unreachable: bufferGetTimestamp is set by all codepaths`)
+	}
+	processingNanos := timeutil.Since(event.BufferGetTimestamp()).Nanoseconds()
+	ca.metrics.ProcessingNanos.Inc(processingNanos)
 
 	switch event.Type() {
 	case kvevent.TypeKV:
-		// Keep track of SLI latency for non-backfill/rangefeed KV events.
-		if event.BackfillTimestamp().IsEmpty() {
-			ca.sliMetrics.AdmitLatency.RecordValue(timeutil.Since(event.Timestamp().GoTime()).Nanoseconds())
-		}
 		return ca.eventConsumer.ConsumeEvent(ca.Ctx, event)
 	case kvevent.TypeResolved:
 		a := event.DetachAlloc()
@@ -535,9 +495,6 @@ func (ca *changeAggregator) tick() error {
 	return nil
 }
 
-// noteResolvedSpan periodically flushes Frontier progress from the current
-// changeAggregator node to the changeFrontier node to allow the changeFrontier
-// to persist the overall changefeed's progress
 func (ca *changeAggregator) noteResolvedSpan(resolved *jobspb.ResolvedSpan) error {
 	advanced, err := ca.frontier.ForwardResolvedSpan(*resolved)
 	if err != nil {
@@ -545,14 +502,13 @@ func (ca *changeAggregator) noteResolvedSpan(resolved *jobspb.ResolvedSpan) erro
 	}
 
 	forceFlush := resolved.BoundaryType != jobspb.ResolvedSpan_NONE
-
 	checkpointFrontier := advanced &&
-		(forceFlush || timeutil.Since(ca.lastFlush) > ca.flushFrequency)
+		(forceFlush || ca.lastFlush.Add(ca.flushFrequency).Before(timeutil.Now()))
 
-	// If backfilling we must also consider the Backfill Checkpointing frequency
+	// We can attempt to checkpoint initial backfill progress.
 	checkpointBackfill := ca.spec.JobID != 0 && /* enterprise changefeed */
-		resolved.Timestamp.Equal(ca.frontier.BackfillTS()) &&
-		canCheckpointBackfill(&ca.flowCtx.Cfg.Settings.SV, ca.lastFlush)
+		ca.frontier.Frontier().IsEmpty() && /* initial backfill */
+		canCheckpointInitialScan(&ca.flowCtx.Cfg.Settings.SV, ca.lastFlush)
 
 	if checkpointFrontier || checkpointBackfill {
 		defer func() {
@@ -577,15 +533,10 @@ func (ca *changeAggregator) flushFrontier() error {
 	// Iterate frontier spans and build a list of spans to emit.
 	var batch jobspb.ResolvedSpans
 	ca.frontier.Entries(func(s roachpb.Span, ts hlc.Timestamp) span.OpResult {
-		boundaryType := jobspb.ResolvedSpan_NONE
-		if ca.frontier.boundaryTime.Equal(ts) {
-			boundaryType = ca.frontier.boundaryType
-		}
-
 		batch.ResolvedSpans = append(batch.ResolvedSpans, jobspb.ResolvedSpan{
 			Span:         s,
 			Timestamp:    ts,
-			BoundaryType: boundaryType,
+			BoundaryType: ca.frontier.boundaryTypeAt(ts),
 		})
 		return span.ContinueMatch
 	})
@@ -714,7 +665,7 @@ func (c *kvEventToRowConsumer) ConsumeEvent(ctx context.Context, ev kvevent.Even
 	}
 	if err := c.sink.EmitRow(
 		ctx, tableDescriptorTopic{r.tableDesc},
-		keyCopy, valueCopy, r.updated, r.mvccTimestamp, ev.DetachAlloc(),
+		keyCopy, valueCopy, r.updated, ev.DetachAlloc(),
 	); err != nil {
 		return err
 	}
@@ -742,7 +693,14 @@ func (c *kvEventToRowConsumer) eventToRow(
 		return r, err
 	}
 
-	r.tableDesc = desc
+	if _, ok := c.details.Targets[desc.GetID()]; !ok {
+		// This kv is for an interleaved table that we're not watching.
+		if log.V(3) {
+			log.Infof(ctx, `skipping key from unwatched table %s: %s`, desc.GetName(), event.KV().Key)
+		}
+		return r, nil
+	}
+
 	rf, err := c.rfCache.RowFetcherForTableDesc(desc)
 	if err != nil {
 		return r, err
@@ -753,11 +711,11 @@ func (c *kvEventToRowConsumer) eventToRow(
 	// Reuse kvs to save allocations.
 	c.kvFetcher.KVs = c.kvFetcher.KVs[:0]
 	c.kvFetcher.KVs = append(c.kvFetcher.KVs, event.KV())
-	if err := rf.StartScanFrom(ctx, &c.kvFetcher, false /* traceKV */); err != nil {
+	if err := rf.StartScanFrom(ctx, &c.kvFetcher); err != nil {
 		return r, err
 	}
 
-	r.datums, err = rf.NextRow(ctx)
+	r.datums, r.tableDesc, _, err = rf.NextRow(ctx)
 	if err != nil {
 		return r, err
 	}
@@ -771,10 +729,8 @@ func (c *kvEventToRowConsumer) eventToRow(
 
 	// Assert that we don't get a second row from the row.Fetcher. We
 	// fed it a single KV, so that would be surprising.
-	nextRow := encodeRow{
-		tableDesc: desc,
-	}
-	nextRow.datums, err = rf.NextRow(ctx)
+	var nextRow encodeRow
+	nextRow.datums, nextRow.tableDesc, _, err = rf.NextRow(ctx)
 	if err != nil {
 		return r, err
 	}
@@ -786,7 +742,6 @@ func (c *kvEventToRowConsumer) eventToRow(
 	_, withDiff := c.details.Opts[changefeedbase.OptDiff]
 	if withDiff {
 		prevRF := rf
-		r.prevTableDesc = r.tableDesc
 		if prevSchemaTimestamp != schemaTimestamp {
 			// If the previous value is being interpreted under a different
 			// version of the schema, fetch the correct table descriptor and
@@ -796,7 +751,6 @@ func (c *kvEventToRowConsumer) eventToRow(
 				return r, err
 			}
 
-			r.prevTableDesc = prevDesc
 			prevRF, err = c.rfCache.RowFetcherForTableDesc(prevDesc)
 			if err != nil {
 				return r, err
@@ -808,10 +762,10 @@ func (c *kvEventToRowConsumer) eventToRow(
 		// Reuse kvs to save allocations.
 		c.kvFetcher.KVs = c.kvFetcher.KVs[:0]
 		c.kvFetcher.KVs = append(c.kvFetcher.KVs, prevKV)
-		if err := prevRF.StartScanFrom(ctx, &c.kvFetcher, false /* traceKV */); err != nil {
+		if err := prevRF.StartScanFrom(ctx, &c.kvFetcher); err != nil {
 			return r, err
 		}
-		r.prevDatums, err = prevRF.NextRow(ctx)
+		r.prevDatums, r.prevTableDesc, _, err = prevRF.NextRow(ctx)
 		if err != nil {
 			return r, err
 		}
@@ -823,10 +777,8 @@ func (c *kvEventToRowConsumer) eventToRow(
 
 		// Assert that we don't get a second row from the row.Fetcher. We
 		// fed it a single KV, so that would be surprising.
-		nextRow := encodeRow{
-			prevTableDesc: r.prevTableDesc,
-		}
-		nextRow.prevDatums, err = prevRF.NextRow(ctx)
+		var nextRow encodeRow
+		nextRow.prevDatums, nextRow.prevTableDesc, _, err = prevRF.NextRow(ctx)
 		if err != nil {
 			return r, err
 		}
@@ -876,8 +828,7 @@ func (c *nativeKVConsumer) ConsumeEvent(ctx context.Context, ev kvevent.Event) e
 		return err
 	}
 
-	return c.sink.EmitRow(
-		ctx, &noTopic{}, keyBytes, valBytes, val.Timestamp, val.Timestamp, ev.DetachAlloc())
+	return c.sink.EmitRow(ctx, &noTopic{}, keyBytes, valBytes, val.Timestamp, ev.DetachAlloc())
 }
 
 const (
@@ -891,7 +842,7 @@ type changeFrontier struct {
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.ChangeFrontierSpec
 	memAcc  mon.BoundAccount
-	a       tree.DatumAlloc
+	a       rowenc.DatumAlloc
 
 	// input returns rows from one or more changeAggregator processors
 	input execinfra.RowSource
@@ -928,8 +879,7 @@ type changeFrontier struct {
 	// `passthroughBuf` being sent, so that one needs to be emptied first.
 	resolvedBuf *encDatumRowBuffer
 	// metrics are monitoring counters shared between all changefeeds.
-	metrics    *Metrics
-	sliMetrics *sliMetrics
+	metrics *Metrics
 	// metricsID is used as the unique id of this changefeed in the
 	// metrics.MaxBehindNanos map.
 	metricsID int
@@ -969,7 +919,7 @@ func newJobState(
 	}
 }
 
-func canCheckpointBackfill(sv *settings.Values, lastCheckpoint time.Time) bool {
+func canCheckpointInitialScan(sv *settings.Values, lastCheckpoint time.Time) bool {
 	freq := changefeedbase.FrontierCheckpointFrequency.Get(sv)
 	if freq == 0 {
 		return false
@@ -977,8 +927,8 @@ func canCheckpointBackfill(sv *settings.Values, lastCheckpoint time.Time) bool {
 	return timeutil.Since(lastCheckpoint) > freq
 }
 
-func (j *jobState) canCheckpointBackfill() bool {
-	return canCheckpointBackfill(&j.settings.SV, j.lastProgressUpdate)
+func (j *jobState) canCheckpointInitialScan() bool {
+	return canCheckpointInitialScan(&j.settings.SV, j.lastProgressUpdate)
 }
 
 // canCheckpointHighWatermark returns true if we should update job high water mark (i.e. progress).
@@ -1039,7 +989,7 @@ func newChangeFrontierProcessor(
 ) (execinfra.Processor, error) {
 	ctx := flowCtx.EvalCtx.Ctx()
 	memMonitor := execinfra.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "changefntr-mem")
-	sf, err := makeSchemaChangeFrontier(hlc.Timestamp{}, spec.TrackedSpans...)
+	sf, err := makeSchemaChangeFrontier(spec.TrackedSpans...)
 	if err != nil {
 		return nil, err
 	}
@@ -1101,24 +1051,12 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 	ctx = cf.StartInternal(ctx, changeFrontierProcName)
 	cf.input.Start(ctx)
 
-	// The job registry has a set of metrics used to monitor the various jobs it
-	// runs. They're all stored as the `metric.Struct` interface because of
-	// dependency cycles.
-	// TODO(yevgeniy): Figure out how to inject replication stream metrics.
-	cf.metrics = cf.flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
-
 	// Pass a nil oracle because this sink is only used to emit resolved timestamps
 	// but the oracle is only used when emitting row updates.
 	var nilOracle timestampLowerBoundOracle
 	var err error
-	sli, err := cf.metrics.getSLIMetrics(cf.spec.Feed.Opts[changefeedbase.OptMetricsScope])
-	if err != nil {
-		cf.MoveToDraining(err)
-		return
-	}
-	cf.sliMetrics = sli
 	cf.sink, err = getSink(ctx, cf.flowCtx.Cfg, cf.spec.Feed, nilOracle,
-		cf.spec.User(), cf.spec.JobID, sli)
+		cf.spec.User(), cf.spec.JobID)
 
 	if err != nil {
 		err = changefeedbase.MarkRetryableError(err)
@@ -1130,11 +1068,17 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 		cf.resolvedBuf = &b.buf
 	}
 
+	// The job registry has a set of metrics used to monitor the various jobs it
+	// runs. They're all stored as the `metric.Struct` interface because of
+	// dependency cycles.
+	// TODO(yevgeniy): Figure out how to inject replication stream metrics.
+	cf.metrics = cf.flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
+	cf.sink = makeMetricsSink(cf.metrics, cf.sink)
 	cf.sink = &errorWrapperSink{wrapped: cf.sink}
 
 	cf.highWaterAtStart = cf.spec.Feed.StatementTime
 	if cf.spec.JobID != 0 {
-		job, err := cf.flowCtx.Cfg.JobRegistry.LoadClaimedJob(ctx, cf.spec.JobID)
+		job, err := cf.flowCtx.Cfg.JobRegistry.LoadJob(ctx, cf.spec.JobID)
 		if err != nil {
 			cf.MoveToDraining(err)
 			return
@@ -1146,22 +1090,9 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 				"Frontier checkpointing disabled; set changefeed.frontier_checkpoint_frequency to non-zero value to re-enable")
 		}
 
-		// Recover highwater information from job progress.
-		// Checkpoint information from job progress will eventually be sent to the
-		// changeFrontier from the changeAggregators.  Note that the changeFrontier
-		// may save a new checkpoint prior to receiving all spans of the
-		// aggregators' frontier, potentially missing spans that were previously
-		// checkpointed, so it is still possible for job progress to regress.
 		p := job.Progress()
 		if ts := p.GetHighWater(); ts != nil {
 			cf.highWaterAtStart.Forward(*ts)
-			cf.frontier.initialHighWater = *ts
-			for _, span := range cf.spec.TrackedSpans {
-				if _, err := cf.frontier.Forward(span, *ts); err != nil {
-					cf.MoveToDraining(err)
-					return
-				}
-			}
 		}
 
 		if p.RunningStatus != "" {
@@ -1175,7 +1106,7 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 	cf.metrics.mu.Lock()
 	cf.metricsID = cf.metrics.mu.id
 	cf.metrics.mu.id++
-	sli.RunningCount.Inc(1)
+	cf.metrics.Running.Inc(1)
 	cf.metrics.mu.Unlock()
 	// TODO(dan): It's very important that we de-register from the metric because
 	// if we orphan an entry in there, our monitoring will lie (say the changefeed
@@ -1212,7 +1143,7 @@ func (cf *changeFrontier) closeMetrics() {
 	// considered by the gauge.
 	cf.metrics.mu.Lock()
 	if cf.metricsID > 0 {
-		cf.sliMetrics.RunningCount.Dec(1)
+		cf.metrics.Running.Dec(1)
 	}
 	delete(cf.metrics.mu.resolved, cf.metricsID)
 	cf.metricsID = -1
@@ -1327,7 +1258,7 @@ func (cf *changeFrontier) forwardFrontier(resolved jobspb.ResolvedSpan) error {
 	// have no distributed state whatsoever. Because of this they also do not
 	// use protected timestamps.
 	if cf.js != nil {
-		checkpointed, err := cf.maybeCheckpointJob(resolved, frontierChanged, isBehind)
+		checkpointed, err := cf.maybeCheckpointJob(frontierChanged, isBehind)
 		if err != nil {
 			return err
 		}
@@ -1353,27 +1284,24 @@ func (cf *changeFrontier) forwardFrontier(resolved jobspb.ResolvedSpan) error {
 	return nil
 }
 
-func (cf *changeFrontier) maybeCheckpointJob(
-	resolvedSpan jobspb.ResolvedSpan, frontierChanged, isBehind bool,
-) (bool, error) {
-	// When in a Backfill, the frontier remains unchanged at the backfill boundary
-	// as we receive spans from the scan request at the Backfill Timestamp
-	inBackfill := !frontierChanged && resolvedSpan.Timestamp.Equal(cf.frontier.BackfillTS())
+func (cf *changeFrontier) maybeCheckpointJob(frontierChanged, isBehind bool) (bool, error) {
+	// See if we can update highwatermark.
+	// We always update watermark when we reach schema change boundary.
+	// Otherwise, we checkpoint when  frontier changes
+	// (and we can checkpoint), or if it has changed in the past, but we skipped that update.
+	updateHighWater :=
+		cf.frontier.schemaChangeBoundaryReached() || cf.js.canCheckpointHighWatermark(frontierChanged)
 
-	// During a backfill we store a checkpoint of completed scans at a throttled rate in the job record
-	updateCheckpoint := inBackfill && cf.js.canCheckpointBackfill()
+	// Update checkpoint if the frontier has not changed, but it is time to checkpoint.
+	// If the frontier has changed, we want to write an empty checkpoint record indicating
+	// that all spans have reached the frontier.
+	updateCheckpoint := !updateHighWater && cf.js.canCheckpointInitialScan()
 
 	var checkpoint jobspb.ChangefeedProgress_Checkpoint
 	if updateCheckpoint {
 		maxBytes := changefeedbase.FrontierCheckpointMaxBytes.Get(&cf.flowCtx.Cfg.Settings.SV)
 		checkpoint.Spans = cf.frontier.getCheckpointSpans(maxBytes)
 	}
-
-	// If we're not in a backfill, highwater progress and an empty checkpoint will
-	// be saved. This is throttled however we always persist progress to a schema
-	// boundary.
-	updateHighWater :=
-		!inBackfill && (cf.frontier.schemaChangeBoundaryReached() || cf.js.canCheckpointHighWatermark(frontierChanged))
 
 	if updateCheckpoint || updateHighWater {
 		manageProtected := updateHighWater
@@ -1522,7 +1450,7 @@ func (cf *changeFrontier) maybeProtectTimestamp(
 }
 
 func (cf *changeFrontier) maybeEmitResolved(newResolved hlc.Timestamp) error {
-	if cf.freqEmitResolved == emitNoResolved || newResolved.IsEmpty() {
+	if cf.freqEmitResolved == emitNoResolved {
 		return nil
 	}
 	sinceEmitted := newResolved.GoTime().Sub(cf.lastEmitResolved)
@@ -1615,77 +1543,63 @@ func (s *spanFrontier) frontierTimestamp() hlc.Timestamp {
 	return s.Frontier.Frontier()
 }
 
-// schemaChangeFrontier encapsulates the span frontier, which keeps track of the
-// per-span timestamps we no longer need to emit, along with information about
-// the most recently observed schema change boundary.
+// schemaChangeFrontier encapsulates span frontier, keeping track of span resolved time,
+// along with the schema change boundary information.
 type schemaChangeFrontier struct {
 	*spanFrontier
 
+	// boundaryTime represents an hlc timestamp at which a schema change
+	// event occurred to a target watched by this frontier. If the changefeed is
+	// configured to stop on schema change then the changeFrontier will wait for
+	// the span frontier to reach the schemaChangeBoundary, will drain, and then
+	// will exit. If the changefeed is configured to backfill on schema changes,
+	// the changeFrontier will protect the scan timestamp in order to ensure that
+	// the scan complete. The protected timestamp will be released when a new scan
+	// schemaChangeBoundary is created or the changefeed reaches a timestamp that
+	// is near the present.
+	//
 	// schemaChangeBoundary values are communicated to the changeFrontier via
 	// Resolved messages send from the changeAggregators. The policy regarding
 	// which schema change events lead to a schemaChangeBoundary is controlled
 	// by the KV feed based on OptSchemaChangeEvents and OptSchemaChangePolicy.
-	//
-	// When the changeFrontier receives a ResolvedSpan with a non-none
-	// BoundaryType, it instructs the changefeed to wait for all watched spans to
-	// reach the boundary and then depending on the specific BoundaryType, either
-	// drain and exit, restart, or begin a backfill.
-	// Upon reaching a boundary, sinkful changefeeds will save a protected
-	// timestamp record in the jobs entry to ensure our ability to
-	// restart/backfill from that boundary.
-
-	// boundaryTime indicates the timestamp of the most recently observed resolved
-	// span with a non-none boundary type, i.e. the most recent schema change
-	// boundary.
 	boundaryTime hlc.Timestamp
 
-	// boundaryType indicates the type of the most recently observed schema change
-	// boundary which corresponds to the action which should be taken when the
-	// frontier reaches that boundary.
+	// boundaryType indicates the type of the schemaChangeBoundary and thus the
+	// action which should be taken when the frontier reaches that boundary.
 	boundaryType jobspb.ResolvedSpan_BoundaryType
-
-	// latestTs indicates the most recent timestamp that any span in the frontier
-	// has ever been forwarded to.
-	latestTs hlc.Timestamp
-
-	// initialHighWater is either the StatementTime for a new changefeed or the
-	// recovered highwater mark for a resumed changefeed
-	initialHighWater hlc.Timestamp
 }
 
-func makeSchemaChangeFrontier(
-	initialHighWater hlc.Timestamp, spans ...roachpb.Span,
-) (*schemaChangeFrontier, error) {
+func makeSchemaChangeFrontier(spans ...roachpb.Span) (*schemaChangeFrontier, error) {
 	sf, err := span.MakeFrontier(spans...)
 	if err != nil {
 		return nil, err
 	}
-	for _, span := range spans {
-		if _, err := sf.Forward(span, initialHighWater); err != nil {
-			return nil, err
-		}
-	}
-	return &schemaChangeFrontier{spanFrontier: &spanFrontier{sf}, initialHighWater: initialHighWater, latestTs: initialHighWater}, nil
+	return &schemaChangeFrontier{spanFrontier: &spanFrontier{sf}}, nil
 }
 
-// ForwardResolvedSpan advances the timestamp for a resolved span, taking care
-// of updating schema change boundary information.
+// ForwardResolvedSpan advances the timestamp for a resolved span.
+// Takes care of updating schema change boundary information.
 func (f *schemaChangeFrontier) ForwardResolvedSpan(r jobspb.ResolvedSpan) (bool, error) {
-	if r.BoundaryType != jobspb.ResolvedSpan_NONE {
+	// We want to ensure that we mark the schemaChangeBoundary and then we want
+	// to detect when the frontier reaches to or past the schemaChangeBoundary.
+	// The behavior when the boundary is reached is controlled by the
+	// boundary type.
+	// NB: boundaryType and time update machinery is tricky.  In particular,
+	// we never go back to ResolvedSpan_None if we have seen newer boundary other than none.
+	switch r.BoundaryType {
+	case jobspb.ResolvedSpan_NONE:
+		if !f.boundaryTime.IsEmpty() && f.boundaryTime.Less(r.Timestamp) {
+			f.boundaryTime = hlc.Timestamp{}
+			f.boundaryType = jobspb.ResolvedSpan_NONE
+		}
+	case jobspb.ResolvedSpan_BACKFILL, jobspb.ResolvedSpan_EXIT, jobspb.ResolvedSpan_RESTART:
 		if !f.boundaryTime.IsEmpty() && r.Timestamp.Less(f.boundaryTime) {
-			// Boundary resolved events should be ingested from the schema feed
-			// serially, where the changefeed won't even observe a new schema change
-			// boundary until it has progressed past the current boundary
 			return false, errors.AssertionFailedf("received boundary timestamp %v < %v "+
 				"of type %v before reaching existing boundary of type %v",
 				r.Timestamp, f.boundaryTime, r.BoundaryType, f.boundaryType)
 		}
 		f.boundaryTime = r.Timestamp
 		f.boundaryType = r.BoundaryType
-	}
-
-	if f.latestTs.Less(r.Timestamp) {
-		f.latestTs = r.Timestamp
 	}
 	return f.Forward(r.Span, r.Timestamp)
 }
@@ -1700,8 +1614,6 @@ func (f *schemaChangeFrontier) SpanFrontier() *span.Frontier {
 	return f.spanFrontier.Frontier
 }
 
-// getCheckpointSpans returns as many spans that should be checkpointed (are
-// above the highwater mark) as can fit in maxBytes.
 func (f *schemaChangeFrontier) getCheckpointSpans(maxBytes int64) (checkpoint []roachpb.Span) {
 	var used int64
 	frontier := f.frontierTimestamp()
@@ -1718,36 +1630,15 @@ func (f *schemaChangeFrontier) getCheckpointSpans(maxBytes int64) (checkpoint []
 	return checkpoint
 }
 
-// BackfillTS returns the timestamp of the incoming spans for an ongoing
-// Backfill (either an Initial Scan backfill or a Schema Change backfill).
-// If no Backfill is occurring, an empty timestamp is returned.
-func (f *schemaChangeFrontier) BackfillTS() hlc.Timestamp {
-	frontier := f.Frontier()
-
-	// The scan for the initial backfill results in spans sent at StatementTime,
-	// which is what initialHighWater is set to when performing an initial scan.
-	if frontier.IsEmpty() {
-		return f.initialHighWater
-	}
-
-	// If the backfill is occurring after any initial scan (non-empty frontier),
-	// then it can only be in a schema change backfill, where the scan is
-	// performed immediately after the boundary timestamp.
-	backfilling := f.boundaryType == jobspb.ResolvedSpan_BACKFILL && frontier.Equal(f.boundaryTime)
-	// If the schema change backfill was paused and resumed, the initialHighWater
-	// is read from the job progress and is equal to the old BACKFILL boundary
-	restarted := frontier.Equal(f.initialHighWater)
-	if backfilling || restarted {
-		return frontier.Next()
-	}
-	return hlc.Timestamp{}
+// schemaChangeBoundaryReached returns true if the schema change boundary has been reached.
+func (f *schemaChangeFrontier) schemaChangeBoundaryReached() (r bool) {
+	return !f.boundaryTime.IsEmpty() && f.boundaryTime.Equal(f.Frontier())
 }
 
-// schemaChangeBoundaryReached returns true at the single moment when all spans
-// have reached a boundary however we have yet to receive any spans after the
-// boundary
-func (f *schemaChangeFrontier) schemaChangeBoundaryReached() (r bool) {
-	return f.boundaryTime.Equal(f.Frontier()) &&
-		f.latestTs.Equal(f.boundaryTime) &&
-		f.boundaryType != jobspb.ResolvedSpan_NONE
+// boundaryTypeAt returns boundary type applicable at the specified timestamp.
+func (f *schemaChangeFrontier) boundaryTypeAt(ts hlc.Timestamp) jobspb.ResolvedSpan_BoundaryType {
+	if f.boundaryTime.IsEmpty() || ts.Less(f.boundaryTime) {
+		return jobspb.ResolvedSpan_NONE
+	}
+	return f.boundaryType
 }
