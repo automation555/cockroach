@@ -83,6 +83,8 @@ type coster struct {
 	// 0.5, and the estimated cost of an expression is c, the cost returned by
 	// ComputeCost will be in the range [c - 0.5 * c, c + 0.5 * c).
 	perturbation float64
+
+	rng *rand.Rand
 }
 
 var _ Coster = &coster{}
@@ -439,14 +441,24 @@ var fnCost = map[string]memo.Cost{
 }
 
 // Init initializes a new coster structure with the given memo.
-func (c *coster) Init(evalCtx *tree.EvalContext, mem *memo.Memo, perturbation float64) {
+func (c *coster) Init(
+	evalCtx *tree.EvalContext, mem *memo.Memo, perturbation float64, rng *rand.Rand,
+) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
+	if perturbation == 0 && rng != nil {
+		// If we've been initialized with a random seed but not an explicit
+		// perturbation value, use the max perturbation. This is used for tests
+		// that set the seed with testing_optimizer_random_cost_seed, and will allow
+		// the coster to hop directly into its random costing mode.
+		perturbation = 1.0
+	}
 	*c = coster{
 		evalCtx:      evalCtx,
 		mem:          mem,
 		locality:     evalCtx.Locality,
 		perturbation: perturbation,
+		rng:          rng,
 	}
 }
 
@@ -555,7 +567,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		// Don't perturb the cost if we are forcing an index.
 		if cost < hugeCost {
 			// Get a random value in the range [-1.0, 1.0)
-			multiplier := 2*rand.Float64() - 1
+			multiplier := 2*c.rng.Float64() - 1
 
 			// If perturbation is p, and the estimated cost of an expression is c,
 			// the new cost is in the range [max(0, c - pc), c + pc). For example,
