@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexechash"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
@@ -59,19 +60,19 @@ var (
 )
 
 type callbackCloser struct {
-	closeCb func(context.Context) error
+	closeCb func() error
 }
 
 var _ colexecop.Closer = callbackCloser{}
 
-func (c callbackCloser) Close(ctx context.Context) error {
-	return c.closeCb(ctx)
+func (c callbackCloser) Close() error {
+	return c.closeCb()
 }
 
 // TestVectorizedFlowShutdown tests that closing the FlowCoordinator correctly
 // closes all the infrastructure corresponding to the flow ending in that
 // FlowCoordinator. Namely:
-// - on a remote node, it creates a colflow.HashRouter with 3 outputs (with a
+// - on a remote node, it creates a colflow.Router with 3 outputs (with a
 // corresponding to each colrpc.Outbox) as well as 3 standalone Outboxes;
 // - on a local node, it creates 6 colrpc.Inboxes that feed into an unordered
 // synchronizer which then outputs all the data into a materializer.
@@ -121,11 +122,10 @@ func (c callbackCloser) Close(ctx context.Context) error {
 func TestVectorizedFlowShutdown(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx,
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticSQLInstanceID,
+	defer stopper.Stop(context.Background())
+	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(
+		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticNodeID,
 	)
 	require.NoError(t, err)
 	dialer := &execinfrapb.MockDialer{Addr: addr}
@@ -137,8 +137,8 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 	for run := 0; run < 10; run++ {
 		for _, scenario := range testScenarios {
 			t.Run(fmt.Sprintf("testScenario=%s", scenario.string), func(t *testing.T) {
-				ctxLocal, cancelLocal := context.WithCancel(ctx)
-				ctxRemote, cancelRemote := context.WithCancel(ctx)
+				ctxLocal, cancelLocal := context.WithCancel(context.Background())
+				ctxRemote, cancelRemote := context.WithCancel(context.Background())
 				// Linter says there is a possibility of "context leak" because
 				// cancelRemote variable may not be used, so we defer the call to it.
 				// This does not change anything about the test since we're blocking on
@@ -152,7 +152,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					EvalCtx: &evalCtx,
 					Cfg:     &execinfra.ServerConfig{Settings: st},
 				}
-				rng, _ := randutil.NewTestRand()
+				rng, _ := randutil.NewPseudoRand()
 				var (
 					err             error
 					wg              sync.WaitGroup
@@ -162,7 +162,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 						rng,
 						coldatatestutils.RandomDataOpArgs{
 							DeterministicTyps: typs,
-							// Set a high number of batches to ensure that the HashRouter is
+							// Set a high number of batches to ensure that the Router is
 							// very far from being finished when the flow is shut down.
 							NumBatches: math.MaxInt64,
 							Selection:  true,
@@ -197,21 +197,24 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				}
 				// The first numHashRouterOutputs streamIDs are allocated to the
 				// outboxes that drain these outputs. The outboxes will drain the router
-				// outputs which should in turn drain the HashRouter that will return
+				// outputs which should in turn drain the Router that will return
 				// this metadata.
 				toDrain := make([]colexecop.MetadataSource, numHashRouterOutputs)
 				for i := range toDrain {
 					toDrain[i] = createMetadataSourceForID(i)
 				}
-				hashRouter, hashRouterOutputs := colflow.NewHashRouter(
+
+				distributor := colexechash.NewTupleHashDistributor(colexechash.DefaultInitHashValue, numHashRouterOutputs,
+					[]uint32{0} /* hashCols */)
+				hashRouter, hashRouterOutputs := colflow.NewRouter(
 					allocators,
 					colexecargs.OpWithMetaInfo{
 						Root:            hashRouterInput,
 						MetadataSources: toDrain,
 					},
 					typs,
-					[]uint32{0}, /* hashCols */
-					execinfra.DefaultMemoryLimit,
+					distributor,
+					64<<20, /* memoryLimit */
 					queueCfg,
 					&colexecop.TestingSemaphore{},
 					diskAccounts,
@@ -257,7 +260,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 						colexecargs.OpWithMetaInfo{
 							Root:            outboxInput,
 							MetadataSources: outboxMetadataSources,
-							ToClose: []colexecop.Closer{callbackCloser{closeCb: func(context.Context) error {
+							ToClose: []colexecop.Closer{callbackCloser{closeCb: func() error {
 								idToClosed.Lock()
 								idToClosed.mapping[id] = true
 								idToClosed.Unlock()
@@ -274,7 +277,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 						outbox.Run(
 							outboxCtx,
 							dialer,
-							execinfra.StaticSQLInstanceID,
+							execinfra.StaticNodeID,
 							flowID,
 							execinfrapb.StreamID(id),
 							flowCtxCancel,
@@ -290,7 +293,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					doneFn := func() { close(serverStreamNotification.Donec) }
 					wg.Add(1)
 					go func(id int, stream execinfrapb.DistSQL_FlowStreamServer, doneFn func()) {
-						handleStreamErrCh[id] <- inbox.RunWithStream(stream.Context(), stream)
+						handleStreamErrCh[id] <- inbox.RunWithStream(stream.Context(), stream, make(<-chan struct{}))
 						doneFn()
 						wg.Done()
 					}(id, serverStream, doneFn)
@@ -326,7 +329,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				}
 
 				var input colexecop.Operator
-				ctxAnotherRemote, cancelAnotherRemote := context.WithCancel(ctx)
+				ctxAnotherRemote, cancelAnotherRemote := context.WithCancel(context.Background())
 				if addAnotherRemote {
 					// Add another "remote" node to the flow.
 					inboxMemAccount := testMemMonitor.MakeBoundAccount()
@@ -358,7 +361,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				inputInfo := colexecargs.OpWithMetaInfo{
 					Root:            input,
 					MetadataSources: colexecop.MetadataSources{inputMetadataSource},
-					ToClose: colexecop.Closers{callbackCloser{closeCb: func(context.Context) error {
+					ToClose: colexecop.Closers{callbackCloser{closeCb: func() error {
 						closeCalled = true
 						return nil
 					}}},
