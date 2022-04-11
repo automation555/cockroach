@@ -24,6 +24,23 @@ import (
 	"strings"
 )
 
+var (
+	// Regexes for matching release tags
+	// Line must start with vX.Y.Z
+	versionTagRE     = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)`)
+	// Match vX.Y.0-alpha.00000000 releases
+	// ex: v21.2.0-alpha.00000000
+	alpha00TagRE     = regexp.MustCompile(`v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-alpha.00+$`)
+	// ex: v21.2.0-beta.1
+	alphaBetaRcTagRE = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-[-.0-9A-Za-z]+$`)
+	// Match releases >= vX.Y.1
+	// ex: v21.2.1
+	patchTagRE       = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.[1-9][0-9]*$`)
+	// Match only vX.Y.0 releases
+	// ex: v21.2.0
+	dotZeroTagRE     = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0$`)
+)
+
 func main() {
 	log.SetFlags(0)
 	var tokenPath, fromRef, toRef, repository, gitCheckoutDir string
@@ -74,12 +91,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Cannot read token from %s: %+v\n", tokenPath, err)
 	}
-	commonBaseRef, err := getCommonBaseRef(fromRef, toRef)
-	if err != nil {
-		log.Fatalf("Cannot get common base ref: %+v\n", err)
-	}
-
-	refList, err := getRefs(commonBaseRef, toRef)
+	refList, err := getRefs(fromRef, toRef)
 	if err != nil {
 		log.Fatalf("Cannot get refs: %+v\n", err)
 	}
@@ -89,27 +101,17 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error getting first tag containing ref %s: %+v\n", ref, err)
 		}
-		if tag == "" {
-			log.Printf("Ref %s has not yet appeared in a released version.", ref)
-			continue
-		}
-		prs, err := getPrNumbers(ref)
+		pr, err := getPrInfo(ref)
 		if err != nil {
 			log.Fatalf("Cannot find PR for ref %s: %+v\n", ref, err)
 		}
-		if len(prs) == 0 {
-			log.Printf("No PRs for ref %s. There should be at least one.", ref)
+		log.Printf("Labeling PR#%s (ref %s) using git tag %s", pr, ref, tag)
+		if dryRun {
+			log.Println("DRY RUN: skipping labeling")
 			continue
 		}
-		for _, pr := range prs {
-			log.Printf("Labeling PR#%s (ref %s) using git tag %s", pr, ref, tag)
-			if dryRun {
-				log.Println("DRY RUN: skipping labeling")
-				continue
-			}
-			if err := labelPR(http.DefaultClient, repository, token, pr, tag); err != nil {
-				log.Fatalf("Failed on label creation for Pull Request %s: '%s'\n", pr, err)
-			}
+		if err := labelPR(http.DefaultClient, repository, token, pr, tag); err != nil {
+			log.Fatalf("Failed on label creation for Pull Request %s: '%s'\n", pr, err)
 		}
 	}
 }
@@ -122,20 +124,10 @@ func readToken(path string) (string, error) {
 	return strings.TrimSpace(string(token)), nil
 }
 
-func getCommonBaseRef(fromRef, toRef string) (string, error) {
-	cmd := exec.Command("git", "merge-base", fromRef, toRef)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 func filterPullRequests(text string) []string {
 	var shas []string
-	matchMerge := regexp.MustCompile(`Merge (#|pull request)`)
 	for _, line := range strings.Split(text, "\n") {
-		if !matchMerge.MatchString(line) {
+		if !strings.Contains(line, "Merge pull request") {
 			continue
 		}
 		sha := strings.Fields(line)[0]
@@ -155,66 +147,80 @@ func getRefs(fromRef, toRef string) ([]string, error) {
 }
 
 func matchVersion(text string) string {
+	var dotZeroTag string
 	for _, line := range strings.Fields(text) {
 		// Only looking for version tags.
-		regVersion := regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)`)
-		if !regVersion.MatchString(line) {
+		if !versionTagRE.MatchString(line) {
 			continue
 		}
-		// Should avoid *-alpha.00000000 tag, so we continue with the next line value.
-		alpha00Regex := regexp.MustCompile(`v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha.00+$`)
-		if alpha00Regex.MatchString(line) {
+		// Should avoid alpha.00000000 tags. When one is seen, the earliest
+		// release should be alpha.1 or beta.1.
+		if alpha00TagRE.MatchString(line) {
 			continue
 		}
-		// Checking first for An alpha/beta/rc tag.
-		// if present, return line value
-		alphaBetaRcRegex := regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[-.0-9A-Za-z]+$`)
-		if alphaBetaRcRegex.MatchString(line) {
+		// Check first for an alpha/beta/rc tag. It might be the first version
+		// tag found or it might come after a .0 and/or an alpha.00000000.
+		if alphaBetaRcTagRE.MatchString(line) {
 			return line
 		}
-		// Second check is vX.Y.Z patch release >= .1 is first (ex: v20.1.1).
-		patchRegex := regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.[1-9][0-9]*$`)
-		if patchRegex.MatchString(line) {
+		// Check second for a patch release >= .1. It might be the first version
+		// tag found or it might come after a .0 tag.
+		if patchTagRE.MatchString(line) {
+			// The .0 tag wins.
+			if dotZeroTag != "" {
+				return dotZeroTag
+			}
 			return line
 		}
-		// Third check is major release A vX.Y.0 release.
-		majorReleaseRegex := regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0$`)
-		if majorReleaseRegex.MatchString(line) {
-			return line
+		// Check third for a .0 release (ex: v21.2.0).
+		// Because git orders alpha, beta and rc tags after the .0 release and
+		// before the .1 release, we need to continue checking subsequent lines
+		// to know if the .0 release is the right release.
+		if dotZeroTagRE.MatchString(line) {
+			dotZeroTag = line
+			continue
 		}
+	}
+	// The .0 version was the only version tag in the list.
+	if dotZeroTag != "" {
+		return dotZeroTag
 	}
 	return ""
 }
 
 func getFirstTagContainingRef(ref string) (string, error) {
-	cmd := exec.Command("git", "tag", "--contains", ref)
+	cmd := exec.Command("git", "tag", "--contains", ref, "--sort", "version:refname")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
 	version := matchVersion(string(out))
+	if version == "" {
+		return "", fmt.Errorf("cannot find valid version")
+	}
 	return version, nil
 }
 
-func extractPrNumbers(text string) []string {
-	var numbers []string
-	lines := strings.SplitN(text, "\n", 2)
-	for _, prNumber := range strings.Fields(lines[0]) {
+func getPrNumber(text string) string {
+	for _, prNumber := range strings.Fields(text) {
 		if strings.HasPrefix(prNumber, "#") {
-			numbers = append(numbers, strings.TrimPrefix(prNumber, "#"))
+			return strings.TrimPrefix(prNumber, "#")
 		}
 	}
-	return numbers
+	return ""
 }
 
-func getPrNumbers(ref string) ([]string, error) {
+func getPrInfo(ref string) (string, error) {
 	cmd := exec.Command("git", "show", "--oneline", "--format=format:%h %s", ref)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	prs := extractPrNumbers(string(out))
-	return prs, nil
+	pr := getPrNumber(string(out))
+	if pr == "" {
+		return "", fmt.Errorf("cannot find PR number")
+	}
+	return pr, nil
 }
 
 func apiCall(client *http.Client, url string, token string, payload interface{}) error {
@@ -231,7 +237,6 @@ func apiCall(client *http.Client, url string, token string, payload interface{})
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 	// Status code 422 is returned when a label already exist
 	if !(resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusUnprocessableEntity || resp.
 		StatusCode == http.StatusOK) {
