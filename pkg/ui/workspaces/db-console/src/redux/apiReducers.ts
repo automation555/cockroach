@@ -300,15 +300,6 @@ const queriesReducerObj = new CachedDataReducer(
 export const invalidateStatements = queriesReducerObj.invalidateData;
 export const refreshStatements = queriesReducerObj.refresh;
 
-const userSQLRolesReducerObj = new CachedDataReducer(
-  api.getUserSQLRoles,
-  "userSQLRoles",
-  moment.duration(1, "m"),
-);
-
-export const invalidateUserSQLRoles = userSQLRolesReducerObj.invalidateData;
-export const refreshUserSQLRoles = userSQLRolesReducerObj.refresh;
-
 const statementDiagnosticsReportsReducerObj = new CachedDataReducer(
   api.getStatementDiagnosticsReports,
   "statementDiagnosticsReports",
@@ -332,6 +323,14 @@ const metricMetadataReducerObj = new CachedDataReducer(
   "metricMetadata",
 );
 export const refreshMetricMetadata = metricMetadataReducerObj.refresh;
+
+export const hotRangesReducerObj = new CachedDataReducer(
+  api.getHotRanges,
+  "hotranges",
+  moment.duration(10, "s")
+);
+
+export const refreshHotRanges = hotRangesReducerObj.refresh;
 
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
@@ -370,7 +369,7 @@ export interface APIReducersState {
   statementDiagnosticsReports: CachedDataReducerState<
     api.StatementDiagnosticsReportsResponseMessage
   >;
-  userSQLRoles: CachedDataReducerState<api.UserSQLRolesResponseMessage>;
+  hotranges: CachedDataReducerState<api.HotRangesV2ResponseMessage>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -407,7 +406,7 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [metricMetadataReducerObj.actionNamespace]: metricMetadataReducerObj.reducer,
   [statementDiagnosticsReportsReducerObj.actionNamespace]:
     statementDiagnosticsReportsReducerObj.reducer,
-  [userSQLRolesReducerObj.actionNamespace]: userSQLRolesReducerObj.reducer,
+  [hotRangesReducerObj.actionNamespace]: hotRangesReducerObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

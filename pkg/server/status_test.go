@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	gosql "database/sql"
-	"encoding/hex"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -1102,6 +1101,31 @@ func TestHotRangesResponse(t *testing.T) {
 	}
 }
 
+func TestHotRanges2Response(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ts := startServer(t)
+	defer ts.Stopper().Stop(context.Background())
+
+	var hotRangesResp serverpb.HotRangesResponseV2
+	if err := postStatusJSONProto(ts, "v2/hotranges", &serverpb.HotRangesRequest{}, &hotRangesResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(hotRangesResp.Ranges) == 0 {
+		t.Fatalf("didn't get hot range responses from any nodes")
+	}
+	lastQPS := math.MaxFloat64
+	for _, r := range hotRangesResp.Ranges {
+		if r.RangeID == 0 {
+			t.Errorf("unexpected empty range id: %d", r.RangeID)
+		}
+		if r.QPS > lastQPS {
+			t.Errorf("unexpected increase in qps between ranges; prev=%.2f, current=%.2f", lastQPS, r.QPS)
+		}
+		lastQPS = r.QPS
+	}
+}
+
 func TestRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1198,7 +1222,7 @@ func TestRaftDebug(t *testing.T) {
 }
 
 // TestStatusVars verifies that prometheus metrics are available via the
-// /_status/vars and /_status/load endpoints.
+// /_status/vars endpoint.
 func TestStatusVars(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1209,11 +1233,6 @@ func TestStatusVars(t *testing.T) {
 		t.Fatal(err)
 	} else if !bytes.Contains(body, []byte("# TYPE sql_bytesout counter\nsql_bytesout")) {
 		t.Errorf("expected sql_bytesout, got: %s", body)
-	}
-	if body, err := getText(s, s.AdminURL()+statusPrefix+"load"); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Contains(body, []byte("# TYPE sys_cpu_user_ns gauge\nsys_cpu_user_ns")) {
-		t.Errorf("expected sys_cpu_user_ns, got: %s", body)
 	}
 }
 
@@ -1484,7 +1503,6 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
-	params.Knobs.SpanConfig = &spanconfig.TestingKnobs{ManagerDisableJobCreation: true} // TODO(irfansharif): #74919.
 	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: params,
 	})
@@ -1955,17 +1973,33 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 
 	statements := []struct {
-		stmt          string
-		fingerprinted string
+		stmt                 string
+		formattedStmt        string
+		fingerprint          string
+		formattedFingerprint string
 	}{
-		{stmt: `CREATE DATABASE roachblog`},
-		{stmt: `SET database = roachblog`},
-		{stmt: `CREATE TABLE posts (id INT8 PRIMARY KEY, body STRING)`},
 		{
-			stmt:          `INSERT INTO posts VALUES (1, 'foo')`,
-			fingerprinted: `INSERT INTO posts VALUES (_, '_')`,
+			stmt:          `CREATE DATABASE roachblog`,
+			formattedStmt: "CREATE DATABASE roachblog\n",
 		},
-		{stmt: `SELECT * FROM posts`},
+		{
+			stmt:          `SET database = roachblog`,
+			formattedStmt: "SET database = roachblog\n",
+		},
+		{
+			stmt:          `CREATE TABLE posts (id INT8 PRIMARY KEY, body STRING)`,
+			formattedStmt: "CREATE TABLE posts (id INT8 PRIMARY KEY, body STRING)\n",
+		},
+		{
+			stmt:                 `INSERT INTO posts VALUES (1, 'foo')`,
+			formattedStmt:        "INSERT INTO posts VALUES (1, 'foo')\n",
+			fingerprint:          `INSERT INTO posts VALUES (_, '_')`,
+			formattedFingerprint: "INSERT INTO posts VALUES (_, '_')\n",
+		},
+		{
+			stmt:          `SELECT * FROM posts`,
+			formattedStmt: "SELECT * FROM posts\n",
+		},
 	}
 
 	for _, stmt := range statements {
@@ -1994,8 +2028,9 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 				continue
 			}
 			if strings.HasPrefix(respStatement.Key.KeyData.App, catconstants.InternalAppNamePrefix) {
-				// CombinedStatementStats should filter out internal queries.
-				t.Fatalf("unexpected internal query: %s", respStatement.Key.KeyData.Query)
+				// We ignore internal queries, these are not relevant for the
+				// validity of this test.
+				continue
 			}
 			if strings.HasPrefix(respStatement.Key.KeyData.Query, "ALTER USER") {
 				// Ignore the ALTER USER ... VIEWACTIVITY statement.
@@ -2021,9 +2056,9 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 
 	var expectedStatements []string
 	for _, stmt := range statements {
-		var expectedStmt = stmt.stmt
-		if stmt.fingerprinted != "" {
-			expectedStmt = stmt.fingerprinted
+		var expectedStmt = stmt.formattedStmt
+		if stmt.fingerprint != "" {
+			expectedStmt = stmt.formattedFingerprint
 		}
 		expectedStatements = append(expectedStatements, expectedStmt)
 	}
@@ -2865,28 +2900,4 @@ SET TRACING=off;
 
 	require.True(t, found,
 		"expect to find contention event for table %d, but found %+v", testTableID, resp)
-}
-
-func TestStatusCancelSessionGatewayMetadataPropagation(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
-	defer testCluster.Stopper().Stop(ctx)
-
-	// Start a SQL session as admin on node 1.
-	sql0 := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
-	results := sql0.QueryStr(t, "SELECT session_id FROM [SHOW SESSIONS] LIMIT 1")
-	sessionID, err := hex.DecodeString(results[0][0])
-	require.NoError(t, err)
-
-	// Attempt to cancel that SQL session as non-admin over HTTP on node 2.
-	req := &serverpb.CancelSessionRequest{
-		SessionID: sessionID,
-	}
-	resp := &serverpb.CancelSessionResponse{}
-	err = postStatusJSONProtoWithAdminOption(testCluster.Server(1), "cancel_session/1", req, resp, false)
-	require.NotNil(t, err)
-	require.Contains(t, err.Error(), "status: 403 Forbidden")
 }
