@@ -17,8 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -109,11 +109,7 @@ func (r *DescriptorResolver) LookupSchema(
 	if scID, ok := schemas[scName]; ok {
 		dbDesc, dbOk := r.DescByID[dbID].(catalog.DatabaseDescriptor)
 		scDesc, scOk := r.DescByID[scID].(catalog.SchemaDescriptor)
-		// TODO(richardjcai): We should remove the check for keys.PublicSchemaID
-		// in 22.2, when we're guaranteed to not have synthesized public schemas
-		// for the non-system databases.
-		if !scOk && scID == keys.SystemPublicSchemaID ||
-			!scOk && scID == keys.PublicSchemaIDForBackup {
+		if !scOk && scID == keys.PublicSchemaID {
 			scDesc, scOk = schemadesc.GetPublicSchema(), true
 		}
 		if dbOk && scOk {
@@ -161,6 +157,7 @@ func (r *DescriptorResolver) LookupObject(
 							"expected schema for ID %d, got %T", scID, r.DescByID[scID])
 					}
 				}
+
 				return true, resolvedPrefix, r.DescByID[objID], nil
 			}
 		}
@@ -190,11 +187,9 @@ func NewDescriptorResolver(descs []catalog.Descriptor) (*DescriptorResolver, err
 			r.DbsByName[desc.GetName()] = desc.GetID()
 			r.ObjsByName[desc.GetID()] = make(map[string]map[string]descpb.ID)
 			r.SchemasByName[desc.GetID()] = make(map[string]descpb.ID)
-
-			if !desc.(catalog.DatabaseDescriptor).HasPublicSchemaWithDescriptor() {
-				r.ObjsByName[desc.GetID()][tree.PublicSchema] = make(map[string]descpb.ID)
-				r.SchemasByName[desc.GetID()][tree.PublicSchema] = keys.PublicSchemaIDForBackup
-			}
+			// Always add an entry for the public schema.
+			r.ObjsByName[desc.GetID()][tree.PublicSchema] = make(map[string]descpb.ID)
+			r.SchemasByName[desc.GetID()][tree.PublicSchema] = keys.PublicSchemaID
 		}
 
 		// Incidentally, also remember all the descriptors by ID.
@@ -240,9 +235,7 @@ func NewDescriptorResolver(descs []catalog.Descriptor) (*DescriptorResolver, err
 		schemaMap := r.ObjsByName[parentDesc.GetID()]
 		scID := desc.GetParentSchemaID()
 		var scName string
-		// TODO(richardjcai): We can remove this in 22.2, still have to handle
-		// this case in the mixed version cluster.
-		if scID == keys.PublicSchemaIDForBackup {
+		if scID == keys.PublicSchemaID {
 			scName = tree.PublicSchema
 		} else {
 			scDescI, ok := r.DescByID[scID]
@@ -344,7 +337,7 @@ func DescriptorsMatchingTargets(
 	alreadyRequestedSchemas := make(map[descpb.ID]struct{})
 	maybeAddSchemaDesc := func(id descpb.ID, requirePublic bool) error {
 		// Only add user defined schemas.
-		if id == keys.PublicSchemaIDForBackup {
+		if id == keys.PublicSchemaID {
 			return nil
 		}
 		if _, ok := alreadyRequestedSchemas[id]; !ok {
@@ -414,7 +407,13 @@ func DescriptorsMatchingTargets(
 		switch p := pattern.(type) {
 		case *tree.TableName:
 			un := p.ToUnresolvedObjectName()
-			found, prefix, descI, err := resolver.ResolveExisting(ctx, un, r, tree.ObjectLookupFlags{}, currentDatabase, searchPath)
+			found, prefix, descI, err := resolver.ResolveExisting(ctx, un, r, tree.ObjectLookupFlags{
+				CommonLookupFlags: tree.CommonLookupFlags{
+					AvoidCached: true,
+					Required:    true,
+				},
+				DesiredObjectKind: tree.TableObject,
+			}, currentDatabase, searchPath)
 			if err != nil {
 				return ret, err
 			}
@@ -546,7 +545,7 @@ func DescriptorsMatchingTargets(
 				}
 				// If this table is a member of a user defined schema, then request the
 				// user defined schema.
-				if desc.GetParentSchemaID() != keys.PublicSchemaIDForBackup {
+				if desc.GetParentSchemaID() != keys.PublicSchemaID {
 					// Note, that although we're processing the database expansions,
 					// since the table is in a PUBLIC state, we also expect the schema
 					// to be in a similar state.
@@ -601,17 +600,21 @@ func DescriptorsMatchingTargets(
 
 // LoadAllDescs returns all of the descriptors in the cluster.
 func LoadAllDescs(
-	ctx context.Context, execCfg *sql.ExecutorConfig, asOf hlc.Timestamp,
-) (allDescs []catalog.Descriptor, _ error) {
-	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		err := txn.SetFixedTimestamp(ctx, asOf)
-		if err != nil {
+	ctx context.Context, codec keys.SQLCodec, db *kv.DB, asOf hlc.Timestamp,
+) ([]catalog.Descriptor, error) {
+	var allDescs []catalog.Descriptor
+	if err := db.Txn(
+		ctx,
+		func(ctx context.Context, txn *kv.Txn) error {
+			err := txn.SetFixedTimestamp(ctx, asOf)
+			if err != nil {
+				return err
+			}
+			allDescs, err = catalogkv.GetAllDescriptors(
+				ctx, txn, codec, true, /* shouldRunPostDeserializationChanges */
+			)
 			return err
-		}
-		all, err := col.GetAllDescriptors(ctx, txn)
-		allDescs = all.OrderedDescriptors()
-		return err
-	}); err != nil {
+		}); err != nil {
 		return nil, err
 	}
 	return allDescs, nil
@@ -624,7 +627,7 @@ func LoadAllDescs(
 func ResolveTargetsToDescriptors(
 	ctx context.Context, p sql.PlanHookState, endTime hlc.Timestamp, targets *tree.TargetList,
 ) ([]catalog.Descriptor, []descpb.ID, error) {
-	allDescs, err := LoadAllDescs(ctx, p.ExecCfg(), endTime)
+	allDescs, err := LoadAllDescs(ctx, p.ExecCfg().Codec, p.ExecCfg().DB, endTime)
 	if err != nil {
 		return nil, nil, err
 	}
