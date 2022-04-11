@@ -4448,7 +4448,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				if !isAdmin {
-					return nil, errInsufficientPriv
+					if err := checkPrivilegedUser(ctx); err != nil {
+						return nil, err
+					}
 				}
 
 				sp := tracing.SpanFromContext(ctx.Context)
@@ -4484,7 +4486,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				if !isAdmin {
-					return nil, errInsufficientPriv
+					if err := checkPrivilegedUser(ctx); err != nil {
+						return nil, err
+					}
 				}
 
 				traceID := tracingpb.TraceID(*(args[0].(*tree.DInt)))
@@ -4975,12 +4979,8 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"msg", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
-				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
 				}
 				s, ok := tree.AsDString(args[0])
 				if !ok {
@@ -5008,12 +5008,8 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"msg", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
-				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
 				}
 				s, ok := tree.AsDString(args[0])
 				if !ok {
@@ -5305,14 +5301,9 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{{"vmodule_string", types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
 				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
-				}
-
 				s, ok := tree.AsDString(args[0])
 				if !ok {
 					return nil, errors.Newf("expected string value, got %T", args[0])
@@ -5337,13 +5328,8 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ArgTypes{},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
-				// The user must be an admin to use this builtin.
-				isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
-				if err != nil {
+				if err := checkPrivilegedUser(ctx); err != nil {
 					return nil, err
-				}
-				if !isAdmin {
-					return nil, errInsufficientPriv
 				}
 				return tree.NewDString(log.GetVModule()), nil
 			},
@@ -6146,7 +6132,8 @@ the locality flag on node startup. Returns an error if no region is set.`,
 			},
 			Info: `Returns the region of the connection's current node as defined by
 the locality flag on node startup. Returns an error if no region is set.`,
-			Volatility: tree.VolatilityStable,
+			Volatility:       tree.VolatilityStable,
+			DistsqlBlocklist: true,
 		},
 	),
 	"crdb_internal.validate_multi_region_zone_configs": makeBuiltin(
@@ -8891,6 +8878,13 @@ func CleanEncodingName(s string) string {
 var errInsufficientPriv = pgerror.New(
 	pgcode.InsufficientPrivilege, "insufficient privilege",
 )
+
+func checkPrivilegedUser(ctx *tree.EvalContext) error {
+	if !ctx.SessionData().User().IsRootUser() {
+		return errInsufficientPriv
+	}
+	return nil
+}
 
 // EvalFollowerReadOffset is a function used often with AS OF SYSTEM TIME queries
 // to determine the appropriate offset from now which is likely to be safe for
