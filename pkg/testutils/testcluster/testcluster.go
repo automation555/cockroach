@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"net"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -78,11 +77,6 @@ func (tc *TestCluster) Server(idx int) serverutils.TestServerInterface {
 	return tc.Servers[idx]
 }
 
-// ServerTyped is like Server, but returns the right type.
-func (tc *TestCluster) ServerTyped(idx int) *server.TestServer {
-	return tc.Servers[idx]
-}
-
 // ServerConn is part of TestClusterInterface.
 func (tc *TestCluster) ServerConn(idx int) *gosql.DB {
 	return tc.Conns[idx]
@@ -122,12 +116,12 @@ func (tc *TestCluster) stopServers(ctx context.Context) {
 		tc.stopServerLocked(i)
 	}
 
-	// TODO(andrei): Instead of checking for empty tracing registries after
-	// shutting down each node, we're doing it after shutting down all nodes. This
-	// is because all the nodes might share the same cluster (in case the Tracer
-	// was passed in at cluster creation time). We should not allow the Tracer to
-	// be passed in like this, and we should then also added this registry
-	// draining check to individual TestServers.
+	// TODO(irfansharif): Instead of checking for empty tracing registries after
+	// shutting down each node, we're doing it after shutting down all nodes.
+	// This is because TestCluster share the same Tracer object. Perhaps a saner
+	// thing to do is to separate out individual TestServers entirely. The
+	// component sharing within TestCluster has bitten in the past as well, and
+	// it's not clear why it has to be this way.
 	for i := 0; i < tc.NumServers(); i++ {
 		// Wait until a server's span registry is emptied out. This helps us check
 		// to see that there are no un-Finish()ed spans. We need to wrap this in a
@@ -137,10 +131,10 @@ func (tc *TestCluster) stopServers(ctx context.Context) {
 		// example of this.
 		//
 		// [1]: cleanupSessionTempObjects
-		tracer := tc.Servers[i].Tracer()
+		tracer := tc.Server(i).Tracer().(*tracing.Tracer)
 		testutils.SucceedsSoon(tc.t, func() error {
-			var sps []tracing.RegistrySpan
-			_ = tracer.VisitSpans(func(span tracing.RegistrySpan) error {
+			var sps []*tracing.Span
+			_ = tracer.VisitSpans(func(span *tracing.Span) error {
 				sps = append(sps, span)
 				return nil
 			})
@@ -150,16 +144,12 @@ func (tc *TestCluster) stopServers(ctx context.Context) {
 			var buf strings.Builder
 			fmt.Fprintf(&buf, "unexpectedly found %d active spans:\n", len(sps))
 			for _, sp := range sps {
-				fmt.Fprintln(&buf, sp.GetFullRecording(tracing.RecordingVerbose))
+				fmt.Fprintln(&buf, sp.GetRecording())
 				fmt.Fprintln(&buf)
 			}
 			return errors.Newf("%s", buf.String())
 		})
 	}
-	// Force a GC in an attempt to run finalizers. Some finalizers run sanity
-	// checks that panic on failure, and ideally we'd run them all before starting
-	// the next test.
-	runtime.GC()
 }
 
 // StopServer stops an individual server in the cluster.
@@ -979,7 +969,7 @@ func (tc *TestCluster) MoveRangeLeaseNonCooperatively(
 		ls, err := r.TestingAcquireLease(ctx)
 		if err != nil {
 			log.Infof(ctx, "TestingAcquireLease failed: %s", err)
-			if lErr := (*roachpb.NotLeaseHolderError)(nil); errors.As(err, &lErr) && lErr.Lease != nil {
+			if lErr := (*roachpb.NotLeaseHolderError)(nil); errors.As(err, &lErr) {
 				newLease = lErr.Lease
 			} else {
 				return err
@@ -1326,7 +1316,12 @@ func (tc *TestCluster) ReadIntFromStores(key roachpb.Key) []int64 {
 // Fails the test if they do not match.
 func (tc *TestCluster) WaitForValues(t testing.TB, key roachpb.Key, expected []int64) {
 	t.Helper()
-	testutils.SucceedsSoon(t, func() error {
+	require.NoError(t, tc.WaitForValuesE(key, expected))
+}
+
+// WaitForValuesE is like WaitForValues, but returns the error and does not take a T.
+func (tc *TestCluster) WaitForValuesE(key roachpb.Key, expected []int64) error {
+	return testutils.SucceedsSoonError(func() error {
 		actual := tc.ReadIntFromStores(key)
 		if !reflect.DeepEqual(expected, actual) {
 			return errors.Errorf("expected %v, got %v", expected, actual)
@@ -1393,7 +1388,7 @@ func (tc *TestCluster) RestartServerWithInspect(idx int, inspect func(s *server.
 	}
 
 	for i, specs := range serverArgs.StoreSpecs {
-		if specs.InMemory && specs.StickyInMemoryEngineID == "" {
+		if specs.StickyInMemoryEngineID == "" {
 			return errors.Errorf("failed to restart Server %d, because a restart can only be used on a server with a sticky engine", i)
 		}
 	}
