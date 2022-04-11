@@ -13,16 +13,13 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
-	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/errors"
@@ -102,8 +99,6 @@ func avroUnionKey(t avroSchemaType) string {
 	}
 }
 
-// memo is either nil or a previously-returned value
-// that can be safely overwritten to save allocs.
 type datumToNativeFn func(datum tree.Datum, memo interface{}) (interface{}, error)
 
 // avroSchemaField is our representation of the schema of a field in an avro
@@ -122,12 +117,8 @@ type avroSchemaField struct {
 	encodeFn func(datum tree.Datum) (interface{}, error)
 
 	// encodeDatum encodes specified datum as go "native" interface value.
-	// encodeDatum is a low level encoding function -- it should not memoize
-	// on its own, but may use the passed-in memo.
+	// encodeDatum is a low level encoding function -- it should not memoize.
 	encodeDatum datumToNativeFn
-
-	// decodeFn decodes specified go "native" value into tree.Datum.
-	decodeFn func(interface{}) (tree.Datum, error)
 
 	// Avro encoder treats every field as optional -- that is, we always
 	// allow null values.  As such, every value returned by encodeFn is an
@@ -135,9 +126,11 @@ type avroSchemaField struct {
 	// and the value either null or the actual encoded value.
 	// nativeEncoded is a map that's returned by encodeFn.  We allocate
 	// this map once to avoid repeated map allocations.  We simply update
-	// "union key" value. nativeEncodedSecondaryType supports unions of two types (plus null).
-	nativeEncoded              map[string]interface{}
-	nativeEncodedSecondaryType map[string]interface{}
+	// "union key" value.
+	nativeEncoded map[string]interface{}
+
+	// decodeFn decodes specified go "native" value into tree.Datum.
+	decodeFn func(interface{}) (tree.Datum, error)
 }
 
 // avroRecord is our representation of the schema of an avro record. Serializing
@@ -157,11 +150,10 @@ type avroDataRecord struct {
 
 	colIdxByFieldIdx map[int]int
 	fieldIdxByName   map[string]int
-	fieldIdxByColIdx map[int]int
 	// Allocate Go native representation once, to avoid repeated map allocation
 	// when encoding.
 	native map[string]interface{}
-	alloc  tree.DatumAlloc
+	alloc  rowenc.DatumAlloc
 }
 
 // avroMetadata is the `avroEnvelopeRecord` metadata.
@@ -224,44 +216,6 @@ func typeToAvroSchema(typ *types.T) (*avroSchemaField, error) {
 		}
 	}
 
-	// Handles types that mostly encode to non-strings,
-	// but have special cases like Infinity that encode as strings.
-	setNullableWithStringFallback := func(
-		avroType avroSchemaType,
-		encoder datumToNativeFn,
-		decoder func(interface{}) (tree.Datum, error),
-	) {
-		schema.SchemaType = []avroSchemaType{avroSchemaNull, avroType, avroSchemaString}
-		mainUnionKey := avroUnionKey(avroType)
-		stringUnionKey := avroUnionKey(avroSchemaString)
-		schema.nativeEncoded = map[string]interface{}{mainUnionKey: nil}
-		schema.nativeEncodedSecondaryType = map[string]interface{}{stringUnionKey: nil}
-		schema.encodeDatum = encoder
-
-		schema.encodeFn = func(d tree.Datum) (interface{}, error) {
-			if d == tree.DNull {
-				return nil /* value */, nil
-			}
-			encoded, err := encoder(d, schema.nativeEncoded[mainUnionKey])
-			if err != nil {
-				return nil, err
-			}
-			_, isString := encoded.(string)
-			if isString {
-				schema.nativeEncodedSecondaryType[stringUnionKey] = encoded
-				return schema.nativeEncodedSecondaryType, nil
-			}
-			schema.nativeEncoded[mainUnionKey] = encoded
-			return schema.nativeEncoded, nil
-		}
-		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
-			if x == nil {
-				return tree.DNull, nil
-			}
-			return decoder(x.(map[string]interface{}))
-		}
-	}
-
 	switch typ.Family() {
 	case types.IntFamily:
 		setNullable(
@@ -281,43 +235,6 @@ func typeToAvroSchema(typ *types.T) (*avroSchemaField, error) {
 			},
 			func(x interface{}) (tree.Datum, error) {
 				return tree.MakeDBool(tree.DBool(x.(bool))), nil
-			},
-		)
-	case types.BitFamily:
-		setNullable(
-			avroArrayType{
-				SchemaType: avroSchemaArray,
-				Items:      avroSchemaLong,
-			},
-			func(d tree.Datum, memo interface{}) (interface{}, error) {
-				uints, lastBitsUsed := d.(*tree.DBitArray).EncodingParts()
-				var signedLongs []interface{}
-				// reuse a previously allocated array if it exists
-				// and is long enough
-				if memo != nil {
-					signedLongs = memo.([]interface{})
-					if len(signedLongs) > len(uints)+1 {
-						signedLongs = signedLongs[:len(uints)+1]
-					}
-				}
-				if signedLongs == nil {
-					signedLongs = make([]interface{}, len(uints)+1)
-				}
-				signedLongs[0] = int64(lastBitsUsed)
-				for idx, word := range uints {
-					signedLongs[idx+1] = int64(word)
-				}
-				return signedLongs, nil
-			},
-			func(x interface{}) (tree.Datum, error) {
-				arr := x.([]interface{})
-				lastBitsUsed, ints := arr[0], arr[1:]
-				uints := make([]uint64, len(ints))
-				for idx, word := range ints {
-					uints[idx] = uint64(word.(int64))
-				}
-				ba, err := bitarray.FromEncodingParts(uints, uint64(lastBitsUsed.(int64)))
-				return &tree.DBitArray{BitArray: ba}, err
 			},
 		)
 	case types.FloatFamily:
@@ -429,10 +346,9 @@ func typeToAvroSchema(typ *types.T) (*avroSchemaField, error) {
 				LogicalType: `time-micros`,
 			},
 			func(d tree.Datum, _ interface{}) (interface{}, error) {
-				// Time of day is stored in microseconds since midnight,
-				// which is also the avro format
-				time := d.(*tree.DTime)
-				return int64(*time), nil
+				// The avro library requires us to return this as a time.Duration.
+				duration := time.Duration(*d.(*tree.DTime)) * time.Microsecond
+				return duration, nil
 			},
 			func(x interface{}) (tree.Datum, error) {
 				// The avro library hands this back as a time.Duration.
@@ -479,26 +395,6 @@ func typeToAvroSchema(typ *types.T) (*avroSchemaField, error) {
 				return tree.MakeDTimestampTZ(x.(time.Time), time.Microsecond)
 			},
 		)
-	case types.IntervalFamily:
-		setNullable(
-			// This would ideally be the avro Duration logical type
-			// However, the spec is not implemented in most tooling
-			// and is problematic--it requires 32-bit integers
-			// representing months, days, and milliseconds, meaning
-			// it can't encode everything we can with our int64 years.
-			// String encoding is still fairly terse and arguably the
-			// only semantically exact representation.
-			// Using ISO 8601 format (https://en.wikipedia.org/wiki/ISO_8601#Durations)
-			// because it's the tersest of the input formats we support
-			// and isn't golang-specific.
-			avroSchemaString,
-			func(d tree.Datum, _ interface{}) (interface{}, error) {
-				return d.(*tree.DInterval).ValueAsISO8601String(), nil
-			},
-			func(x interface{}) (tree.Datum, error) {
-				return tree.ParseDInterval(duration.IntervalStyle_ISO_8601, x.(string))
-			},
-		)
 	case types.DecimalFamily:
 		if typ.Precision() == 0 {
 			return nil, errors.Errorf(
@@ -507,20 +403,15 @@ func typeToAvroSchema(typ *types.T) (*avroSchemaField, error) {
 
 		width := int(typ.Width())
 		prec := int(typ.Precision())
-		decimalType := avroLogicalType{
-			SchemaType:  avroSchemaBytes,
-			LogicalType: `decimal`,
-			Precision:   prec,
-			Scale:       width,
-		}
-		setNullableWithStringFallback(
-			decimalType,
+		setNullable(
+			avroLogicalType{
+				SchemaType:  avroSchemaBytes,
+				LogicalType: `decimal`,
+				Precision:   prec,
+				Scale:       width,
+			},
 			func(d tree.Datum, _ interface{}) (interface{}, error) {
 				dec := d.(*tree.DDecimal).Decimal
-
-				if dec.Form != apd.Finite {
-					return d.String(), nil
-				}
 
 				// If the decimal happens to fit a smaller width than the
 				// column allows, add trailing zeroes so the scale is constant
@@ -545,12 +436,7 @@ func typeToAvroSchema(typ *types.T) (*avroSchemaField, error) {
 				return &rat, nil
 			},
 			func(x interface{}) (tree.Datum, error) {
-				unionMap := x.(map[string]interface{})
-				rat, ok := unionMap[avroUnionKey(decimalType)]
-				if ok {
-					return &tree.DDecimal{Decimal: ratToDecimal(*rat.(*big.Rat), int32(width))}, nil
-				}
-				return tree.ParseDDecimal(unionMap[avroUnionKey(avroSchemaString)].(string))
+				return &tree.DDecimal{Decimal: ratToDecimal(*x.(*big.Rat), int32(width))}, nil
 			},
 		)
 	case types.UuidFamily:
@@ -585,16 +471,6 @@ func typeToAvroSchema(typ *types.T) (*avroSchemaField, error) {
 				return tree.ParseDJSON(x.(string))
 			},
 		)
-	case types.EnumFamily:
-		setNullable(
-			avroSchemaString,
-			func(d tree.Datum, _ interface{}) (interface{}, error) {
-				return d.(*tree.DEnum).LogicalRep, nil
-			},
-			func(x interface{}) (tree.Datum, error) {
-				return tree.MakeDEnumFromLogicalRepresentation(typ, x.(string))
-			},
-		)
 	case types.ArrayFamily:
 		itemSchema, err := typeToAvroSchema(typ.ArrayContents())
 		if err != nil {
@@ -626,14 +502,14 @@ func typeToAvroSchema(typ *types.T) (*avroSchemaField, error) {
 						encoded = nil
 					} else {
 						var encErr error
-						if i < len(avroArr) {
-							encoded, encErr = itemSchema.encodeDatum(elt, avroArr[i].(map[string]interface{})[itemUnionKey])
-						} else {
-							encoded, encErr = itemSchema.encodeDatum(elt, nil)
-						}
+						encoded, encErr = itemSchema.encodeDatum(elt, nil)
 						if encErr != nil {
 							return nil, encErr
 						}
+					}
+
+					if i > len(avroArr) && i < cap(avroArr) {
+						avroArr = avroArr[:len(avroArr)+1]
 					}
 
 					if i < len(avroArr) {
@@ -714,7 +590,6 @@ func indexToAvroSchema(
 		},
 		fieldIdxByName:   make(map[string]int),
 		colIdxByFieldIdx: make(map[int]int),
-		fieldIdxByColIdx: make(map[int]int),
 	}
 	colIdxByID := catalog.ColumnIDToOrdinalMap(tableDesc.PublicColumns())
 	for i := 0; i < index.NumKeyColumns(); i++ {
@@ -729,7 +604,6 @@ func indexToAvroSchema(
 			return nil, err
 		}
 		schema.colIdxByFieldIdx[len(schema.Fields)] = colIdx
-		schema.fieldIdxByColIdx[colIdx] = len(schema.Fields)
 		schema.fieldIdxByName[field.Name] = len(schema.Fields)
 		schema.Fields = append(schema.Fields, field)
 	}
@@ -755,10 +629,7 @@ const (
 // If a name suffix is provided (as opposed to avroSchemaNoSuffix), it will be
 // appended to the end of the avro record's name.
 func tableToAvroSchema(
-	tableDesc catalog.TableDescriptor,
-	nameSuffix string,
-	namespace string,
-	virtualColumnVisibility string,
+	tableDesc catalog.TableDescriptor, nameSuffix string, namespace string,
 ) (*avroDataRecord, error) {
 	name := SQLNameToAvroName(tableDesc.GetName())
 	if nameSuffix != avroSchemaNoSuffix {
@@ -772,19 +643,14 @@ func tableToAvroSchema(
 		},
 		fieldIdxByName:   make(map[string]int),
 		colIdxByFieldIdx: make(map[int]int),
-		fieldIdxByColIdx: make(map[int]int),
 	}
 	for _, col := range tableDesc.PublicColumns() {
-		if col.IsVirtual() && virtualColumnVisibility == string(changefeedbase.OptVirtualColumnsOmitted) {
-			continue
-		}
 		field, err := columnToAvroSchema(col)
 		if err != nil {
 			return nil, err
 		}
 		schema.colIdxByFieldIdx[len(schema.Fields)] = col.Ordinal()
 		schema.fieldIdxByName[field.Name] = len(schema.Fields)
-		schema.fieldIdxByColIdx[col.Ordinal()] = len(schema.Fields)
 		schema.Fields = append(schema.Fields, field)
 	}
 	schemaJSON, err := json.Marshal(schema)
@@ -998,16 +864,6 @@ func (r *avroEnvelopeRecord) BinaryFromRow(
 	return r.codec.BinaryFromNative(buf, native)
 }
 
-// Refresh the metadata for user-defined types on a cached schema
-// The only user-defined type is enum, so this is usually a no-op.
-func (r *avroDataRecord) refreshTypeMetadata(tbl catalog.TableDescriptor) {
-	for _, col := range tbl.UserDefinedTypeColumns() {
-		if fieldIdx, ok := r.fieldIdxByColIdx[col.Ordinal()]; ok {
-			r.Fields[fieldIdx].typ = col.GetType()
-		}
-	}
-}
-
 // decimalToRat converts one of our apd decimals to the format expected by the
 // avro library we use. If the column has a fixed scale (which is always true if
 // precision is set) this is roundtripable without information loss.
@@ -1022,13 +878,12 @@ func decimalToRat(dec apd.Decimal, scale int32) (big.Rat, error) {
 	if dec.Exponent >= 0 {
 		exp := big.NewInt(10)
 		exp = exp.Exp(exp, big.NewInt(int64(dec.Exponent)), nil)
-		coeff := dec.Coeff.MathBigInt()
-		r.SetFrac(coeff.Mul(coeff, exp), big.NewInt(1))
+		var coeff big.Int
+		r.SetFrac(coeff.Mul(&dec.Coeff, exp), big.NewInt(1))
 	} else {
 		exp := big.NewInt(10)
 		exp = exp.Exp(exp, big.NewInt(int64(-dec.Exponent)), nil)
-		coeff := dec.Coeff.MathBigInt()
-		r.SetFrac(coeff, exp)
+		r.SetFrac(&dec.Coeff, exp)
 	}
 	if dec.Negative {
 		r.Mul(&r, big.NewRat(-1, 1))
@@ -1044,8 +899,7 @@ func ratToDecimal(rat big.Rat, scale int32) apd.Decimal {
 	exp := big.NewInt(10)
 	exp = exp.Exp(exp, big.NewInt(int64(scale)), nil)
 	sf := denom.Div(exp, denom)
-	var coeff apd.BigInt
-	coeff.SetMathBigInt(num.Mul(num, sf))
-	dec := apd.NewWithBigInt(&coeff, -scale)
+	coeff := num.Mul(num, sf)
+	dec := apd.NewWithBigInt(coeff, -scale)
 	return *dec
 }
