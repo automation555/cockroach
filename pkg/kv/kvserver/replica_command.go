@@ -49,15 +49,6 @@ import (
 // why this value was chosen in particular, but it seems to work.
 const mergeApplicationTimeout = 5 * time.Second
 
-// sendSnapshotTimeout is the timeout for sending snapshots. While a snapshot is
-// in transit, Raft log truncation is halted to allow the recipient to catch up.
-// If the snapshot takes very long to transfer for whatever reason this can
-// cause the Raft log to grow very large. We therefore set a conservative
-// timeout to eventually allow Raft log truncation while avoiding snapshot
-// starvation -- even if another snapshot is sent immediately, this still
-// allows truncation up to the new snapshot index.
-const sendSnapshotTimeout = 20 * time.Minute
-
 // AdminSplit divides the range into into two ranges using args.SplitKey.
 func (r *Replica) AdminSplit(
 	ctx context.Context, args roachpb.AdminSplitRequest, reason string,
@@ -343,22 +334,14 @@ func (r *Replica) adminSplitWithDescriptor(
 			// range's bounds, return an error for the client to try again on the
 			// correct range.
 			if !kvserverbase.ContainsKey(desc, args.Key) {
-				ri := r.GetRangeInfo(ctx)
-				return reply, roachpb.NewRangeKeyMismatchErrorWithCTPolicy(ctx, args.Key, args.Key, desc, &ri.Lease, ri.ClosedTimestampPolicy)
+				l, _ := r.GetLease()
+				return reply, roachpb.NewRangeKeyMismatchError(ctx, args.Key, args.Key, desc, &l)
 			}
 			foundSplitKey = args.SplitKey
 		}
 
 		if !kvserverbase.ContainsKey(desc, foundSplitKey) {
 			return reply, errors.Errorf("requested split key %s out of bounds of %s", args.SplitKey, r)
-		}
-
-		// If predicate keys are specified, make sure they are contained by this
-		// range as well.
-		for _, k := range args.PredicateKeys {
-			if !kvserverbase.ContainsKey(desc, k) {
-				return reply, errors.Errorf("requested predicate key %s out of bounds of %s", k, r)
-			}
 		}
 
 		var err error
@@ -966,7 +949,7 @@ func waitForReplicasInit(
 func (r *Replica) ChangeReplicas(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
-	priority kvserverpb.SnapshotRequest_Priority,
+	priority SnapshotRequest_Priority,
 	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs roachpb.ReplicationChanges,
@@ -996,7 +979,7 @@ func (r *Replica) ChangeReplicas(
 func (r *Replica) changeReplicasImpl(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
-	priority kvserverpb.SnapshotRequest_Priority,
+	priority SnapshotRequest_Priority,
 	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs roachpb.ReplicationChanges,
@@ -1547,7 +1530,7 @@ func getChangesByNodeID(chgs roachpb.ReplicationChanges) changesByNodeID {
 func (r *Replica) initializeRaftLearners(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
-	priority kvserverpb.SnapshotRequest_Priority,
+	priority SnapshotRequest_Priority,
 	reason kvserverpb.RangeLogEventReason,
 	details string,
 	targets []roachpb.ReplicationTarget,
@@ -1693,7 +1676,7 @@ func (r *Replica) initializeRaftLearners(
 		// orphaned learner. Second, this tickled some bugs in etcd/raft around
 		// switching between StateSnapshot and StateProbe. Even if we worked through
 		// these, it would be susceptible to future similar issues.
-		if err := r.sendSnapshot(ctx, rDesc, kvserverpb.SnapshotRequest_INITIAL, priority); err != nil {
+		if err := r.sendSnapshot(ctx, rDesc, SnapshotRequest_INITIAL, priority); err != nil {
 			return nil, err
 		}
 	}
@@ -2435,8 +2418,8 @@ func recordRangeEventsInLog(
 func (r *Replica) sendSnapshot(
 	ctx context.Context,
 	recipient roachpb.ReplicaDescriptor,
-	snapType kvserverpb.SnapshotRequest_Type,
-	priority kvserverpb.SnapshotRequest_Priority,
+	snapType SnapshotRequest_Type,
+	priority SnapshotRequest_Priority,
 ) (retErr error) {
 	defer func() {
 		// Report the snapshot status to Raft, which expects us to do this once we
@@ -2490,10 +2473,10 @@ func (r *Replica) sendSnapshot(
 	// explicitly for snapshots going out to followers.
 	snap.State.DeprecatedUsingAppliedStateKey = true
 
-	req := kvserverpb.SnapshotRequest_Header{
+	req := SnapshotRequest_Header{
 		State:                                snap.State,
 		DeprecatedUnreplicatedTruncatedState: true,
-		RaftMessageRequest: kvserverpb.RaftMessageRequest{
+		RaftMessageRequest: RaftMessageRequest{
 			RangeID:     r.RangeID,
 			FromReplica: sender,
 			ToReplica:   recipient,
@@ -2507,7 +2490,7 @@ func (r *Replica) sendSnapshot(
 		},
 		RangeSize: r.GetMVCCStats().Total(),
 		Priority:  priority,
-		Strategy:  kvserverpb.SnapshotRequest_KV_BATCH,
+		Strategy:  SnapshotRequest_KV_BATCH,
 		Type:      snapType,
 	}
 	newBatchFn := func() storage.Batch {
@@ -2516,31 +2499,14 @@ func (r *Replica) sendSnapshot(
 	sent := func() {
 		r.store.metrics.RangeSnapshotsGenerated.Inc(1)
 	}
-	err = contextutil.RunWithTimeout(
-		ctx, "send-snapshot", sendSnapshotTimeout, func(ctx context.Context) error {
-			return r.store.cfg.Transport.SendSnapshot(
-				ctx,
-				r.store.allocator.storePool,
-				req,
-				snap,
-				newBatchFn,
-				sent,
-			)
-		})
-	if err != nil {
-		if errors.Is(err, errMalformedSnapshot) {
-			tag := fmt.Sprintf("r%d_%s", r.RangeID, snap.SnapUUID.Short())
-			if dir, err := r.store.checkpoint(ctx, tag); err != nil {
-				log.Warningf(ctx, "unable to create checkpoint %s: %+v", dir, err)
-			} else {
-				log.Warningf(ctx, "created checkpoint %s", dir)
-			}
-
-			log.Fatal(ctx, "malformed snapshot generated")
-		}
-		return errors.Mark(err, errMarkSnapshotError)
-	}
-	return nil
+	return r.store.cfg.Transport.SendSnapshot(
+		ctx,
+		r.store.allocator.storePool,
+		req,
+		snap,
+		newBatchFn,
+		sent,
+	)
 }
 
 // replicasCollocated is used in AdminMerge to ensure that the ranges are
@@ -2678,7 +2644,6 @@ func (s *Store) AdminRelocateRange(
 	ctx context.Context,
 	rangeDesc roachpb.RangeDescriptor,
 	voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
-	transferLeaseToFirstVoter bool,
 ) error {
 	if containsDuplicates(voterTargets) {
 		return errors.AssertionFailedf(
@@ -2708,9 +2673,7 @@ func (s *Store) AdminRelocateRange(
 	}
 	rangeDesc = *newDesc
 
-	rangeDesc, err = s.relocateReplicas(
-		ctx, rangeDesc, voterTargets, nonVoterTargets, transferLeaseToFirstVoter,
-	)
+	rangeDesc, err = s.relocateReplicas(ctx, rangeDesc, voterTargets, nonVoterTargets)
 	if err != nil {
 		return err
 	}
@@ -2742,7 +2705,6 @@ func (s *Store) relocateReplicas(
 	ctx context.Context,
 	rangeDesc roachpb.RangeDescriptor,
 	voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
-	transferLeaseToFirstVoter bool,
 ) (roachpb.RangeDescriptor, error) {
 	startKey := rangeDesc.StartKey.AsRawKey()
 	transferLease := func(target roachpb.ReplicationTarget) error {
@@ -2769,13 +2731,10 @@ func (s *Store) relocateReplicas(
 				return rangeDesc, err
 			}
 
-			ops, leaseTarget, err := s.relocateOne(
-				ctx, &rangeDesc, voterTargets, nonVoterTargets, transferLeaseToFirstVoter,
-			)
+			ops, leaseTarget, err := s.relocateOne(ctx, &rangeDesc, voterTargets, nonVoterTargets)
 			if err != nil {
 				return rangeDesc, err
 			}
-
 			if leaseTarget != nil {
 				// NB: we may need to transfer even if there are no ops, to make
 				// sure the attempt is made to make the first target the final
@@ -2784,7 +2743,6 @@ func (s *Store) relocateReplicas(
 					return rangeDesc, err
 				}
 			}
-
 			if len(ops) == 0 {
 				// Done.
 				return rangeDesc, ctx.Err()
@@ -2862,7 +2820,6 @@ func (s *Store) relocateOne(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
-	transferLeaseToFirstVoter bool,
 ) ([]roachpb.ReplicationChange, *roachpb.ReplicationTarget, error) {
 	if repls := desc.Replicas(); len(repls.VoterFullAndNonVoterDescriptors()) != len(repls.Descriptors()) {
 		// The caller removed all the learners and left the joint config, so there
@@ -2921,7 +2878,7 @@ func (s *Store) relocateOne(
 		}
 		candidateStoreList := makeStoreList(candidateDescs)
 
-		additionTarget, _ = s.allocator.allocateTargetFromList(
+		targetStore, _ := s.allocator.allocateTargetFromList(
 			ctx,
 			candidateStoreList,
 			conf,
@@ -2934,11 +2891,16 @@ func (s *Store) relocateOne(
 			true, /* allowMultipleReplsPerNode */
 			args.targetType,
 		)
-		if roachpb.Empty(additionTarget) {
+		if targetStore == nil {
 			return nil, nil, fmt.Errorf(
 				"none of the remaining %ss %v are legal additions to %v",
 				args.targetType, args.targetsToAdd(), desc.Replicas(),
 			)
+		}
+
+		additionTarget = roachpb.ReplicationTarget{
+			NodeID:  targetStore.Node.NodeID,
+			StoreID: targetStore.StoreID,
 		}
 
 		// Pretend the new replica is already there so that the removal logic below
@@ -2992,7 +2954,7 @@ func (s *Store) relocateOne(
 		targetStore, _, err := s.allocator.removeTarget(
 			ctx,
 			conf,
-			s.allocator.storeListForTargets(args.targetsToRemove()),
+			args.targetsToRemove(),
 			existingVoters,
 			existingNonVoters,
 			args.targetType,
@@ -3090,9 +3052,9 @@ func (s *Store) relocateOne(
 		}
 	}
 
-	if len(ops) == 0 && transferLeaseToFirstVoter {
-		// Make sure that the first target is the final leaseholder, if the caller
-		// asked for it.
+	if len(ops) == 0 {
+		// Make sure that the first target is the final leaseholder, as
+		// AdminRelocateRange specifies.
 		transferTarget = &voterTargets[0]
 	}
 	return ops, transferTarget, nil
@@ -3207,9 +3169,7 @@ func (r *Replica) adminScatter(
 	var allowLeaseTransfer bool
 	canTransferLease := func(ctx context.Context, repl *Replica) bool { return allowLeaseTransfer }
 	for re := retry.StartWithCtx(ctx, retryOpts); re.Next(); {
-		requeue, err := rq.processOneChange(
-			ctx, r, canTransferLease, true /* scatter */, false, /* dryRun */
-		)
+		requeue, err := rq.processOneChange(ctx, r, canTransferLease, false /* dryRun */)
 		if err != nil {
 			// TODO(tbg): can this use IsRetriableReplicationError?
 			if isSnapshotError(err) {
