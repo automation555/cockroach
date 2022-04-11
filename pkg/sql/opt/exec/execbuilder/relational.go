@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
@@ -34,11 +33,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -159,15 +156,12 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 		// `BEGIN; INSERT INTO ...; CREATE TABLE IF NOT EXISTS ...; COMMIT;`
 		// where the table already exists. This will generate some false schema
 		// cache refreshes, but that's expected to be quite rare in practice.
-		if !descs.UnsafeSkipSystemConfigTrigger.Get(&b.evalCtx.Settings.SV) {
-			if err := b.evalCtx.Txn.SetSystemConfigTrigger(b.evalCtx.Codec.ForSystemTenant()); err != nil {
-				return execPlan{}, errors.WithSecondaryError(
-					unimplemented.NewWithIssuef(26508,
-						"the first schema change statement in a transaction must precede any writes"),
-					err)
-			}
+		if err := b.evalCtx.Txn.SetSystemConfigTrigger(b.evalCtx.Codec.ForSystemTenant()); err != nil {
+			return execPlan{}, errors.WithSecondaryError(
+				unimplemented.NewWithIssuef(26508,
+					"the first schema change statement in a transaction must precede any writes"),
+				err)
 		}
-
 	}
 
 	if opt.IsMutationOp(e) {
@@ -236,9 +230,6 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 
 	case *memo.SortExpr:
 		ep, err = b.buildSort(t)
-
-	case *memo.DistributeExpr:
-		ep, err = b.buildDistribute(t)
 
 	case *memo.IndexJoinExpr:
 		ep, err = b.buildIndexJoin(t)
@@ -321,9 +312,6 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	case *memo.AlterTableRelocateExpr:
 		ep, err = b.buildAlterTableRelocate(t)
 
-	case *memo.AlterRangeRelocateExpr:
-		ep, err = b.buildAlterRangeRelocate(t)
-
 	case *memo.ControlJobsExpr:
 		ep, err = b.buildControlJobs(t)
 
@@ -363,7 +351,7 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 
 	// In test builds, assert that the exec plan output columns match the opt
 	// plan output columns.
-	if buildutil.CrdbTestBuild {
+	if util.CrdbTestBuild {
 		optCols := e.Relational().OutputCols
 		var execCols opt.ColSet
 		ep.outputCols.ForEach(func(key, val int) {
@@ -394,7 +382,6 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 					val.TableStatsRowCount = 1
 				}
 				val.TableStatsCreatedAt = stat.CreatedAt()
-				val.LimitHint = scan.RequiredPhysical().LimitHint
 			}
 		}
 		ef.AnnotateNode(ep.root, exec.EstimatedStatsID, &val)
@@ -550,13 +537,8 @@ func (b *Builder) scanParams(
 				idx.Name(),
 			)
 		default:
+			// This should never happen.
 			err = fmt.Errorf("index \"%s\" cannot be used for this query", idx.Name())
-			if b.evalCtx.SessionData().DisallowFullTableScans &&
-				(b.ContainsLargeFullTableScan || b.ContainsLargeFullIndexScan) {
-				err = errors.WithHint(err,
-					"try overriding the `disallow_full_table_scans` or increasing the `large_full_scan_rows` cluster/session settings",
-				)
-			}
 		}
 
 		return exec.ScanParams{}, opt.ColMap{}, err
@@ -613,7 +595,7 @@ func (b *Builder) scanParams(
 		}
 		if !valid {
 			return exec.ScanParams{}, opt.ColMap{}, unimplemented.NewWithIssuef(67562,
-				"cannot use bounded staleness for queries that may touch more than one range or require an index join",
+				"cannot use bounded staleness for queries that may touch more than one row or require an index join",
 			)
 		}
 		b.containsBoundedStalenessScan = true
@@ -666,35 +648,6 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		telemetry.Inc(sqltelemetry.PartialIndexScanUseCounter)
 	}
 
-	if scan.Flags.ForceZigzag {
-		return execPlan{}, fmt.Errorf("could not produce a query plan conforming to the FORCE_ZIGZAG hint")
-	}
-
-	isUnfiltered := scan.IsUnfiltered(md)
-	if scan.Flags.NoFullScan {
-		// Normally a full scan of a partial index would be allowed with the
-		// NO_FULL_SCAN hint (isUnfiltered is false for partial indexes), but if the
-		// user has explicitly forced the partial index *and* used NO_FULL_SCAN, we
-		// disallow the full index scan.
-		if isUnfiltered || (scan.Flags.ForceIndex && scan.IsFullIndexScan(md)) {
-			return execPlan{}, fmt.Errorf("could not produce a query plan conforming to the NO_FULL_SCAN hint")
-		}
-	}
-
-	// Save if we planned a full table/index scan on the builder so that the
-	// planner can be made aware later. We only do this for non-virtual tables.
-	if !tab.IsVirtualTable() && isUnfiltered {
-		stats := scan.Relational().Stats
-		large := !stats.Available || stats.RowCount > b.evalCtx.SessionData().LargeFullScanRows
-		if scan.Index == cat.PrimaryIndex {
-			b.ContainsFullTableScan = true
-			b.ContainsLargeFullTableScan = b.ContainsLargeFullTableScan || large
-		} else {
-			b.ContainsFullIndexScan = true
-			b.ContainsLargeFullIndexScan = b.ContainsLargeFullIndexScan || large
-		}
-	}
-
 	params, outputCols, err := b.scanParams(tab, &scan.ScanPrivate, scan.Relational(), scan.RequiredPhysical())
 	if err != nil {
 		return execPlan{}, err
@@ -708,6 +661,24 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 	)
 	if err != nil {
 		return execPlan{}, err
+	}
+
+	if scan.Flags.ForceZigzag {
+		return execPlan{}, fmt.Errorf("could not produce a query plan conforming to the FORCE_ZIGZAG hint")
+	}
+
+	// Save if we planned a full table/index scan on the builder so that the
+	// planner can be made aware later. We only do this for non-virtual tables.
+	if !tab.IsVirtualTable() && scan.Constraint == nil && scan.InvertedConstraint == nil && !scan.HardLimit.IsSet() {
+		stats := scan.Relational().Stats
+		large := !stats.Available || stats.RowCount > b.evalCtx.SessionData().LargeFullScanRows
+		if scan.Index == cat.PrimaryIndex {
+			b.ContainsFullTableScan = true
+			b.ContainsLargeFullTableScan = b.ContainsLargeFullTableScan || large
+		} else {
+			b.ContainsFullIndexScan = true
+			b.ContainsLargeFullIndexScan = b.ContainsLargeFullIndexScan || large
+		}
 	}
 
 	res.root = root
@@ -1173,40 +1144,19 @@ func (b *Builder) buildMergeJoin(join *memo.MergeJoinExpr) (execPlan, error) {
 	}
 
 	joinType := joinOpToJoinType(join.JoinType)
-	leftExpr, rightExpr := join.Left, join.Right
-	leftEq, rightEq := join.LeftEq, join.RightEq
-
-	if joinType == descpb.LeftSemiJoin || joinType == descpb.LeftAntiJoin {
-		// We have a partial join, and we want to make sure that the relation
-		// with smaller cardinality is on the right side. Note that we assumed
-		// it during the costing.
-		// TODO(raduberinde): we might also need to look at memo.JoinFlags when
-		// choosing a side.
-		leftRowCount := leftExpr.Relational().Stats.RowCount
-		rightRowCount := rightExpr.Relational().Stats.RowCount
-		if leftRowCount < rightRowCount {
-			if joinType == descpb.LeftSemiJoin {
-				joinType = descpb.RightSemiJoin
-			} else {
-				joinType = descpb.RightAntiJoin
-			}
-			leftExpr, rightExpr = rightExpr, leftExpr
-			leftEq, rightEq = rightEq, leftEq
-		}
-	}
 
 	left, right, onExpr, outputCols, err := b.initJoinBuild(
-		leftExpr, rightExpr, join.On, joinType,
+		join.Left, join.Right, join.On, joinType,
 	)
 	if err != nil {
 		return execPlan{}, err
 	}
-	leftOrd := left.sqlOrdering(leftEq)
-	rightOrd := right.sqlOrdering(rightEq)
+	leftOrd := left.sqlOrdering(join.LeftEq)
+	rightOrd := right.sqlOrdering(join.RightEq)
 	ep := execPlan{outputCols: outputCols}
 	reqOrd := ep.reqOrdering(join)
-	leftEqColsAreKey := leftExpr.Relational().FuncDeps.ColsAreStrictKey(leftEq.ColSet())
-	rightEqColsAreKey := rightExpr.Relational().FuncDeps.ColsAreStrictKey(rightEq.ColSet())
+	leftEqColsAreKey := join.Left.Relational().FuncDeps.ColsAreStrictKey(join.LeftEq.ColSet())
+	rightEqColsAreKey := join.Right.Relational().FuncDeps.ColsAreStrictKey(join.RightEq.ColSet())
 	ep.root, err = b.factory.ConstructMergeJoin(
 		joinType,
 		left.root, right.root,
@@ -1367,9 +1317,8 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 			&groupBy.GroupingPrivate, &groupBy.RequiredPhysical().Ordering,
 		))
 		reqOrdering := ep.reqOrdering(groupBy)
-		orderType := exec.GroupingOrderType(groupBy.GroupingOrderType(&groupBy.RequiredPhysical().Ordering))
 		ep.root, err = b.factory.ConstructGroupBy(
-			input.root, groupingColIdx, groupingColOrder, aggInfos, reqOrdering, orderType,
+			input.root, groupingColIdx, groupingColOrder, aggInfos, reqOrdering,
 		)
 	}
 	if err != nil {
@@ -1658,26 +1607,6 @@ func (b *Builder) buildSort(sort *memo.SortExpr) (execPlan, error) {
 	return execPlan{root: node, outputCols: input.outputCols}, nil
 }
 
-func (b *Builder) buildDistribute(distribute *memo.DistributeExpr) (execPlan, error) {
-	input, err := b.buildRelational(distribute.Input)
-	if err != nil {
-		return execPlan{}, err
-	}
-
-	distribution := distribute.ProvidedPhysical().Distribution
-	inputDistribution := distribute.Input.ProvidedPhysical().Distribution
-	if distribution.Equals(inputDistribution) {
-		// Don't bother creating a no-op distribution. This likely exists because
-		// the input is a Sort expression, and this is an artifact of how physical
-		// properties are enforced.
-		return input, err
-	}
-
-	// TODO(rytaft): This is currently a no-op. We should pass this distribution
-	// info to the DistSQL planner.
-	return input, err
-}
-
 func (b *Builder) buildOrdinality(ord *memo.OrdinalityExpr) (execPlan, error) {
 	input, err := b.buildRelational(ord.Input)
 	if err != nil {
@@ -1753,25 +1682,10 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 
 	inputCols := join.Input.Relational().OutputCols
 	lookupCols := join.Cols.Difference(inputCols)
-	if join.IsFirstJoinInPairedJoiner {
-		lookupCols.Remove(join.ContinuationCol)
-	}
 
 	lookupOrdinals, lookupColMap := b.getColumns(lookupCols, join.Table)
-	// allExprCols are the columns used in expressions evaluated by this join.
-	allExprCols := joinOutputMap(input.outputCols, lookupColMap)
-	allCols := allExprCols
-	if join.IsFirstJoinInPairedJoiner {
-		// allCols needs to include the continuation column since it will be
-		// in the result output by this join.
-		allCols = allExprCols.Copy()
-		maxValue, ok := allCols.MaxValue()
-		if !ok {
-			return execPlan{}, errors.AssertionFailedf("allCols should not be empty")
-		}
-		// Assign the continuation column the next unused value in the map.
-		allCols.Set(int(join.ContinuationCol), maxValue+1)
-	}
+	allCols := joinOutputMap(input.outputCols, lookupColMap)
+
 	res := execPlan{outputCols: allCols}
 	if join.JoinType == opt.SemiJoinOp || join.JoinType == opt.AntiJoinOp {
 		// For semi and anti join, only the left columns are output.
@@ -1779,8 +1693,8 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 	}
 
 	ctx := buildScalarCtx{
-		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allExprCols.Len()),
-		ivarMap: allExprCols,
+		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allCols.Len()),
+		ivarMap: allCols,
 	}
 	var lookupExpr, remoteLookupExpr tree.TypedExpr
 	if len(join.LookupExpr) > 0 {
@@ -1825,7 +1739,6 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 		remoteLookupExpr,
 		lookupOrdinals,
 		onExpr,
-		join.IsFirstJoinInPairedJoiner,
 		join.IsSecondJoinInPairedJoiner,
 		res.reqOrdering(join),
 		locking,
@@ -2125,7 +2038,7 @@ func (b *Builder) buildRecursiveCTE(rec *memo.RecursiveCTEExpr) (execPlan, error
 
 	label := fmt.Sprintf("working buffer (%s)", rec.Name)
 	var ep execPlan
-	ep.root, err = b.factory.ConstructRecursiveCTE(initial.root, fn, label, rec.Deduplicate)
+	ep.root, err = b.factory.ConstructRecursiveCTE(initial.root, fn, label)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -2267,8 +2180,8 @@ func (b *Builder) extractWindowFunction(e opt.ScalarExpr) opt.ScalarExpr {
 	return b.extractWindowFunction(e.Child(0).(opt.ScalarExpr))
 }
 
-func (b *Builder) isOffsetMode(boundType treewindow.WindowFrameBoundType) bool {
-	return boundType == treewindow.OffsetPreceding || boundType == treewindow.OffsetFollowing
+func (b *Builder) isOffsetMode(boundType tree.WindowFrameBoundType) bool {
+	return boundType == tree.OffsetPreceding || boundType == tree.OffsetFollowing
 }
 
 func (b *Builder) buildFrame(input execPlan, w *memo.WindowsItem) (*tree.WindowFrame, error) {
