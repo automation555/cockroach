@@ -199,11 +199,6 @@ type Replica struct {
 	log.AmbientContext
 
 	RangeID roachpb.RangeID // Only set by the constructor
-	// The ID of the replica within the Raft group. Only set by the constructor,
-	// so it will not change over the lifetime of this replica. If addressed
-	// under a newer replicaID, the replica immediately replicaGCs itself to
-	// make way for the newer incarnation.
-	replicaID roachpb.ReplicaID
 
 	// The start key of a Range remains constant throughout its lifetime (it does
 	// not change through splits or merges). This field carries a copy of
@@ -452,6 +447,14 @@ type Replica struct {
 		// log was checked for truncation or at the time of the last Raft log
 		// truncation.
 		raftLogLastCheckSize int64
+		// The log truncations that are pending. Note that the above sizes, when
+		// accurate, do not include the effect of pending truncations. Hence, they
+		// are fine for metrics etc., but not for deciding whether we should
+		// create another pending truncation. For the latter, we compute the
+		// post-pending-truncation size using pendingLogTruncations.
+		// Writes also require that raftMu be held, which means one of mu or
+		// raftMu is sufficient for reads.
+		pendingLogTruncations pendingLogTruncations
 		// pendingLeaseRequest is used to coalesce RequestLease requests.
 		pendingLeaseRequest pendingLeaseRequest
 		// minLeaseProposedTS is the minimum acceptable lease.ProposedTS; only
@@ -521,6 +524,13 @@ type Replica struct {
 		applyingEntries bool
 		// The replica's Raft group "node".
 		internalRaftGroup *raft.RawNode
+		// The ID of the replica within the Raft group. This value may never be 0.
+		// It will not change over the lifetime of this replica. If addressed under
+		// a newer replicaID, the replica immediately replicaGCs itself to make
+		// way for the newer incarnation.
+		// TODO(sumeer): since this is initialized in newUnloadedReplica and never
+		// changed, lift this out of the mu struct.
+		replicaID roachpb.ReplicaID
 		// The minimum allowed ID for this replica. Initialized from
 		// RangeTombstone.NextReplicaID.
 		tombstoneMinReplicaID roachpb.ReplicaID
@@ -713,7 +723,11 @@ func (r *Replica) SafeFormat(w redact.SafePrinter, _ rune) {
 // ReplicaID returns the ID for the Replica. This value is fixed for the
 // lifetime of the Replica.
 func (r *Replica) ReplicaID() roachpb.ReplicaID {
-	return r.replicaID
+	// The locking of mu is unnecessary. It will be removed when we lift
+	// replicaID out of the mu struct.
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mu.replicaID
 }
 
 // cleanupFailedProposal cleans up after a proposal that has failed. It
@@ -909,18 +923,6 @@ func (r *Replica) GetGCThreshold() hlc.Timestamp {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return *r.mu.state.GCThreshold
-}
-
-// ExcludeDataFromBackup returns whether the replica is to be excluded from a
-// backup.
-func (r *Replica) ExcludeDataFromBackup() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.mu.conf.ExcludeDataFromBackup
-}
-
-func (r *Replica) exludeReplicaFromBackupRLocked() bool {
-	return r.mu.conf.ExcludeDataFromBackup
 }
 
 // Version returns the replica version.
@@ -1326,8 +1328,8 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 		if !ok {
 			log.Fatalf(ctx, "%+v does not contain local store s%d", r.mu.state.Desc, r.store.StoreID())
 		}
-		if replDesc.ReplicaID != r.replicaID {
-			log.Fatalf(ctx, "replica's replicaID %d diverges from descriptor %+v", r.replicaID, r.mu.state.Desc)
+		if replDesc.ReplicaID != r.mu.replicaID {
+			log.Fatalf(ctx, "replica's replicaID %d diverges from descriptor %+v", r.mu.replicaID, r.mu.state.Desc)
 		}
 	}
 }
@@ -1526,9 +1528,8 @@ func (r *Replica) checkTSAboveGCThresholdRLocked(
 		return nil
 	}
 	return &roachpb.BatchTimestampBeforeGCError{
-		Timestamp:              ts,
-		Threshold:              threshold,
-		DataExcludedFromBackup: r.exludeReplicaFromBackupRLocked(),
+		Timestamp: ts,
+		Threshold: threshold,
 	}
 }
 
@@ -1684,7 +1685,7 @@ func (r *Replica) isNewerThanSplitRLocked(split *roachpb.SplitTrigger) bool {
 		// ID which is above the replica ID of the split then we would not have
 		// written a tombstone but we will have a replica ID that will exceed the
 		// split replica ID.
-		r.replicaID > rightDesc.ReplicaID
+		r.mu.replicaID > rightDesc.ReplicaID
 }
 
 // WatchForMerge is like maybeWatchForMergeLocked, except it expects a merge to
@@ -2023,4 +2024,69 @@ func (r *Replica) LockRaftMuForTesting() (unlockFunc func()) {
 	return func() {
 		r.raftMu.Unlock()
 	}
+}
+
+// Implementation of replicaForTruncator interface.
+
+var _ replicaForTruncator = &Replica{}
+
+func (r *Replica) lockReplicaState() {
+	r.mu.Lock()
+}
+
+func (r *Replica) getDestroyStatus() destroyStatus {
+	return r.mu.destroyStatus
+}
+
+func (r *Replica) getTruncatedState() roachpb.RaftTruncatedState {
+	// TruncatedState is guaranteed to be non-nil
+	return *r.mu.state.TruncatedState
+}
+
+func (r *Replica) setTruncatedState(state roachpb.RaftTruncatedState) {
+	*r.mu.state.TruncatedState = state
+}
+
+func (r *Replica) getPendingTruncs() *pendingLogTruncations {
+	return &r.mu.pendingLogTruncations
+}
+
+func (r *Replica) setTruncationDeltaAndTrusted(deltaBytes int64, isDeltaTrusted bool) {
+	r.mu.raftLogSize += deltaBytes
+	r.mu.raftLogLastCheckSize += deltaBytes
+	if r.mu.raftLogSize < 0 {
+		r.mu.raftLogSize = 0
+	}
+	if r.mu.raftLogLastCheckSize < 0 {
+		r.mu.raftLogLastCheckSize = 0
+	}
+	if !isDeltaTrusted {
+		r.mu.raftLogSizeTrusted = false
+	}
+}
+
+func (r *Replica) unlockReplicaState() {
+	r.mu.Unlock()
+}
+
+func (r *Replica) lockRaftState() {
+	r.raftMu.Lock()
+}
+
+func (r *Replica) assertRaftStateLockHeld() {
+	r.raftMu.AssertHeld()
+}
+
+func (r *Replica) sideloadedBytesIfTruncatedFromTo(
+	ctx context.Context, from, to uint64,
+) (freed, retained int64, _ error) {
+	return r.raftMu.sideloaded.BytesIfTruncatedFromTo(ctx, from, to)
+}
+
+func (r *Replica) getStateLoader() stateloader.StateLoader {
+	return r.raftMu.stateLoader
+}
+
+func (r *Replica) unlockRaftState() {
+	r.raftMu.Unlock()
 }

@@ -19,7 +19,6 @@ import "roachpb/data.proto";
 import "roachpb/errors.proto";
 import "roachpb/metadata.proto";
 import "roachpb/span_config.proto";
-import "settings/encoding.proto";
 import "storage/enginepb/mvcc.proto";
 import "storage/enginepb/mvcc3.proto";
 import "util/hlc/timestamp.proto";
@@ -1201,6 +1200,19 @@ message TruncateLogRequest {
   // itself. The range may have changed from the one specified in the header
   // in the case of a merge.
   int64 range_id = 3 [(gogoproto.customname) = "RangeID", (gogoproto.casttype) = "RangeID"];
+
+  // ExpectedFirstIndex is the expected Index of the last TruncateLogRequest,
+  // i.e., we expect that this request will typically be truncating entries
+  // [ExpectedFirstIndex, Index).
+  //
+  // There is no correctness issue if the replica applying this truncation has
+  // not seen the preceding TruncateLogRequest or has seen one with an Index
+  // that is not equal to ExpectedFirstIndex. This is an optimization that
+  // typically allows the potentially expensive computation of the bytes being
+  // discarded from the raft log to be performed once, at the leaseholder.
+  //
+  // Populated starting at cluster version LooselyCoupledRaftLogTruncation.
+  uint64 expected_first_index = 4;
 }
 
 // TruncateLogResponse is the response to a TruncateLog() operation.
@@ -2136,24 +2148,14 @@ message Header {
   // (txn.WriteTimestamp).
   util.hlc.Timestamp timestamp = 1 [(gogoproto.nullable) = false];
   // timestamp_from_server_clock is set when a non-transactional BatchRequest
-  // has its timestamp initialized to the wall time of the server node. When
-  // non-nil, this denotes the clock timestamp that the timestamp field was
-  // initially assigned upon arriving at the server node.
-  //
-  // It is needed to ensure that such requests are never served as follower
+  // has its timestamp initialized to the wall time of the server node. This
+  // flag is needed to ensure that such requests are never served as follower
   // reads. Initializing the timestamp of a request on a node that holds a
   // follower instead of the leaseholder for a range and then using this
   // timestamp to deem a follower read safe could allow for consistency
   // violations where a non-transactional read following a write could fail to
   // observe the write.
-  //
-  // It is also needed to record the time at which the request was received by
-  // the server node. The operation timestamp cannot serve this role because it
-  // can change due to server-side uncertainty retries. By remembering a stable
-  // reference to the initial timestamp, we ensure that a non-transactional
-  // request's uncertainty interval remains fixed across retries.
-  util.hlc.Timestamp timestamp_from_server_clock = 27 [
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
+  bool timestamp_from_server_clock = 20;
   // replica specifies the destination of the request.
   ReplicaDescriptor replica = 2 [(gogoproto.nullable) = false];
   // range_id specifies the ID of the Raft consensus group which the key
@@ -2387,7 +2389,7 @@ message Header {
 
   util.tracing.tracingpb.TraceInfo trace_info = 25 [(gogoproto.nullable) = false];
 
-  reserved 7, 10, 12, 14, 20;
+  reserved 7, 10, 12, 14;
 }
 
 // BoundedStalenessHeader contains configuration values pertaining to bounded
@@ -2730,7 +2732,7 @@ message TenantSettingsEvent {
   //  - the changed overrides since the last event for the precedence if
   //    Incremental is true (removed overrides have empty RawValue and ValueType
   //    fields).
-  repeated TenantSetting overrides = 3 [(gogoproto.nullable) = false];
+  repeated TenantSetting overrides = 3;
 
   // If non-nil, the other fields will be empty and this will be the final event
   // sent on the stream before it is terminated.
@@ -2738,9 +2740,13 @@ message TenantSettingsEvent {
 }
 
 // TenantSetting contains the name and value of a tenant setting.
+//
+// The value representation is the same as that used by the system.settings
+// table (value and valueType columns).
 message TenantSetting {
   string name = 1;
-  settings.EncodedValue value = 2 [(gogoproto.nullable) = false];
+  string raw_value = 2;
+  string value_type = 3;
 }
 
 // TenantConsumption contains information about resource utilization by a
@@ -2876,6 +2882,12 @@ service Internal {
   // UpdateSpanConfigs is used to update the span configurations over given
   // keyspans.
   rpc UpdateSpanConfigs (UpdateSpanConfigsRequest) returns (UpdateSpanConfigsResponse) { }
+
+  //  GetSystemSpanConfigs is used to fetch system span configurations.
+  rpc GetSystemSpanConfigs(GetSystemSpanConfigsRequest) returns (GetSystemSpanConfigsResponse) { }
+
+  // UpdateSystemSpanConfigs is used to update system span configurations.
+  rpc UpdateSystemSpanConfigs (UpdateSystemSpanConfigsRequest) returns (UpdateSystemSpanConfigsResponse) {}
 
   // TenantSettings is used by tenants to obtain and stay up to date with tenant
   // setting overrides.
