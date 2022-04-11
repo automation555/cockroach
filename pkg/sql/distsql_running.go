@@ -18,7 +18,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
@@ -41,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -64,24 +64,24 @@ const clientRejectedMsg string = "client rejected when attempting to run DistSQL
 
 // runnerRequest is the request that is sent (via a channel) to a worker.
 type runnerRequest struct {
-	ctx           context.Context
-	nodeDialer    *nodedialer.Dialer
-	flowReq       *execinfrapb.SetupFlowRequest
-	sqlInstanceID base.SQLInstanceID
-	resultChan    chan<- runnerResult
+	ctx        context.Context
+	nodeDialer *nodedialer.Dialer
+	flowReq    *execinfrapb.SetupFlowRequest
+	nodeID     roachpb.NodeID
+	resultChan chan<- runnerResult
 }
 
 // runnerResult is returned by a worker (via a channel) for each received
 // request.
 type runnerResult struct {
-	nodeID base.SQLInstanceID
+	nodeID roachpb.NodeID
 	err    error
 }
 
 func (req runnerRequest) run() {
-	res := runnerResult{nodeID: req.sqlInstanceID}
+	res := runnerResult{nodeID: req.nodeID}
 
-	conn, err := req.nodeDialer.Dial(req.ctx, roachpb.NodeID(req.sqlInstanceID), rpc.DefaultClass)
+	conn, err := req.nodeDialer.Dial(req.ctx, req.nodeID, rpc.DefaultClass)
 	if err != nil {
 		res.err = err
 	} else {
@@ -140,16 +140,15 @@ func (dsp *DistSQLPlanner) initCancelingWorkers(initCtx context.Context) {
 					return
 
 				case <-dsp.cancelFlowsCoordinator.workerWait:
-					req, sqlInstanceID := dsp.cancelFlowsCoordinator.getFlowsToCancel()
+					req, nodeID := dsp.cancelFlowsCoordinator.getFlowsToCancel()
 					if req == nil {
 						// There are no flows to cancel at the moment. This
 						// shouldn't really happen.
 						log.VEventf(parentCtx, 2, "worker %d woke up but didn't find any flows to cancel", workerID)
 						continue
 					}
-					log.VEventf(parentCtx, 2, "worker %d is canceling at most %d flows on node %d", workerID, len(req.FlowIDs), sqlInstanceID)
-					// TODO: Double check that we only ever cancel flows on SQL nodes/pods here.
-					conn, err := dsp.podNodeDialer.Dial(parentCtx, roachpb.NodeID(sqlInstanceID), rpc.DefaultClass)
+					log.VEventf(parentCtx, 2, "worker %d is canceling at most %d flows on node %d", workerID, len(req.FlowIDs), nodeID)
+					conn, err := dsp.nodeDialer.Dial(parentCtx, nodeID, rpc.DefaultClass)
 					if err != nil {
 						// We failed to dial the node, so we give up given that
 						// our cancellation is best effort. It is possible that
@@ -172,8 +171,8 @@ func (dsp *DistSQLPlanner) initCancelingWorkers(initCtx context.Context) {
 }
 
 type deadFlowsOnNode struct {
-	ids           []execinfrapb.FlowID
-	sqlInstanceID base.SQLInstanceID
+	ids    []execinfrapb.FlowID
+	nodeID roachpb.NodeID
 }
 
 // cancelFlowsCoordinator is responsible for batching up the requests to cancel
@@ -195,36 +194,34 @@ type cancelFlowsCoordinator struct {
 // concurrent usage.
 func (c *cancelFlowsCoordinator) getFlowsToCancel() (
 	*execinfrapb.CancelDeadFlowsRequest,
-	base.SQLInstanceID,
+	roachpb.NodeID,
 ) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.mu.deadFlowsByNode.Len() == 0 {
-		return nil, base.SQLInstanceID(0)
+		return nil, roachpb.NodeID(0)
 	}
 	deadFlows := c.mu.deadFlowsByNode.GetFirst().(*deadFlowsOnNode)
 	c.mu.deadFlowsByNode.RemoveFirst()
 	req := &execinfrapb.CancelDeadFlowsRequest{
 		FlowIDs: deadFlows.ids,
 	}
-	return req, deadFlows.sqlInstanceID
+	return req, deadFlows.nodeID
 }
 
 // addFlowsToCancel adds all remote flows from flows map to be canceled via
 // CancelDeadFlows RPC. Safe for concurrent usage.
-func (c *cancelFlowsCoordinator) addFlowsToCancel(
-	flows map[base.SQLInstanceID]*execinfrapb.FlowSpec,
-) {
+func (c *cancelFlowsCoordinator) addFlowsToCancel(flows map[roachpb.NodeID]*execinfrapb.FlowSpec) {
 	c.mu.Lock()
-	for sqlInstanceID, f := range flows {
-		if sqlInstanceID != f.Gateway {
+	for nodeID, f := range flows {
+		if nodeID != f.Gateway {
 			// c.mu.deadFlowsByNode.Len() is at most the number of nodes in the
 			// cluster, so a linear search for the node ID should be
 			// sufficiently fast.
 			found := false
 			for j := 0; j < c.mu.deadFlowsByNode.Len(); j++ {
 				deadFlows := c.mu.deadFlowsByNode.Get(j).(*deadFlowsOnNode)
-				if sqlInstanceID == deadFlows.sqlInstanceID {
+				if nodeID == deadFlows.nodeID {
 					deadFlows.ids = append(deadFlows.ids, f.FlowID)
 					found = true
 					break
@@ -232,8 +229,8 @@ func (c *cancelFlowsCoordinator) addFlowsToCancel(
 			}
 			if !found {
 				c.mu.deadFlowsByNode.AddLast(&deadFlowsOnNode{
-					ids:           []execinfrapb.FlowID{f.FlowID},
-					sqlInstanceID: sqlInstanceID,
+					ids:    []execinfrapb.FlowID{f.FlowID},
+					nodeID: nodeID,
 				})
 			}
 		}
@@ -271,13 +268,13 @@ func (dsp *DistSQLPlanner) setupFlows(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
 	leafInputState *roachpb.LeafTxnInputState,
-	flows map[base.SQLInstanceID]*execinfrapb.FlowSpec,
+	flows map[roachpb.NodeID]*execinfrapb.FlowSpec,
 	recv *DistSQLReceiver,
 	localState distsql.LocalState,
 	collectStats bool,
 	statementSQL string,
 ) (context.Context, flowinfra.Flow, execinfra.OpChains, error) {
-	thisNodeID := dsp.gatewaySQLInstanceID
+	thisNodeID := dsp.gatewayNodeID
 	_, ok := flows[thisNodeID]
 	if !ok {
 		return nil, nil, nil, errors.AssertionFailedf("missing gateway flow")
@@ -336,11 +333,11 @@ func (dsp *DistSQLPlanner) setupFlows(
 		req := setupReq
 		req.Flow = *flowSpec
 		runReq := runnerRequest{
-			ctx:           ctx,
-			nodeDialer:    dsp.nodeDialer,
-			flowReq:       &req,
-			sqlInstanceID: nodeID,
-			resultChan:    resultChan,
+			ctx:        ctx,
+			nodeDialer: dsp.nodeDialer,
+			flowReq:    &req,
+			nodeID:     nodeID,
+			resultChan: resultChan,
 		}
 
 		// Send out a request to the workers; if no worker is available, run
@@ -406,7 +403,6 @@ func (dsp *DistSQLPlanner) Run(
 	evalCtx *extendedEvalContext,
 	finishedSetupFn func(),
 ) (cleanup func()) {
-	cleanup = func() {}
 	ctx := planCtx.ctx
 
 	flows := plan.GenerateFlowSpecs()
@@ -415,9 +411,9 @@ func (dsp *DistSQLPlanner) Run(
 			physicalplan.ReleaseFlowSpec(flowSpec)
 		}
 	}()
-	if _, ok := flows[dsp.gatewaySQLInstanceID]; !ok {
+	if _, ok := flows[dsp.gatewayNodeID]; !ok {
 		recv.SetError(errors.Errorf("expected to find gateway flow"))
-		return cleanup
+		return func() {}
 	}
 
 	var (
@@ -469,7 +465,7 @@ func (dsp *DistSQLPlanner) Run(
 		if err != nil {
 			log.Infof(ctx, "%s: %s", clientRejectedMsg, err)
 			recv.SetError(err)
-			return cleanup
+			return func() {}
 		}
 		leafInputState = tis
 	}
@@ -532,15 +528,9 @@ func (dsp *DistSQLPlanner) Run(
 	ctx, flow, opChains, err := dsp.setupFlows(
 		ctx, evalCtx, leafInputState, flows, recv, localState, planCtx.collectExecStats, statementSQL,
 	)
-	// Make sure that the local flow is always cleaned up if it was created.
-	if flow != nil {
-		cleanup = func() {
-			flow.Cleanup(ctx)
-		}
-	}
 	if err != nil {
 		recv.SetError(err)
-		return cleanup
+		return func() {}
 	}
 
 	if finishedSetupFn != nil {
@@ -554,7 +544,7 @@ func (dsp *DistSQLPlanner) Run(
 	if planCtx.saveFlows != nil {
 		if err := planCtx.saveFlows(flows, opChains); err != nil {
 			recv.SetError(err)
-			return cleanup
+			return func() {}
 		}
 	}
 
@@ -567,7 +557,7 @@ func (dsp *DistSQLPlanner) Run(
 	if txn != nil && !localState.MustUseLeafTxn() && flow.ConcurrentTxnUse() {
 		recv.SetError(errors.AssertionFailedf(
 			"unexpected concurrency for a flow that was forced to be planned locally"))
-		return cleanup
+		return func() {}
 	}
 
 	// TODO(radu): this should go through the flow scheduler.
@@ -590,7 +580,9 @@ func (dsp *DistSQLPlanner) Run(
 
 	// ignoreClose is set to true meaning that someone else will handle the
 	// closing of the current plan, so we simply clean up the flow.
-	return cleanup
+	return func() {
+		flow.Cleanup(ctx)
+	}
 }
 
 // DistSQLReceiver is an execinfra.RowReceiver and execinfra.BatchReceiver that
@@ -1406,6 +1398,15 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 		return physPlanCleanup
 	}
 	dsp.finalizePlanWithRowCount(planCtx, physPlan, planCtx.planner.curPlan.mainRowCount)
+
+	if buildutil.CrdbTestBuild {
+		err = evalCtx.Planner.ValidateDistSQLPlan(ctx)
+		if err != nil {
+			recv.SetError(err)
+			return physPlanCleanup
+		}
+	}
+
 	recv.expectedRowsRead = int64(physPlan.TotalEstimatedScannedRows)
 	runCleanup := dsp.Run(planCtx, txn, physPlan, recv, evalCtx, nil /* finishedSetupFn */)
 	return func() {

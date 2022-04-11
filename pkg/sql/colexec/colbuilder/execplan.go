@@ -36,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -724,7 +723,7 @@ func NewColOperator(
 			estimatedRowCount := spec.EstimatedRowCount
 			scanOp, err := colfetcher.NewColBatchScan(
 				ctx, colmem.NewAllocator(ctx, cFetcherMemAcc, factory), kvFetcherMemAcc,
-				flowCtx, core.TableReader, post, estimatedRowCount,
+				flowCtx, args.ExprHelper, core.TableReader, post, estimatedRowCount,
 			)
 			if err != nil {
 				return r, err
@@ -748,16 +747,11 @@ func NewColOperator(
 			kvFetcherMemAcc := args.MonitorRegistry.CreateUnlimitedMemAccount(
 				ctx, flowCtx, "kvfetcher" /* opName */, spec.ProcessorID,
 			)
-			var streamerBudgetAcc *mon.BoundAccount
-			// We have an index join, and when the ordering doesn't have to be
-			// maintained, we might use the Streamer API which requires a
-			// separate memory account that is bound to an unlimited memory
-			// monitor.
-			if !core.JoinReader.MaintainOrdering {
-				streamerBudgetAcc = args.MonitorRegistry.CreateUnlimitedMemAccount(
-					ctx, flowCtx, "streamer" /* opName */, spec.ProcessorID,
-				)
-			}
+			// We might use the Streamer API which requires a separate memory
+			// account that is bound to an unlimited memory monitor.
+			streamerBudgetAcc := args.MonitorRegistry.CreateUnlimitedMemAccount(
+				ctx, flowCtx, "streamer" /* opName */, spec.ProcessorID,
+			)
 			inputTypes := make([]*types.T, len(spec.Input[0].ColumnTypes))
 			copy(inputTypes, spec.Input[0].ColumnTypes)
 			indexJoinOp, err := colfetcher.NewColIndexJoin(
@@ -1869,19 +1863,19 @@ func planSelectionOperators(
 		lTyp := ct[leftIdx]
 		if constArg, ok := t.Right.(tree.Datum); ok {
 			switch cmpOp.Symbol {
-			case treecmp.Like, treecmp.NotLike:
-				negate := cmpOp.Symbol == treecmp.NotLike
+			case tree.Like, tree.NotLike:
+				negate := cmpOp.Symbol == tree.NotLike
 				op, err = colexecsel.GetLikeOperator(
 					evalCtx, leftOp, leftIdx, string(tree.MustBeDString(constArg)), negate,
 				)
-			case treecmp.In, treecmp.NotIn:
-				negate := cmpOp.Symbol == treecmp.NotIn
+			case tree.In, tree.NotIn:
+				negate := cmpOp.Symbol == tree.NotIn
 				datumTuple, ok := tree.AsDTuple(constArg)
 				if !ok || useDefaultCmpOpForIn(datumTuple) {
 					break
 				}
 				op, err = colexec.GetInOperator(evalCtx, lTyp, leftOp, leftIdx, datumTuple, negate)
-			case treecmp.IsDistinctFrom, treecmp.IsNotDistinctFrom:
+			case tree.IsDistinctFrom, tree.IsNotDistinctFrom:
 				if constArg != tree.DNull {
 					// Optimized IsDistinctFrom and IsNotDistinctFrom are
 					// supported only with NULL argument, so we fallback to the
@@ -1892,7 +1886,7 @@ func planSelectionOperators(
 				// DISTINCT FROM NULL is synonymous with IS NOT NULL (except for
 				// tuples). Therefore, negate when the operator is IS DISTINCT
 				// FROM NULL.
-				negate := cmpOp.Symbol == treecmp.IsDistinctFrom
+				negate := cmpOp.Symbol == tree.IsDistinctFrom
 				op = colexec.NewIsNullSelOp(leftOp, leftIdx, negate, false /* isTupleNull */)
 			}
 			if op == nil || err != nil {
@@ -2123,7 +2117,7 @@ func planProjectionOperators(
 				// resultIdx, so we simply create an ordinal referencing that
 				// column.
 				right := tree.NewTypedOrdinalReference(resultIdx, whenTyped.ResolvedType())
-				cmpExpr := tree.NewTypedComparisonExpr(treecmp.MakeComparisonOperator(treecmp.EQ), left, right)
+				cmpExpr := tree.NewTypedComparisonExpr(tree.MakeComparisonOperator(tree.EQ), left, right)
 				caseOps[i], resultIdx, typs, err = planProjectionOperators(
 					ctx, evalCtx, cmpExpr, typs, caseOps[i], acc, factory, releasables,
 				)
@@ -2241,11 +2235,11 @@ func planProjectionExpr(
 	allocator := colmem.NewAllocator(ctx, acc, factory)
 	resultIdx = -1
 
-	cmpProjOp, isCmpProjOp := projOp.(treecmp.ComparisonOperator)
+	cmpProjOp, isCmpProjOp := projOp.(tree.ComparisonOperator)
 	var hasOptimizedOp bool
 	if isCmpProjOp {
 		switch cmpProjOp.Symbol {
-		case treecmp.Like, treecmp.NotLike, treecmp.In, treecmp.NotIn, treecmp.IsDistinctFrom, treecmp.IsNotDistinctFrom:
+		case tree.Like, tree.NotLike, tree.In, tree.NotIn, tree.IsDistinctFrom, tree.IsNotDistinctFrom:
 			hasOptimizedOp = true
 		}
 	}
@@ -2298,7 +2292,7 @@ func planProjectionExpr(
 		// creates a cast expression from tree.DNull to the desired type in
 		// order to propagate the type of the null. We need to extract the
 		// constant NULL so that the optimized operator was planned below.
-		if isCmpProjOp && (cmpProjOp.Symbol == treecmp.IsDistinctFrom || cmpProjOp.Symbol == treecmp.IsNotDistinctFrom) {
+		if isCmpProjOp && (cmpProjOp.Symbol == tree.IsDistinctFrom || cmpProjOp.Symbol == tree.IsNotDistinctFrom) {
 			if cast, ok := right.(*tree.CastExpr); ok {
 				if cast.Expr == tree.DNull {
 					right = tree.DNull
@@ -2312,14 +2306,14 @@ func planProjectionExpr(
 			resultIdx = len(typs)
 			if isCmpProjOp {
 				switch cmpProjOp.Symbol {
-				case treecmp.Like, treecmp.NotLike:
-					negate := cmpProjOp.Symbol == treecmp.NotLike
+				case tree.Like, tree.NotLike:
+					negate := cmpProjOp.Symbol == tree.NotLike
 					op, err = colexecproj.GetLikeProjectionOperator(
 						allocator, evalCtx, input, leftIdx, resultIdx,
 						string(tree.MustBeDString(rConstArg)), negate,
 					)
-				case treecmp.In, treecmp.NotIn:
-					negate := cmpProjOp.Symbol == treecmp.NotIn
+				case tree.In, tree.NotIn:
+					negate := cmpProjOp.Symbol == tree.NotIn
 					datumTuple, ok := tree.AsDTuple(rConstArg)
 					if !ok || useDefaultCmpOpForIn(datumTuple) {
 						break
@@ -2327,7 +2321,7 @@ func planProjectionExpr(
 					op, err = colexec.GetInProjectionOperator(
 						evalCtx, allocator, typs[leftIdx], input, leftIdx, resultIdx, datumTuple, negate,
 					)
-				case treecmp.IsDistinctFrom, treecmp.IsNotDistinctFrom:
+				case tree.IsDistinctFrom, tree.IsNotDistinctFrom:
 					if right != tree.DNull {
 						// Optimized IsDistinctFrom and IsNotDistinctFrom are
 						// supported only with NULL argument, so we fallback to the
@@ -2336,7 +2330,7 @@ func planProjectionExpr(
 					}
 					// IS NULL is replaced with IS NOT DISTINCT FROM NULL, so we
 					// want to negate when IS DISTINCT FROM is used.
-					negate := cmpProjOp.Symbol == treecmp.IsDistinctFrom
+					negate := cmpProjOp.Symbol == tree.IsDistinctFrom
 					op = colexec.NewIsNullProjOp(
 						allocator, input, leftIdx, resultIdx, negate, false, /* isTupleNull */
 					)
