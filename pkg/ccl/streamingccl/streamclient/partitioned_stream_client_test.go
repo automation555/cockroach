@@ -72,7 +72,7 @@ INSERT INTO d.t2 VALUES (2);
 
 	client, err := newPartitionedStreamClient(&h.PGUrl)
 	defer func() {
-		_ = client.Close()
+		require.NoError(t, client.Close())
 	}()
 	require.NoError(t, err)
 	expectStreamState := func(streamID streaming.StreamID, status jobs.Status) {
@@ -136,7 +136,16 @@ INSERT INTO d.t2 VALUES (2);
 	}
 
 	// Ignore table t2 and only subscribe to the changes to table t1.
-	sub, err := client.Subscribe(ctx, id, encodeSpec("t1"), hlc.Timestamp{})
+	require.Equal(t, len(top), 1)
+	url, err := streamingccl.StreamAddress(h.PGUrl.String()).URL()
+	require.NoError(t, err)
+	// Create a new stream client with the given partition address.
+	subClient, err := newPartitionedStreamClient(url)
+	defer func() {
+		require.NoError(t, subClient.Close())
+	}()
+	require.NoError(t, err)
+	sub, err := subClient.Subscribe(ctx, id, encodeSpec("t1"), hlc.Timestamp{})
 	require.NoError(t, err)
 
 	rf := streamingtest.MakeReplicationFeed(t, &subscriptionFeedSource{sub: sub})
