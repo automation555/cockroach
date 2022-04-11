@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -109,7 +108,7 @@ func (ds *ServerImpl) Start() {
 	if g, ok := ds.ServerConfig.Gossip.Optional(MultiTenancyIssueNo); ok {
 		if nodeID, ok := ds.ServerConfig.NodeID.OptionalNodeID(); ok {
 			if err := g.AddInfoProto(
-				gossip.MakeDistSQLNodeVersionKey(base.SQLInstanceID(nodeID)),
+				gossip.MakeDistSQLNodeVersionKey(nodeID),
 				&execinfrapb.DistSQLVersionGossipInfo{
 					Version:            execinfra.Version,
 					MinAcceptedVersion: execinfra.MinAcceptedVersion,
@@ -181,7 +180,7 @@ func (ds *ServerImpl) setDraining(drain bool) error {
 	}
 	if g, ok := ds.ServerConfig.Gossip.Optional(MultiTenancyIssueNo); ok {
 		return g.AddInfoProto(
-			gossip.MakeDistSQLDrainingKey(base.SQLInstanceID(nodeID)),
+			gossip.MakeDistSQLDrainingKey(nodeID),
 			&execinfrapb.DistSQLDrainingInfo{
 				Draining: drain,
 			},
@@ -289,7 +288,7 @@ func (ds *ServerImpl) setupFlow(
 		}
 		// The flow will run in a LeafTxn because we do not want each distributed
 		// Txn to heartbeat the transaction.
-		return kv.NewLeafTxn(ctx, ds.DB, roachpb.NodeID(req.Flow.Gateway), tis), nil
+		return kv.NewLeafTxn(ctx, ds.DB, req.Flow.Gateway, tis), nil
 	}
 
 	var evalCtx *tree.EvalContext
@@ -367,7 +366,7 @@ func (ds *ServerImpl) setupFlow(
 
 	// Create the FlowCtx for the flow.
 	flowCtx := ds.newFlowContext(
-		ctx, req.Flow.FlowID, evalCtx, req.TraceKV, req.CollectStats, localState, req.Flow.Gateway == ds.NodeID.SQLInstanceID(),
+		ctx, req.Flow.FlowID, evalCtx, req.TraceKV, req.CollectStats, localState, req.Flow.Gateway == roachpb.NodeID(ds.NodeID.SQLInstanceID()),
 	)
 
 	// req always contains the desired vectorize mode, regardless of whether we
@@ -376,8 +375,8 @@ func (ds *ServerImpl) setupFlow(
 	// to restore the original value which can have data races under stress.
 	isVectorized := req.EvalContext.SessionData.VectorizeMode != sessiondatapb.VectorizeOff
 	f := newFlow(
-		flowCtx, sp, ds.flowRegistry, rowSyncFlowConsumer, batchSyncFlowConsumer,
-		localState.LocalProcs, isVectorized, onFlowCleanup, req.StatementSQL,
+		flowCtx, ds.flowRegistry, rowSyncFlowConsumer, batchSyncFlowConsumer,
+		localState.LocalProcs, isVectorized, onFlowCleanup,
 	)
 	opt := flowinfra.FuseNormally
 	if !localState.MustUseLeafTxn() {
@@ -397,8 +396,7 @@ func (ds *ServerImpl) setupFlow(
 		return ctx, nil, nil, err
 	}
 	if !f.IsLocal() {
-		flowCtx.AmbientContext.AddLogTag("f", f.GetFlowCtx().ID.Short())
-		ctx = flowCtx.AmbientContext.AnnotateCtx(ctx)
+		flowCtx.AddLogTag("f", f.GetFlowCtx().ID.Short())
 		telemetry.Inc(sqltelemetry.DistSQLExecCounter)
 	}
 	if f.IsVectorized() {
@@ -409,19 +407,8 @@ func (ds *ServerImpl) setupFlow(
 	// that have no remote flows and also no concurrency, the txn comes from
 	// localState.Txn. Otherwise, we create a txn based on the request's
 	// LeafTxnInputState.
-	useLeaf := false
-	for _, proc := range req.Flow.Processors {
-		if jr := proc.Core.JoinReader; jr != nil {
-			if !jr.MaintainOrdering && jr.IsIndexJoin() {
-				// Index joins when ordering doesn't have to be maintained are
-				// executed via the Streamer API that has concurrency.
-				useLeaf = true
-				break
-			}
-		}
-	}
 	var txn *kv.Txn
-	if localState.IsLocal && !f.ConcurrentTxnUse() && !useLeaf {
+	if localState.IsLocal && !f.ConcurrentTxnUse() {
 		txn = localState.Txn
 	} else {
 		// If I haven't created the leaf already, do it now.
@@ -480,29 +467,35 @@ func (ds *ServerImpl) newFlowContext(
 		// If we were passed a descs.Collection to use, then take it. In this case,
 		// the caller will handle releasing the used descriptors, so we don't need
 		// to cleanup the descriptors when cleaning up the flow.
-		flowCtx.Descriptors = localState.Collection
+		flowCtx.TypeResolverFactory = &descs.DistSQLTypeResolverFactory{
+			Descriptors: localState.Collection,
+			CleanupFunc: func(ctx context.Context) {},
+		}
 	} else {
 		// If we weren't passed a descs.Collection, then make a new one. We are
 		// responsible for cleaning it up and releasing any accessed descriptors
 		// on flow cleanup.
-		flowCtx.Descriptors = ds.CollectionFactory.NewCollection(ctx, descs.NewTemporarySchemaProvider(evalCtx.SessionDataStack))
-		flowCtx.IsDescriptorsCleanupRequired = true
+		collection := ds.CollectionFactory.NewCollection(descs.NewTemporarySchemaProvider(evalCtx.SessionDataStack))
+		flowCtx.TypeResolverFactory = &descs.DistSQLTypeResolverFactory{
+			Descriptors: collection,
+			CleanupFunc: func(ctx context.Context) {
+				collection.ReleaseAll(ctx)
+			},
+		}
 	}
 	return flowCtx
 }
 
 func newFlow(
 	flowCtx execinfra.FlowCtx,
-	sp *tracing.Span,
 	flowReg *flowinfra.FlowRegistry,
 	rowSyncFlowConsumer execinfra.RowReceiver,
 	batchSyncFlowConsumer execinfra.BatchReceiver,
 	localProcessors []execinfra.LocalProcessor,
 	isVectorized bool,
 	onFlowCleanup func(),
-	statementSQL string,
 ) flowinfra.Flow {
-	base := flowinfra.NewFlowBase(flowCtx, sp, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, onFlowCleanup, statementSQL)
+	base := flowinfra.NewFlowBase(flowCtx, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, onFlowCleanup)
 	if isVectorized {
 		return colflow.NewVectorizedFlow(base)
 	}
@@ -570,56 +563,18 @@ func (ds *ServerImpl) SetupLocalSyncFlow(
 	return ctx, f, opChains, err
 }
 
-// setupSpanForIncomingRPC creates a span for a SetupFlow RPC. The caller must
-// finish the returned span.
-//
-// For most other RPCs, there's a gRPC server interceptor that opens spans based
-// on trace info passed as gRPC metadata. But the SetupFlow RPC is common and so
-// we have a more efficient implementation based on tracing information being
-// passed in the request proto.
-func (ds *ServerImpl) setupSpanForIncomingRPC(
-	ctx context.Context, req *execinfrapb.SetupFlowRequest,
-) (context.Context, *tracing.Span) {
-	tr := ds.ServerConfig.AmbientContext.Tracer
-	parentSpan := tracing.SpanFromContext(ctx)
-	if parentSpan != nil {
-		// It's not expected to have a span in the context since the gRPC server
-		// interceptor that generally opens spans exempts this particular RPC. Note
-		// that this method is not called for flows local to the gateway.
-		return tr.StartSpanCtx(ctx, tracing.SetupFlowMethodName,
-			tracing.WithParent(parentSpan),
-			tracing.WithServerSpanKind)
-	}
-
-	if !req.TraceInfo.Empty() {
-		return tr.StartSpanCtx(ctx, tracing.SetupFlowMethodName,
-			tracing.WithRemoteParentFromTraceInfo(&req.TraceInfo),
-			tracing.WithServerSpanKind)
-	}
-	// For backwards compatibility with 21.2, if tracing info was passed as
-	// gRPC metadata, we use it.
-	remoteParent, err := tracing.ExtractSpanMetaFromGRPCCtx(ctx, tr)
-	if err != nil {
-		log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
-	}
-	return tr.StartSpanCtx(ctx, tracing.SetupFlowMethodName,
-		tracing.WithRemoteParentFromSpanMeta(remoteParent),
-		tracing.WithServerSpanKind)
-}
-
 // SetupFlow is part of the execinfrapb.DistSQLServer interface.
 func (ds *ServerImpl) SetupFlow(
 	ctx context.Context, req *execinfrapb.SetupFlowRequest,
 ) (*execinfrapb.SimpleResponse, error) {
 	log.VEventf(ctx, 1, "received SetupFlow request from n%v for flow %v", req.Flow.Gateway, req.Flow.FlowID)
-	_, rpcSpan := ds.setupSpanForIncomingRPC(ctx, req)
-	defer rpcSpan.Finish()
+	parentSpan := tracing.SpanFromContext(ctx)
 
 	// Note: the passed context will be canceled when this RPC completes, so we
 	// can't associate it with the flow.
 	ctx = ds.AnnotateCtx(context.Background())
 	ctx, f, _, err := ds.setupFlow(
-		ctx, rpcSpan, ds.memMonitor, req, nil, /* rowSyncFlowConsumer */
+		ctx, parentSpan, ds.memMonitor, req, nil, /* rowSyncFlowConsumer */
 		nil /* batchSyncFlowConsumer */, LocalState{},
 	)
 	if err == nil {
@@ -669,7 +624,7 @@ func (ds *ServerImpl) flowStreamInt(
 	}
 	defer cleanup()
 	log.VEventf(ctx, 1, "connected inbound stream %s/%d", flowID.Short(), streamID)
-	return streamStrategy.Run(f.AmbientContext.AnnotateCtx(ctx), stream, msg, f)
+	return streamStrategy.Run(f.AnnotateCtx(ctx), stream, msg, f)
 }
 
 // FlowStream is part of the execinfrapb.DistSQLServer interface.
