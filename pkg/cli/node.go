@@ -449,7 +449,7 @@ func runDecommissionNodeImpl(
 	nodeIDs []roachpb.NodeID,
 	localNodeID roachpb.NodeID,
 ) error {
-	minReplicaCount := int64(math.MaxInt64)
+	minReplicaCount := uint64(math.MaxInt64)
 	opts := retry.Options{
 		InitialBackoff: 5 * time.Millisecond,
 		Multiplier:     2,
@@ -466,7 +466,11 @@ func runDecommissionNodeImpl(
 	// after a drain, issuing a decommission RPC against this node will fail.
 	// TODO(cameron): update the note once decommission requests are
 	// routed to another selected "control" node in the cluster.
-	prevResponse := serverpb.DecommissionStatusResponse{}
+	var (
+		prevResponse         = serverpb.DecommissionResponse{}
+		prevReplicaCount     = uint64(math.MaxUint64)
+		numSameStatusRetries = 0
+	)
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
 		req := &serverpb.DecommissionRequest{
 			NodeIDs:          nodeIDs,
@@ -489,10 +493,10 @@ func runDecommissionNodeImpl(
 		}
 
 		anyActive := false
-		var replicaCount int64
+		var replicaCount uint64
 		for _, status := range resp.Status {
 			anyActive = anyActive || status.Membership.Active()
-			replicaCount += status.ReplicaCount
+			replicaCount += uint64(status.ReplicaCount)
 		}
 
 		if !anyActive && replicaCount == 0 {
@@ -535,6 +539,19 @@ func runDecommissionNodeImpl(
 			return nil
 		}
 
+		// If the replica count stalls or the number of remaining replicas somehow
+		// increases, and if there has not been progress after many retries,
+		// print the descriptions of the remaining replicas.
+		if replicaCount >= prevReplicaCount {
+			numSameStatusRetries += 1
+			if numSameStatusRetries == 20 {
+				printDecommissioningReplicas(resp)
+			}
+		} else {
+			numSameStatusRetries = 0
+		}
+		prevReplicaCount = replicaCount
+
 		if wait == nodeDecommissionWaitNone {
 			// The intent behind --wait=none is for it to be used when polling
 			// manually from an external system. We'll only mark nodes as
@@ -556,9 +573,7 @@ func decommissionResponseAlignment() string {
 
 // decommissionResponseValueToRows converts DecommissionStatusResponse_Status to
 // SQL-like result rows, so that we can pretty-print them.
-func decommissionResponseValueToRows(
-	statuses []serverpb.DecommissionStatusResponse_Status,
-) [][]string {
+func decommissionResponseValueToRows(statuses []serverpb.DecommissionResponse_Status) [][]string {
 	// Create results that are like the results for SQL results, so that we can pretty-print them.
 	var rows [][]string
 	for _, node := range statuses {
@@ -585,9 +600,14 @@ signaling the affected nodes to participate in the cluster again.
 	RunE: clierrorplus.MaybeDecorateError(runRecommissionNode),
 }
 
-func printDecommissionStatus(resp serverpb.DecommissionStatusResponse) error {
+func printDecommissionStatus(resp serverpb.DecommissionResponse) error {
 	return sqlExecCtx.PrintQueryOutput(os.Stdout, stderr, decommissionNodesColumnHeaders,
 		clisqlexec.NewRowSliceIter(decommissionResponseValueToRows(resp.Status), decommissionResponseAlignment()))
+}
+
+/* TODO */
+func printDecommissioningReplicas(resp serverpb.DecommissionResponse) error {
+	return nil
 }
 
 func runRecommissionNode(cmd *cobra.Command, args []string) error {
