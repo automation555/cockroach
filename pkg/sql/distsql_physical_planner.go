@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -43,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -123,6 +125,13 @@ type DistSQLPlanner struct {
 	nodeDescs kvcoord.NodeDescStore
 	// rpcCtx is used to construct the spanResolver upon SetSQLInstanceInfo.
 	rpcCtx *rpc.Context
+
+	// sqlInstanceProvider has information about SQL instances in a multi-tenant
+	// environment
+	sqlInstanceProvider sqlinstance.Provider
+
+	// bulk IO interface
+	distSQLTenantPlanner
 }
 
 // ReplicaOraclePolicy controls which policy the physical planner uses to choose
@@ -154,6 +163,8 @@ func NewDistSQLPlanner(
 	isAvailable func(base.SQLInstanceID) bool,
 	nodeDialer *nodedialer.Dialer,
 	podNodeDialer *nodedialer.Dialer,
+	codec keys.SQLCodec,
+	sqlInstanceProvider sqlinstance.Provider,
 ) *DistSQLPlanner {
 	dsp := &DistSQLPlanner{
 		planVersion:          planVersion,
@@ -173,6 +184,13 @@ func NewDistSQLPlanner(
 		nodeDescs:             nodeDescs,
 		rpcCtx:                rpcCtx,
 		metadataTestTolerance: execinfra.NoExplain,
+		sqlInstanceProvider:   sqlInstanceProvider,
+	}
+
+	if codec.ForSystemTenant() {
+		dsp.distSQLTenantPlanner = &singleTenantPlanner{dsp}
+	} else {
+		dsp.distSQLTenantPlanner = &multiTenantPlanner{dsp}
 	}
 
 	dsp.parallelLocalScansSem = quotapool.NewIntPool("parallel local scans concurrency",
@@ -1115,7 +1133,7 @@ func getIndexIdx(index catalog.Index, desc catalog.TableDescriptor) (uint32, err
 // The generated specs will be used as templates for planning potentially
 // multiple TableReaders.
 func initTableReaderSpecTemplate(
-	n *scanNode, codec keys.SQLCodec,
+	n *scanNode,
 ) (*execinfrapb.TableReaderSpec, execinfrapb.PostProcessSpec, error) {
 	if n.isCheck {
 		return nil, execinfrapb.PostProcessSpec{}, errors.AssertionFailedf("isCheck no longer supported")
@@ -1126,14 +1144,21 @@ func initTableReaderSpecTemplate(
 	}
 	s := physicalplan.NewTableReaderSpec()
 	*s = execinfrapb.TableReaderSpec{
-		Reverse:                         n.reverse,
-		TableDescriptorModificationTime: n.desc.GetModificationTime(),
-		LockingStrength:                 n.lockingStrength,
-		LockingWaitPolicy:               n.lockingWaitPolicy,
+		Table:             *n.desc.TableDesc(),
+		Reverse:           n.reverse,
+		ColumnIDs:         colIDs,
+		LockingStrength:   n.lockingStrength,
+		LockingWaitPolicy: n.lockingWaitPolicy,
 	}
-	if err := rowenc.InitIndexFetchSpec(&s.FetchSpec, codec, n.desc, n.index, colIDs); err != nil {
+	if vc := getInvertedColumn(n.colCfg.invertedColumnID, n.cols); vc != nil {
+		s.InvertedColumn = vc.ColumnDesc()
+	}
+
+	indexIdx, err := getIndexIdx(n.index, n.desc)
+	if err != nil {
 		return nil, execinfrapb.PostProcessSpec{}, err
 	}
+	s.IndexIdx = indexIdx
 
 	var post execinfrapb.PostProcessSpec
 	if n.hardLimit != 0 {
@@ -1142,6 +1167,21 @@ func initTableReaderSpecTemplate(
 		s.LimitHint = n.softLimit
 	}
 	return s, post, nil
+}
+
+// getInvertedColumn returns the column in cols with ID matching
+// invertedColumnID.
+func getInvertedColumn(invertedColumnID tree.ColumnID, cols []catalog.Column) catalog.Column {
+	if invertedColumnID == 0 {
+		return nil
+	}
+
+	for i := range cols {
+		if cols[i].GetID() == invertedColumnID {
+			return cols[i]
+		}
+	}
+	return nil
 }
 
 // tableOrdinal returns the index of a column with the given ID.
@@ -1243,7 +1283,7 @@ func (dsp *DistSQLPlanner) CheckInstanceHealthAndVersion(
 func (dsp *DistSQLPlanner) createTableReaders(
 	planCtx *PlanningCtx, n *scanNode,
 ) (*PhysicalPlan, error) {
-	spec, post, err := initTableReaderSpecTemplate(n, planCtx.ExtendedEvalCtx.Codec)
+	spec, post, err := initTableReaderSpecTemplate(n)
 	if err != nil {
 		return nil, err
 	}
@@ -1261,6 +1301,7 @@ func (dsp *DistSQLPlanner) createTableReaders(
 			parallelize:       n.parallelize,
 			estimatedRowCount: n.estimatedRowCount,
 			reqOrdering:       n.reqOrdering,
+			cols:              n.cols,
 		},
 	)
 	return p, err
@@ -1278,6 +1319,7 @@ type tableReaderPlanningInfo struct {
 	parallelize       bool
 	estimatedRowCount uint64
 	reqOrdering       ReqOrdering
+	cols              []catalog.Column
 }
 
 const defaultLocalScansConcurrencyLimit = 1024
@@ -1455,15 +1497,13 @@ func (dsp *DistSQLPlanner) planTableReaders(
 		corePlacement[i].Core.TableReader = tr
 	}
 
-	typs := make([]*types.T, len(info.spec.FetchSpec.FetchedColumns))
-	for i := range typs {
-		typs[i] = info.spec.FetchSpec.FetchedColumns[i].Type
-	}
+	invertedColumn := tabledesc.FindInvertedColumn(info.desc, info.spec.InvertedColumn)
+	typs := catalog.ColumnTypesWithInvertedCol(info.cols, invertedColumn)
 
 	// Note: we will set a merge ordering below.
 	p.AddNoInputStage(corePlacement, info.post, typs, execinfrapb.Ordering{})
 
-	p.PlanToStreamColMap = identityMap(make([]int, len(typs)), len(typs))
+	p.PlanToStreamColMap = identityMap(make([]int, len(info.cols)), len(info.cols))
 	p.SetMergeOrdering(dsp.convertOrdering(info.reqOrdering, p.PlanToStreamColMap))
 
 	if parallelizeLocal {
@@ -3947,14 +3987,21 @@ func checkScanParallelizationIfLocal(
 
 // NewPlanningCtx returns a new PlanningCtx. When distribute is false, a
 // lightweight version PlanningCtx is returned that can be used when the caller
-// knows plans will only be run on one node. It is coerced to false on SQL
-// SQL tenants (in which case only local planning is supported), regardless of
-// the passed-in value. planner argument can be left nil.
+// knows plans will only be run on one node. On SQL tenants, the plan is only
+// distributed if tenantDistributionEnabled is true. planner argument can be
+// left nil.
+// TODO(#47900): Remove tenantDistributionEnabled when distsql supports
+// multi-tenancy for all operations.
 func (dsp *DistSQLPlanner) NewPlanningCtx(
-	ctx context.Context, evalCtx *extendedEvalContext, planner *planner, txn *kv.Txn, distribute bool,
+	ctx context.Context,
+	evalCtx *extendedEvalContext,
+	planner *planner,
+	txn *kv.Txn,
+	distribute bool,
+	tenantDistributionEnabled bool,
 ) *PlanningCtx {
-	// Tenants can not distribute plans.
-	distribute = distribute && evalCtx.Codec.ForSystemTenant()
+	// Tenants can only distribute plans with tenantDistributionEnabled.
+	distribute = distribute && (tenantDistributionEnabled || evalCtx.Codec.ForSystemTenant())
 	planCtx := &PlanningCtx{
 		ctx:             ctx,
 		ExtendedEvalCtx: evalCtx,

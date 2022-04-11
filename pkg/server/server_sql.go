@@ -310,9 +310,6 @@ type sqlServerArgs struct {
 	// settingsStorage is an optional interface to drive storing of settings
 	// data on disk to provide a fresh source of settings upon next startup.
 	settingsStorage settingswatcher.Storage
-
-	// grpc is the RPC service.
-	grpc *grpcServer
 }
 
 type monitorAndMetrics struct {
@@ -394,7 +391,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 			}
 			info, err := cfg.sqlInstanceProvider.GetInstance(cfg.rpcContext.MasterCtx, base.SQLInstanceID(nodeID))
 			if err != nil {
-				return nil, errors.Errorf("unable to look up descriptor for n%d", nodeID)
+				return nil, errors.Errorf("unable to look up descriptor for nsql%d", nodeID)
 			}
 			return &util.UnresolvedAddr{AddressField: info.InstanceAddr}, nil
 		}
@@ -708,6 +705,8 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 			isAvailable,
 			cfg.nodeDialer,
 			cfg.podNodeDialer,
+			codec,
+			cfg.sqlInstanceProvider,
 		),
 
 		TableStatsCache: stats.NewTableStatisticsCache(
@@ -773,9 +772,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	}
 	if backupRestoreKnobs := cfg.TestingKnobs.BackupRestore; backupRestoreKnobs != nil {
 		execCfg.BackupRestoreTestingKnobs = backupRestoreKnobs.(*sql.BackupRestoreTestingKnobs)
-	}
-	if ttlKnobs := cfg.TestingKnobs.TTL; ttlKnobs != nil {
-		execCfg.TTLTestingKnobs = ttlKnobs.(*sql.TTLTestingKnobs)
 	}
 	if sqlStatsKnobs := cfg.TestingKnobs.SQLStatsKnobs; sqlStatsKnobs != nil {
 		execCfg.SQLStatsTestingKnobs = sqlStatsKnobs.(*sqlstats.TestingKnobs)
