@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/geo/geotest"
 	"github.com/stretchr/testify/require"
 	"github.com/twpayne/go-geom"
 )
@@ -495,19 +496,12 @@ func TestRemovePoint(t *testing.T) {
 func TestLineSubstring(t *testing.T) {
 	tests := []struct {
 		name          string
-		lineString    geom.T
+		lineString    *geom.LineString
 		start         float64
 		end           float64
 		wantGeomT     geom.T
 		wantErrString string
 	}{
-		{
-			name:       "empty",
-			lineString: geom.NewLineString(geom.XY),
-			start:      0.1,
-			end:        0.2,
-			wantGeomT:  geom.NewLineString(geom.XY),
-		},
 		{
 			name:       "1/3 mid-range part of a linestring",
 			lineString: geom.NewLineStringFlat(geom.XY, []float64{25, 50, 100, 125, 150, 190}),
@@ -565,13 +559,6 @@ func TestLineSubstring(t *testing.T) {
 			wantGeomT:  geom.NewLineStringFlat(geom.XY, []float64{1, 1, 0.8, 0.8}),
 		},
 		{
-			name:       "duplicate points",
-			lineString: geom.NewLineStringFlat(geom.XY, []float64{0, 0, 0.5, 0, 0.5, 0, 0.6, 0, 0.6, 0, 1, 0}),
-			start:      0.5,
-			end:        0.7,
-			wantGeomT:  geom.NewLineStringFlat(geom.XY, []float64{0.5, 0, 0.6, 0, 0.7, 0}),
-		},
-		{
 			name:          "the `start` and the `end` are neither 0 or 1",
 			lineString:    geom.NewLineStringFlat(geom.XY, []float64{25, 50, 100, 125, 150, 190}),
 			start:         1.2,
@@ -587,13 +574,6 @@ func TestLineSubstring(t *testing.T) {
 			wantGeomT:     geom.NewLineStringFlat(geom.XY, []float64{25, 50, 100, 125, 150, 190}),
 			wantErrString: "end must be greater or equal to the start",
 		},
-		{
-			name:          "not a line string",
-			lineString:    geom.NewPointEmpty(geom.XY),
-			start:         0.4,
-			end:           0.6,
-			wantErrString: "geometry has to be of type LineString",
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -604,7 +584,7 @@ func TestLineSubstring(t *testing.T) {
 				require.Equal(t, tt.wantErrString, err.Error())
 				return
 			}
-			requireGeometryWithinEpsilon(t, requireGeometryFromGeomT(t, tt.wantGeomT), got, 1e-4)
+			geotest.RequireGeometryInEpsilon(t, requireGeometryFromGeomT(t, tt.wantGeomT), got, geotest.Epsilon)
 		})
 	}
 }

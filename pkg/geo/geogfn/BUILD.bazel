@@ -24,8 +24,7 @@ go_library(
         "//pkg/geo/geopb",
         "//pkg/geo/geoprojbase",
         "//pkg/geo/geosegmentize",
-        "//pkg/sql/pgwire/pgcode",
-        "//pkg/sql/pgwire/pgerror",
+        "@com_github_cockroachdb_errors//:errors",
         "@com_github_golang_geo//r3",
         "@com_github_golang_geo//s1",
         "@com_github_golang_geo//s2",
@@ -53,6 +52,7 @@ go_test(
     deps = [
         "//pkg/geo",
         "//pkg/geo/geoprojbase",
+        "//pkg/geo/geotest",
         "@com_github_golang_geo//s1",
         "@com_github_golang_geo//s2",
         "@com_github_stretchr_testify//require",
