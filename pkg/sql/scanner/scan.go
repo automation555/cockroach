@@ -16,6 +16,7 @@ import (
 	"go/token"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 	"unsafe"
 
@@ -28,6 +29,7 @@ const errInvalidUTF8 = "invalid UTF-8 byte sequence"
 const errInvalidHexNumeric = "invalid hexadecimal numeric literal"
 const singleQuote = '\''
 const identQuote = '"'
+const errControlCharacter = "control character found"
 
 // NewNumValFn allows us to use tree.NewNumVal without a dependency on tree.
 var NewNumValFn = func(constant.Value, string, bool) interface{} {
@@ -547,7 +549,6 @@ func (s *Scanner) scanIdent(lval ScanSymType) {
 	// of whether the string is only ASCII or only ASCII lowercase for later.
 	for {
 		ch := s.peek()
-		//fmt.Println(ch, ch >= utf8.RuneSelf, ch >= 'A' && ch <= 'Z')
 
 		if ch >= utf8.RuneSelf {
 			isASCII = false
@@ -561,9 +562,8 @@ func (s *Scanner) scanIdent(lval ScanSymType) {
 
 		s.pos++
 	}
-	//fmt.Println("parsed: ", s.in[start:s.pos], isASCII, isLower)
 
-	if isLower && isASCII {
+	if isLower {
 		// Already lowercased - nothing to do.
 		lval.SetStr(s.in[start:s.pos])
 	} else if isASCII {
@@ -830,6 +830,7 @@ func (s *Scanner) scanString(lval ScanSymType, ch int, allowEscapes, requireUTF8
 	buf := s.buffer()
 	var runeTmp [utf8.UTFMax]byte
 	start := s.pos
+
 outer:
 	for {
 		switch s.next() {
@@ -911,17 +912,23 @@ outer:
 		}
 	}
 
+	if ch == identQuote {
+		for _, r := range buf {
+			if unicode.IsControl(rune(r)) {
+				lval.SetID(lexbase.ERROR)
+				lval.SetStr(errControlCharacter)
+				return false
+			}
+		}
+	}
+
 	if requireUTF8 && !utf8.Valid(buf) {
 		lval.SetID(lexbase.ERROR)
 		lval.SetStr(errInvalidUTF8)
 		return false
 	}
 
-	if ch == identQuote {
-		lval.SetStr(lexbase.NormalizeString(s.finishString(buf)))
-	} else {
-		lval.SetStr(s.finishString(buf))
-	}
+	lval.SetStr(s.finishString(buf))
 	return true
 }
 
