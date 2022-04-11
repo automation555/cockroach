@@ -158,52 +158,6 @@ func (p *planner) CheckPrivilege(
 	return p.CheckPrivilegeForUser(ctx, descriptor, privilege, p.User())
 }
 
-// CheckGrantOptionsForUser calls PrivilegeDescriptor.CheckGrantOptions, which
-// will return an error if a user tries to grant a privilege it does not have
-// grant options for. Owners implicitly have all grant options, and also grant
-// options are inherited from parent roles.
-func (p *planner) CheckGrantOptionsForUser(
-	ctx context.Context,
-	descriptor catalog.Descriptor,
-	privList privilege.List,
-	user security.SQLUsername,
-	isGrant bool,
-) error {
-	// Always allow the command to go through if performed by a superuser or the
-	// owner of the object
-	if isAdmin, err := p.UserHasAdminRole(ctx, user); err != nil {
-		return err
-	} else if isAdmin {
-		return nil
-	}
-
-	privs := descriptor.GetPrivileges()
-	hasPriv, err := p.checkRolePredicate(ctx, user, func(role security.SQLUsername) bool {
-		return IsOwner(descriptor, role) || privs.CheckGrantOptions(role, privList)
-	})
-	if err != nil {
-		return err
-	}
-	if hasPriv {
-		return nil
-	}
-
-	code := pgcode.WarningPrivilegeNotGranted
-	if !isGrant {
-		code = pgcode.WarningPrivilegeNotRevoked
-	}
-	if privList.Len() > 1 {
-		return pgerror.Newf(
-			code, "user %s missing WITH GRANT OPTION privilege on one or more of %s",
-			user, privList.String(),
-		)
-	}
-	return pgerror.Newf(
-		code, "user %s missing WITH GRANT OPTION privilege on %s",
-		user, privList.String(),
-	)
-}
-
 func getOwnerOfDesc(desc catalog.Descriptor) security.SQLUsername {
 	// Descriptors created prior to 20.2 do not have owners set.
 	owner := desc.GetPrivileges().Owner()
@@ -348,7 +302,7 @@ func (p *planner) RequireAdminRole(ctx context.Context, action string) error {
 		return err
 	}
 	if !ok {
-		// raise error if user is not a super-user
+		//raise error if user is not a super-user
 		return pgerror.Newf(pgcode.InsufficientPrivilege,
 			"only users with the admin role are allowed to %s", action)
 	}
@@ -360,10 +314,12 @@ func (p *planner) RequireAdminRole(ctx context.Context, action string) error {
 func (p *planner) MemberOfWithAdminOption(
 	ctx context.Context, member security.SQLUsername,
 ) (map[security.SQLUsername]bool, error) {
+	ie := p.MakeInternalExecutor(ctx)
+	defer ie.Close(ctx)
 	return MemberOfWithAdminOption(
 		ctx,
 		p.execCfg,
-		p.ExecCfg().InternalExecutor,
+		ie,
 		p.Descriptors(),
 		p.Txn(),
 		member,
@@ -538,7 +494,9 @@ func (p *planner) HasRoleOption(ctx context.Context, roleOption roleoption.Optio
 		return true, nil
 	}
 
-	hasRolePrivilege, err := p.ExecCfg().InternalExecutor.QueryRowEx(
+	ie := p.MakeInternalExecutor(ctx)
+	defer ie.Close(ctx)
+	hasRolePrivilege, err := ie.QueryRowEx(
 		ctx, "has-role-option", p.Txn(),
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		fmt.Sprintf(
@@ -613,7 +571,7 @@ func (p *planner) canCreateOnSchema(
 	checkPublicSchema shouldCheckPublicSchema,
 ) error {
 	scDesc, err := p.Descriptors().GetImmutableSchemaByID(
-		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{Required: true})
+		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{})
 	if err != nil {
 		return err
 	}
@@ -738,7 +696,7 @@ func (p *planner) HasOwnershipOnSchema(
 		return p.User().IsNodeUser(), nil
 	}
 	scDesc, err := p.Descriptors().GetImmutableSchemaByID(
-		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{Required: true},
+		ctx, p.Txn(), schemaID, tree.SchemaLookupFlags{},
 	)
 	if err != nil {
 		return false, err
@@ -770,26 +728,9 @@ func (p *planner) HasOwnershipOnSchema(
 	return hasOwnership, nil
 }
 
-func (p *planner) HasViewActivityOrViewActivityRedactedRole(ctx context.Context) (bool, error) {
-	hasAdmin, err := p.HasAdminRole(ctx)
-	if err != nil {
-		return hasAdmin, err
-	}
-	if !hasAdmin {
-		hasViewActivity, err := p.HasRoleOption(ctx, roleoption.VIEWACTIVITY)
-		if err != nil {
-			return hasViewActivity, err
-		}
-		if !hasViewActivity {
-			hasViewActivityRedacted, err := p.HasRoleOption(ctx, roleoption.VIEWACTIVITYREDACTED)
-			if err != nil {
-				return hasViewActivityRedacted, err
-			}
-			if !hasViewActivityRedacted {
-				return false, nil
-			}
-		}
-	}
-
-	return true, nil
+// MakeInternalExecutor makes an InternalExecutor using the
+// InternalExecutorFactory on planner's ExecCfg.
+// The caller of MakeInternalExecutor must call Close on the InternalExecutor.
+func (p *planner) MakeInternalExecutor(ctx context.Context) sqlutil.InternalExecutor {
+	return p.ExecCfg().InternalExecutorFactory(ctx, p.SessionData())
 }

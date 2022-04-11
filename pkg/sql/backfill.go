@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -75,17 +77,23 @@ const (
 // entries for before we attempt to fill in a single index batch before queueing
 // it up for ingestion and progress reporting in the index backfiller processor.
 var indexBackfillBatchSize = settings.RegisterIntSetting(
-	settings.TenantWritable,
 	"bulkio.index_backfill.batch_size",
 	"the number of rows for which we construct index entries in a single batch",
 	50000,
 	settings.NonNegativeInt, /* validateFn */
 )
 
+// indexBackfillCheckpointInterval is the duration between backfill detail updates.
+var indexBackfillCheckpointInterval = settings.RegisterDurationSetting(
+	"bulkio.index_backfill.checkpoint_interval",
+	"the amount of time between index backfill checkpoint updates",
+	30*time.Second,
+	settings.NonNegativeDuration,
+)
+
 // columnBackfillBatchSize is the maximum number of rows we update at once when
 // adding or removing columns.
 var columnBackfillBatchSize = settings.RegisterIntSetting(
-	settings.TenantWritable,
 	"bulkio.column_backfill.batch_size",
 	"the number of rows updated at a time to add/remove columns",
 	200,
@@ -141,7 +149,7 @@ func (sc *SchemaChanger) makeFixedTimestampRunner(readAsOf hlc.Timestamp) histor
 			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 		) error {
 			// We need to re-create the evalCtx since the txn may retry.
-			evalCtx := createSchemaChangeEvalCtx(ctx, sc.execCfg, readAsOf, descriptors)
+			evalCtx := createSchemaChangeEvalCtx(ctx, sc.execCfg, readAsOf, sc.ieFactory, descriptors)
 			return retryable(ctx, txn, &evalCtx)
 		})
 	}
@@ -157,7 +165,9 @@ func (sc *SchemaChanger) makeFixedTimestampInternalExecRunner(
 			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 		) error {
 			// We need to re-create the evalCtx since the txn may retry.
-			ie := sc.ieFactory(ctx, NewFakeSessionData(sc.execCfg.SV()))
+			ie := createSchemaChangeEvalCtx(
+				ctx, sc.execCfg, readAsOf, sc.ieFactory, descriptors,
+			).SchemaChangeInternalExecutor
 			return retryable(ctx, txn, ie)
 		})
 	}
@@ -191,6 +201,7 @@ func (sc *SchemaChanger) runBackfill(ctx context.Context) error {
 
 	// Mutations are applied in a FIFO order. Only apply the first set of
 	// mutations. Collect the elements that are part of the mutation.
+	var droppedIndexes []catalog.Index
 	var addedIndexSpans []roachpb.Span
 	var addedIndexes []descpb.IndexID
 
@@ -226,9 +237,9 @@ func (sc *SchemaChanger) runBackfill(ctx context.Context) error {
 	if tableDesc.Dropped() {
 		return nil
 	}
-	version := tableDesc.GetVersion()
+	version := tableDesc.Version
 
-	log.Infof(ctx, "running backfill for %q, v=%d", tableDesc.GetName(), tableDesc.GetVersion())
+	log.Infof(ctx, "running backfill for %q, v=%d", tableDesc.Name, tableDesc.Version)
 
 	needColumnBackfill := false
 	for _, m := range tableDesc.AllMutations() {
@@ -243,25 +254,24 @@ func (sc *SchemaChanger) runBackfill(ctx context.Context) error {
 
 		if m.Adding() {
 			if col := m.AsColumn(); col != nil {
-				// Its possible have a mix of columns that need a backfill and others
-				// that don't, so preserve the flag if its already been flipped.
-				needColumnBackfill = needColumnBackfill || catalog.ColumnNeedsBackfill(col)
+				needColumnBackfill = catalog.ColumnNeedsBackfill(col)
 			} else if idx := m.AsIndex(); idx != nil {
 				addedIndexSpans = append(addedIndexSpans, tableDesc.IndexSpan(sc.execCfg.Codec, idx.GetID()))
 				addedIndexes = append(addedIndexes, idx.GetID())
 			} else if c := m.AsConstraint(); c != nil {
-				isValidating := c.IsCheck() && c.Check().Validity == descpb.ConstraintValidity_Validating ||
-					c.IsForeignKey() && c.ForeignKey().Validity == descpb.ConstraintValidity_Validating ||
-					c.IsUniqueWithoutIndex() && c.UniqueWithoutIndex().Validity == descpb.ConstraintValidity_Validating ||
-					c.IsNotNull()
-				isSkippingValidation, err := shouldSkipConstraintValidation(tableDesc, c)
-				if err != nil {
-					return err
+				isValidating := false
+				if c.IsCheck() {
+					isValidating = c.Check().Validity == descpb.ConstraintValidity_Validating
+				} else if c.IsForeignKey() {
+					isValidating = c.ForeignKey().Validity == descpb.ConstraintValidity_Validating
+				} else if c.IsUniqueWithoutIndex() {
+					isValidating = c.UniqueWithoutIndex().Validity == descpb.ConstraintValidity_Validating
+				} else if c.IsNotNull() {
+					// NOT NULL constraints are always validated before they can be added
+					isValidating = true
 				}
 				if isValidating {
 					constraintsToAddBeforeValidation = append(constraintsToAddBeforeValidation, c)
-				}
-				if isValidating && !isSkippingValidation {
 					constraintsToValidate = append(constraintsToValidate, c)
 				}
 			} else if mvRefresh := m.AsMaterializedViewRefresh(); mvRefresh != nil {
@@ -273,11 +283,9 @@ func (sc *SchemaChanger) runBackfill(ctx context.Context) error {
 			}
 		} else if m.Dropped() {
 			if col := m.AsColumn(); col != nil {
-				// Its possible have a mix of columns that need a backfill and others
-				// that don't, so preserve the flag if its already been flipped.
-				needColumnBackfill = needColumnBackfill || catalog.ColumnNeedsBackfill(col)
+				needColumnBackfill = catalog.ColumnNeedsBackfill(col)
 			} else if idx := m.AsIndex(); idx != nil {
-				// no-op. Handled in (*schemaChanger).done by queueing an index gc job.
+				// no-op
 			} else if c := m.AsConstraint(); c != nil {
 				constraintsToDrop = append(constraintsToDrop, c)
 			} else if m.AsPrimaryKeySwap() != nil || m.AsComputedColumnSwap() != nil || m.AsMaterializedViewRefresh() != nil {
@@ -304,7 +312,14 @@ func (sc *SchemaChanger) runBackfill(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		version = descs[tableDesc.GetID()].GetVersion()
+		version = descs[tableDesc.ID].GetVersion()
+	}
+
+	// Drop indexes not to be removed by `ClearRange`.
+	if len(droppedIndexes) > 0 {
+		if err := sc.truncateIndexes(ctx, version, droppedIndexes); err != nil {
+			return err
+		}
 	}
 
 	// Add and drop columns.
@@ -344,7 +359,7 @@ func (sc *SchemaChanger) runBackfill(ctx context.Context) error {
 		}
 	}
 
-	log.Infof(ctx, "completed backfill for %q, v=%d", tableDesc.GetName(), tableDesc.GetVersion())
+	log.Infof(ctx, "completed backfill for %q, v=%d", tableDesc.Name, tableDesc.Version)
 
 	if sc.testingKnobs.RunAfterBackfill != nil {
 		if err := sc.testingKnobs.RunAfterBackfill(sc.job.ID()); err != nil {
@@ -353,35 +368,6 @@ func (sc *SchemaChanger) runBackfill(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-// shouldSkipConstraintValidation checks if a validating constraint should skip
-// validation and be added directly. A Check Constraint can skip validation if it's
-// created for a shard column internally.
-func shouldSkipConstraintValidation(
-	tableDesc catalog.TableDescriptor, c catalog.ConstraintToUpdate,
-) (bool, error) {
-	if !c.IsCheck() {
-		return false, nil
-	}
-
-	check := c.Check()
-	// The check constraint on shard column is always on the shard column itself.
-	if len(check.ColumnIDs) != 1 {
-		return false, nil
-	}
-
-	checkCol, err := tableDesc.FindColumnWithID(check.ColumnIDs[0])
-	if err != nil {
-		return false, err
-	}
-
-	// We only want to skip validation when the shard column is first added and
-	// the constraint is created internally since the shard column computation is
-	// well defined. Note that we show the shard column in `SHOW CREATE TABLE`,
-	// and we don't prevent users from adding other constraints on it. For those
-	// constraints, we still want to validate.
-	return tableDesc.IsShardColumn(checkCol) && checkCol.Adding(), nil
 }
 
 // dropConstraints publishes a new version of the given table descriptor with
@@ -669,7 +655,7 @@ func (sc *SchemaChanger) validateConstraints(
 	}
 
 	if fn := sc.testingKnobs.RunBeforeConstraintValidation; fn != nil {
-		if err := fn(constraints); err != nil {
+		if err := fn(); err != nil {
 			return err
 		}
 	}
@@ -681,7 +667,7 @@ func (sc *SchemaChanger) validateConstraints(
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) error {
 		flags := tree.ObjectLookupFlagsWithRequired()
-		flags.AvoidLeased = true
+		flags.AvoidCached = true
 		tableDesc, err = descriptors.GetImmutableTableByID(ctx, txn, sc.descID, flags)
 		return err
 	}); err != nil {
@@ -724,21 +710,21 @@ func (sc *SchemaChanger) validateConstraints(
 				defer func() { collection.ReleaseAll(ctx) }()
 				if c.IsCheck() {
 					if err := validateCheckInTxn(
-						ctx, &semaCtx, sc.ieFactory, evalCtx.SessionData(), desc, txn, c.Check().Expr,
+						ctx, &semaCtx, evalCtx.SchemaChangeInternalExecutor, evalCtx.SessionData(), desc, txn, c.Check().Expr,
 					); err != nil {
 						return err
 					}
 				} else if c.IsForeignKey() {
-					if err := validateFkInTxn(ctx, sc.ieFactory, evalCtx.SessionData(), desc, txn, collection, c.GetName()); err != nil {
+					if err := validateFkInTxn(ctx, sc.leaseMgr, evalCtx.SchemaChangeInternalExecutor, desc, txn, c.GetName(), evalCtx.Codec); err != nil {
 						return err
 					}
 				} else if c.IsUniqueWithoutIndex() {
-					if err := validateUniqueWithoutIndexConstraintInTxn(ctx, sc.ieFactory(ctx, evalCtx.SessionData()), desc, txn, c.GetName()); err != nil {
+					if err := validateUniqueWithoutIndexConstraintInTxn(ctx, evalCtx.SchemaChangeInternalExecutor, desc, txn, c.GetName()); err != nil {
 						return err
 					}
 				} else if c.IsNotNull() {
 					if err := validateCheckInTxn(
-						ctx, &semaCtx, sc.ieFactory, evalCtx.SessionData(), desc, txn, c.Check().Expr,
+						ctx, &semaCtx, evalCtx.SchemaChangeInternalExecutor, evalCtx.SessionData(), desc, txn, c.Check().Expr,
 					); err != nil {
 						// TODO (lucy): This should distinguish between constraint
 						// validation errors and other types of unexpected errors, and
@@ -779,6 +765,73 @@ func (sc *SchemaChanger) getTableVersion(
 	return tableDesc, nil
 }
 
+// truncateIndexes truncate the KV ranges corresponding to dropped indexes.
+//
+// The indexes are dropped chunk by chunk, each chunk being deleted in
+// its own txn.
+func (sc *SchemaChanger) truncateIndexes(
+	ctx context.Context, version descpb.DescriptorVersion, dropped []catalog.Index,
+) error {
+	log.Infof(ctx, "clearing data for %d indexes", len(dropped))
+
+	alloc := &rowenc.DatumAlloc{}
+	droppedIndexIDs := make([]uint32, len(dropped))
+	for i, idx := range dropped {
+		droppedIndexIDs[i] = uint32(idx.GetID())
+	}
+	for _, idx := range dropped {
+		if log.V(2) {
+			log.Infof(ctx, "drop index (%d, %d)",
+				sc.descID, sc.mutationID)
+		}
+
+		// Make a new txn just to drop this index.
+		if err := sc.txn(ctx, func(
+			ctx context.Context, txn *kv.Txn, tc *descs.Collection,
+		) error {
+			if fn := sc.execCfg.DistSQLRunTestingKnobs.RunBeforeBackfillChunk; fn != nil {
+				if err := fn(roachpb.Span{}); err != nil {
+					return err
+				}
+			}
+			if fn := sc.execCfg.DistSQLRunTestingKnobs.RunAfterBackfillChunk; fn != nil {
+				defer fn()
+			}
+
+			// Retrieve a lease for this table inside the current txn.
+			tableDesc, err := sc.getTableVersion(ctx, txn, tc, version)
+			if err != nil {
+				return err
+			}
+			rd := row.MakeDeleter(
+				sc.execCfg.Codec, tableDesc, nil /* requestedCols */, &sc.settings.SV,
+				true /* internal */, sc.execCfg.GetRowMetrics(true /* internal */),
+			)
+			td := tableDeleter{rd: rd, alloc: alloc}
+			if err := td.init(ctx, txn, nil /* *tree.EvalContext */, &sc.settings.SV); err != nil {
+				return err
+			}
+			return td.clearIndex(ctx, idx)
+		}); err != nil {
+			return err
+		}
+
+		// All the data chunks have been removed. Now also removed the
+		// zone configs for the dropped indexes, if any.
+		if err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			table, err := catalogkv.MustGetTableDescByID(ctx, txn, sc.execCfg.Codec, sc.descID)
+			if err != nil {
+				return err
+			}
+			return RemoveIndexZoneConfigs(ctx, txn, sc.execCfg, table, droppedIndexIDs)
+		}); err != nil {
+			return err
+		}
+	}
+	log.Info(ctx, "finished clearing data for indexes")
+	return nil
+}
+
 // getJobIDForMutationWithDescriptor returns a job id associated with a mutation given
 // a table descriptor. Unlike getJobIDForMutation this doesn't need transaction.
 // TODO (lucy): This is not a good way to look up all schema change jobs
@@ -789,7 +842,7 @@ func getJobIDForMutationWithDescriptor(
 ) (jobspb.JobID, error) {
 	for _, job := range tableDesc.GetMutationJobs() {
 		if job.MutationID == mutationID {
-			return job.JobID, nil
+			return jobspb.JobID(job.JobID), nil
 		}
 	}
 
@@ -826,42 +879,6 @@ func numRangesInSpans(
 	return len(rangeIds), nil
 }
 
-// NumRangesInSpanContainedBy returns the number of ranges that covers
-// a span and how many of those ranged are wholly contained in containedBy.
-//
-// It operates entirely on the current goroutine and is thus able to
-// reuse an existing kv.Txn safely.
-func NumRangesInSpanContainedBy(
-	ctx context.Context,
-	db *kv.DB,
-	distSQLPlanner *DistSQLPlanner,
-	outerSpan roachpb.Span,
-	containedBy []roachpb.Span,
-) (total, inContainedBy int, _ error) {
-	txn := db.NewTxn(ctx, "num-ranges-in-spans")
-	spanResolver := distSQLPlanner.spanResolver.NewSpanResolverIterator(txn)
-	// For each span, iterate the spanResolver until it's exhausted, storing
-	// the found range ids in the map to de-duplicate them.
-	spanResolver.Seek(ctx, outerSpan, kvcoord.Ascending)
-	var g roachpb.SpanGroup
-	g.Add(containedBy...)
-	for {
-		if !spanResolver.Valid() {
-			return 0, 0, spanResolver.Error()
-		}
-		total++
-		desc := spanResolver.Desc()
-		if g.Encloses(desc.RSpan().AsRawSpanWithNoLocals().Intersect(outerSpan)) {
-			inContainedBy++
-		}
-		if !spanResolver.NeedAnother() {
-			break
-		}
-		spanResolver.Next(ctx)
-	}
-	return total, inContainedBy, nil
-}
-
 // TODO(adityamaru): Consider moving this to sql/backfill. It has a lot of
 // schema changer dependencies which will need to be passed around.
 func (sc *SchemaChanger) distIndexBackfill(
@@ -880,9 +897,10 @@ func (sc *SchemaChanger) distIndexBackfill(
 	// Gather the initial resume spans for the table.
 	var todoSpans []roachpb.Span
 	var mutationIdx int
-	if err := DescsTxn(ctx, sc.execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
+	if err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		var err error
 		todoSpans, _, mutationIdx, err = rowexec.GetResumeSpans(
-			ctx, sc.jobRegistry, txn, sc.execCfg.Codec, col, sc.descID, sc.mutationID, filter)
+			ctx, sc.jobRegistry, txn, sc.execCfg.Codec, sc.descID, sc.mutationID, filter)
 		return err
 	}); err != nil {
 		return err
@@ -970,7 +988,7 @@ func (sc *SchemaChanger) distIndexBackfill(
 		if err != nil {
 			return err
 		}
-		evalCtx = createSchemaChangeEvalCtx(ctx, sc.execCfg, txn.ReadTimestamp(), descriptors)
+		evalCtx = createSchemaChangeEvalCtx(ctx, sc.execCfg, txn.ReadTimestamp(), sc.ieFactory, descriptors)
 		planCtx = sc.distSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn,
 			true /* distribute */)
 		indexBatchSize := indexBackfillBatchSize.Get(&sc.execCfg.Settings.SV)
@@ -1056,7 +1074,7 @@ func (sc *SchemaChanger) distIndexBackfill(
 		if updatedTodoSpans == nil {
 			return nil
 		}
-		nRanges, err := numRangesInSpans(ctx, sc.db, sc.distSQLPlanner, updatedTodoSpans)
+		nRanges, err := numRangesInSpans(ctx, sc.db, sc.distSQLPlanner, mu.updatedTodoSpans)
 		if err != nil {
 			return err
 		}
@@ -1077,16 +1095,9 @@ func (sc *SchemaChanger) distIndexBackfill(
 		})
 	}
 
-	// updateJobMu ensures only one goroutine is calling
-	// updateJobDetails at a time to avoid a data race in
-	// SetResumeSpansInJob. This mutex should be uncontended when
-	// sc.testingKnobs.AlwaysUpdateIndexBackfillDetails is false.
-	var updateJobMu syncutil.Mutex
 	updateJobDetails = func() error {
 		updatedTodoSpans := getTodoSpansForUpdate()
 		return sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			updateJobMu.Lock()
-			defer updateJobMu.Unlock()
 			// No processor has returned completed spans yet.
 			if updatedTodoSpans == nil {
 				return nil
@@ -1120,7 +1131,7 @@ func (sc *SchemaChanger) distIndexBackfill(
 
 	// Setup periodic job details update.
 	stopJobDetailsUpdate := make(chan struct{})
-	detailsDuration := backfill.IndexBackfillCheckpointInterval.Get(&sc.settings.SV)
+	detailsDuration := indexBackfillCheckpointInterval.Get(&sc.settings.SV)
 	g.GoCtx(func(ctx context.Context) error {
 		tick := time.NewTicker(detailsDuration)
 		defer tick.Stop()
@@ -1143,9 +1154,6 @@ func (sc *SchemaChanger) distIndexBackfill(
 	g.GoCtx(func(ctx context.Context) error {
 		defer close(stopProgress)
 		defer close(stopJobDetailsUpdate)
-		if err := sc.jobRegistry.CheckPausepoint("indexbackfill.before_flow"); err != nil {
-			return err
-		}
 		// Copy the evalCtx, as dsp.Run() might change it.
 		evalCtxCopy := evalCtx
 		sc.distSQLPlanner.Run(
@@ -1197,9 +1205,10 @@ func (sc *SchemaChanger) distColumnBackfill(
 	// Gather the initial resume spans for the table.
 	var todoSpans []roachpb.Span
 	var mutationIdx int
-	if err := DescsTxn(ctx, sc.execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
+	if err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		var err error
 		todoSpans, _, mutationIdx, err = rowexec.GetResumeSpans(
-			ctx, sc.jobRegistry, txn, sc.execCfg.Codec, col, sc.descID, sc.mutationID, filter)
+			ctx, sc.jobRegistry, txn, sc.execCfg.Codec, sc.descID, sc.mutationID, filter)
 		return err
 	}); err != nil {
 		return err
@@ -1250,7 +1259,7 @@ func (sc *SchemaChanger) distColumnBackfill(
 				return nil
 			}
 			cbw := MetadataCallbackWriter{rowResultWriter: &errOnlyResultWriter{}, fn: metaFn}
-			evalCtx := createSchemaChangeEvalCtx(ctx, sc.execCfg, txn.ReadTimestamp(), descriptors)
+			evalCtx := createSchemaChangeEvalCtx(ctx, sc.execCfg, txn.ReadTimestamp(), sc.ieFactory, descriptors)
 			recv := MakeDistSQLReceiver(
 				ctx,
 				&cbw,
@@ -1300,31 +1309,40 @@ func (sc *SchemaChanger) distColumnBackfill(
 // with the given value.
 //
 // The update is performed in a separate txn at the current logical
-// timestamp.
+// timestamp. Note that while a MutableTableDescriptor is returned, this is an
+// odd case in that the descriptor is not tied to the lifetime of a transaction.
 // TODO(ajwerner): Fix the transaction and descriptor lifetimes here.
 func (sc *SchemaChanger) updateJobRunningStatus(
 	ctx context.Context, status jobs.RunningStatus,
-) (tableDesc catalog.TableDescriptor, err error) {
-	err = DescsTxn(ctx, sc.execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-		// Read table descriptor without holding a lease.
-		tableDesc, err = col.Direct().MustGetTableDescByID(ctx, txn, sc.descID)
+) (*tabledesc.Mutable, error) {
+	var tableDesc *tabledesc.Mutable
+	err := sc.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+		tableDesc, err = catalogkv.MustGetMutableTableDescByID(ctx, txn, sc.execCfg.Codec, sc.descID)
 		if err != nil {
 			return err
 		}
 
 		// Update running status of job.
 		updateJobRunningProgress := false
-		for _, mutation := range tableDesc.AllMutations() {
-			if mutation.MutationID() != sc.mutationID {
+		for _, mutation := range tableDesc.Mutations {
+			if mutation.MutationID != sc.mutationID {
 				// Mutations are applied in a FIFO order. Only apply the first set of
 				// mutations if they have the mutation ID we're looking for.
 				break
 			}
 
-			if mutation.Adding() && mutation.WriteAndDeleteOnly() {
-				updateJobRunningProgress = true
-			} else if mutation.Dropped() && mutation.DeleteOnly() {
-				updateJobRunningProgress = true
+			switch mutation.Direction {
+			case descpb.DescriptorMutation_ADD:
+				switch mutation.State {
+				case descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY:
+					updateJobRunningProgress = true
+				}
+
+			case descpb.DescriptorMutation_DROP:
+				switch mutation.State {
+				case descpb.DescriptorMutation_DELETE_ONLY:
+					updateJobRunningProgress = true
+				}
 			}
 		}
 		if updateJobRunningProgress && !tableDesc.Dropped() {
@@ -1367,7 +1385,7 @@ func (sc *SchemaChanger) validateIndexes(ctx context.Context) error {
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) (err error) {
 		flags := tree.ObjectLookupFlagsWithRequired()
-		flags.AvoidLeased = true
+		flags.AvoidCached = true
 		tableDesc, err = descriptors.GetImmutableTableByID(ctx, txn, sc.descID, flags)
 		return err
 	}); err != nil {
@@ -1400,29 +1418,12 @@ func (sc *SchemaChanger) validateIndexes(ctx context.Context) error {
 
 	if len(forwardIndexes) > 0 {
 		grp.GoCtx(func(ctx context.Context) error {
-			return ValidateForwardIndexes(
-				ctx,
-				tableDesc,
-				forwardIndexes,
-				runHistoricalTxn,
-				true,  /* withFirstMutationPubic */
-				false, /* gatherAllInvalid */
-				sessiondata.InternalExecutorOverride{},
-			)
+			return ValidateForwardIndexes(ctx, tableDesc, forwardIndexes, runHistoricalTxn, true /* withFirstMutationPubic */, false /* gatherAllInvalid */, sessiondata.InternalExecutorOverride{})
 		})
 	}
 	if len(invertedIndexes) > 0 {
 		grp.GoCtx(func(ctx context.Context) error {
-			return ValidateInvertedIndexes(
-				ctx,
-				sc.execCfg.Codec,
-				tableDesc,
-				invertedIndexes,
-				runHistoricalTxn,
-				true,  /* withFirstMutationPublic */
-				false, /* gatherAllInvalid */
-				sessiondata.InternalExecutorOverride{},
-			)
+			return ValidateInvertedIndexes(ctx, sc.execCfg.Codec, tableDesc, invertedIndexes, runHistoricalTxn, false /* gatherAllInvalid */, sessiondata.InternalExecutorOverride{})
 		})
 	}
 	if err := grp.Wait(); err != nil {
@@ -1454,7 +1455,6 @@ func ValidateInvertedIndexes(
 	tableDesc catalog.TableDescriptor,
 	indexes []catalog.Index,
 	runHistoricalTxn sqlutil.HistoricalInternalExecTxnRunner,
-	withFirstMutationPublic bool,
 	gatherAllInvalid bool,
 	execOverride sessiondata.InternalExecutorOverride,
 ) error {
@@ -1519,22 +1519,11 @@ func ValidateInvertedIndexes(
 
 		grp.GoCtx(func(ctx context.Context) error {
 			defer close(countReady[i])
-			desc := tableDesc
-			if withFirstMutationPublic {
-				// Make the mutations public in an in-memory copy of the descriptor and
-				// add it to the Collection's synthetic descriptors, so that we can use
-				// SQL below to perform the validation.
-				fakeDesc, err := tableDesc.MakeFirstMutationPublic(catalog.IgnoreConstraints)
-				if err != nil {
-					return err
-				}
-				desc = fakeDesc
-			}
 
 			start := timeutil.Now()
 
 			colID := idx.InvertedColumnID()
-			col, err := desc.FindColumnWithID(colID)
+			col, err := tableDesc.FindColumnWithID(colID)
 			if err != nil {
 				return err
 			}
@@ -1560,12 +1549,12 @@ func ValidateInvertedIndexes(
 				if geoindex.IsEmptyConfig(&geoConfig) {
 					stmt = fmt.Sprintf(
 						`SELECT coalesce(sum_int(crdb_internal.num_inverted_index_entries(%s, %d)), 0) FROM [%d AS t]`,
-						colNameOrExpr, idx.GetVersion(), desc.GetID(),
+						colNameOrExpr, idx.GetVersion(), tableDesc.GetID(),
 					)
 				} else {
 					stmt = fmt.Sprintf(
 						`SELECT coalesce(sum_int(crdb_internal.num_geo_inverted_index_entries(%d, %d, %s)), 0) FROM [%d AS t]`,
-						desc.GetID(), idx.GetID(), colNameOrExpr, desc.GetID(),
+						tableDesc.GetID(), idx.GetID(), colNameOrExpr, tableDesc.GetID(),
 					)
 				}
 				// If the index is a partial index the predicate must be added
@@ -1573,7 +1562,7 @@ func ValidateInvertedIndexes(
 				if idx.IsPartial() {
 					stmt = fmt.Sprintf(`%s WHERE %s`, stmt, idx.GetPredicate())
 				}
-				return ie.WithSyntheticDescriptors([]catalog.Descriptor{desc}, func() error {
+				return ie.WithSyntheticDescriptors([]catalog.Descriptor{tableDesc}, func() error {
 					row, err := ie.QueryRowEx(ctx, "verify-inverted-idx-count", txn, execOverride, stmt)
 					if err != nil {
 						return err
@@ -1588,7 +1577,7 @@ func ValidateInvertedIndexes(
 				return err
 			}
 			log.Infof(ctx, "%s %s expected inverted index count = %d, took %s",
-				desc.GetName(), colNameOrExpr, expectedCount[i], timeutil.Since(start))
+				tableDesc.GetName(), colNameOrExpr, expectedCount[i], timeutil.Since(start))
 			return nil
 		})
 	}
@@ -1674,16 +1663,16 @@ func ValidateForwardIndexes(
 				}
 			}
 
-			desc := tableDesc
+			var desc catalog.TableDescriptor = tableDesc
 			if withFirstMutationPublic {
 				// Make the mutations public in an in-memory copy of the descriptor and
 				// add it to the Collection's synthetic descriptors, so that we can use
 				// SQL below to perform the validation.
-				fakeDesc, err := tableDesc.MakeFirstMutationPublic(catalog.IgnoreConstraints)
+				var err error
+				desc, err = tableDesc.MakeFirstMutationPublic(catalog.IgnoreConstraints)
 				if err != nil {
 					return err
 				}
-				desc = fakeDesc
 			}
 
 			// Retrieve the row count in the index.
@@ -1716,7 +1705,6 @@ func ValidateForwardIndexes(
 							idx.GetPredicate(),
 							ie,
 							txn,
-							false, /* preExisting */
 						); err != nil {
 							return err
 						}
@@ -1766,17 +1754,17 @@ func ValidateForwardIndexes(
 		var tableRowCountTime time.Duration
 		start := timeutil.Now()
 
-		desc := tableDesc
+		var desc catalog.TableDescriptor = tableDesc
 		if withFirstMutationPublic {
 			// The query to count the expected number of rows can reference columns
 			// added earlier in the same mutation. Make the mutations public in an
 			// in-memory copy of the descriptor and add it to the Collection's synthetic
 			// descriptors, so that we can use SQL below to perform the validation.
-			fakeDesc, err := tableDesc.MakeFirstMutationPublic(catalog.IgnoreConstraintsAndPKSwaps)
+			descI, err := tableDesc.MakeFirstMutationPublic(catalog.IgnoreConstraintsAndPKSwaps)
 			if err != nil {
 				return err
 			}
-			desc = fakeDesc
+			desc = descI.(*tabledesc.Mutable)
 		}
 
 		// Count the number of rows in the table.
@@ -2062,13 +2050,14 @@ func runSchemaChangesInTxn(
 
 	// Now that the table descriptor is in a valid state with all column and index
 	// mutations applied, it can be used for validating check/FK constraints.
+	ie := planner.MakeInternalExecutor(ctx)
+	defer ie.Close(ctx)
 	for _, c := range constraintAdditionMutations {
 		if c.IsCheck() || c.IsNotNull() {
 			check := &c.ConstraintToUpdateDesc().Check
 			if check.Validity == descpb.ConstraintValidity_Validating {
 				if err := validateCheckInTxn(
-					ctx, &planner.semaCtx, planner.ExecCfg().InternalExecutorFactory,
-					planner.SessionData(), tableDesc, planner.txn, check.Expr,
+					ctx, &planner.semaCtx, ie, planner.SessionData(), tableDesc, planner.txn, check.Expr,
 				); err != nil {
 					return err
 				}
@@ -2092,7 +2081,7 @@ func runSchemaChangesInTxn(
 			uwi := &c.ConstraintToUpdateDesc().UniqueWithoutIndexConstraint
 			if uwi.Validity == descpb.ConstraintValidity_Validating {
 				if err := validateUniqueWithoutIndexConstraintInTxn(
-					ctx, planner.ExecCfg().InternalExecutor, tableDesc, planner.txn, c.GetName(),
+					ctx, ie, tableDesc, planner.txn, c.GetName(),
 				); err != nil {
 					return err
 				}
@@ -2165,7 +2154,7 @@ func runSchemaChangesInTxn(
 func validateCheckInTxn(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	ief sqlutil.SessionBoundInternalExecutorFactory,
+	ie sqlutil.InternalExecutor,
 	sessionData *sessiondata.SessionData,
 	tableDesc *tabledesc.Mutable,
 	txn *kv.Txn,
@@ -2175,7 +2164,6 @@ func validateCheckInTxn(
 	if tableDesc.Version > tableDesc.ClusterVersion.Version {
 		syntheticDescs = append(syntheticDescs, tableDesc)
 	}
-	ie := ief(ctx, sessionData)
 	return ie.WithSyntheticDescriptors(syntheticDescs, func() error {
 		return validateCheckExpr(ctx, semaCtx, sessionData, checkExpr, tableDesc, ie, txn)
 	})
@@ -2195,20 +2183,21 @@ func validateCheckInTxn(
 // reuse an existing kv.Txn safely.
 func validateFkInTxn(
 	ctx context.Context,
-	ief sqlutil.SessionBoundInternalExecutorFactory,
-	sd *sessiondata.SessionData,
-	srcTable *tabledesc.Mutable,
+	leaseMgr *lease.Manager,
+	ie sqlutil.InternalExecutor,
+	tableDesc *tabledesc.Mutable,
 	txn *kv.Txn,
-	descsCol *descs.Collection,
 	fkName string,
+	codec keys.SQLCodec,
 ) error {
-	var syntheticTable catalog.TableDescriptor
-	if srcTable.Version > srcTable.ClusterVersion.Version {
-		syntheticTable = srcTable
+	var syntheticDescs []catalog.Descriptor
+	if tableDesc.Version > tableDesc.ClusterVersion.Version {
+		syntheticDescs = append(syntheticDescs, tableDesc)
 	}
+
 	var fk *descpb.ForeignKeyConstraint
-	for i := range srcTable.OutboundFKs {
-		def := &srcTable.OutboundFKs[i]
+	for i := range tableDesc.OutboundFKs {
+		def := &tableDesc.OutboundFKs[i]
 		if def.Name == fkName {
 			fk = def
 			break
@@ -2217,20 +2206,9 @@ func validateFkInTxn(
 	if fk == nil {
 		return errors.AssertionFailedf("foreign key %s does not exist", fkName)
 	}
-	targetTable, err := descsCol.Direct().MustGetTableDescByID(ctx, txn, fk.ReferencedTableID)
-	if err != nil {
-		return err
-	}
-	var syntheticDescs []catalog.Descriptor
-	if syntheticTable != nil {
-		syntheticDescs = append(syntheticDescs, syntheticTable)
-		if targetTable.GetID() == syntheticTable.GetID() {
-			targetTable = syntheticTable
-		}
-	}
-	ie := ief(ctx, sd)
+
 	return ie.WithSyntheticDescriptors(syntheticDescs, func() error {
-		return validateForeignKey(ctx, srcTable, targetTable, fk, ie, txn)
+		return validateForeignKey(ctx, tableDesc, fk, ie, txn, codec)
 	})
 }
 
@@ -2271,9 +2249,7 @@ func validateUniqueWithoutIndexConstraintInTxn(
 	}
 
 	return ie.WithSyntheticDescriptors(syntheticDescs, func() error {
-		return validateUniqueConstraint(
-			ctx, tableDesc, uc.Name, uc.ColumnIDs, uc.Predicate, ie, txn, false, /* preExisting */
-		)
+		return validateUniqueConstraint(ctx, tableDesc, uc.Name, uc.ColumnIDs, uc.Predicate, ie, txn)
 	})
 }
 
@@ -2374,7 +2350,7 @@ func indexTruncateInTxn(
 	idx catalog.Index,
 	traceKV bool,
 ) error {
-	alloc := &tree.DatumAlloc{}
+	alloc := &rowenc.DatumAlloc{}
 	var sp roachpb.Span
 	for done := false; !done; done = sp.Key == nil {
 		internal := evalCtx.SessionData().Internal

@@ -15,8 +15,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -325,48 +325,33 @@ func (p *planner) dropTableImpl(
 	return droppedViews, err
 }
 
-// UnsplitRangesInSpan unsplist any manually split ranges within a span.
-// TODO(Chengxiong): move this function to gc_job.go in 22.2
-func UnsplitRangesInSpan(ctx context.Context, kvDB *kv.DB, span roachpb.Span) error {
-	ranges, err := kvclient.ScanMetaKVs(ctx, kvDB.NewTxn(ctx, "unsplit-ranges-in-span"), span)
-	if err != nil {
-		return err
-	}
-	for _, r := range ranges {
-		var desc roachpb.RangeDescriptor
-		if err := r.ValueProto(&desc); err != nil {
-			return err
-		}
-
-		if !span.ContainsKey(desc.StartKey.AsRawKey()) {
-			continue
-		}
-
-		if !desc.GetStickyBit().IsEmpty() {
-			// Swallow "key is not the start of a range" errors because it would mean
-			// that the sticky bit was removed and merged concurrently. DROP TABLE
-			// should not fail because of this.
-			if err := kvDB.AdminUnsplit(ctx, desc.StartKey); err != nil &&
-				!strings.Contains(err.Error(), "is not the start of a range") {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-// unsplitRangesForTable unsplit any manually split ranges within the tablespan.
-// TODO(Chengxiong): Remove this function in 22.2
+// unsplitRangesForTable unsplit any manually split ranges within the table span.
 func (p *planner) unsplitRangesForTable(ctx context.Context, tableDesc *tabledesc.Mutable) error {
 	// Gate this on being the system tenant because secondary tenants aren't
 	// allowed to scan the meta ranges directly.
-	if !p.ExecCfg().Codec.ForSystemTenant() {
-		return nil
+	if p.ExecCfg().Codec.ForSystemTenant() {
+		span := tableDesc.TableSpan(p.ExecCfg().Codec)
+		ranges, err := kvclient.ScanMetaKVs(ctx, p.execCfg.DB.NewTxn(ctx, "unsplit-ranges-for-table"), span)
+		if err != nil {
+			return err
+		}
+		for _, r := range ranges {
+			var desc roachpb.RangeDescriptor
+			if err := r.ValueProto(&desc); err != nil {
+				return err
+			}
+			if !desc.GetStickyBit().IsEmpty() {
+				// Swallow "key is not the start of a range" errors because it would mean
+				// that the sticky bit was removed and merged concurrently. DROP TABLE
+				// should not fail because of this.
+				if err := p.ExecCfg().DB.AdminUnsplit(ctx, desc.StartKey); err != nil &&
+					!strings.Contains(err.Error(), "is not the start of a range") {
+					return err
+				}
+			}
+		}
 	}
-
-	span := tableDesc.TableSpan(p.ExecCfg().Codec)
-	return UnsplitRangesInSpan(ctx, p.execCfg.DB, span)
+	return nil
 }
 
 // drainName when set implies that the name needs to go through the draining
@@ -380,12 +365,12 @@ func (p *planner) initiateDropTable(
 		return errors.Errorf("table %q is already being dropped", tableDesc.Name)
 	}
 
-	// Exit early with an error if the table is undergoing a declarative schema
+	// Exit early with an error if the table is undergoing a new-style schema
 	// change, before we try to get job IDs and update job statuses later. See
 	// createOrUpdateSchemaChangeJob.
-	if tableDesc.GetDeclarativeSchemaChangerState() != nil {
+	if tableDesc.NewSchemaChangeJobID != 0 {
 		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-			"cannot perform a schema change on table %q while it is undergoing a declarative schema change",
+			"cannot perform a schema change on table %q while it is undergoing a new-style schema change",
 			tableDesc.GetName(),
 		)
 	}
@@ -396,14 +381,10 @@ func (p *planner) initiateDropTable(
 		tableDesc.DropTime = timeutil.Now().UnixNano()
 	}
 
-	// TODO(Chengxiong): Remove this range unsplitting in 22.2
-	st := p.EvalContext().Settings
-	if !st.Version.IsActive(ctx, clusterversion.UnsplitRangesInAsyncGCJobs) {
-		// Unsplit all manually split ranges in the table so they can be
-		// automatically merged by the merge queue.
-		if err := p.unsplitRangesForTable(ctx, tableDesc); err != nil {
-			return err
-		}
+	// Unsplit all manually split ranges in the table so they can be
+	// automatically merged by the merge queue.
+	if err := p.unsplitRangesForTable(ctx, tableDesc); err != nil {
+		return err
 	}
 
 	// Actually mark table descriptor as dropped.
@@ -459,7 +440,7 @@ func (p *planner) markTableMutationJobsSuccessful(
 	ctx context.Context, tableDesc *tabledesc.Mutable,
 ) error {
 	for _, mj := range tableDesc.MutationJobs {
-		jobID := mj.JobID
+		jobID := jobspb.JobID(mj.JobID)
 		// Jobs are only added in the cache during the transaction and are created
 		// in a batch only when the transaction commits. So, if a job's record exists
 		// in the cache, we can simply delete that record from cache because the
@@ -637,7 +618,9 @@ func removeMatchingReferences(
 }
 
 func (p *planner) removeTableComments(ctx context.Context, tableDesc *tabledesc.Mutable) error {
-	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
+	ie := p.ExtendedEvalContext().ExecCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+	defer ie.Close(ctx)
+	_, err := ie.ExecEx(
 		ctx,
 		"delete-table-comments",
 		p.txn,

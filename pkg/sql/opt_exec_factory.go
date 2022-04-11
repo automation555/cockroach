@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -89,8 +88,15 @@ func (ef *execFactory) ConstructScan(
 	scan := ef.planner.Scan()
 	colCfg := makeScanColumnsConfig(table, params.NeededCols)
 
+	// initTable checks that the current user has the correct privilege to access
+	// the table. However, the privilege has already been checked in optbuilder,
+	// and does not need to be rechecked. In fact, it's an error to check the
+	// privilege if the table was originally part of a view, since lower privilege
+	// users might be able to access a view that uses a higher privilege table.
+	ef.planner.skipSelectPrivilegeChecks = true
+	defer func() { ef.planner.skipSelectPrivilegeChecks = false }()
 	ctx := ef.planner.extendedEvalCtx.Ctx()
-	if err := scan.initTable(ctx, ef.planner, tabDesc, colCfg); err != nil {
+	if err := scan.initTable(ctx, ef.planner, tabDesc, nil, colCfg); err != nil {
 		return nil, err
 	}
 
@@ -128,7 +134,7 @@ func (ef *execFactory) ConstructScan(
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
 	}
 
 	return scan, nil
@@ -604,7 +610,7 @@ func (ef *execFactory) ConstructIndexJoin(
 	tableScan := ef.planner.Scan()
 
 	ctx := ef.planner.extendedEvalCtx.Ctx()
-	if err := tableScan.initTable(ctx, ef.planner, tabDesc, colCfg); err != nil {
+	if err := tableScan.initTable(ctx, ef.planner, tabDesc, nil, colCfg); err != nil {
 		return nil, err
 	}
 
@@ -639,7 +645,6 @@ func (ef *execFactory) ConstructLookupJoin(
 	remoteLookupExpr tree.TypedExpr,
 	lookupCols exec.TableColumnOrdinalSet,
 	onCond tree.TypedExpr,
-	isFirstJoinInPairedJoiner bool,
 	isSecondJoinInPairedJoiner bool,
 	reqOrdering exec.OutputOrdering,
 	locking *tree.LockingItem,
@@ -653,7 +658,7 @@ func (ef *execFactory) ConstructLookupJoin(
 	tableScan := ef.planner.Scan()
 
 	ctx := ef.planner.extendedEvalCtx.Ctx()
-	if err := tableScan.initTable(ctx, ef.planner, tabDesc, colCfg); err != nil {
+	if err := tableScan.initTable(ctx, ef.planner, tabDesc, nil, colCfg); err != nil {
 		return nil, err
 	}
 
@@ -668,7 +673,7 @@ func (ef *execFactory) ConstructLookupJoin(
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
 	}
 
 	n := &lookupJoinNode{
@@ -676,7 +681,6 @@ func (ef *execFactory) ConstructLookupJoin(
 		table:                      tableScan,
 		joinType:                   joinType,
 		eqColsAreKey:               eqColsAreKey,
-		isFirstJoinInPairedJoiner:  isFirstJoinInPairedJoiner,
 		isSecondJoinInPairedJoiner: isSecondJoinInPairedJoiner,
 		reqOrdering:                ReqOrdering(reqOrdering),
 	}
@@ -695,9 +699,6 @@ func (ef *execFactory) ConstructLookupJoin(
 		n.onCond = pred.iVarHelper.Rebind(onCond)
 	}
 	n.columns = pred.cols
-	if isFirstJoinInPairedJoiner {
-		n.columns = append(n.columns, colinfo.ResultColumn{Name: "cont", Typ: types.Bool})
-	}
 
 	return n, nil
 }
@@ -740,7 +741,7 @@ func (ef *execFactory) constructVirtualTableLookupJoin(
 	// column analysis.
 	colCfg := makeScanColumnsConfig(table, lookupCols)
 	ctx := ef.planner.extendedEvalCtx.Ctx()
-	if err := tableScan.initTable(ctx, ef.planner, tableDesc, colCfg); err != nil {
+	if err := tableScan.initTable(ctx, ef.planner, tableDesc, nil, colCfg); err != nil {
 		return nil, err
 	}
 	tableScan.index = idx
@@ -792,7 +793,7 @@ func (ef *execFactory) ConstructInvertedJoin(
 	tableScan := ef.planner.Scan()
 
 	ctx := ef.planner.extendedEvalCtx.Ctx()
-	if err := tableScan.initTable(ctx, ef.planner, tabDesc, colCfg); err != nil {
+	if err := tableScan.initTable(ctx, ef.planner, tabDesc, nil, colCfg); err != nil {
 		return nil, err
 	}
 	tableScan.index = idx
@@ -802,7 +803,7 @@ func (ef *execFactory) ConstructInvertedJoin(
 			TableID: roachpb.TableID(tabDesc.GetID()),
 			IndexID: roachpb.IndexID(idx.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
 	}
 
 	n := &invertedJoinNode{
@@ -852,12 +853,12 @@ func (ef *execFactory) constructScanForZigzag(
 	}
 
 	for c, ok := cols.Next(0); ok; c, ok = cols.Next(c + 1) {
-		colCfg.wantedColumns = append(colCfg.wantedColumns, tableDesc.PublicColumns()[c].GetID())
+		colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(tableDesc.PublicColumns()[c].GetID()))
 	}
 
 	scan := ef.planner.Scan()
 	ctx := ef.planner.extendedEvalCtx.Ctx()
-	if err := scan.initTable(ctx, ef.planner, tableDesc, colCfg); err != nil {
+	if err := scan.initTable(ctx, ef.planner, tableDesc, nil, colCfg); err != nil {
 		return nil, err
 	}
 
@@ -866,7 +867,7 @@ func (ef *execFactory) constructScanForZigzag(
 			TableID: roachpb.TableID(tableDesc.GetID()),
 			IndexID: roachpb.IndexID(index.GetID()),
 		}
-		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(idxUsageKey)
+		ef.planner.extendedEvalCtx.indexUsageStats.RecordRead(ctx, idxUsageKey)
 	}
 
 	scan.index = index
@@ -1087,7 +1088,7 @@ func (ef *execFactory) ConstructWindow(root exec.Node, wi exec.WindowInfo) (exec
 		}
 		if len(wi.Ordering) == 0 {
 			frame := p.funcs[i].frame
-			if frame.Mode == treewindow.RANGE && frame.Bounds.HasOffset() {
+			if frame.Mode == tree.RANGE && frame.Bounds.HasOffset() {
 				// Execution requires a single column to order by when there is
 				// a RANGE mode frame with at least one 'offset' bound.
 				return nil, errors.AssertionFailedf("a RANGE mode frame with an offset bound must have an ORDER BY column")
@@ -1160,6 +1161,7 @@ func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.N
 		ef.planner.EvalContext().Context,
 		ef.planner.SessionData(),
 	)
+	defer ie.Close(ef.planner.EvalContext().Context)
 	c := makeStmtEnvCollector(ef.planner.EvalContext().Context, ie.(*InternalExecutor))
 
 	// Show the version of Cockroach running.
@@ -1954,36 +1956,35 @@ func (ef *execFactory) ConstructAlterTableUnsplitAll(index cat.Index) (exec.Node
 
 // ConstructAlterTableRelocate is part of the exec.Factory interface.
 func (ef *execFactory) ConstructAlterTableRelocate(
-	index cat.Index, input exec.Node, relocateSubject tree.RelocateSubject,
+	index cat.Index, input exec.Node, relocateLease bool, relocateNonVoters bool,
 ) (exec.Node, error) {
 	if !ef.planner.ExecCfg().Codec.ForSystemTenant() {
 		return nil, errorutil.UnsupportedWithMultiTenancy(54250)
 	}
 
 	return &relocateNode{
-		subjectReplicas: relocateSubject,
-		tableDesc:       index.Table().(*optTable).desc,
-		index:           index.(*optIndex).idx,
-		rows:            input.(planNode),
+		relocateLease:     relocateLease,
+		relocateNonVoters: relocateNonVoters,
+		tableDesc:         index.Table().(*optTable).desc,
+		index:             index.(*optIndex).idx,
+		rows:              input.(planNode),
 	}, nil
 }
 
 // ConstructAlterRangeRelocate is part of the exec.Factory interface.
 func (ef *execFactory) ConstructAlterRangeRelocate(
-	input exec.Node,
-	relocateSubject tree.RelocateSubject,
-	toStoreID tree.TypedExpr,
-	fromStoreID tree.TypedExpr,
+	input exec.Node, relocateLease bool, relocateNonVoters bool, toStoreID int64, fromStoreID int64,
 ) (exec.Node, error) {
 	if !ef.planner.ExecCfg().Codec.ForSystemTenant() {
 		return nil, errorutil.UnsupportedWithMultiTenancy(54250)
 	}
 
 	return &relocateRange{
-		rows:            input.(planNode),
-		subjectReplicas: relocateSubject,
-		toStoreID:       toStoreID,
-		fromStoreID:     fromStoreID,
+		rows:              input.(planNode),
+		relocateLease:     relocateLease,
+		relocateNonVoters: relocateNonVoters,
+		toStoreID:         roachpb.StoreID(toStoreID),
+		fromStoreID:       roachpb.StoreID(fromStoreID),
 	}, nil
 }
 

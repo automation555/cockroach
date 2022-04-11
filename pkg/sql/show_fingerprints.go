@@ -148,14 +148,16 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	  FROM [%d AS t]@{FORCE_INDEX=[%d]}
 	`, strings.Join(cols, `,`), n.tableDesc.GetID(), index.GetID())
 	// If were'in in an AOST context, propagate it to the inner statement so that
-	// the inner statement gets planned with planner.avoidLeasedDescriptors set,
+	// the inner statement gets planned with planner.avoidCachedDescriptors set,
 	// like the outter one.
 	if params.p.EvalContext().AsOfSystemTime != nil {
 		ts := params.p.txn.ReadTimestamp()
 		sql = sql + " AS OF SYSTEM TIME " + ts.AsOfSystemTime()
 	}
 
-	fingerprintCols, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRowEx(
+	ie := params.extendedEvalCtx.ExecCfg.InternalExecutorFactory(params.ctx, nil /* sessionData */)
+	defer ie.Close(params.ctx)
+	fingerprintCols, err := ie.QueryRowEx(
 		params.ctx, "hash-fingerprint",
 		params.p.txn,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},

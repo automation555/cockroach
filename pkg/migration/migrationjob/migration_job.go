@@ -61,7 +61,7 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 	execCtx := execCtxI.(sql.JobExecContext)
 	pl := r.j.Payload()
 	cv := *pl.GetMigration().ClusterVersion
-	ie := execCtx.ExecCfg().InternalExecutor
+	ie := execCtx.ExecCfg().InternalExecutorFactory(ctx, execCtx.SessionData())
 
 	alreadyCompleted, err := CheckIfMigrationCompleted(ctx, nil /* txn */, ie, cv)
 	if alreadyCompleted || err != nil {
@@ -82,19 +82,15 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 	case *migration.SystemMigration:
 		err = m.Run(ctx, cv, mc.SystemDeps(), r.j)
 	case *migration.TenantMigration:
-		tenantDeps := migration.TenantDeps{
+		err = m.Run(ctx, cv, migration.TenantDeps{
 			DB:                execCtx.ExecCfg().DB,
 			Codec:             execCtx.ExecCfg().Codec,
 			Settings:          execCtx.ExecCfg().Settings,
 			CollectionFactory: execCtx.ExecCfg().CollectionFactory,
 			LeaseManager:      execCtx.ExecCfg().LeaseManager,
-			InternalExecutor:  execCtx.ExecCfg().InternalExecutor,
+			InternalExecutor:  ie,
 			TestingKnobs:      execCtx.ExecCfg().MigrationTestingKnobs,
-		}
-		tenantDeps.SpanConfig.KVAccessor = execCtx.ExecCfg().SpanConfigKVAccessor
-		tenantDeps.SpanConfig.Default = execCtx.ExecCfg().DefaultZoneConfig.AsSpanConfig()
-
-		err = m.Run(ctx, cv, tenantDeps, r.j)
+		}, r.j)
 	default:
 		return errors.AssertionFailedf("unknown migration type %T", m)
 	}

@@ -50,7 +50,7 @@ import (
 type setClusterSettingNode struct {
 	name    string
 	st      *cluster.Settings
-	setting settings.NonMaskedSetting
+	setting settings.WritableSetting
 	// If value is nil, the setting should be reset.
 	value tree.TypedExpr
 	// versionUpgradeHook is called after validating a `SET CLUSTER SETTING
@@ -82,7 +82,7 @@ func (p *planner) SetClusterSetting(
 ) (planNode, error) {
 	name := strings.ToLower(n.Name)
 	st := p.EvalContext().Settings
-	v, ok := settings.Lookup(name, settings.LookupForLocalAccess, p.ExecCfg().Codec.ForSystemTenant())
+	v, ok := settings.Lookup(name, settings.LookupForLocalAccess)
 	if !ok {
 		return nil, errors.Errorf("unknown cluster setting '%s'", name)
 	}
@@ -91,12 +91,12 @@ func (p *planner) SetClusterSetting(
 		return nil, err
 	}
 
-	setting, ok := v.(settings.NonMaskedSetting)
+	setting, ok := v.(settings.WritableSetting)
 	if !ok {
 		return nil, errors.AssertionFailedf("expected writable setting, got %T", v)
 	}
 
-	if setting.Class() == settings.SystemOnly && !p.execCfg.Codec.ForSystemTenant() {
+	if setting.SystemOnly() && !p.execCfg.Codec.ForSystemTenant() {
 		return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
 			"setting %s is only settable in the system tenant", name)
 	}
@@ -170,26 +170,16 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 	if !params.p.ExtendedEvalContext().TxnImplicit {
 		return errors.Errorf("SET CLUSTER SETTING cannot be used inside a transaction")
 	}
-
-	// Set the system config trigger explicitly here as it might not happen
-	// implicitly due to the setting of the
-	// sql.catalog.unsafe_skip_system_config_trigger.enabled cluster setting.
-	// The usage of gossip to propagate cluster settings in the system tenant
-	// will be fixed in an upcoming PR with #70566.
-	if err := params.p.EvalContext().Txn.SetSystemConfigTrigger(
-		params.EvalContext().Codec.ForSystemTenant(),
-	); err != nil {
-		return err
-	}
-
 	execCfg := params.extendedEvalCtx.ExecCfg
 	var expectedEncodedValue string
 	if err := execCfg.DB.Txn(params.ctx, func(ctx context.Context, txn *kv.Txn) error {
+		ie := execCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
+		defer ie.Close(ctx)
 		var reportedValue string
 		if n.value == nil {
 			reportedValue = "DEFAULT"
 			expectedEncodedValue = n.setting.EncodedDefault()
-			if _, err := execCfg.InternalExecutor.ExecEx(
+			if _, err := ie.ExecEx(
 				ctx, "reset-setting", txn,
 				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 				"DELETE FROM system.settings WHERE name = $1", n.name,
@@ -205,7 +195,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			var prev tree.Datum
 			_, isSetVersion := n.setting.(*settings.VersionSetting)
 			if isSetVersion {
-				datums, err := execCfg.InternalExecutor.QueryRowEx(
+				datums, err := ie.QueryRowEx(
 					ctx, "retrieve-prev-setting", txn,
 					sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 					"SELECT value FROM system.settings WHERE name = $1", n.name,
@@ -256,7 +246,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 					}
 					return execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 						// Confirm if the version has actually changed on us.
-						datums, err := execCfg.InternalExecutor.QueryRowEx(
+						datums, err := ie.QueryRowEx(
 							ctx, "retrieve-prev-setting", txn,
 							sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 							"SELECT value FROM system.settings WHERE name = $1", n.name,
@@ -272,7 +262,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 						}
 						// Only if the version has changed alter the setting.
 						if versionIsDifferent {
-							_, err = execCfg.InternalExecutor.ExecEx(
+							_, err = ie.ExecEx(
 								ctx, "update-setting", txn,
 								sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 								`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
@@ -288,7 +278,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 					return err
 				}
 			} else {
-				if _, err = execCfg.InternalExecutor.ExecEx(
+				if _, err = ie.ExecEx(
 					ctx, "update-setting", txn,
 					sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 					`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
@@ -299,11 +289,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			}
 
 			if knobs := params.p.execCfg.TenantTestingKnobs; knobs != nil && knobs.ClusterSettingsUpdater != nil {
-				encVal := settings.EncodedValue{
-					Value: encoded,
-					Type:  n.setting.Typ(),
-				}
-				if err := params.p.execCfg.TenantTestingKnobs.ClusterSettingsUpdater.Set(ctx, n.name, encVal); err != nil {
+				if err := params.p.execCfg.TenantTestingKnobs.ClusterSettingsUpdater.Set(ctx, n.name, encoded, n.setting.Typ()); err != nil {
 					return err
 				}
 			}

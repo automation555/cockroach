@@ -30,8 +30,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
@@ -82,6 +82,7 @@ type preparedSchemaMetadata struct {
 // Resume is part of the jobs.Resumer interface.
 func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	p := execCtx.(sql.JobExecContext)
+	ie := p.ExecCfg().InternalExecutorFactory(ctx, p.SessionData())
 	if err := r.parseBundleSchemaIfNeeded(ctx, p); err != nil {
 		return err
 	}
@@ -111,22 +112,6 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 						return err
 					}
 					curDetails = schemaMetadata.schemaPreparedDetails
-				}
-
-				if r.settings.Version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) {
-					// In 22.1, the Public schema should always be present in the database.
-					// Make sure it is part of schemaMetadata, it is not guaranteed to
-					// be added in prepareSchemasForIngestion if we're not importing any
-					// schemas.
-					// The Public schema will not change in the database so both the
-					// oldSchemaIDToName and newSchemaIDToName entries will be the
-					// same for the Public schema.
-					_, dbDesc, err := descsCol.GetImmutableDatabaseByID(ctx, txn, details.ParentID, tree.DatabaseLookupFlags{Required: true})
-					if err != nil {
-						return err
-					}
-					schemaMetadata.oldSchemaIDToName[dbDesc.GetSchemaID(tree.PublicSchema)] = tree.PublicSchema
-					schemaMetadata.newSchemaIDToName[dbDesc.GetSchemaID(tree.PublicSchema)] = tree.PublicSchema
 				}
 
 				preparedDetails, err = r.prepareTablesForIngestion(ctx, p, curDetails, txn, descsCol,
@@ -181,7 +166,7 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			// is in keeping with the semantics we use when creating a schema during
 			// sql execution. Namely, queue job in the txn which creates the schema
 			// desc and run once the txn has committed.
-			if err := p.ExecCfg().JobRegistry.Run(ctx, p.ExecCfg().InternalExecutor,
+			if err := p.ExecCfg().JobRegistry.Run(ctx, ie,
 				schemaMetadata.queuedSchemaJobs); err != nil {
 				return err
 			}
@@ -277,14 +262,10 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			r.res.IndexEntries += count
 		}
 	}
-
 	if r.testingKnobs.afterImport != nil {
 		if err := r.testingKnobs.afterImport(r.res); err != nil {
 			return err
 		}
-	}
-	if err := p.ExecCfg().JobRegistry.CheckPausepoint("import.after_ingest"); err != nil {
-		return err
 	}
 
 	// If the table being imported into referenced UDTs, ensure that a concurrent
@@ -375,7 +356,7 @@ func (r *importResumer) prepareTablesForIngestion(
 			// account when constructing the newTablenameToIdx map.
 			// At this point the table descriptor's parent schema ID has not being
 			// remapped to the newly generated schema ID.
-			key, err := constructSchemaAndTableKey(ctx, table.Desc, schemaMetadata.oldSchemaIDToName, p.ExecCfg().Settings.Version)
+			key, err := constructSchemaAndTableKey(table.Desc, schemaMetadata.oldSchemaIDToName)
 			if err != nil {
 				return importDetails, err
 			}
@@ -403,7 +384,7 @@ func (r *importResumer) prepareTablesForIngestion(
 		}
 
 		for _, desc := range res {
-			key, err := constructSchemaAndTableKey(ctx, desc, schemaMetadata.newSchemaIDToName, p.ExecCfg().Settings.Version)
+			key, err := constructSchemaAndTableKey(desc, schemaMetadata.newSchemaIDToName)
 			if err != nil {
 				return importDetails, err
 			}
@@ -496,7 +477,7 @@ func prepareNewTablesForIngestion(
 	}
 	seqVals := make(map[descpb.ID]int64, len(importTables))
 	for _, tableDesc := range importTables {
-		id, err := descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+		id, err := catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
 		if err != nil {
 			return nil, err
 		}
@@ -522,9 +503,10 @@ func prepareNewTablesForIngestion(
 	// collisions with any importing tables.
 	for i := range newMutableTableDescriptors {
 		tbl := newMutableTableDescriptors[i]
-		err := descsCol.Direct().CheckObjectCollision(
+		err := catalogkv.CheckObjectCollision(
 			ctx,
 			txn,
+			p.ExecCfg().Codec,
 			tbl.GetParentID(),
 			tbl.GetParentSchemaID(),
 			tree.NewUnqualifiedTableName(tree.Name(tbl.GetName())),
@@ -591,7 +573,7 @@ func (r *importResumer) prepareSchemasForIngestion(
 	schemaMetadata.schemaPreparedDetails.Schemas = make([]jobspb.ImportDetails_Schema,
 		len(details.Schemas))
 
-	desc, err := descsCol.GetMutableDescriptorByID(ctx, txn, details.ParentID)
+	desc, err := descsCol.GetMutableDescriptorByID(ctx, details.ParentID, txn)
 	if err != nil {
 		return nil, err
 	}
@@ -600,6 +582,10 @@ func (r *importResumer) prepareSchemasForIngestion(
 	if !ok {
 		return nil, errors.Newf("expected ID %d to refer to the database being imported into",
 			details.ParentID)
+	}
+
+	if dbDesc.Schemas == nil {
+		dbDesc.Schemas = make(map[string]descpb.DatabaseDescriptor_SchemaInfo)
 	}
 
 	schemaMetadata.schemaRewrites = make(backupccl.DescRewriteMap)
@@ -611,7 +597,7 @@ func (r *importResumer) prepareSchemasForIngestion(
 		// Verification steps have passed, generate a new schema ID. We do this
 		// last because we want to avoid calling GenerateUniqueDescID if there's
 		// any kind of error in the prior stages of import.
-		id, err := descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+		id, err := catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
 		if err != nil {
 			return nil, err
 		}
@@ -622,8 +608,8 @@ func (r *importResumer) prepareSchemasForIngestion(
 		schemaMetadata.newSchemaIDToName[id] = newMutableSchemaDescriptor.GetName()
 
 		// Update the parent database with this schema information.
-		dbDesc.AddSchemaToDatabase(newMutableSchemaDescriptor.Name,
-			descpb.DatabaseDescriptor_SchemaInfo{ID: newMutableSchemaDescriptor.ID})
+		dbDesc.Schemas[newMutableSchemaDescriptor.Name] =
+			descpb.DatabaseDescriptor_SchemaInfo{ID: newMutableSchemaDescriptor.ID}
 
 		schemaMetadata.schemaRewrites[desc.Desc.ID] = &jobspb.RestoreDetails_DescriptorRewrite{
 			ID: id,
@@ -675,10 +661,13 @@ func createSchemaDescriptorWithID(
 		log.VEventf(ctx, 2, "CPut %s -> %d", idKey, descID)
 	}
 	b.CPut(idKey, descID, nil)
-	if err := descsCol.Direct().WriteNewDescToBatch(
+	if err := catalogkv.WriteNewDescToBatch(
 		ctx,
 		p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
+		p.ExecCfg().Settings,
 		b,
+		p.ExecCfg().Codec,
+		descID,
 		descriptor,
 	); err != nil {
 		return err
@@ -735,11 +724,8 @@ func (r *importResumer) parseBundleSchemaIfNeeded(ctx context.Context, phs inter
 			) (err error) {
 				_, dbDesc, err = descriptors.GetImmutableDatabaseByID(ctx, txn, parentID, tree.DatabaseLookupFlags{
 					Required:    true,
-					AvoidLeased: true,
+					AvoidCached: true,
 				})
-				if err != nil {
-					return err
-				}
 				return err
 			}); err != nil {
 				return err
@@ -793,25 +779,6 @@ func (r *importResumer) parseBundleSchemaIfNeeded(ctx context.Context, phs inter
 	return nil
 }
 
-func getPublicSchemaDescForDatabase(
-	ctx context.Context, execCfg *sql.ExecutorConfig, db catalog.DatabaseDescriptor,
-) (scDesc catalog.SchemaDescriptor, err error) {
-	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) {
-		return schemadesc.GetPublicSchema(), err
-	}
-	if err := sql.DescsTxn(ctx, execCfg, func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
-	) error {
-		publicSchemaID := db.GetSchemaID(tree.PublicSchema)
-		scDesc, err = descriptors.GetImmutableSchemaByID(ctx, txn, publicSchemaID, tree.SchemaLookupFlags{Required: true})
-		return err
-	}); err != nil {
-		return nil, err
-	}
-
-	return scDesc, nil
-}
-
 // parseAndCreateBundleTableDescs parses and creates the table
 // descriptors for bundle formats.
 func parseAndCreateBundleTableDescs(
@@ -861,19 +828,12 @@ func parseAndCreateBundleTableDescs(
 	}}
 	switch format.Format {
 	case roachpb.IOFileFormat_Mysqldump:
-		id, err := descidgen.PeekNextUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
-		if err != nil {
-			return tableDescs, schemaDescs, err
-		}
 		fks.resolver.format.Format = roachpb.IOFileFormat_Mysqldump
 		evalCtx := &p.ExtendedEvalContext().EvalContext
 		tableDescs, err = readMysqlCreateTable(
-			ctx, reader, evalCtx, p, id, parentDB, tableName, fks,
+			ctx, reader, evalCtx, p, defaultCSVTableID, parentDB, tableName, fks,
 			seqVals, owner, walltime,
 		)
-		if err != nil {
-			return tableDescs, schemaDescs, err
-		}
 	case roachpb.IOFileFormat_PgDump:
 		fks.resolver.format.Format = roachpb.IOFileFormat_PgDump
 		evalCtx := &p.ExtendedEvalContext().EvalContext
@@ -995,6 +955,7 @@ func (r *importResumer) publishTables(
 func (r *importResumer) writeStubStatisticsForImportedTables(
 	ctx context.Context, execCfg *sql.ExecutorConfig, res roachpb.BulkOpSummary,
 ) {
+	ie := execCfg.InternalExecutorFactory(ctx, nil /* sessionData */)
 	details := r.job.Details().(jobspb.ImportDetails)
 	for _, tbl := range details.Tables {
 		if tbl.IsNew {
@@ -1018,7 +979,7 @@ func (r *importResumer) writeStubStatisticsForImportedTables(
 					statistic.AvgSize = avgRowSize
 				}
 				// TODO(michae2): parallelize insertion of statistics.
-				err = stats.InsertNewStats(ctx, execCfg.Settings, execCfg.InternalExecutor, nil /* txn */, statistics)
+				err = stats.InsertNewStats(ctx, ie, nil /* txn */, statistics)
 			}
 			if err != nil {
 				// Failure to create statistics should not fail the entire import.
@@ -1045,7 +1006,7 @@ func (r *importResumer) publishSchemas(ctx context.Context, execCfg *sql.Executo
 	) error {
 		b := txn.NewBatch()
 		for _, schema := range details.Schemas {
-			newDesc, err := descsCol.GetMutableDescriptorByID(ctx, txn, schema.Desc.GetID())
+			newDesc, err := descsCol.GetMutableDescriptorByID(ctx, schema.Desc.GetID(), txn)
 			if err != nil {
 				return err
 			}
@@ -1128,7 +1089,9 @@ func (r *importResumer) checkForUDTModification(
 		ctx context.Context, txn *kv.Txn, col *descs.Collection,
 		savedTypeDesc *descpb.TypeDescriptor,
 	) error {
-		typeDesc, err := col.Direct().MustGetTypeDescByID(ctx, txn, savedTypeDesc.GetID())
+		typeDesc, err := catalogkv.MustGetTypeDescByID(
+			ctx, txn, execCfg.Codec, savedTypeDesc.GetID(),
+		)
 		if err != nil {
 			return errors.Wrap(err, "resolving type descriptor when checking version mismatch")
 		}
@@ -1215,7 +1178,7 @@ func ingestWithRetry(
 
 		// Re-load the job in order to update our progress object, which may have
 		// been updated by the changeFrontier processor since the flow started.
-		reloadedJob, reloadErr := execCtx.ExecCfg().JobRegistry.LoadClaimedJob(ctx, job.ID())
+		reloadedJob, reloadErr := execCtx.ExecCfg().JobRegistry.LoadJob(ctx, job.ID())
 		if reloadErr != nil {
 			if ctx.Err() != nil {
 				return res, ctx.Err()
@@ -1248,20 +1211,12 @@ func emitImportJobEvent(
 }
 
 func constructSchemaAndTableKey(
-	ctx context.Context,
-	tableDesc *descpb.TableDescriptor,
-	schemaIDToName map[descpb.ID]string,
-	version clusterversion.Handle,
+	tableDesc *descpb.TableDescriptor, schemaIDToName map[descpb.ID]string,
 ) (schemaAndTableName, error) {
-	if !version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) {
-		if tableDesc.UnexposedParentSchemaID == keys.PublicSchemaIDForBackup {
-			return schemaAndTableName{schema: "", table: tableDesc.GetName()}, nil
-		}
-	}
 	schemaName, ok := schemaIDToName[tableDesc.GetUnexposedParentSchemaID()]
-	if !ok && schemaName != tree.PublicSchema {
-		return schemaAndTableName{}, errors.Newf("invalid parent schema %s with ID %d for table %s",
-			schemaName, tableDesc.UnexposedParentSchemaID, tableDesc.GetName())
+	if !ok && tableDesc.UnexposedParentSchemaID != keys.PublicSchemaID {
+		return schemaAndTableName{}, errors.Newf("invalid parent schema ID %d for table %s",
+			tableDesc.UnexposedParentSchemaID, tableDesc.GetName())
 	}
 
 	return schemaAndTableName{schema: schemaName, table: tableDesc.GetName()}, nil
@@ -1363,8 +1318,9 @@ func (r *importResumer) OnFailOrCancel(ctx context.Context, execCtx interface{})
 	// Run any jobs which might have been queued when dropping the schemas.
 	// This would be a job to drop all the schemas, and a job to update the parent
 	// database descriptor.
+	ie := p.ExecCfg().InternalExecutorFactory(ctx, p.SessionData())
 	if len(jobsToRunAfterTxnCommit) != 0 {
-		if err := p.ExecCfg().JobRegistry.Run(ctx, p.ExecCfg().InternalExecutor,
+		if err := p.ExecCfg().JobRegistry.Run(ctx, ie,
 			jobsToRunAfterTxnCommit); err != nil {
 			return errors.Wrap(err, "failed to run jobs that drop the imported schemas")
 		}
@@ -1425,10 +1381,10 @@ func (r *importResumer) dropTables(
 		// admin knob (e.g. ALTER TABLE REVERT TO SYSTEM TIME) if anything goes wrong.
 		ts := hlc.Timestamp{WallTime: details.Walltime}.Prev()
 
-		// disallowShadowingBelow=writeTS used to write means no existing keys could
-		// have been covered by a key imported and the table was offline to other
-		// writes, so even if GC has run it would not have GC'ed any keys to which
-		// we need to revert, so we can safely ignore the target-time GC check.
+		// disallowShadowing means no existing keys could have been covered by a key
+		// imported and the table was offline to other writes, so even if GC has run
+		// it would not have GC'ed any keys to which we need to revert, so we can
+		// safely ignore the target-time GC check.
 		const ignoreGC = true
 		if err := sql.RevertTables(ctx, txn.DB(), execCfg, revert, ts, ignoreGC, sql.RevertTableDefaultBatchSize); err != nil {
 			return errors.Wrap(err, "rolling back partially completed IMPORT")
@@ -1465,7 +1421,7 @@ func (r *importResumer) dropTables(
 			newTableDesc.DropTime = dropTime
 			b.Del(catalogkeys.EncodeNameKey(execCfg.Codec, newTableDesc))
 			tablesToGC = append(tablesToGC, newTableDesc.ID)
-			descsCol.AddDeletedDescriptor(newTableDesc.GetID())
+			descsCol.AddDeletedDescriptor(newTableDesc)
 		} else {
 			// IMPORT did not create this table, so we should not drop it.
 			newTableDesc.SetPublic()
@@ -1518,7 +1474,7 @@ func (r *importResumer) dropSchemas(
 	}
 
 	// Resolve the database descriptor.
-	desc, err := descsCol.GetMutableDescriptorByID(ctx, txn, details.ParentID)
+	desc, err := descsCol.GetMutableDescriptorByID(ctx, details.ParentID, txn)
 	if err != nil {
 		return nil, err
 	}
@@ -1531,7 +1487,7 @@ func (r *importResumer) dropSchemas(
 
 	droppedSchemaIDs := make([]descpb.ID, 0)
 	for _, schema := range details.Schemas {
-		desc, err := descsCol.GetMutableDescriptorByID(ctx, txn, schema.Desc.ID)
+		desc, err := descsCol.GetMutableDescriptorByID(ctx, schema.Desc.ID, txn)
 		if err != nil {
 			return nil, err
 		}
@@ -1562,7 +1518,10 @@ func (r *importResumer) dropSchemas(
 				Name:           schemaDesc.Name,
 			})
 			// Update the parent database with information about the dropped schema.
-			dbDesc.AddSchemaToDatabase(schema.Desc.Name, descpb.DatabaseDescriptor_SchemaInfo{ID: dbDesc.ID, Dropped: true})
+			if dbDesc.Schemas == nil {
+				dbDesc.Schemas = make(map[string]descpb.DatabaseDescriptor_SchemaInfo)
+			}
+			dbDesc.Schemas[schema.Desc.Name] = descpb.DatabaseDescriptor_SchemaInfo{ID: dbDesc.ID, Dropped: true}
 		}
 
 		if err := descsCol.WriteDescToBatch(ctx, p.ExtendedEvalContext().Tracing.KVTracingEnabled(),

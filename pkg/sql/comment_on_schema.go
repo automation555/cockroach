@@ -14,18 +14,18 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 )
 
 type commentOnSchemaNode struct {
-	n               *tree.CommentOnSchema
-	schemaDesc      catalog.SchemaDescriptor
-	metadataUpdater scexec.DescriptorMetadataUpdater
+	n          *tree.CommentOnSchema
+	schemaDesc catalog.SchemaDescriptor
 }
 
 // CommentOnSchema add comment on a schema.
@@ -54,7 +54,7 @@ func (p *planner) CommentOnSchema(ctx context.Context, n *tree.CommentOnSchema) 
 	}
 
 	schemaDesc, err := p.Descriptors().GetImmutableSchemaByID(ctx, p.txn,
-		db.GetSchemaID(string(n.Name)), tree.SchemaLookupFlags{Required: true})
+		db.GetSchemaID(string(n.Name)), tree.DatabaseLookupFlags{Required: true})
 	if err != nil {
 		return nil, err
 	}
@@ -63,27 +63,27 @@ func (p *planner) CommentOnSchema(ctx context.Context, n *tree.CommentOnSchema) 
 		return nil, err
 	}
 
-	return &commentOnSchemaNode{
-		n:          n,
-		schemaDesc: schemaDesc,
-		metadataUpdater: p.execCfg.DescMetadaUpdaterFactory.NewMetadataUpdater(
-			ctx,
-			p.txn,
-			p.SessionData(),
-		),
-	}, nil
+	return &commentOnSchemaNode{n: n, schemaDesc: schemaDesc}, nil
 }
 
 func (n *commentOnSchemaNode) startExec(params runParams) error {
+	ie := params.p.extendedEvalCtx.ExecCfg.InternalExecutorFactory(params.ctx, nil /* sessionData */)
+	defer ie.Close(params.ctx)
 	if n.n.Comment != nil {
-		err := n.metadataUpdater.UpsertDescriptorComment(
-			int64(n.schemaDesc.GetID()), 0, keys.SchemaCommentType, *n.n.Comment)
+		_, err := ie.ExecEx(
+			params.ctx,
+			"set-schema-comment",
+			params.p.Txn(),
+			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			"UPSERT INTO system.comments VALUES ($1, $2, 0, $3)",
+			keys.SchemaCommentType,
+			n.schemaDesc.GetID(),
+			*n.n.Comment)
 		if err != nil {
 			return err
 		}
 	} else {
-		err := n.metadataUpdater.DeleteDescriptorComment(
-			int64(n.schemaDesc.GetID()), 0, keys.SchemaCommentType)
+		err := params.p.removeSchemaComment(params.ctx, n.schemaDesc.GetID())
 		if err != nil {
 			return err
 		}

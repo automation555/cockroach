@@ -94,6 +94,10 @@ func (ie *InternalExecutor) WithSyntheticDescriptors(
 	return run()
 }
 
+func (ie *InternalExecutor) Close(ctx context.Context) {
+	ie.mon.Stop(ctx)
+}
+
 // MakeInternalExecutor creates an InternalExecutor.
 func MakeInternalExecutor(
 	ctx context.Context, s *Server, memMetrics MemoryMetrics, settings *cluster.Settings,
@@ -662,15 +666,15 @@ func (ie *InternalExecutor) execInternal(
 		//
 		// TODO(knz): track the callers and check whether opName could be turned
 		// into a type safe for reporting.
-		if retErr != nil || r == nil {
-			// Both retErr and r can be nil in case of panic.
-			if retErr != nil && !errIsRetriable(retErr) {
+		if retErr != nil {
+			if !errIsRetriable(retErr) {
 				retErr = errors.Wrapf(retErr, "%s", opName)
 			}
 			stmtBuf.Close()
 			wg.Wait()
 			sp.Finish()
 		} else {
+			// r must be non-nil here.
 			r.errCallback = func(err error) error {
 				if err != nil && !errIsRetriable(err) {
 					err = errors.Wrapf(err, "%s", opName)
