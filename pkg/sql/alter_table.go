@@ -16,10 +16,8 @@ import (
 	gojson "encoding/json"
 	"fmt"
 	"sort"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -29,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -216,10 +213,9 @@ func (n *alterTableNode) startExec(params runParams) error {
 				if d.PrimaryKey {
 					// Translate this operation into an ALTER PRIMARY KEY command.
 					alterPK := &tree.AlterTableAlterPrimaryKey{
-						Columns:       d.Columns,
-						Sharded:       d.Sharded,
-						Name:          d.Name,
-						StorageParams: d.StorageParams,
+						Columns: d.Columns,
+						Sharded: d.Sharded,
+						Name:    d.Name,
 					}
 					if err := params.p.AlterPrimaryKey(
 						params.ctx,
@@ -272,7 +268,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 					Name:             string(d.Name),
 					Unique:           true,
 					StoreColumnNames: d.Storing.ToStrings(),
-					CreatedAtNanos:   params.EvalContext().GetTxnTimestamp(time.Microsecond).UnixNano(),
 				}
 				if err := idx.FillColumns(d.Columns); err != nil {
 					return err
@@ -310,8 +305,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 				// We need to allocate IDs upfront in the event we need to update the zone config
 				// in the same transaction.
-				version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
-				if err := n.tableDesc.AllocateIDs(params.ctx, version); err != nil {
+				if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
 					return err
 				}
 				if err := params.p.configureZoneConfigForNewIndexPartitioning(
@@ -830,13 +824,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 						"constraint %q in the middle of being added, try again later", t.Constraint)
 				}
 				if err := validateFkInTxn(
-					params.ctx,
+					params.ctx, params.p.LeaseMgr(),
 					params.ExecCfg().InternalExecutorFactory,
 					params.p.SessionData(),
 					n.tableDesc,
 					params.EvalContext().Txn,
-					params.p.Descriptors(),
-					name,
+					name, params.EvalContext().Codec,
 				); err != nil {
 					return err
 				}
@@ -972,45 +965,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 
-		case *tree.AlterTableSetStorageParams:
-			var ttlBefore *descpb.TableDescriptor_RowLevelTTL
-			if ttl := n.tableDesc.GetRowLevelTTL(); ttl != nil {
-				ttlBefore = protoutil.Clone(ttl).(*descpb.TableDescriptor_RowLevelTTL)
-			}
-			if err := paramparse.SetStorageParameters(
-				params.ctx,
-				params.p.SemaCtx(),
-				params.EvalContext(),
-				t.StorageParams,
-				paramparse.NewTableStorageParamObserver(n.tableDesc),
-			); err != nil {
-				return err
-			}
-			descriptorChanged = true
-
-			if err := handleTTLStorageParamChange(params, ttlBefore, n.tableDesc.GetRowLevelTTL()); err != nil {
-				return err
-			}
-
-		case *tree.AlterTableResetStorageParams:
-			var ttlBefore *descpb.TableDescriptor_RowLevelTTL
-			if ttl := n.tableDesc.GetRowLevelTTL(); ttl != nil {
-				ttlBefore = protoutil.Clone(ttl).(*descpb.TableDescriptor_RowLevelTTL)
-			}
-			if err := paramparse.ResetStorageParameters(
-				params.ctx,
-				params.EvalContext(),
-				t.Params,
-				paramparse.NewTableStorageParamObserver(n.tableDesc),
-			); err != nil {
-				return err
-			}
-			descriptorChanged = true
-
-			if err := handleTTLStorageParamChange(params, ttlBefore, n.tableDesc.GetRowLevelTTL()); err != nil {
-				return err
-			}
-
 		case *tree.AlterTableRenameColumn:
 			descChanged, err := params.p.renameColumn(params.ctx, n.tableDesc, t.Column, t.NewName)
 			if err != nil {
@@ -1073,8 +1027,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 		}
 
 		// Allocate IDs now, so new IDs are available to subsequent commands
-		version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
-		if err := n.tableDesc.AllocateIDs(params.ctx, version); err != nil {
+		if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
 			return err
 		}
 	}
@@ -1231,9 +1184,8 @@ func applyColumnMutation(
 		for k := range info {
 			inuseNames[k] = struct{}{}
 		}
-		check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), tableDesc.GetNextConstraintID(), inuseNames, descpb.ConstraintValidity_Validating)
+		check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), inuseNames, descpb.ConstraintValidity_Validating)
 		tableDesc.AddNotNullMutation(check, descpb.DescriptorMutation_ADD)
-		tableDesc.NextConstraintID++
 
 	case *tree.AlterTableDropNotNull:
 		if col.IsNullable() {
@@ -1271,12 +1223,11 @@ func applyColumnMutation(
 
 		// Add a check constraint equivalent to the non-null constraint and drop
 		// it in the schema changer.
-		check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), tableDesc.GetNextConstraintID(), inuseNames, descpb.ConstraintValidity_Dropping)
+		check := tabledesc.MakeNotNullCheckConstraint(col.GetName(), col.GetID(), inuseNames, descpb.ConstraintValidity_Dropping)
 		tableDesc.Checks = append(tableDesc.Checks, check)
-		tableDesc.NextConstraintID++
 		tableDesc.AddNotNullMutation(check, descpb.DescriptorMutation_DROP)
 
-	case *tree.AlterTableDropStored:
+	case *tree.AlterTableDropStored, *tree.AlterTableDropExpression:
 		if !col.IsComputed() {
 			return pgerror.Newf(pgcode.InvalidColumnDefinition,
 				"column %q is not a computed column", col.GetName())
@@ -1658,19 +1609,11 @@ func validateConstraintNameIsNotUsed(
 				name == tree.Name(defaultPKName) {
 				return false, nil
 			}
-			// If there is no active primary key, then adding one with the exact
-			// same name is allowed.
-			if !tableDesc.HasPrimaryKey() &&
-				tableDesc.PrimaryIndex.Name == name.String() {
-				return false, nil
-			}
 		}
 		if name == "" {
 			return false, nil
 		}
 		idx, _ := tableDesc.FindIndexWithName(string(name))
-		// If an index is found and its disabled, then we know it will be dropped
-		// later on.
 		if idx == nil {
 			return false, nil
 		}
@@ -1695,23 +1638,8 @@ func validateConstraintNameIsNotUsed(
 		// Unexpected error: table descriptor should be valid at this point.
 		return false, errors.WithAssertionFailure(err)
 	}
-	constraintInfo, isInUse := info[name.String()]
-	if !isInUse {
+	if _, isInUse := info[name.String()]; !isInUse {
 		return false, nil
-	}
-	// If the primary index is being replaced, then the name can be reused for
-	// another constraint.
-	if isInUse &&
-		constraintInfo.Index != nil &&
-		constraintInfo.Index.ID == tableDesc.PrimaryIndex.ID {
-		for _, mut := range tableDesc.GetMutations() {
-			if primaryKeySwap := mut.GetPrimaryKeySwap(); primaryKeySwap != nil &&
-				primaryKeySwap.OldPrimaryIndexId == tableDesc.PrimaryIndex.ID &&
-				primaryKeySwap.NewPrimaryIndexName != name.String() {
-				return false, nil
-			}
-		}
-
 	}
 	if hasIfNotExists {
 		return true, nil
@@ -1759,39 +1687,6 @@ func (p *planner) updateFKBackReferenceName(
 		}
 	}
 	return errors.Errorf("missing backreference for foreign key %s", ref.Name)
-}
-
-func handleTTLStorageParamChange(
-	params runParams, before, after *descpb.TableDescriptor_RowLevelTTL,
-) error {
-	switch {
-	case before == nil && after == nil:
-		// Do not have to do anything here.
-	case before != nil && after != nil:
-		if before.DeletionCron != after.DeletionCron {
-			env := JobSchedulerEnv(params.ExecCfg())
-			s, err := jobs.LoadScheduledJob(
-				params.ctx,
-				env,
-				after.ScheduleID,
-				params.ExecCfg().InternalExecutor,
-				params.p.txn,
-			)
-			if err != nil {
-				return err
-			}
-			if err := s.SetSchedule(rowLevelTTLSchedule(after)); err != nil {
-				return err
-			}
-			if err := s.Update(params.ctx, params.ExecCfg().InternalExecutor, params.p.txn); err != nil {
-				return err
-			}
-		}
-	default:
-		// TODO(#75428): handle adding or dropping TTL
-	}
-
-	return nil
 }
 
 // tryRemoveFKBackReferences determines whether the provided unique constraint
