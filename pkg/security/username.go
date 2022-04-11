@@ -65,6 +65,9 @@ type SQLUsername struct {
 // NodeUser is used by nodes for intra-cluster traffic.
 const NodeUser = "node"
 
+// SQLNodeUser is used by SQL servers (pods) for inter-pod traffic.
+const SQLNodeUser = "sql-node"
+
 // NodeUserName is the SQLUsername for NodeUser.
 func NodeUserName() SQLUsername { return SQLUsername{NodeUser} }
 
@@ -111,7 +114,7 @@ func (s SQLUsername) IsPublicRole() bool { return s.u == PublicRole }
 // IsReserved is true if the given username is reserved.
 // Matches Postgres and also includes crdb_internal_.
 func (s SQLUsername) IsReserved() bool {
-	return s.IsPublicRole() || s.u == NoneRole || s.IsNodeUser() ||
+	return s.IsPublicRole() || s.u == NoneRole ||
 		strings.HasPrefix(s.u, "pg_") ||
 		strings.HasPrefix(s.u, "crdb_internal_")
 }
@@ -155,7 +158,7 @@ const (
 	// UsernameValidation indicates that the SQLUsername is
 	// being input for the purpose of looking up an existing
 	// user, or to compare with an existing username.
-	// This skips the structural restrictions imposed
+	// This skips the stuctural restrictions imposed
 	// for the purpose UsernameCreation.
 	UsernameValidation UsernamePurpose = true
 )

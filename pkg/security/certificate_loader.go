@@ -79,9 +79,9 @@ const (
 	_ PemUsage = iota
 	// CAPem describes the main CA certificate.
 	CAPem
-	// TenantCAPem describes the CA certificate used to broker authN/Z for SQL
+	// TenantClientCAPem describes the CA certificate used to broker authN/Z for SQL
 	// tenants wishing to access the KV layer.
-	TenantCAPem
+	TenantClientCAPem
 	// ClientCAPem describes the CA certificate used to verify client certificates.
 	ClientCAPem
 	// UICAPem describes the CA certificate used to verify the Admin UI server certificate.
@@ -89,14 +89,15 @@ const (
 	// NodePem describes the server certificate for the node, possibly a combined server/client
 	// certificate for user Node if a separate 'client.node.crt' is not present.
 	NodePem
+	// TenantNodePem describes the server certificate for a SQL tenant
+	// server, for connections across SQL tenant servers.
+	TenantNodePem
 	// UIPem describes the server certificate for the admin UI.
 	UIPem
 	// ClientPem describes a client certificate.
 	ClientPem
-	// TenantPem describes a SQL tenant client certificate.
-	TenantPem
-	// TenantSigningPem describes a SQL tenant signing certificate.
-	TenantSigningPem
+	// TenantClientPem describes a SQL tenant client certificate.
+	TenantClientPem
 
 	// Maximum allowable permissions.
 	maxKeyPermissions os.FileMode = 0700
@@ -104,7 +105,7 @@ const (
 	// Maximum allowable permissions if file is owned by root.
 	maxGroupKeyPermissions os.FileMode = 0740
 
-	// Filename extensions.
+	// Filename extenstions.
 	certExtension = `.crt`
 	keyExtension  = `.key`
 	// Certificate directory permissions.
@@ -112,7 +113,7 @@ const (
 )
 
 func isCA(usage PemUsage) bool {
-	return usage == CAPem || usage == ClientCAPem || usage == TenantCAPem || usage == UICAPem
+	return usage == CAPem || usage == ClientCAPem || usage == TenantClientCAPem || usage == UICAPem
 }
 
 func (p PemUsage) String() string {
@@ -121,17 +122,19 @@ func (p PemUsage) String() string {
 		return "CA"
 	case ClientCAPem:
 		return "Client CA"
-	case TenantCAPem:
+	case TenantClientCAPem:
 		return "Tenant Client CA"
 	case UICAPem:
 		return "UI CA"
 	case NodePem:
 		return "Node"
+	case TenantNodePem:
+		return "Tenant Node"
 	case UIPem:
 		return "UI"
 	case ClientPem:
 		return "Client"
-	case TenantPem:
+	case TenantClientPem:
 		return "Tenant Client"
 	default:
 		return "unknown"
@@ -203,7 +206,7 @@ func CertInfoFromFilename(filename string) (*CertInfo, error) {
 			return nil, errors.Errorf("client CA certificate filename should match ca-client%s", certExtension)
 		}
 	case `ca-client-tenant`:
-		fileUsage = TenantCAPem
+		fileUsage = TenantClientCAPem
 		if numParts != 2 {
 			return nil, errors.Errorf("tenant CA certificate filename should match ca%s", certExtension)
 		}
@@ -216,6 +219,11 @@ func CertInfoFromFilename(filename string) (*CertInfo, error) {
 		fileUsage = NodePem
 		if numParts != 2 {
 			return nil, errors.Errorf("node certificate filename should match node%s", certExtension)
+		}
+	case `sql-node`:
+		fileUsage = TenantNodePem
+		if numParts != 2 {
+			return nil, errors.Errorf("SQL node certificate filename should match node%s", certExtension)
 		}
 	case `ui`:
 		fileUsage = UIPem
@@ -230,18 +238,11 @@ func CertInfoFromFilename(filename string) (*CertInfo, error) {
 			return nil, errors.Errorf("client certificate filename should match client.<user>%s", certExtension)
 		}
 	case `client-tenant`:
-		fileUsage = TenantPem
+		fileUsage = TenantClientPem
 		// Strip prefix and suffix and re-join middle parts.
 		name = strings.Join(parts[1:numParts-1], `.`)
 		if len(name) == 0 {
 			return nil, errors.Errorf("tenant certificate filename should match client-tenant.<tenantid>%s", certExtension)
-		}
-	case `tenant-signing`:
-		fileUsage = TenantSigningPem
-		// Strip prefix and suffix and re-join middle parts.
-		name = strings.Join(parts[1:numParts-1], `.`)
-		if len(name) == 0 {
-			return nil, errors.Errorf("tenant signing certificate filename should match tenant-signing.<tenantid>%s", certExtension)
 		}
 	default:
 		return nil, errors.Errorf("unknown prefix %q", prefix)
@@ -468,7 +469,7 @@ func parseCertificate(ci *CertInfo) error {
 // This should only be called on the NodePem CertInfo when there is no specific
 // client certificate for the 'node' user.
 // Fields required for a valid server certificate are already checked.
-func validateDualPurposeNodeCert(ci *CertInfo) error {
+func validateDualPurposeNodeCert(ci *CertInfo, nodeUser string) error {
 	if ci == nil {
 		return errors.Errorf("no node certificate found")
 	}
@@ -480,9 +481,9 @@ func validateDualPurposeNodeCert(ci *CertInfo) error {
 	// The first certificate is used in client auth.
 	cert := ci.ParsedCertificates[0]
 	principals := getCertificatePrincipals(cert)
-	if !Contains(principals, NodeUser) {
+	if !Contains(principals, nodeUser) {
 		return errors.Errorf("client/server node certificate has principals %q, expected %q",
-			principals, NodeUser)
+			principals, nodeUser)
 	}
 
 	return nil
@@ -495,6 +496,9 @@ func validateCockroachCertificate(ci *CertInfo, cert *x509.Certificate) error {
 	switch ci.FileUsage {
 	case NodePem:
 		// Common Name is checked only if there is no client certificate for 'node'.
+		// This is done in validateDualPurposeNodeCert.
+	case TenantNodePem:
+		// Common Name is checked only if there is no client certificate for 'sql-node'.
 		// This is done in validateDualPurposeNodeCert.
 	case ClientPem:
 		// Check that CommonName matches the username extracted from the filename.
