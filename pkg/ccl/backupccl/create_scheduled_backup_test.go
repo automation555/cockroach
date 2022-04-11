@@ -40,7 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
-	"github.com/robfig/cron/v3"
+	"github.com/gorhill/cronexpr"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,8 +66,7 @@ func newTestHelper(t *testing.T) (*testHelper, func()) {
 	dir, dirCleanupFn := testutils.TempDir(t)
 
 	th := &testHelper{
-		env: jobstest.NewJobSchedulerTestEnv(
-			jobstest.UseSystemTables, timeutil.Now(), tree.ScheduledBackupExecutor),
+		env:   jobstest.NewJobSchedulerTestEnv(jobstest.UseSystemTables, timeutil.Now()),
 		iodir: dir,
 	}
 
@@ -97,7 +96,6 @@ func newTestHelper(t *testing.T) (*testHelper, func()) {
 	require.NotNil(t, th.cfg)
 	th.sqlDB = sqlutils.MakeSQLRunner(db)
 	th.server = s
-	th.sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.merge_file_buffer_size = '1MiB'`)
 
 	return th, func() {
 		dirCleanupFn()
@@ -409,6 +407,19 @@ func TestSerializesScheduledBackupExecutionArgs(t *testing.T) {
 			},
 		},
 		{
+			name:  "full-cluster-with-interleaved-table",
+			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup?AWS_SECRET_ACCESS_KEY=neverappears' WITH INCLUDE_DEPRECATED_INTERLEAVES RECURRING '@hourly'",
+			user:  freeUser,
+			expectedSchedules: []expectedSchedule{
+				{
+					nameRe:     "BACKUP .+",
+					backupStmt: "BACKUP INTO 'nodelocal://0/backup?AWS_SECRET_ACCESS_KEY=neverappears' WITH detached, include_deprecated_interleaves",
+					shownStmt:  "BACKUP INTO 'nodelocal://0/backup?AWS_SECRET_ACCESS_KEY=redacted' WITH detached, include_deprecated_interleaves",
+					period:     time.Hour,
+				},
+			},
+		},
+		{
 			name:  "full-cluster-always",
 			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup' WITH revision_history RECURRING '@hourly' FULL BACKUP ALWAYS",
 			user:  enterpriseUser,
@@ -598,6 +609,12 @@ func TestSerializesScheduledBackupExecutionArgs(t *testing.T) {
 			user:   enterpriseUser,
 			query:  `CREATE SCHEDULE FOR BACKUP INTO 'foo' WITH encryption_passphrase=$1 RECURRING '@hourly'`,
 			errMsg: "failed to evaluate backup encryption_passphrase",
+		},
+		{
+			name:   "malformed-cron-expression",
+			query:  "CREATE SCHEDULE backup_schedule FOR BACKUP INTO 'userfile:///a' RECURRING '* 12-8 * * *';",
+			user:   freeUser,
+			errMsg: "pq: failed to parse cron expression: \"\\* 12-8 \\* \\* \\*\"",
 		},
 	}
 
@@ -1079,11 +1096,10 @@ INSERT INTO t values (1), (10), (100);
 		// to the next scheduled recurrence.
 		for _, id := range []int64{fullID, incID} {
 			s := th.loadSchedule(t, id)
-			e, err := cron.ParseStandard(s.ScheduleExpr())
+			expr := cronexpr.MustParse(s.ScheduleExpr())
+			nextRun, err := jobs.CronParseNext(expr, th.env.Now(), s.ScheduleExpr())
 			require.NoError(t, err)
-			require.EqualValues(t,
-				e.Next(th.env.Now()).Round(time.Microsecond),
-				s.NextRun())
+			require.EqualValues(t, nextRun.Round(time.Microsecond), s.NextRun())
 		}
 
 		// We expect that, eventually, both backups would succeed.

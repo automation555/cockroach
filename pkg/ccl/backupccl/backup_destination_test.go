@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/nodelocal"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -138,9 +137,10 @@ func TestBackupRestoreResolveDestination(t *testing.T) {
 
 					collectionURI, defaultURI, chosenSuffix, urisByLocalityKV, prevBackupURIs, err := resolveDest(
 						ctx, security.RootUserName(),
-						jobspb.BackupDetails_Destination{To: to},
+						false /* nested */, false, /* appendToLatest */
+						defaultDest, localitiesDest,
 						externalStorageFromURI, endTime,
-						incrementalFrom,
+						to, incrementalFrom, "", nil,
 					)
 					require.NoError(t, err)
 
@@ -202,11 +202,14 @@ func TestBackupRestoreResolveDestination(t *testing.T) {
 				) {
 					endTime := hlc.Timestamp{WallTime: backupTime.UnixNano()}
 
+					dest, localitiesDest, err := getURIsByLocalityKV(to, "")
+					require.NoError(t, err)
 					collectionURI, defaultURI, chosenSuffix, urisByLocalityKV, prevBackupURIs, err := resolveDest(
 						ctx, security.RootUserName(),
-						jobspb.BackupDetails_Destination{To: to},
+						false /* nested */, false, /* appendToLatest */
+						dest, localitiesDest,
 						externalStorageFromURI, endTime,
-						nil, /* incrementalFrom */
+						to, nil /* incrementalFrom */, "", nil,
 					)
 					require.NoError(t, err)
 
@@ -317,13 +320,7 @@ func TestBackupRestoreResolveDestination(t *testing.T) {
 					endTime := hlc.Timestamp{WallTime: backupTime.UnixNano()}
 					incrementalFrom := []string(nil)
 
-					if appendToLatest {
-						subdir = latestFileName
-					} else if subdir == "" {
-						subdir = endTime.GoTime().Format(DateBasedIntoFolderName)
-					}
-
-					_, localityCollections, err := getURIsByLocalityKV(collectionTo, "")
+					defaultCollection, localityCollections, err := getURIsByLocalityKV(collectionTo, "")
 					require.NoError(t, err)
 
 					if len(incrementalTo) > 0 {
@@ -332,10 +329,10 @@ func TestBackupRestoreResolveDestination(t *testing.T) {
 					}
 					collectionURI, defaultURI, chosenSuffix, urisByLocalityKV, prevBackupURIs, err := resolveDest(
 						ctx, security.RootUserName(),
-						jobspb.BackupDetails_Destination{To: collectionTo, Subdir: subdir, IncrementalStorage: incrementalTo},
-						externalStorageFromURI,
-						endTime,
-						incrementalFrom,
+						true /* nested */, appendToLatest,
+						defaultCollection, localityCollections,
+						externalStorageFromURI, endTime,
+						collectionTo, incrementalFrom, subdir, incrementalTo,
 					)
 					require.NoError(t, err)
 

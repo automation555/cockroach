@@ -36,11 +36,12 @@ const (
 
 // BackupOptions describes options for the BACKUP execution.
 type BackupOptions struct {
-	CaptureRevisionHistory bool
-	EncryptionPassphrase   Expr
-	Detached               bool
-	EncryptionKMSURI       StringOrPlaceholderOptList
-	IncrementalStorage     StringOrPlaceholderOptList
+	CaptureRevisionHistory       bool
+	EncryptionPassphrase         Expr
+	Detached                     bool
+	EncryptionKMSURI             StringOrPlaceholderOptList
+	IncludeDeprecatedInterleaves bool
+	IncrementalStorage           StringOrPlaceholderOptList
 }
 
 var _ NodeFormatter = &BackupOptions{}
@@ -130,7 +131,6 @@ type RestoreOptions struct {
 	Detached                  bool
 	SkipLocalitiesCheck       bool
 	DebugPauseOn              Expr
-	NewDBName                 Expr
 	IncrementalStorage        StringOrPlaceholderOptList
 }
 
@@ -265,6 +265,11 @@ func (o *BackupOptions) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&o.EncryptionKMSURI)
 	}
 
+	if o.IncludeDeprecatedInterleaves {
+		maybeAddSep()
+		ctx.WriteString("include_deprecated_interleaves")
+	}
+
 	if o.IncrementalStorage != nil {
 		maybeAddSep()
 		ctx.WriteString("incremental_location = ")
@@ -307,6 +312,14 @@ func (o *BackupOptions) CombineWith(other *BackupOptions) error {
 		o.IncrementalStorage = other.IncrementalStorage
 	} else if other.IncrementalStorage != nil {
 		return errors.New("incremental_location option specified multiple times")
+	}
+
+	if o.IncludeDeprecatedInterleaves {
+		if other.IncludeDeprecatedInterleaves {
+			return errors.New("include_deprecated_interleaves option specified multiple times")
+		}
+	} else {
+		o.IncludeDeprecatedInterleaves = other.IncludeDeprecatedInterleaves
 	}
 
 	return nil
@@ -384,11 +397,6 @@ func (o *RestoreOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("skip_localities_check")
 	}
 
-	if o.NewDBName != nil {
-		maybeAddSep()
-		ctx.WriteString("new_db_name = ")
-		ctx.FormatNode(o.NewDBName)
-	}
 	if o.IncrementalStorage != nil {
 		maybeAddSep()
 		ctx.WriteString("incremental_location = ")
@@ -471,12 +479,6 @@ func (o *RestoreOptions) CombineWith(other *RestoreOptions) error {
 		return errors.New("debug_pause_on specified multiple times")
 	}
 
-	if o.NewDBName == nil {
-		o.NewDBName = other.NewDBName
-	} else if other.NewDBName != nil {
-		return errors.New("new_db_name specified multiple times")
-	}
-
 	if o.IncrementalStorage == nil {
 		o.IncrementalStorage = other.IncrementalStorage
 	} else if other.IncrementalStorage != nil {
@@ -499,6 +501,5 @@ func (o RestoreOptions) IsDefault() bool {
 		o.Detached == options.Detached &&
 		o.SkipLocalitiesCheck == options.SkipLocalitiesCheck &&
 		o.DebugPauseOn == options.DebugPauseOn &&
-		o.NewDBName == options.NewDBName &&
 		cmp.Equal(o.IncrementalStorage, options.IncrementalStorage)
 }

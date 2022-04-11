@@ -26,20 +26,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
-	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/jsonpb"
 	pbtypes "github.com/gogo/protobuf/types"
-	"github.com/robfig/cron/v3"
+	"github.com/gorhill/cronexpr"
 )
 
 const (
@@ -61,7 +60,6 @@ var scheduledBackupOptionExpectValues = map[string]sql.KVStringOptValidate{
 // scheduledBackupGCProtectionEnabled is used to enable and disable the chaining
 // of protected timestamps amongst scheduled backups.
 var scheduledBackupGCProtectionEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
 	"schedules.backup.gc_protection.enabled",
 	"enable chaining of GC protection across backups run as part of a schedule; default is false",
 	false, /* defaultValue */
@@ -195,19 +193,26 @@ func computeScheduleRecurrence(
 	if evalFn == nil {
 		return neverRecurs, nil
 	}
-	cronStr, err := evalFn()
+	cron, err := evalFn()
 	if err != nil {
 		return nil, err
 	}
-	expr, err := cron.ParseStandard(cronStr)
+	expr, err := cronexpr.Parse(cron)
 	if err != nil {
 		return nil, errors.Newf(
 			`error parsing schedule expression: %q; it must be a valid cron expression`,
-			cronStr)
+			cron)
 	}
-	nextRun := expr.Next(now)
-	frequency := expr.Next(nextRun).Sub(nextRun)
-	return &scheduleRecurrence{cronStr, frequency}, nil
+	nextRun, err := jobs.CronParseNext(expr, now, cron)
+	if err != nil {
+		return nil, err
+	}
+	nextToNextRun, err := jobs.CronParseNext(expr, nextRun, cron)
+	if err != nil {
+		return nil, err
+	}
+	frequency := nextToNextRun.Sub(nextRun)
+	return &scheduleRecurrence{cron, frequency}, nil
 }
 
 var forceFullBackup *scheduleRecurrence
@@ -301,7 +306,12 @@ func doCreateBackupSchedules(
 		}
 	}
 
-	env := sql.JobSchedulerEnv(p.ExecCfg())
+	env := scheduledjobs.ProdJobSchedulerEnv
+	if knobs, ok := p.ExecCfg().DistSQLSrv.TestingKnobs.JobsTestingKnobs.(*jobs.TestingKnobs); ok {
+		if knobs.JobSchedulerEnv != nil {
+			env = knobs.JobSchedulerEnv
+		}
+	}
 
 	// Evaluate incremental and full recurrence.
 	incRecurrence, err := computeScheduleRecurrence(env.Now(), eval.recurrence)
@@ -333,8 +343,9 @@ func doCreateBackupSchedules(
 	// Prepare backup statement (full).
 	backupNode := &tree.Backup{
 		Options: tree.BackupOptions{
-			CaptureRevisionHistory: eval.BackupOptions.CaptureRevisionHistory,
-			Detached:               true,
+			CaptureRevisionHistory:       eval.BackupOptions.CaptureRevisionHistory,
+			Detached:                     true,
+			IncludeDeprecatedInterleaves: eval.BackupOptions.IncludeDeprecatedInterleaves,
 		},
 		Nested:         true,
 		AppendToLatest: false,
@@ -346,7 +357,7 @@ func doCreateBackupSchedules(
 		if err != nil {
 			return errors.Wrapf(err, "failed to evaluate backup encryption_passphrase")
 		}
-		backupNode.Options.EncryptionPassphrase = tree.NewStrVal(pw)
+		backupNode.Options.EncryptionPassphrase = tree.NewDString(pw)
 	}
 
 	// Evaluate encryption KMS URIs if set.
@@ -360,7 +371,7 @@ func doCreateBackupSchedules(
 		}
 		for _, kmsURI := range kmsURIs {
 			backupNode.Options.EncryptionKMSURI = append(backupNode.Options.EncryptionKMSURI,
-				tree.NewStrVal(kmsURI))
+				tree.NewDString(kmsURI))
 		}
 	}
 
@@ -371,7 +382,7 @@ func doCreateBackupSchedules(
 	}
 
 	for _, dest := range destinations {
-		backupNode.To = append(backupNode.To, tree.NewStrVal(dest))
+		backupNode.To = append(backupNode.To, tree.NewDString(dest))
 	}
 
 	backupNode.Targets = eval.Targets
@@ -612,7 +623,10 @@ func makeBackupSchedule(
 
 	// We do not set backupNode.AsOf: this is done when the scheduler kicks off the backup.
 	// Serialize backup statement and set schedule executor and its args.
-	args.BackupStatement = tree.AsStringWithFlags(backupNode, tree.FmtParsable|tree.FmtShowPasswords)
+	//
+	// TODO(bulkio): this serialization is erroneous, see issue
+	// https://github.com/cockroachdb/cockroach/issues/63216
+	args.BackupStatement = tree.AsStringWithFlags(backupNode, tree.FmtSimple|tree.FmtShowPasswords)
 	any, err := pbtypes.MarshalAny(args)
 	if err != nil {
 		return nil, nil, err
@@ -762,20 +776,22 @@ func fullyQualifyScheduledBackupTargetTables(
 				// successfully resolve the schema, we will add the DATABASE prefix.
 				// Otherwise, no updates are needed since the schema field refers to the
 				// database.
-				var schemaID descpb.ID
-				if err := sql.DescsTxn(ctx, p.ExecCfg(), func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-					flags := tree.DatabaseLookupFlags{Required: true}
-					dbDesc, err := col.GetImmutableDatabaseByName(ctx, txn, p.CurrentDatabase(), flags)
+				var resolvedSchema bool
+				if err := sql.DescsTxn(ctx, p.ExecCfg(), func(ctx context.Context, txn *kv.Txn,
+					col *descs.Collection) error {
+					dbDesc, err := col.GetImmutableDatabaseByName(ctx, txn, p.CurrentDatabase(),
+						tree.DatabaseLookupFlags{Required: true})
 					if err != nil {
 						return err
 					}
-					schemaID, err = col.Direct().ResolveSchemaID(ctx, txn, dbDesc.GetID(), tp.SchemaName.String())
+					resolvedSchema, _, err = catalogkv.ResolveSchemaID(ctx, txn, p.ExecCfg().Codec,
+						dbDesc.GetID(), tp.SchemaName.String())
 					return err
 				}); err != nil {
 					return nil, err
 				}
 
-				if schemaID != descpb.InvalidID {
+				if resolvedSchema {
 					tp.ExplicitCatalog = true
 					tp.CatalogName = tree.Name(p.CurrentDatabase())
 				}
@@ -955,13 +971,9 @@ func createBackupScheduleHook(
 	return fn, scheduledBackupHeader, nil, false, nil
 }
 
-// MarshalJSONPB implements jsonpb.JSONPBMarshaller to provide a custom Marshaller
-// for jsonpb that redacts secrets in URI fields.
-func (m ScheduledBackupExecutionArgs) MarshalJSONPB(marshaller *jsonpb.Marshaler) ([]byte, error) {
-	if !protoreflect.ShouldRedact(marshaller) {
-		return json.Marshal(m)
-	}
-
+// MarshalJSONPB provides a custom Marshaller for jsonpb that redacts secrets in
+// URI fields.
+func (m ScheduledBackupExecutionArgs) MarshalJSONPB(x *jsonpb.Marshaler) ([]byte, error) {
 	stmt, err := parser.ParseOne(m.BackupStatement)
 	if err != nil {
 		return nil, err
@@ -1030,5 +1042,5 @@ func (m ScheduledBackupExecutionArgs) MarshalJSONPB(marshaller *jsonpb.Marshaler
 }
 
 func init() {
-	sql.AddPlanHook("schedule backup", createBackupScheduleHook)
+	sql.AddPlanHook(createBackupScheduleHook)
 }
