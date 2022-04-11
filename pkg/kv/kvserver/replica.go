@@ -81,7 +81,6 @@ const (
 var testingDisableQuiescence = envutil.EnvOrDefaultBool("COCKROACH_DISABLE_QUIESCENCE", false)
 
 var disableSyncRaftLog = settings.RegisterBoolSetting(
-	settings.TenantWritable,
 	"kv.raft_log.disable_synchronization_unsafe",
 	"set to true to disable synchronization on Raft log writes to persistent storage. "+
 		"Setting to true risks data loss or data corruption on server crashes. "+
@@ -100,7 +99,6 @@ const (
 
 // MaxCommandSize wraps "kv.raft.command.max_size".
 var MaxCommandSize = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
 	"kv.raft.command.max_size",
 	"maximum size of a raft command",
 	MaxCommandSizeDefault,
@@ -116,7 +114,6 @@ var MaxCommandSize = settings.RegisterByteSizeSetting(
 // threshold and the current GC TTL (true) or just based on the GC threshold
 // (false).
 var StrictGCEnforcement = settings.RegisterBoolSetting(
-	settings.TenantWritable,
 	"kv.gc_ttl.strict_enforcement.enabled",
 	"if true, fail to serve requests at timestamps below the TTL even if the data still exists",
 	true,
@@ -194,17 +191,9 @@ func (c *atomicConnectionClass) set(cc rpc.ConnectionClass) {
 // integrity by replacing failed replicas, splitting and merging
 // as appropriate.
 type Replica struct {
-	// A replica's AmbientCtx includes the log tags from the parent node and
-	// store.
 	log.AmbientContext
 
 	RangeID roachpb.RangeID // Only set by the constructor
-	// The ID of the replica within the Raft group. Only set by the constructor,
-	// so it will not change over the lifetime of this replica. If addressed
-	// under a newer replicaID, the replica immediately replicaGCs itself to
-	// make way for the newer incarnation.
-	replicaID roachpb.ReplicaID
-
 	// The start key of a Range remains constant throughout its lifetime (it does
 	// not change through splits or merges). This field carries a copy of
 	// r.mu.state.Desc.StartKey (and nil if the replica is not initialized). The
@@ -222,27 +211,14 @@ type Replica struct {
 	// The writes to this key happen in Replica.setStartKeyLocked.
 	startKey roachpb.RKey
 
-	// creationTime is the time that the Replica struct was initially constructed.
-	creationTime time.Time
-
 	store     *Store
 	abortSpan *abortspan.AbortSpan // Avoids anomalous reads after abort
 
 	// leaseholderStats tracks all incoming BatchRequests to the replica and which
 	// localities they come from in order to aid in lease rebalancing decisions.
 	leaseholderStats *replicaStats
-	// writeStats tracks the number of mutations (as counted by the pebble batch
-	// to be applied to the state machine), and additionally, the number of keys
-	// added to MVCCStats, which notably may be approximate in the case of an
-	// AddSSTable. In other words, writeStats should loosely track the write
-	// activity on the replica on a per-key basis, though in an inconsistent way
-	// that in particular may overcount by a factor of roughly two.
-	//
-	// Note that while writeStats were originally introduced to aid in rebalancing
-	// decisions in [1], at the time of writing they are not used for that
-	// purpose.
-	//
-	// [1]: https://github.com/cockroachdb/cockroach/pull/16664
+	// writeStats tracks the number of keys written by applied raft commands
+	// in order to aid in replica rebalancing decisions.
 	writeStats *replicaStats
 
 	// creatingReplica is set when a replica is created as uninitialized
@@ -262,22 +238,8 @@ type Replica struct {
 	// connectionClass controls the ConnectionClass used to send raft messages.
 	connectionClass atomicConnectionClass
 
-	// raftCtx is the Context to use for below-Raft work on this replica. The
-	// context is pre-determined in order to save on allocations for annotating
-	// with the replica ID. The Raft contexts that raftCtx replaces don't have
-	// anything interesting in them, so the operations using this raftCtx don't
-	// miss out on anything.
-	raftCtx context.Context
-
-	// breaker is a per-Replica circuit breaker. Its purpose is to avoid incurring
-	// large (infinite) latencies on client requests when the Replica is unable to
-	// serve commands. This circuit breaker does *not* recruit the occasional
-	// request to determine whether it is safe to heal the breaker. Instead, it
-	// has its own probe that is executed asynchronously and determines when the
-	// Replica is healthy again.
-	//
-	// See replica_circuit_breaker.go for details.
-	breaker *replicaCircuitBreaker
+	// schedulerCtx is a cached instance of an annotated Raft scheduler context.
+	schedulerCtx atomic.Value // context.Context
 
 	// raftMu protects Raft processing the replica.
 	//
@@ -294,47 +256,6 @@ type Replica struct {
 		stateMachine replicaStateMachine
 		// decoder is used to decode committed raft entries.
 		decoder replicaDecoder
-
-		// The last seen replica descriptors from incoming Raft messages. These are
-		// stored so that the replica still knows the replica descriptors for itself
-		// and for its message recipients in the circumstances when its RangeDescriptor
-		// is out of date.
-		//
-		// Normally, a replica knows about the other replica descriptors for a
-		// range via the RangeDescriptor stored in Replica.mu.state.Desc. But that
-		// descriptor is only updated during a Split or ChangeReplicas operation.
-		// There are periods during a Replica's lifetime when that information is
-		// out of date:
-		//
-		// 1. When a replica is being newly created as the result of an incoming
-		// Raft message for it. This is the common case for ChangeReplicas and an
-		// uncommon case for Splits. The leader will be sending the replica
-		// messages and the replica needs to be able to respond before it can
-		// receive an updated range descriptor (via a snapshot,
-		// changeReplicasTrigger, or splitTrigger).
-		//
-		// 2. If the node containing a replica is partitioned or down while the
-		// replicas for the range are updated. When the node comes back up, other
-		// replicas may begin communicating with it and it needs to be able to
-		// respond. Unlike 1 where there is no range descriptor, in this situation
-		// the replica has a range descriptor but it is out of date. Note that a
-		// replica being removed from a node and then quickly re-added before the
-		// replica has been GC'd will also use the last seen descriptors. In
-		// effect, this is another path for which the replica's local range
-		// descriptor is out of date.
-		//
-		// The last seen replica descriptors are updated on receipt of every raft
-		// message via Replica.setLastReplicaDescriptors (see
-		// Store.HandleRaftRequest). These last seen descriptors are used when
-		// the replica's RangeDescriptor contains missing or out of date descriptors
-		// for a replica (see Replica.sendRaftMessageRaftMuLocked).
-		//
-		// Removing a replica from Store.mu.replicas is not a problem because
-		// when a replica is completely removed, it won't be recreated until
-		// there is another event that will repopulate the replicas map in the
-		// range descriptor. When it is temporarily dropped and recreated, the
-		// newly recreated replica will have a complete range descriptor.
-		lastToReplica, lastFromReplica roachpb.ReplicaDescriptor
 	}
 
 	// Contains the lease history when enabled.
@@ -380,20 +301,12 @@ type Replica struct {
 		destroyStatus
 		// Is the range quiescent? Quiescent ranges are not Tick()'d and unquiesce
 		// whenever a Raft operation is performed.
-		//
-		// Replica objects always begin life in a quiescent state, as the field is
-		// set to true in the Replica constructor newUnloadedReplica. They unquiesce
-		// and set the field to false in either maybeUnquiesceAndWakeLeaderLocked or
-		// maybeUnquiesceWithOptionsLocked, which are called in response to Raft
-		// traffic.
-		//
-		// Only initialized replicas that have a non-nil internalRaftGroup are
-		// allowed to unquiesce and be Tick()'d. See canUnquiesceRLocked for an
-		// explanation of these conditions.
 		quiescent bool
 		// laggingFollowersOnQuiesce is the set of dead replicas that are not
 		// up-to-date with the rest of the quiescent Raft group. Nil if !quiescent.
 		laggingFollowersOnQuiesce laggingReplicaSet
+		// TODO(nvanbenschoten): remove in v21.1.
+		laggingFollowersOnQuiesceAccurate bool
 		// mergeComplete is non-nil if a merge is in-progress, in which case any
 		// requests should be held until the completion of the merge is signaled by
 		// the closing of the channel.
@@ -471,14 +384,8 @@ type Replica struct {
 		// lease extension that were in flight at the time of the transfer cannot be
 		// used, if they eventually apply.
 		minLeaseProposedTS hlc.ClockTimestamp
-
 		// The span config for this replica.
 		conf roachpb.SpanConfig
-		// spanConfigExplicitlySet tracks whether a span config was explicitly set
-		// on this replica (as opposed to it having initialized with the default
-		// span config).
-		spanConfigExplicitlySet bool
-
 		// proposalBuf buffers Raft commands as they are passed to the Raft
 		// replication subsystem. The buffer is populated by requests after
 		// evaluation and is consumed by the Raft processing thread. Once
@@ -521,6 +428,11 @@ type Replica struct {
 		applyingEntries bool
 		// The replica's Raft group "node".
 		internalRaftGroup *raft.RawNode
+		// The ID of the replica within the Raft group. This value may never be 0.
+		// It will not change over the lifetime of this replica. If addressed under
+		// a newer replicaID, the replica immediately replicaGCs itself to make
+		// way for the newer incarnation.
+		replicaID roachpb.ReplicaID
 		// The minimum allowed ID for this replica. Initialized from
 		// RangeTombstone.NextReplicaID.
 		tombstoneMinReplicaID roachpb.ReplicaID
@@ -555,6 +467,47 @@ type Replica struct {
 		// this kind of risk though: a replica that gets stuck on an otherwise
 		// live node will not lose leaseholdership.
 		lastUpdateTimes lastUpdateTimesMap
+
+		// The last seen replica descriptors from incoming Raft messages. These are
+		// stored so that the replica still knows the replica descriptors for itself
+		// and for its message recipients in the circumstances when its RangeDescriptor
+		// is out of date.
+		//
+		// Normally, a replica knows about the other replica descriptors for a
+		// range via the RangeDescriptor stored in Replica.mu.state.Desc. But that
+		// descriptor is only updated during a Split or ChangeReplicas operation.
+		// There are periods during a Replica's lifetime when that information is
+		// out of date:
+		//
+		// 1. When a replica is being newly created as the result of an incoming
+		// Raft message for it. This is the common case for ChangeReplicas and an
+		// uncommon case for Splits. The leader will be sending the replica
+		// messages and the replica needs to be able to respond before it can
+		// receive an updated range descriptor (via a snapshot,
+		// changeReplicasTrigger, or splitTrigger).
+		//
+		// 2. If the node containing a replica is partitioned or down while the
+		// replicas for the range are updated. When the node comes back up, other
+		// replicas may begin communicating with it and it needs to be able to
+		// respond. Unlike 1 where there is no range descriptor, in this situation
+		// the replica has a range descriptor but it is out of date. Note that a
+		// replica being removed from a node and then quickly re-added before the
+		// replica has been GC'd will also use the last seen descriptors. In
+		// effect, this is another path for which the replica's local range
+		// descriptor is out of date.
+		//
+		// The last seen replica descriptors are updated on receipt of every raft
+		// message via Replica.setLastReplicaDescriptors (see
+		// Store.HandleRaftRequest). These last seen descriptors are used when
+		// the replica's RangeDescriptor contains missing or out of date descriptors
+		// for a replica (see Replica.sendRaftMessage).
+		//
+		// Removing a replica from Store.mu.replicas is not a problem because
+		// when a replica is completely removed, it won't be recreated until
+		// there is another event that will repopulate the replicas map in the
+		// range descriptor. When it is temporarily dropped and recreated, the
+		// newly recreated replica will have a complete range descriptor.
+		lastToReplica, lastFromReplica roachpb.ReplicaDescriptor
 
 		// Computed checksum at a snapshot UUID.
 		checksums map[uuid.UUID]ReplicaChecksum
@@ -609,6 +562,11 @@ type Replica struct {
 		// size drops below its current conf.MaxRangeBytes or if the
 		// conf.MaxRangeBytes increases to surpass the current value.
 		largestPreviousMaxRangeSizeBytes int64
+		// spanConfigExplicitlySet tracks whether a span config was explicitly set
+		// on this replica (as opposed to it having initialized with the default
+		// span config). It's used to reason about
+		// largestPreviousMaxRangeSizeBytes.
+		spanConfigExplicitlySet bool
 
 		// failureToGossipSystemConfig is set to true when the leaseholder of the
 		// range containing the system config span fails to gossip due to an
@@ -710,10 +668,12 @@ func (r *Replica) SafeFormat(w redact.SafePrinter, _ rune) {
 		r.store.Ident.NodeID, r.store.Ident.StoreID, r.rangeStr.get())
 }
 
-// ReplicaID returns the ID for the Replica. This value is fixed for the
-// lifetime of the Replica.
+// ReplicaID returns the ID for the Replica. It may be zero if the replica does
+// not know its ID. Once a Replica has a non-zero ReplicaID it will never change.
 func (r *Replica) ReplicaID() roachpb.ReplicaID {
-	return r.replicaID
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mu.replicaID
 }
 
 // cleanupFailedProposal cleans up after a proposal that has failed. It
@@ -765,9 +725,6 @@ func (r *Replica) SetSpanConfig(conf roachpb.SpanConfig) {
 		}
 	}
 
-	if knobs := r.store.TestingKnobs(); knobs != nil && knobs.SetSpanConfigInterceptor != nil {
-		conf = knobs.SetSpanConfigInterceptor(r.descRLocked(), conf)
-	}
 	r.mu.conf, r.mu.spanConfigExplicitlySet = conf, true
 }
 
@@ -911,18 +868,6 @@ func (r *Replica) GetGCThreshold() hlc.Timestamp {
 	return *r.mu.state.GCThreshold
 }
 
-// ExcludeDataFromBackup returns whether the replica is to be excluded from a
-// backup.
-func (r *Replica) ExcludeDataFromBackup() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.mu.conf.ExcludeDataFromBackup
-}
-
-func (r *Replica) exludeReplicaFromBackupRLocked() bool {
-	return r.mu.conf.ExcludeDataFromBackup
-}
-
 // Version returns the replica version.
 func (r *Replica) Version() roachpb.Version {
 	if r.mu.state.Version == nil {
@@ -983,14 +928,13 @@ func (r *Replica) GetRangeInfo(ctx context.Context) roachpb.RangeInfo {
 // should be used to determine the validity of commands. The returned timestamp
 // may be newer than the replica's true GC threshold if strict enforcement
 // is enabled and the TTL has passed. If this is an admin command or this range
-// opts out of strict GC enforcement (typically data outside the user keyspace),
-// we return the true GC threshold.
+// contains data outside of the user keyspace, we return the true GC threshold.
 func (r *Replica) getImpliedGCThresholdRLocked(
 	st kvserverpb.LeaseStatus, isAdmin bool,
 ) hlc.Timestamp {
 	// The GC threshold is the oldest value we can return here.
 	if isAdmin || !StrictGCEnforcement.Get(&r.store.ClusterSettings().SV) ||
-		r.shouldIgnoreStrictGCEnforcementRLocked() {
+		r.isSystemRangeRLocked() {
 		return *r.mu.state.GCThreshold
 	}
 
@@ -1003,7 +947,7 @@ func (r *Replica) getImpliedGCThresholdRLocked(
 	// user experience win; it's always safe to allow reads to continue so long
 	// as they are after the GC threshold.
 	c := r.mu.cachedProtectedTS
-	if st.State != kvserverpb.LeaseState_VALID || c.readAt.Less(st.Lease.Start.ToTimestamp()) {
+	if st.State != kvserverpb.LeaseState_VALID || c.readAt.IsEmpty() || c.readAt.Less(st.Lease.Start.ToTimestamp()) {
 		return *r.mu.state.GCThreshold
 	}
 
@@ -1018,26 +962,17 @@ func (r *Replica) getImpliedGCThresholdRLocked(
 	return threshold
 }
 
-func (r *Replica) isRangefeedEnabled() (ret bool) {
+// isSystemRange returns true if r's key range precedes the start of user
+// structured data (SQL keys) for the range's tenant keyspace.
+func (r *Replica) isSystemRange() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-
-	if !r.mu.spanConfigExplicitlySet {
-		return true
-	}
-	return r.mu.conf.RangefeedEnabled
+	return r.isSystemRangeRLocked()
 }
 
-func (r *Replica) shouldIgnoreStrictGCEnforcementRLocked() (ret bool) {
-	if !r.mu.spanConfigExplicitlySet {
-		return true
-	}
-
-	if knobs := r.store.TestingKnobs(); knobs != nil && knobs.IgnoreStrictGCEnforcement {
-		return true
-	}
-
-	return r.mu.conf.GCPolicy.IgnoreStrictEnforcement
+func (r *Replica) isSystemRangeRLocked() bool {
+	rem, _, err := keys.DecodeTenantPrefix(r.mu.state.Desc.StartKey.AsRawKey())
+	return err == nil && roachpb.Key(rem).Compare(keys.UserTableDataMin) < 0
 }
 
 // maxReplicaIDOfAny returns the maximum ReplicaID of any replica, including
@@ -1097,11 +1032,13 @@ func (r *Replica) mergeInProgressRLocked() bool {
 }
 
 // setLastReplicaDescriptors sets the most recently seen replica
-// descriptors to those contained in the *RaftMessageRequest.
-func (r *Replica) setLastReplicaDescriptorsRaftMuLocked(req *kvserverpb.RaftMessageRequest) {
-	r.raftMu.AssertHeld()
-	r.raftMu.lastFromReplica = req.FromReplica
-	r.raftMu.lastToReplica = req.ToReplica
+// descriptors to those contained in the *RaftMessageRequest, acquiring r.mu
+// to do so.
+func (r *Replica) setLastReplicaDescriptors(req *RaftMessageRequest) {
+	r.mu.Lock()
+	r.mu.lastFromReplica = req.FromReplica
+	r.mu.lastToReplica = req.ToReplica
+	r.mu.Unlock()
 }
 
 // GetMVCCStats returns a copy of the MVCC stats object for this range.
@@ -1261,9 +1198,6 @@ func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
 		ctx, r.RangeID, r.mu.state.Lease.Replica.NodeID)
 	ri.ClosedTimestampSideTransportInfo.CentralClosed = centralClosed
 	ri.ClosedTimestampSideTransportInfo.CentralLAI = centralLAI
-	if err := r.breaker.Signal().Err(); err != nil {
-		ri.CircuitBreakerError = err.Error()
-	}
 
 	return ri
 }
@@ -1326,8 +1260,8 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 		if !ok {
 			log.Fatalf(ctx, "%+v does not contain local store s%d", r.mu.state.Desc, r.store.StoreID())
 		}
-		if replDesc.ReplicaID != r.replicaID {
-			log.Fatalf(ctx, "replica's replicaID %d diverges from descriptor %+v", r.replicaID, r.mu.state.Desc)
+		if replDesc.ReplicaID != r.mu.replicaID {
+			log.Fatalf(ctx, "replica's replicaID %d diverges from descriptor %+v", r.mu.replicaID, r.mu.state.Desc)
 		}
 	}
 }
@@ -1512,8 +1446,9 @@ func (r *Replica) checkSpanInRangeRLocked(ctx context.Context, rspan roachpb.RSp
 	if desc.ContainsKeyRange(rspan.Key, rspan.EndKey) {
 		return nil
 	}
-	return roachpb.NewRangeKeyMismatchErrorWithCTPolicy(
-		ctx, rspan.Key.AsRawKey(), rspan.EndKey.AsRawKey(), desc, r.mu.state.Lease, r.closedTimestampPolicyRLocked())
+	return roachpb.NewRangeKeyMismatchError(
+		ctx, rspan.Key.AsRawKey(), rspan.EndKey.AsRawKey(), desc, r.mu.state.Lease,
+	)
 }
 
 // checkTSAboveGCThresholdRLocked returns an error if a request (identified by
@@ -1526,9 +1461,8 @@ func (r *Replica) checkTSAboveGCThresholdRLocked(
 		return nil
 	}
 	return &roachpb.BatchTimestampBeforeGCError{
-		Timestamp:              ts,
-		Threshold:              threshold,
-		DataExcludedFromBackup: r.exludeReplicaFromBackupRLocked(),
+		Timestamp: ts,
+		Threshold: threshold,
 	}
 }
 
@@ -1684,7 +1618,7 @@ func (r *Replica) isNewerThanSplitRLocked(split *roachpb.SplitTrigger) bool {
 		// ID which is above the replica ID of the split then we would not have
 		// written a tombstone but we will have a replica ID that will exceed the
 		// split replica ID.
-		r.replicaID > rightDesc.ReplicaID
+		r.mu.replicaID > rightDesc.ReplicaID
 }
 
 // WatchForMerge is like maybeWatchForMergeLocked, except it expects a merge to
@@ -1755,7 +1689,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 	// orphaned followers would fail to queue themselves for GC.) Unquiesce the
 	// range in case it managed to quiesce between when the Subsume request
 	// arrived and now, which is rare but entirely legal.
-	r.maybeUnquiesceLocked()
+	r.unquiesceLocked()
 
 	taskCtx := r.AnnotateCtx(context.Background())
 	err = r.store.stopper.RunAsyncTask(taskCtx, "wait-for-merge", func(ctx context.Context) {
@@ -1893,13 +1827,11 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 // facilitates quick command application (requests generally need to make it to
 // both the lease holder and the raft leader before being applied by other
 // replicas).
-func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
-	ctx context.Context, now hlc.ClockTimestamp,
-) {
+func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(ctx context.Context) {
 	if r.store.TestingKnobs().DisableLeaderFollowsLeaseholder {
 		return
 	}
-	status := r.leaseStatusAtRLocked(ctx, now)
+	status := r.leaseStatusAtRLocked(ctx, r.Clock().NowAsClockTimestamp())
 	if !status.IsValid() || status.OwnedBy(r.StoreID()) {
 		return
 	}
@@ -2012,15 +1944,4 @@ func (r *Replica) GetResponseMemoryAccount() *mon.BoundAccount {
 
 func init() {
 	tracing.RegisterTagRemapping("r", "range")
-}
-
-// LockRaftMuForTesting is for use only by tests in other packages that are
-// trying to avoid a race with concurrent raft application. For tests in the
-// kvserver package, use Replica.{RaftLock,RaftUnlock} that are defined in
-// helpers_test.go.
-func (r *Replica) LockRaftMuForTesting() (unlockFunc func()) {
-	r.raftMu.Lock()
-	return func() {
-		r.raftMu.Unlock()
-	}
 }
