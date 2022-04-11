@@ -49,6 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/server/tenantsettingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	_ "github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigjob" // register jobs declared outside of pkg/sql
@@ -611,11 +612,15 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	tenantUsage := NewTenantUsageServer(st, db, internalExecutor)
 	registry.AddMetricStruct(tenantUsage.Metrics())
 
+	tenantSettingsWatcher := tenantsettingswatcher.New(
+		clock, rangeFeedFactory, stopper, st,
+	)
+
 	node := NewNode(
 		storeCfg, recorder, registry, stopper,
 		txnMetrics, stores, nil /* execCfg */, cfg.ClusterIDContainer,
 		gcoords.Regular.GetWorkQueue(admission.KVWork), gcoords.Stores,
-		tenantUsage, spanConfig.kvAccessor,
+		tenantUsage, tenantSettingsWatcher, spanConfig.kvAccessor,
 	)
 	roachpb.RegisterInternalServer(grpcServer.Server, node)
 	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
@@ -1464,6 +1469,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// started. At this point we know that all startupmigrations have successfully
 	// been run so it is safe to upgrade to the binary's current version.
 	s.startAttemptUpgrade(ctx)
+
+	if err := s.node.tenantSettingsWatcher.Start(ctx, s.sqlServer.execCfg.SystemTableIDResolver); err != nil {
+		return errors.Wrap(err, "failed to initialize the tenant settings watcher")
+	}
 
 	if err := s.kvProber.Start(ctx, s.stopper); err != nil {
 		return errors.Wrapf(err, "failed to start KV prober")
