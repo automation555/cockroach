@@ -199,7 +199,6 @@ func newRouterOutputOp(args routerOutputOpArgs) *routerOutputOp {
 		testingKnobs:        args.testingKnobs,
 	}
 	o.mu.cond = sync.NewCond(&o.mu)
-	args.cfg.SetCacheMode(colcontainer.DiskQueueCacheModeIntertwinedCalls)
 	o.mu.data = colexecutils.NewSpillingQueue(
 		&colexecutils.NewSpillingQueueArgs{
 			UnlimitedAllocator: args.unlimitedAllocator,
@@ -463,6 +462,7 @@ func NewHashRouter(
 	fdSemaphore semaphore.Semaphore,
 	diskAccounts []*mon.BoundAccount,
 ) (*HashRouter, []colexecop.DrainableOperator) {
+	diskQueueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeIntertwinedCalls)
 	outputs := make([]routerOutput, len(unlimitedAllocators))
 	outputsAsOps := make([]colexecop.DrainableOperator, len(unlimitedAllocators))
 	// unblockEventsChan is buffered to 2*numOutputs as we don't want the outputs
@@ -474,12 +474,6 @@ func NewHashRouter(
 	// all unblock events preceding it since these *must* be on the channel.
 	unblockEventsChan := make(chan struct{}, 2*len(unlimitedAllocators))
 	memoryLimitPerOutput := memoryLimit / int64(len(unlimitedAllocators))
-	if memoryLimit == 1 {
-		// If total memory limit is 1, we're likely in a "force disk spill"
-		// scenario, so we'll give each output 1 byte too (if we don't override
-		// the value, outputs will end with up "no limit").
-		memoryLimitPerOutput = 1
-	}
 	for i := range unlimitedAllocators {
 		op := newRouterOutputOp(
 			routerOutputOpArgs{

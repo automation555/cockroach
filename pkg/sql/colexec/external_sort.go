@@ -137,8 +137,8 @@ type externalSorter struct {
 	columnOrdering     colinfo.ColumnOrdering
 	inMemSorter        colexecop.ResettableOperator
 	inMemSorterInput   *inputPartitioningOperator
-	partitioner        colcontainer.PartitionedQueue
-	partitionerCreator func() colcontainer.PartitionedQueue
+	partitioner        *colcontainer.PartitionedDiskQueue
+	partitionerCreator func() *colcontainer.PartitionedDiskQueue
 	// partitionerToOperators stores all partitionerToOperator instances that we
 	// have created when merging partitions. This allows for reusing them in
 	// case we need to perform repeated merging (namely, we'll be able to reuse
@@ -291,7 +291,7 @@ func NewExternalSorter(
 		mergeMemoryLimit:         mergeMemoryLimit,
 		inMemSorter:              inMemSorter,
 		inMemSorterInput:         inputPartitioner.(*inputPartitioningOperator),
-		partitionerCreator: func() colcontainer.PartitionedQueue {
+		partitionerCreator: func() *colcontainer.PartitionedDiskQueue {
 			return colcontainer.NewPartitionedDiskQueue(inputTypes, diskQueueCfg, partitionedDiskQueueSemaphore, colcontainer.PartitionerStrategyCloseOnNewPartition, diskAcc)
 		},
 		inputTypes:           inputTypes,
@@ -406,9 +406,6 @@ func (s *externalSorter) Next() coldata.Batch {
 			for b := merger.Next(); ; b = merger.Next() {
 				partitionDone := s.enqueue(b)
 				if b.Length() == 0 || partitionDone {
-					if err := merger.Close(s.Ctx); err != nil {
-						colexecerror.InternalError(err)
-					}
 					break
 				}
 			}
@@ -469,7 +466,7 @@ func (s *externalSorter) Next() coldata.Batch {
 			return b
 
 		case externalSorterFinished:
-			if err := s.Close(s.Ctx); err != nil {
+			if err := s.Close(); err != nil {
 				colexecerror.InternalError(err)
 			}
 			return coldata.ZeroBatch
@@ -584,7 +581,7 @@ func (s *externalSorter) Reset(ctx context.Context) {
 		r.Reset(ctx)
 	}
 	s.state = externalSorterNewPartition
-	if err := s.Close(ctx); err != nil {
+	if err := s.Close(); err != nil {
 		colexecerror.InternalError(err)
 	}
 	// Reset the CloserHelper so that the sorter may be closed again.
@@ -597,27 +594,23 @@ func (s *externalSorter) Reset(ctx context.Context) {
 	s.emitted = 0
 }
 
-func (s *externalSorter) Close(ctx context.Context) error {
+func (s *externalSorter) Close() error {
 	if !s.CloserHelper.Close() {
 		return nil
 	}
+	ctx := s.EnsureCtx()
 	log.VEvent(ctx, 1, "external sorter is closed")
-	var lastErr error
+	var err error
 	if s.partitioner != nil {
-		lastErr = s.partitioner.Close(ctx)
+		err = s.partitioner.Close(ctx)
 		s.partitioner = nil
-	}
-	if c, ok := s.emitter.(colexecop.Closer); ok {
-		if err := c.Close(ctx); err != nil {
-			lastErr = err
-		}
 	}
 	s.inMemSorterInput.close()
 	if !s.testingKnobs.delegateFDAcquisitions && s.fdState.fdSemaphore != nil && s.fdState.acquiredFDs > 0 {
 		s.fdState.fdSemaphore.Release(s.fdState.acquiredFDs)
 		s.fdState.acquiredFDs = 0
 	}
-	return lastErr
+	return err
 }
 
 // createPartitionerToOperators updates s.partitionerToOperators to correspond
@@ -643,7 +636,7 @@ func (s *externalSorter) createPartitionerToOperators(n int) {
 
 // createMergerForPartitions creates an ordered synchronizer that will merge
 // the last n current partitions.
-func (s *externalSorter) createMergerForPartitions(n int) *OrderedSynchronizer {
+func (s *externalSorter) createMergerForPartitions(n int) colexecop.Operator {
 	s.createPartitionerToOperators(n)
 	syncInputs := make([]colexecargs.OpWithMetaInfo, n)
 	for i := range syncInputs {
@@ -658,7 +651,7 @@ func (s *externalSorter) createMergerForPartitions(n int) *OrderedSynchronizer {
 			}
 			partitionOrdinal := s.numPartitions - n + i
 			counts.WriteString(fmt.Sprintf("%d", s.partitionsInfo.tupleCount[partitionOrdinal]))
-			sizes.WriteString(string(humanizeutil.IBytes(s.partitionsInfo.totalSize[partitionOrdinal])))
+			sizes.WriteString(humanizeutil.IBytes(s.partitionsInfo.totalSize[partitionOrdinal]))
 		}
 		log.Infof(s.Ctx,
 			"external sorter is merging partitions with partition indices %v with counts [%s] and sizes [%s]",
