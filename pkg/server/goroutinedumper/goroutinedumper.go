@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/dumpstore"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -34,19 +35,20 @@ const (
 
 var (
 	numGoroutinesThreshold = settings.RegisterIntSetting(
-		settings.TenantWritable,
 		"server.goroutine_dump.num_goroutines_threshold",
 		"a threshold beyond which if number of goroutines increases, "+
 			"then goroutine dump can be triggered",
 		1000,
 	)
 	totalDumpSizeLimit = settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
 		"server.goroutine_dump.total_dump_size_limit",
 		"total size of goroutine dumps to be kept. "+
 			"Dumps are GC'ed in the order of creation time. The latest dump is "+
 			"always kept even if its size exceeds the limit.",
-		500<<20, // 500MiB
+		envutil.EnvOrDefaultInt64(
+			"COCKROACH_SERVER_GOROUTINEDUMP_TOTAL_SIZE_LIMIT",
+			500<<20, // 500MiB
+		),
 	)
 )
 
