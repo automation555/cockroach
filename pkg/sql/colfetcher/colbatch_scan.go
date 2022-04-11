@@ -16,15 +16,19 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -38,20 +42,17 @@ import (
 // should get rid off table readers entirely. We will have to be careful about
 // propagating the metadata though.
 
-// ColBatchScan is the exec.Operator implementation of TableReader. It reads a
-// table from kv, presenting it as coldata.Batches via the exec.Operator
-// interface.
+// ColBatchScan is the exec.Operator implementation of TableReader. It reads a table
+// from kv, presenting it as coldata.Batches via the exec.Operator interface.
 type ColBatchScan struct {
 	colexecop.ZeroInputNode
 	colexecop.InitHelper
-	execinfra.SpansWithCopy
 
-	flowCtx         *execinfra.FlowCtx
-	bsHeader        *roachpb.BoundedStalenessHeader
-	cf              *cFetcher
-	limitHint       rowinfra.RowLimit
-	batchBytesLimit rowinfra.BytesLimit
-	parallelize     bool
+	spans       roachpb.Spans
+	flowCtx     *execinfra.FlowCtx
+	rf          *cFetcher
+	limitHint   int64
+	parallelize bool
 	// tracingSpan is created when the stats should be collected for the query
 	// execution, and it will be finished when closing the operator.
 	tracingSpan *tracing.Span
@@ -60,22 +61,28 @@ type ColBatchScan struct {
 		// rowsRead contains the number of total rows this ColBatchScan has
 		// returned so far.
 		rowsRead int64
+		// rowsReadSinceLastUpdate tracks how many rows this ColBatchScan has
+		// returned since the last progress update metadata has been emitted.
+		rowsReadSinceLastUpdate int64
 	}
+	// streamingMetaReceiver, if set, will be used to propagate the metrics
+	// about the number of rows read in order to show the progress of the query.
+	streamingMetaReceiver colexecop.StreamingMetadataReceiver
 	// ResultTypes is the slice of resulting column types from this operator.
 	// It should be used rather than the slice of column types from the scanned
 	// table because the scan might synthesize additional implicit system columns.
 	ResultTypes []*types.T
 }
 
-// ScanOperator combines common interfaces between operators that perform KV
-// scans, such as ColBatchScan and ColIndexJoin.
-type ScanOperator interface {
-	colexecop.KVReader
-	execinfra.Releasable
-	colexecop.ClosableOperator
-}
+var _ colexecop.KVReader = &ColBatchScan{}
+var _ execinfra.Releasable = &ColBatchScan{}
+var _ colexecop.Closer = &ColBatchScan{}
+var _ colexecop.Operator = &ColBatchScan{}
 
-var _ ScanOperator = &ColBatchScan{}
+// SetReceiver is part of the colexecop.StreamingMetadataSource interface.
+func (s *ColBatchScan) SetReceiver(receiver colexecop.StreamingMetadataReceiver) {
+	s.streamingMetaReceiver = receiver
+}
 
 // Init initializes a ColBatchScan.
 func (s *ColBatchScan) Init(ctx context.Context) {
@@ -88,14 +95,8 @@ func (s *ColBatchScan) Init(ctx context.Context) {
 	// tracing is enabled.
 	s.Ctx, s.tracingSpan = execinfra.ProcessorSpan(s.Ctx, "colbatchscan")
 	limitBatches := !s.parallelize
-	if err := s.cf.StartScan(
-		s.Ctx,
-		s.flowCtx.Txn,
-		s.Spans,
-		s.bsHeader,
-		limitBatches,
-		s.batchBytesLimit,
-		s.limitHint,
+	if err := s.rf.StartScan(
+		s.flowCtx.Txn, s.spans, limitBatches, s.limitHint, s.flowCtx.TraceKV,
 		s.flowCtx.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 	); err != nil {
 		colexecerror.InternalError(err)
@@ -104,16 +105,48 @@ func (s *ColBatchScan) Init(ctx context.Context) {
 
 // Next is part of the Operator interface.
 func (s *ColBatchScan) Next() coldata.Batch {
-	bat, err := s.cf.NextBatch(s.Ctx)
+	bat, err := s.rf.NextBatch(s.Ctx)
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
 	if bat.Selection() != nil {
 		colexecerror.InternalError(errors.AssertionFailedf("unexpectedly a selection vector is set on the batch coming from CFetcher"))
 	}
+	var sinceLastUpdate int64
 	s.mu.Lock()
 	s.mu.rowsRead += int64(bat.Length())
+	s.mu.rowsReadSinceLastUpdate += int64(bat.Length())
+	if s.streamingMetaReceiver != nil {
+		sinceLastUpdate = s.mu.rowsReadSinceLastUpdate
+		if sinceLastUpdate >= execinfra.ScanProgressFrequency {
+			s.mu.rowsReadSinceLastUpdate = 0
+		} else {
+			sinceLastUpdate = 0
+		}
+	}
 	s.mu.Unlock()
+	if sinceLastUpdate > 0 {
+		// It's time to emit the progress update.
+		meta := execinfrapb.GetProducerMeta()
+		meta.Metrics = execinfrapb.GetMetricsMeta()
+		meta.Metrics.RowsRead = sinceLastUpdate
+		if err := s.streamingMetaReceiver.PushStreamingMeta(s.Ctx, meta); err != nil {
+			// If this progress metadata wasn't successfully propagated, it's
+			// not an issue for correctness. However, we still want to try
+			// propagating the correct metrics via DrainMeta route.
+			//
+			// Note that it is ok to swallow the error without inspecting it
+			// because the error is either
+			// 1. a context cancellation (but we always plan a cancel checker
+			//    on top of the ColBatchScan, and the checker will see it), or
+			// 2. an error indicating that the data producing goroutine of the
+			//    streaming metadata receiver has exited. In this case we don't
+			//    want to do anything about the error.
+			s.mu.Lock()
+			s.mu.rowsReadSinceLastUpdate = sinceLastUpdate
+			s.mu.Unlock()
+		}
+	}
 	return bat
 }
 
@@ -123,7 +156,7 @@ func (s *ColBatchScan) DrainMeta() []execinfrapb.ProducerMetadata {
 	if !s.flowCtx.Local {
 		nodeID, ok := s.flowCtx.NodeID.OptionalNodeID()
 		if ok {
-			ranges := execinfra.MisplannedRanges(s.Ctx, s.SpansCopy, nodeID, s.flowCtx.Cfg.RangeCache)
+			ranges := execinfra.MisplannedRanges(s.Ctx, s.spans, nodeID, s.flowCtx.Cfg.RangeCache)
 			if ranges != nil {
 				trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
 			}
@@ -135,7 +168,14 @@ func (s *ColBatchScan) DrainMeta() []execinfrapb.ProducerMetadata {
 	meta := execinfrapb.GetProducerMeta()
 	meta.Metrics = execinfrapb.GetMetricsMeta()
 	meta.Metrics.BytesRead = s.GetBytesRead()
-	meta.Metrics.RowsRead = s.GetRowsRead()
+	// We have been emitting the progress about the rows read, so in order to
+	// not double count some rows, we have to emit the number of rows read since
+	// the last update. (If s.streamingMetaReceiver is nil,
+	// s.mu.rowsReadSinceLastUpdate still contains the correct number.)
+	s.mu.Lock()
+	meta.Metrics.RowsRead = s.mu.rowsReadSinceLastUpdate
+	s.mu.rowsReadSinceLastUpdate = 0
+	s.mu.Unlock()
 	trailingMeta = append(trailingMeta, *meta)
 	if trace := execinfra.GetTraceData(s.Ctx); trace != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{TraceData: trace})
@@ -147,7 +187,11 @@ func (s *ColBatchScan) DrainMeta() []execinfrapb.ProducerMetadata {
 func (s *ColBatchScan) GetBytesRead() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.cf.getBytesRead()
+	// Note that if Init() was never called, s.rf.fetcher will remain nil, and
+	// GetBytesRead() will return 0. We are also holding the mutex, so a
+	// concurrent call to Init() will have to wait, and the fetcher will remain
+	// uninitialized until we return.
+	return s.rf.fetcher.GetBytesRead()
 }
 
 // GetRowsRead is part of the colexecop.KVReader interface.
@@ -162,11 +206,6 @@ func (s *ColBatchScan) GetCumulativeContentionTime() time.Duration {
 	return execinfra.GetCumulativeContentionTime(s.Ctx)
 }
 
-// GetScanStats is part of the colexecop.KVReader interface.
-func (s *ColBatchScan) GetScanStats() execinfra.ScanStats {
-	return execinfra.GetScanStats(s.Ctx)
-}
-
 var colBatchScanPool = sync.Pool{
 	New: func() interface{} {
 		return &ColBatchScan{}
@@ -177,8 +216,8 @@ var colBatchScanPool = sync.Pool{
 func NewColBatchScan(
 	ctx context.Context,
 	allocator *colmem.Allocator,
-	kvFetcherMemAcc *mon.BoundAccount,
 	flowCtx *execinfra.FlowCtx,
+	evalCtx *tree.EvalContext,
 	spec *execinfrapb.TableReaderSpec,
 	post *execinfrapb.PostProcessSpec,
 	estimatedRowCount uint64,
@@ -187,98 +226,130 @@ func NewColBatchScan(
 	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
 		return nil, errors.Errorf("attempting to create a ColBatchScan with uninitialized NodeID")
 	}
-	limitHint := rowinfra.RowLimit(execinfra.LimitHint(spec.LimitHint, post))
-	tableArgs, err := populateTableArgs(ctx, flowCtx, &spec.FetchSpec)
-	if err != nil {
+	if spec.IsCheck {
+		// cFetchers don't support these checks.
+		return nil, errors.AssertionFailedf("attempting to create a cFetcher with the IsCheck flag set")
+	}
+
+	limitHint := execinfra.LimitHint(spec.LimitHint, post)
+	// TODO(ajwerner): The need to construct an immutable here
+	// indicates that we're probably doing this wrong. Instead we should be
+	// just setting the ID and Version in the spec or something like that and
+	// retrieving the hydrated immutable from cache.
+	table := spec.BuildTableDescriptor()
+	virtualColumn := tabledesc.FindVirtualColumn(table, spec.VirtualColumn)
+	cols := table.PublicColumns()
+	if spec.Visibility == execinfra.ScanVisibilityPublicAndNotPublic {
+		cols = table.DeletableColumns()
+	}
+	columnIdxMap := catalog.ColumnIDToOrdinalMap(cols)
+	typs := catalog.ColumnTypesWithVirtualCol(cols, virtualColumn)
+
+	// Add all requested system columns to the output.
+	if spec.HasSystemColumns {
+		for _, sysCol := range table.SystemColumns() {
+			typs = append(typs, sysCol.GetType())
+			columnIdxMap.Set(sysCol.GetID(), columnIdxMap.Len())
+		}
+	}
+
+	// Before we can safely use types from the table descriptor, we need to
+	// make sure they are hydrated. In row execution engine it is done during
+	// the processor initialization, but neither ColBatchScan nor cFetcher are
+	// processors, so we need to do the hydration ourselves.
+	resolver := flowCtx.TypeResolverFactory.NewTypeResolver(evalCtx.Txn)
+	if err := resolver.HydrateTypeSlice(ctx, typs); err != nil {
 		return nil, err
+	}
+
+	var neededColumns util.FastIntSet
+	for _, neededColumn := range spec.NeededColumns {
+		neededColumns.Add(int(neededColumn))
 	}
 
 	fetcher := cFetcherPool.Get().(*cFetcher)
-	fetcher.cFetcherArgs = cFetcherArgs{
-		spec.LockingStrength,
-		spec.LockingWaitPolicy,
-		flowCtx.EvalCtx.SessionData().LockTimeout,
-		execinfra.GetWorkMemLimit(flowCtx),
-		estimatedRowCount,
-		spec.Reverse,
-		flowCtx.TraceKV,
-	}
-
-	if err = fetcher.Init(allocator, kvFetcherMemAcc, tableArgs); err != nil {
-		fetcher.Release()
+	fetcher.estimatedRowCount = estimatedRowCount
+	if _, _, err := initCRowFetcher(
+		flowCtx.Codec(), allocator, execinfra.GetWorkMemLimit(flowCtx),
+		fetcher, table, columnIdxMap, neededColumns, spec, spec.HasSystemColumns,
+	); err != nil {
 		return nil, err
 	}
 
-	var bsHeader *roachpb.BoundedStalenessHeader
-	if aost := flowCtx.EvalCtx.AsOfSystemTime; aost != nil && aost.BoundedStaleness {
-		ts := aost.Timestamp
-		// If the descriptor's modification time is after the bounded staleness min bound,
-		// we have to increase the min bound.
-		// Otherwise, we would have table data which would not correspond to the correct
-		// schema.
-		if aost.Timestamp.Less(spec.TableDescriptorModificationTime) {
-			ts = spec.TableDescriptorModificationTime
-		}
-		bsHeader = &roachpb.BoundedStalenessHeader{
-			MinTimestampBound:       ts,
-			MinTimestampBoundStrict: aost.NearestOnly,
-			MaxTimestampBound:       flowCtx.EvalCtx.AsOfSystemTime.MaxTimestampBound, // may be empty
-		}
-	}
-
 	s := colBatchScanPool.Get().(*ColBatchScan)
-	s.Spans = spec.Spans
-	if !flowCtx.Local {
-		// Make a copy of the spans so that we could get the misplanned ranges
-		// info.
-		allocator.AdjustMemoryUsage(s.Spans.MemUsage())
-		s.MakeSpansCopy()
+	spans := s.spans[:0]
+	specSpans := spec.Spans
+	for i := range specSpans {
+		//gcassert:bce
+		spans = append(spans, specSpans[i].Span)
 	}
-
-	if spec.LimitHint > 0 || spec.BatchBytesLimit > 0 {
+	*s = ColBatchScan{
+		spans:     spans,
+		flowCtx:   flowCtx,
+		rf:        fetcher,
+		limitHint: limitHint,
 		// Parallelize shouldn't be set when there's a limit hint, but double-check
 		// just in case.
-		spec.Parallelize = false
-	}
-	var batchBytesLimit rowinfra.BytesLimit
-	if !spec.Parallelize {
-		batchBytesLimit = rowinfra.BytesLimit(spec.BatchBytesLimit)
-		if batchBytesLimit == 0 {
-			batchBytesLimit = rowinfra.DefaultBatchBytesLimit
-		}
-	}
-
-	*s = ColBatchScan{
-		SpansWithCopy:   s.SpansWithCopy,
-		flowCtx:         flowCtx,
-		bsHeader:        bsHeader,
-		cf:              fetcher,
-		limitHint:       limitHint,
-		batchBytesLimit: batchBytesLimit,
-		parallelize:     spec.Parallelize,
-		ResultTypes:     tableArgs.typs,
+		parallelize: spec.Parallelize && limitHint == 0,
+		ResultTypes: typs,
 	}
 	return s, nil
 }
 
+// initCRowFetcher initializes a row.cFetcher. See initRowFetcher.
+func initCRowFetcher(
+	codec keys.SQLCodec,
+	allocator *colmem.Allocator,
+	memoryLimit int64,
+	fetcher *cFetcher,
+	desc catalog.TableDescriptor,
+	colIdxMap catalog.TableColMap,
+	valNeededForCol util.FastIntSet,
+	spec *execinfrapb.TableReaderSpec,
+	withSystemColumns bool,
+) (index catalog.Index, isSecondaryIndex bool, err error) {
+	indexIdx := int(spec.IndexIdx)
+	if indexIdx >= len(desc.ActiveIndexes()) {
+		return nil, false, errors.Errorf("invalid indexIdx %d", indexIdx)
+	}
+	index = desc.ActiveIndexes()[indexIdx]
+	isSecondaryIndex = !index.Primary()
+
+	tableArgs := row.FetcherTableArgs{
+		Desc:             desc,
+		Index:            index,
+		ColIdxMap:        colIdxMap,
+		IsSecondaryIndex: isSecondaryIndex,
+		ValNeededForCol:  valNeededForCol,
+	}
+
+	virtualColumn := tabledesc.FindVirtualColumn(desc, spec.VirtualColumn)
+	tableArgs.InitCols(desc, spec.Visibility, withSystemColumns, virtualColumn)
+
+	if err := fetcher.Init(
+		codec, allocator, memoryLimit, spec.Reverse, spec.LockingStrength, spec.LockingWaitPolicy, tableArgs,
+	); err != nil {
+		return nil, false, err
+	}
+
+	return index, isSecondaryIndex, nil
+}
+
 // Release implements the execinfra.Releasable interface.
 func (s *ColBatchScan) Release() {
-	s.cf.Release()
+	s.rf.Release()
 	// Deeply reset the spans so that we don't hold onto the keys of the spans.
-	s.SpansWithCopy.Reset()
+	for i := range s.spans {
+		s.spans[i] = roachpb.Span{}
+	}
 	*s = ColBatchScan{
-		SpansWithCopy: s.SpansWithCopy,
+		spans: s.spans[:0],
 	}
 	colBatchScanPool.Put(s)
 }
 
 // Close implements the colexecop.Closer interface.
-func (s *ColBatchScan) Close(context.Context) error {
-	// Note that we're using the context of the ColBatchScan rather than the
-	// argument of Close() because the ColBatchScan derives its own tracing
-	// span.
-	ctx := s.EnsureCtx()
-	s.cf.Close(ctx)
+func (s *ColBatchScan) Close() error {
 	if s.tracingSpan != nil {
 		s.tracingSpan.Finish()
 		s.tracingSpan = nil

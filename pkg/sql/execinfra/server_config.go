@@ -16,12 +16,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -30,13 +28,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -57,9 +55,6 @@ type ServerConfig struct {
 
 	// NodeID is the id of the node on which this Server is running.
 	NodeID *base.SQLIDContainer
-
-	// Locality is the locality of the node on which this Server is running.
-	Locality roachpb.Locality
 
 	// Codec is capable of encoding and decoding sql table keys.
 	Codec keys.SQLCodec
@@ -102,10 +97,6 @@ type ServerConfig struct {
 	// used by the column and index backfillers.
 	BackfillerMonitor *mon.BytesMonitor
 
-	// Child monitor of the bulk monitor which will be used to monitor the memory
-	// used during backup.
-	BackupMonitor *mon.BytesMonitor
-
 	// ParentDiskMonitor is normally the root disk monitor. It should only be used
 	// when setting up a server, a child monitor (usually belonging to a sql
 	// execution flow), or in tests. It is used to monitor temporary storage disk
@@ -113,9 +104,7 @@ type ServerConfig struct {
 	// because of RocksDB space amplification.
 	ParentDiskMonitor *mon.BytesMonitor
 
-	Metrics            *DistSQLMetrics
-	RowMetrics         *row.Metrics
-	InternalRowMetrics *row.Metrics
+	Metrics *DistSQLMetrics
 
 	// SQLLivenessReader provides access to reading the liveness of sessions.
 	SQLLivenessReader sqlliveness.Reader
@@ -131,11 +120,7 @@ type ServerConfig struct {
 	// draining state.
 	Gossip gossip.OptionalGossip
 
-	// Dialer for communication between SQL and KV nodes.
 	NodeDialer *nodedialer.Dialer
-
-	// Dialer for communication between SQL nodes/pods.
-	PodNodeDialer *nodedialer.Dialer
 
 	// SessionBoundInternalExecutorFactory is used to construct session-bound
 	// executors. The idea is that a higher-layer binds some of the arguments
@@ -150,28 +135,22 @@ type ServerConfig struct {
 	// AdminVerifyProtectedTimestampRequest.
 	ProtectedTimestampProvider protectedts.Provider
 
-	DistSender *kvcoord.DistSender
-
 	// RangeCache is used by processors that were supposed to have been planned on
 	// the leaseholders of the data ranges that they're consuming. These
 	// processors query the cache to see if they should communicate updates to the
 	// gateway.
 	RangeCache *rangecache.RangeCache
 
-	// SQLStatsController is an interface used to reset SQL stats without the need to
+	// HydratedTables is a node-level cache of table descriptors which utilize
+	// user-defined types.
+	HydratedTables *hydratedtables.Cache
+
+	// SQLStatsResetter is an interface used to reset SQL stats without the need to
 	// introduce dependency on the sql package.
-	SQLStatsController tree.SQLStatsController
+	SQLStatsResetter tree.SQLStatsResetter
 
-	// IndexUsageStatsController is an interface used to reset index usage stats without
-	// the need to introduce dependency on the sql package.
-	IndexUsageStatsController tree.IndexUsageStatsController
-
-	// SQLSQLResponseAdmissionQ is the admission queue to use for
-	// SQLSQLResponseWork.
-	SQLSQLResponseAdmissionQ *admission.WorkQueue
-
-	// CollectionFactory is used to construct descs.Collections.
-	CollectionFactory *descs.CollectionFactory
+	// VirtualSchemas hold the virtual table schemas.
+	VirtualSchemas catalog.VirtualSchemas
 }
 
 // RuntimeStats is an interface through which the rowexec layer can get
@@ -228,15 +207,6 @@ type TestingKnobs struct {
 	// Cannot be set together with ForceDiskSpill.
 	MemoryLimitBytes int64
 
-	// TableReaderBatchBytesLimit, if not 0, overrides the limit that the
-	// TableReader will set on the size of results it wants to get for individual
-	// requests.
-	TableReaderBatchBytesLimit int64
-	// JoinReaderBatchBytesLimit, if not 0, overrides the limit that the
-	// joinReader will set on the size of results it wants to get for individual
-	// lookup requests.
-	JoinReaderBatchBytesLimit int64
-
 	// DrainFast, if enabled, causes the server to not wait for any currently
 	// running flows to complete or give a grace period of minFlowDrainWait
 	// to incoming flows to register.
@@ -262,8 +232,9 @@ type TestingKnobs struct {
 	// BackupRestoreTestingKnobs are backup and restore specific testing knobs.
 	BackupRestoreTestingKnobs base.ModuleTestingKnobs
 
-	// StreamingTestingKnobs are backup and restore specific testing knobs.
-	StreamingTestingKnobs base.ModuleTestingKnobs
+	// DistSQLNoSpans, if enabled, causes the root components of the vectorized
+	// DistSQL flows to not create tracing spans.
+	DistSQLNoSpans bool
 }
 
 // MetadataTestLevel represents the types of queries where metadata test
@@ -295,22 +266,12 @@ func GetWorkMemLimit(flowCtx *FlowCtx) int64 {
 	}
 	if flowCtx.Cfg.TestingKnobs.ForceDiskSpill {
 		return 1
-	}
-	if flowCtx.Cfg.TestingKnobs.MemoryLimitBytes != 0 {
+	} else if flowCtx.Cfg.TestingKnobs.MemoryLimitBytes != 0 {
 		return flowCtx.Cfg.TestingKnobs.MemoryLimitBytes
 	}
-	if flowCtx.EvalCtx.SessionData().WorkMemLimit <= 0 {
+	if flowCtx.EvalCtx.SessionData.WorkMemLimit <= 0 {
 		// If for some reason workmem limit is not set, use the default value.
 		return DefaultMemoryLimit
 	}
-	return flowCtx.EvalCtx.SessionData().WorkMemLimit
-}
-
-// GetRowMetrics returns the proper RowMetrics for either internal or user
-// queries.
-func (flowCtx *FlowCtx) GetRowMetrics() *row.Metrics {
-	if flowCtx.EvalCtx.SessionData().Internal {
-		return flowCtx.Cfg.InternalRowMetrics
-	}
-	return flowCtx.Cfg.RowMetrics
+	return flowCtx.EvalCtx.SessionData.WorkMemLimit
 }

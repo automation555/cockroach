@@ -72,9 +72,6 @@ type KVReader interface {
 	// GetCumulativeContentionTime returns the amount of time KV reads spent
 	// contending. It must be safe for concurrent use.
 	GetCumulativeContentionTime() time.Duration
-	// GetScanStats returns statistics about the scan that happened during the
-	// KV reads. It must be safe for concurrent use.
-	GetScanStats() execinfra.ScanStats
 }
 
 // ZeroInputNode is an execinfra.OpNode with no inputs.
@@ -144,18 +141,7 @@ type Closer interface {
 	// Close releases the resources associated with this Closer. If this Closer
 	// is an Operator, the implementation of Close must be safe to execute even
 	// if Operator.Init wasn't called.
-	//
-	// Unless the Closer derives its own context with a separate tracing span,
-	// the argument context rather than the one from Init() must be used
-	// (wherever necessary) by the implementation. This is so since the span in
-	// the context from Init() might be already finished when Close() is called
-	// whereas the argument context will contain an unfinished span.
-	//
-	// If this Closer is an execinfra.Releasable, the implementation must be
-	// safe to execute even after Release() was called.
-	// TODO(yuzefovich): refactor this because the Release()'d objects should
-	// not be used anymore.
-	Close(context.Context) error
+	Close() error
 }
 
 // Closers is a slice of Closers.
@@ -166,22 +152,19 @@ type Closers []Closer
 // Note: this method should *only* be used when returning an error doesn't make
 // sense.
 func (c Closers) CloseAndLogOnErr(ctx context.Context, prefix string) {
-	if err := colexecerror.CatchVectorizedRuntimeError(func() {
-		for _, closer := range c {
-			if err := closer.Close(ctx); err != nil && log.V(1) {
-				log.Infof(ctx, "%s: error closing Closer: %v", prefix, err)
-			}
+	prefix += ":"
+	for _, closer := range c {
+		if err := closer.Close(); err != nil && log.V(1) {
+			log.Infof(ctx, "%s error closing Closer: %v", prefix, err)
 		}
-	}); err != nil && log.V(1) {
-		log.Infof(ctx, "%s: runtime error closing the closers: %v", prefix, err)
 	}
 }
 
 // Close closes all Closers and returns the last error (if any occurs).
-func (c Closers) Close(ctx context.Context) error {
+func (c Closers) Close() error {
 	var lastErr error
 	for _, closer := range c {
-		if err := closer.Close(ctx); err != nil {
+		if err := closer.Close(); err != nil {
 			lastErr = err
 		}
 	}
@@ -337,12 +320,12 @@ type OneInputCloserHelper struct {
 var _ Closer = &OneInputCloserHelper{}
 
 // Close implements the Closer interface.
-func (c *OneInputCloserHelper) Close(ctx context.Context) error {
+func (c *OneInputCloserHelper) Close() error {
 	if !c.CloserHelper.Close() {
 		return nil
 	}
 	if closer, ok := c.Input.(Closer); ok {
-		return closer.Close(ctx)
+		return closer.Close()
 	}
 	return nil
 }
@@ -435,4 +418,26 @@ type VectorizedStatsCollector interface {
 	// GetStats returns the execution statistics of a single Operator. It will
 	// always return non-nil (but possibly empty) object.
 	GetStats() *execinfrapb.ComponentStats
+}
+
+// StreamingMetadataReceiver should be implemented by the root components (like
+// flow coordinators and outboxes) in order to propagate the metadata in a
+// streaming fashion. This is in contrast with MetadataSource where the metadata
+// is buffered in place where it originates until the flow transitions into the
+// draining state.
+type StreamingMetadataReceiver interface {
+	// PushStreamingMeta pushes the metadata in a streaming fashion and returns
+	// an error if the push wasn't successful. If no error is returned, then the
+	// metadata can be assumed to have been delivered.
+	//
+	// WARNING: the caller is **not** allowed to reuse the metadata object.
+	PushStreamingMeta(context.Context, *execinfrapb.ProducerMetadata) error
+}
+
+// StreamingMetadataSource should be implemented by all components that want
+// to propagate the metadata in a streaming fashion. The interface exists in
+// order to facilitate instantiation of the source before the receiver is
+// created.
+type StreamingMetadataSource interface {
+	SetReceiver(receiver StreamingMetadataReceiver)
 }

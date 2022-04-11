@@ -35,7 +35,7 @@ var (
 
 	// timeTZIncludesDateRegex is a regex to check whether there is a date
 	// associated with the given string when attempting to parse it.
-	timeTZIncludesDateRegex = regexp.MustCompile(`^\d+[-/]`)
+	timeTZIncludesDateRegex = regexp.MustCompile(`^\d{4}-`)
 	// timeTZHasTimeComponent determines whether there is a time component at all
 	// in a given string.
 	timeTZHasTimeComponent = regexp.MustCompile(`\d:`)
@@ -101,7 +101,7 @@ func Now() TimeTZ {
 // `now` value (either for the time or the local timezone).
 //
 func ParseTimeTZ(
-	now time.Time, dateStyle pgdate.DateStyle, s string, precision time.Duration,
+	now time.Time, s string, precision time.Duration,
 ) (_ TimeTZ, dependsOnContext bool, _ error) {
 	// Special case as we have to use `ParseTimestamp` to get the date.
 	// We cannot use `ParseTime` as it does not have timezone awareness.
@@ -121,7 +121,7 @@ func ParseTimeTZ(
 		s = timeutil.ReplaceLibPQTimePrefix(s)
 	}
 
-	t, dependsOnContext, err := pgdate.ParseTimestamp(now, dateStyle, s)
+	t, dependsOnContext, err := pgdate.ParseTimestamp(now, pgdate.ParseModeYMD, s)
 	if err != nil {
 		// Build our own error message to avoid exposing the dummy date.
 		return TimeTZ{}, false, pgerror.Newf(
@@ -157,11 +157,18 @@ func (t *TimeTZ) String() string {
 	if t.TimeOfDay == timeofday.Time2400 {
 		timeComponent = "24:00:00"
 	}
-	timeZoneComponent := tTime.Format("Z07:00:00")
+	var timeZoneComponent string
+	if t.OffsetSecs%60 != 0 {
+		timeZoneComponent = tTime.Format("Z07:00:00")
+	} else if t.OffsetSecs%3600 != 0 {
+		timeZoneComponent = tTime.Format("Z07:00")
+	} else {
+		timeZoneComponent = tTime.Format("Z07")
+	}
 	// If it is UTC, .Format converts it to "Z".
 	// Fully expand this component.
 	if t.OffsetSecs == 0 {
-		timeZoneComponent = "+00:00:00"
+		timeZoneComponent = "+00"
 	}
 	// Go's time.Format functionality does not work for offsets which
 	// in the range -0s < offsetSecs < -60s, e.g. -22s offset prints as 00:00:-22.
@@ -174,7 +181,7 @@ func (t *TimeTZ) String() string {
 
 // ToTime converts a DTimeTZ to a time.Time, corrected to the given location.
 func (t *TimeTZ) ToTime() time.Time {
-	loc := timeutil.TimeZoneOffsetToLocation(-int(t.OffsetSecs))
+	loc := timeutil.FixedOffsetTimeZoneToLocation(-int(t.OffsetSecs), "TimeTZ")
 	return t.TimeOfDay.ToTime().Add(time.Duration(t.OffsetSecs) * time.Second).In(loc)
 }
 

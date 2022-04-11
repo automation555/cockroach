@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -52,20 +53,19 @@ type testScenario struct {
 }
 
 var (
-	consumerDone     = testScenario{"ConsumerDone"}
-	consumerClosed   = testScenario{"ConsumerClosed"}
+	useRowReceiver   = testScenario{"RowReceiver"}
 	useBatchReceiver = testScenario{"BatchReceiver"}
-	testScenarios    = []testScenario{consumerDone, consumerClosed, useBatchReceiver}
+	testScenarios    = []testScenario{useRowReceiver, useBatchReceiver}
 )
 
 type callbackCloser struct {
-	closeCb func(context.Context) error
+	closeCb func() error
 }
 
 var _ colexecop.Closer = callbackCloser{}
 
-func (c callbackCloser) Close(ctx context.Context) error {
-	return c.closeCb(ctx)
+func (c callbackCloser) Close() error {
+	return c.closeCb()
 }
 
 // TestVectorizedFlowShutdown tests that closing the FlowCoordinator correctly
@@ -121,11 +121,10 @@ func (c callbackCloser) Close(ctx context.Context) error {
 func TestVectorizedFlowShutdown(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx,
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticSQLInstanceID,
+	defer stopper.Stop(context.Background())
+	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(
+		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticNodeID,
 	)
 	require.NoError(t, err)
 	dialer := &execinfrapb.MockDialer{Addr: addr}
@@ -137,8 +136,8 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 	for run := 0; run < 10; run++ {
 		for _, scenario := range testScenarios {
 			t.Run(fmt.Sprintf("testScenario=%s", scenario.string), func(t *testing.T) {
-				ctxLocal, cancelLocal := context.WithCancel(ctx)
-				ctxRemote, cancelRemote := context.WithCancel(ctx)
+				ctxLocal, cancelLocal := context.WithCancel(context.Background())
+				ctxRemote, cancelRemote := context.WithCancel(context.Background())
 				// Linter says there is a possibility of "context leak" because
 				// cancelRemote variable may not be used, so we defer the call to it.
 				// This does not change anything about the test since we're blocking on
@@ -152,7 +151,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					EvalCtx: &evalCtx,
 					Cfg:     &execinfra.ServerConfig{Settings: st},
 				}
-				rng, _ := randutil.NewTestRand()
+				rng, _ := randutil.NewPseudoRand()
 				var (
 					err             error
 					wg              sync.WaitGroup
@@ -211,7 +210,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					},
 					typs,
 					[]uint32{0}, /* hashCols */
-					execinfra.DefaultMemoryLimit,
+					64<<20,      /* memoryLimit */
 					queueCfg,
 					&colexecop.TestingSemaphore{},
 					diskAccounts,
@@ -257,7 +256,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 						colexecargs.OpWithMetaInfo{
 							Root:            outboxInput,
 							MetadataSources: outboxMetadataSources,
-							ToClose: []colexecop.Closer{callbackCloser{closeCb: func(context.Context) error {
+							ToClose: []colexecop.Closer{callbackCloser{closeCb: func() error {
 								idToClosed.Lock()
 								idToClosed.mapping[id] = true
 								idToClosed.Unlock()
@@ -274,7 +273,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 						outbox.Run(
 							outboxCtx,
 							dialer,
-							execinfra.StaticSQLInstanceID,
+							execinfra.StaticNodeID,
 							flowID,
 							execinfrapb.StreamID(id),
 							flowCtxCancel,
@@ -290,7 +289,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					doneFn := func() { close(serverStreamNotification.Donec) }
 					wg.Add(1)
 					go func(id int, stream execinfrapb.DistSQL_FlowStreamServer, doneFn func()) {
-						handleStreamErrCh[id] <- inbox.RunWithStream(stream.Context(), stream)
+						handleStreamErrCh[id] <- inbox.RunWithStream(stream.Context(), stream, make(<-chan struct{}))
 						doneFn()
 						wg.Done()
 					}(id, serverStream, doneFn)
@@ -326,7 +325,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				}
 
 				var input colexecop.Operator
-				ctxAnotherRemote, cancelAnotherRemote := context.WithCancel(ctx)
+				ctxAnotherRemote, cancelAnotherRemote := context.WithCancel(context.Background())
 				if addAnotherRemote {
 					// Add another "remote" node to the flow.
 					inboxMemAccount := testMemMonitor.MakeBoundAccount()
@@ -358,37 +357,10 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				inputInfo := colexecargs.OpWithMetaInfo{
 					Root:            input,
 					MetadataSources: colexecop.MetadataSources{inputMetadataSource},
-					ToClose: colexecop.Closers{callbackCloser{closeCb: func(context.Context) error {
+					ToClose: colexecop.Closers{callbackCloser{closeCb: func() error {
 						closeCalled = true
 						return nil
 					}}},
-				}
-
-				// runFlowCoordinator creates a pair of a materializer and a
-				// FlowCoordinator, requests 10 rows from it, and returns the
-				// coordinator.
-				runFlowCoordinator := func() *colflow.FlowCoordinator {
-					materializer := colexec.NewMaterializer(
-						flowCtx,
-						1, /* processorID */
-						inputInfo,
-						typs,
-					)
-					coordinator := colflow.NewFlowCoordinator(
-						flowCtx,
-						1, /* processorID */
-						materializer,
-						nil, /* output */
-						cancelLocal,
-					)
-					coordinator.Start(ctxLocal)
-
-					for i := 0; i < 10; i++ {
-						row, meta := coordinator.Next()
-						require.NotNil(t, row)
-						require.Nil(t, meta)
-					}
-					return coordinator
 				}
 
 				// checkMetadata verifies that all the metadata from all
@@ -407,30 +379,34 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				}
 
 				switch scenario {
-				case consumerDone:
-					coordinator := runFlowCoordinator()
-					coordinator.ConsumerDone()
-					var receivedMeta []execinfrapb.ProducerMetadata
-					for {
-						row, meta := coordinator.Next()
-						require.Nil(t, row)
-						if meta == nil {
-							break
-						}
-						receivedMeta = append(receivedMeta, *meta)
-					}
-					checkMetadata(receivedMeta)
-
-				case consumerClosed:
-					coordinator := runFlowCoordinator()
-					coordinator.ConsumerClosed()
+				case useRowReceiver:
+					// Use a row receiver that will ask for 10 rows and then
+					// will transition to draining.
+					recv := &fakeReceiver{numMoreItemsNeeded: 10}
+					materializer := colexec.NewMaterializer(
+						flowCtx,
+						1, /* processorID */
+						inputInfo,
+						typs,
+					)
+					coordinator := colflow.NewFlowCoordinator(
+						flowCtx,
+						1, /* processorID */
+						materializer,
+						recv,
+						nil, /* streamingMetadataSources */
+						cancelLocal,
+					)
+					coordinator.Run(ctxLocal)
+					checkMetadata(recv.receivedMeta)
 
 				case useBatchReceiver:
 					// Use a batch receiver that will ask for 10 batches and
 					// then will transition to draining.
-					recv := &batchReceiver{numMoreBatchesNeeded: 10}
+					recv := &fakeReceiver{numMoreItemsNeeded: 10}
 					coordinator := colflow.NewBatchFlowCoordinator(
 						flowCtx,
+						testAllocator,
 						1, /* processorID */
 						inputInfo,
 						recv,
@@ -466,26 +442,47 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 	}
 }
 
-// batchReceiver is a utility execinfra.BatchReceiver that will request the
-// specified number of batches before transitioning to draining.
+// fakeReceiver is a utility execinfra.RowReceiver and execinfra.BatchReceiver
+// that will request the specified number of rows/batches before transitioning
+// to draining.
 //
-// numMoreBatchesReceived is expected to be set to a positive number before the
+// numMoreItemsNeeded is expected to be set to a positive number before the
 // usage of the receiver.
-type batchReceiver struct {
-	numMoreBatchesNeeded int
-	receivedMeta         []execinfrapb.ProducerMetadata
+type fakeReceiver struct {
+	numMoreItemsNeeded int
+	receivedMeta       []execinfrapb.ProducerMetadata
 }
 
-var _ execinfra.BatchReceiver = &batchReceiver{}
+var _ execinfra.RowReceiver = &fakeReceiver{}
+var _ execinfra.BatchReceiver = &fakeReceiver{}
 
-func (b *batchReceiver) ProducerDone() {}
+func (b *fakeReceiver) ProducerDone() {}
 
-func (b *batchReceiver) PushBatch(
+func (b *fakeReceiver) Push(
+	row rowenc.EncDatumRow, meta *execinfrapb.ProducerMetadata,
+) execinfra.ConsumerStatus {
+	if row != nil {
+		b.numMoreItemsNeeded--
+		if b.numMoreItemsNeeded < 0 {
+			colexecerror.InternalError(errors.New("unexpectedly received a row after drain was requested"))
+		}
+	} else if meta != nil {
+		b.receivedMeta = append(b.receivedMeta, *meta)
+	} else {
+		colexecerror.InternalError(errors.New("unexpectedly Push is called with two nil arguments"))
+	}
+	if b.numMoreItemsNeeded == 0 {
+		return execinfra.DrainRequested
+	}
+	return execinfra.NeedMoreRows
+}
+
+func (b *fakeReceiver) PushBatch(
 	batch coldata.Batch, meta *execinfrapb.ProducerMetadata,
 ) execinfra.ConsumerStatus {
 	if batch != nil {
-		b.numMoreBatchesNeeded--
-		if b.numMoreBatchesNeeded < 0 {
+		b.numMoreItemsNeeded--
+		if b.numMoreItemsNeeded < 0 {
 			colexecerror.InternalError(errors.New("unexpectedly received a batch after drain was requested"))
 		}
 	} else if meta != nil {
@@ -493,7 +490,7 @@ func (b *batchReceiver) PushBatch(
 	} else {
 		colexecerror.InternalError(errors.New("unexpectedly PushBatch is called with two nil arguments"))
 	}
-	if b.numMoreBatchesNeeded == 0 {
+	if b.numMoreItemsNeeded == 0 {
 		return execinfra.DrainRequested
 	}
 	return execinfra.NeedMoreRows
