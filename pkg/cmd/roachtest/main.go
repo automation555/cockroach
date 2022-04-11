@@ -21,13 +21,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/tests"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq" // register postgres driver
@@ -69,7 +68,7 @@ func parseCreateOpts(flags *pflag.FlagSet, opts *vm.CreateOpts) {
 func main() {
 	rand.Seed(timeutil.Now().UnixNano())
 	username := os.Getenv("ROACHPROD_USER")
-	parallelism := 10
+	parallelism := 1
 	var cpuQuota int
 	// Path to a local dir where the test logs and artifacts collected from
 	// cluster will be placed.
@@ -278,8 +277,7 @@ runner itself.
 		cmd.Flags().IntVarP(
 			&parallelism, "parallelism", "p", parallelism, "number of tests to run in parallel")
 		cmd.Flags().StringVar(
-			&deprecatedRoachprodBinary, "roachprod", "", "DEPRECATED")
-		_ = cmd.Flags().MarkDeprecated("roachprod", "roachtest now uses roachprod as a library")
+			&roachprodBinary, "roachprod", "", "path to roachprod binary to use")
 		cmd.Flags().BoolVar(
 			&clusterWipe, "wipe", true,
 			"wipe existing cluster before starting test (for use with --cluster)")
@@ -358,20 +356,13 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	}
 	register(&r)
 	cr := newClusterRegistry()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	runner := newTestRunner(cr, stopper, r.buildVersion)
+	runner := newTestRunner(cr, r.buildVersion)
 
 	filter := registry.NewTestFilter(cfg.args)
 	clusterType := roachprodCluster
 	if local {
 		clusterType = localCluster
-		if cfg.parallelism != 1 {
-			fmt.Printf("--local specified. Overriding --parallelism to 1.\n")
-			cfg.parallelism = 1
-		}
 	}
-
 	opt := clustersOpt{
 		typ:                       clusterType,
 		clusterName:               clusterName,
