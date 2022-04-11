@@ -18,27 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/errors"
 )
-
-// ErrBufferClosed is returned by Readers when no more values will be
-// returned from the buffer.
-type ErrBufferClosed struct {
-	reason error
-}
-
-// Error() implements the error interface
-func (e ErrBufferClosed) Error() string {
-	return "buffer closed"
-}
-
-func (e ErrBufferClosed) Unwrap() error {
-	return e.reason
-}
-
-// ErrNormalRestartReason is a sentinel error to indicate the
-// ErrBufferClosed's reason is a pending restart
-var ErrNormalRestartReason = errors.New("writer can restart")
 
 // Buffer is an interface for communicating kvfeed entries between processors.
 type Buffer interface {
@@ -54,12 +34,9 @@ type Reader interface {
 
 // Writer is the write portion of the Buffer interface.
 type Writer interface {
-	// Add adds event to this writer.
-	Add(ctx context.Context, event Event) error
-	// Drain waits until all events buffered by this writer has been consumed.
-	Drain(ctx context.Context) error
-	// CloseWithReason closes this writer. reason may be added as a detail to ErrBufferClosed.
-	CloseWithReason(ctx context.Context, reason error) error
+	AddKV(ctx context.Context, kv roachpb.KeyValue, prevVal roachpb.Value, backfillTimestamp hlc.Timestamp) error
+	AddResolved(ctx context.Context, span roachpb.Span, ts hlc.Timestamp, boundaryType jobspb.ResolvedSpan_BoundaryType) error
+	Close(ctx context.Context)
 }
 
 // Type indicates the type of the event.
@@ -76,14 +53,6 @@ const (
 	// TypeResolved indicates that the Resolved method on the Event will be
 	// meaningful.
 	TypeResolved
-
-	// TypeFlush indicates a request to flush buffered data.
-	// This request type is emitted by blocking buffer when it's blocked, waiting
-	// for more memory.
-	TypeFlush
-
-	// TypeUnknown indicates the event could not be parsed. Will fail the feed.
-	TypeUnknown
 )
 
 // Event represents an event emitted by a kvfeed. It is either a KV or a
@@ -91,12 +60,9 @@ const (
 type Event struct {
 	kv                 roachpb.KeyValue
 	prevVal            roachpb.Value
-	flush              bool
 	resolved           *jobspb.ResolvedSpan
 	backfillTimestamp  hlc.Timestamp
-	bufferAddTimestamp time.Time
-	approxSize         int
-	alloc              Alloc
+	bufferGetTimestamp time.Time
 }
 
 // Type returns the event's Type.
@@ -107,15 +73,8 @@ func (b *Event) Type() Type {
 	if b.resolved != nil {
 		return TypeResolved
 	}
-	if b.flush {
-		return TypeFlush
-	}
-	return TypeUnknown
-}
-
-// ApproximateSize returns events approximate size in bytes.
-func (b *Event) ApproximateSize() int {
-	return b.approxSize
+	log.Fatalf(context.TODO(), "found event with unknown type: %+v", *b)
+	return 0 // unreachable
 }
 
 // KV is populated if this event returns true for IsKV().
@@ -146,9 +105,9 @@ func (b *Event) BackfillTimestamp() hlc.Timestamp {
 	return b.backfillTimestamp
 }
 
-// BufferAddTimestamp is the time this event came into  the buffer.
-func (b *Event) BufferAddTimestamp() time.Time {
-	return b.bufferAddTimestamp
+// BufferGetTimestamp is the time this event came out of the buffer.
+func (b *Event) BufferGetTimestamp() time.Time {
+	return b.bufferGetTimestamp
 }
 
 // Timestamp returns the timestamp of the write if this is a KV event.
@@ -164,12 +123,9 @@ func (b *Event) Timestamp() hlc.Timestamp {
 			return b.backfillTimestamp
 		}
 		return b.kv.Value.Timestamp
-	case TypeFlush:
-		return hlc.Timestamp{}
 	default:
-		log.Warningf(context.TODO(),
-			"setting empty timestamp for unknown event type")
-		return hlc.Timestamp{}
+		log.Fatalf(context.TODO(), "unknown event type")
+		return hlc.Timestamp{} // unreachable
 	}
 }
 
@@ -182,24 +138,13 @@ func (b *Event) MVCCTimestamp() hlc.Timestamp {
 		return b.resolved.Timestamp
 	case TypeKV:
 		return b.kv.Value.Timestamp
-	case TypeFlush:
-		return hlc.Timestamp{}
 	default:
-		log.Warningf(context.TODO(),
-			"setting empty timestamp for unknown event type")
-		return hlc.Timestamp{}
+		log.Fatalf(context.TODO(), "unknown event type")
+		return hlc.Timestamp{} // unreachable
 	}
 }
 
-// DetachAlloc detaches and returns allocation associated with this event.
-func (b *Event) DetachAlloc() Alloc {
-	a := b.alloc
-	b.alloc.clear()
-	return a
-}
-
-// MakeResolvedEvent returns resolved event.
-func MakeResolvedEvent(
+func makeResolvedEvent(
 	span roachpb.Span, ts hlc.Timestamp, boundaryType jobspb.ResolvedSpan_BoundaryType,
 ) Event {
 	return Event{
@@ -208,18 +153,15 @@ func MakeResolvedEvent(
 			Timestamp:    ts,
 			BoundaryType: boundaryType,
 		},
-		approxSize: span.Size() + ts.Size() + 4,
 	}
 }
 
-// MakeKVEvent returns KV event.
-func MakeKVEvent(
+func makeKVEvent(
 	kv roachpb.KeyValue, prevVal roachpb.Value, backfillTimestamp hlc.Timestamp,
 ) Event {
 	return Event{
 		kv:                kv,
 		prevVal:           prevVal,
 		backfillTimestamp: backfillTimestamp,
-		approxSize:        kv.Size() + prevVal.Size() + backfillTimestamp.Size(),
 	}
 }

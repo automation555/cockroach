@@ -14,6 +14,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 )
 
+const pollRequestNanosHistMaxLatency = time.Hour
+
 var (
 	metaChangefeedBufferEntriesIn = metric.Metadata{
 		Name:        "changefeed.buffer_entries.in",
@@ -27,27 +29,9 @@ var (
 		Measurement: "Entries",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaChangefeedBufferEntriesReleased = metric.Metadata{
-		Name:        "changefeed.buffer_entries.released",
-		Help:        "Total entries processed, emitted and acknowledged by the sinks",
-		Measurement: "Entries",
-		Unit:        metric.Unit_COUNT,
-	}
-	metaChangefeedBufferMemAcquired = metric.Metadata{
-		Name:        "changefeed.buffer_entries_mem.acquired",
-		Help:        "Total amount of memory acquired for entries as they enter the system",
-		Measurement: "Entries",
-		Unit:        metric.Unit_COUNT,
-	}
-	metaChangefeedBufferMemReleased = metric.Metadata{
-		Name:        "changefeed.buffer_entries_mem.released",
-		Help:        "Total amount of memory released by the entries after they have been emitted",
-		Measurement: "Entries",
-		Unit:        metric.Unit_COUNT,
-	}
-	metaChangefeedBufferPushbackNanos = metric.Metadata{
-		Name:        "changefeed.buffer_pushback_nanos",
-		Help:        "Total time spent waiting while the buffer was full",
+	metaChangefeedPollRequestNanos = metric.Metadata{
+		Name:        "changefeed.poll_request_nanos",
+		Help:        "Time spent fetching changes",
 		Measurement: "Nanoseconds",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
@@ -55,23 +39,32 @@ var (
 
 // Metrics is a metric.Struct for kvfeed metrics.
 type Metrics struct {
-	BufferEntriesIn          *metric.Counter
-	BufferEntriesOut         *metric.Counter
-	BufferEntriesReleased    *metric.Counter
-	BufferPushbackNanos      *metric.Counter
-	BufferEntriesMemAcquired *metric.Counter
-	BufferEntriesMemReleased *metric.Counter
+	BufferEntriesIn      *metric.Counter
+	BufferEntriesOut     *metric.Counter
+	PollRequestNanosHist *metric.Histogram
 }
 
 // MakeMetrics constructs a Metrics struct with the provided histogram window.
 func MakeMetrics(histogramWindow time.Duration) Metrics {
 	return Metrics{
-		BufferEntriesIn:          metric.NewCounter(metaChangefeedBufferEntriesIn),
-		BufferEntriesOut:         metric.NewCounter(metaChangefeedBufferEntriesOut),
-		BufferEntriesReleased:    metric.NewCounter(metaChangefeedBufferEntriesReleased),
-		BufferEntriesMemAcquired: metric.NewCounter(metaChangefeedBufferMemAcquired),
-		BufferEntriesMemReleased: metric.NewCounter(metaChangefeedBufferMemReleased),
-		BufferPushbackNanos:      metric.NewCounter(metaChangefeedBufferPushbackNanos),
+		BufferEntriesIn:  metric.NewCounter(metaChangefeedBufferEntriesIn),
+		BufferEntriesOut: metric.NewCounter(metaChangefeedBufferEntriesOut),
+		// Metrics for changefeed performance debugging: - PollRequestNanos and
+		// PollRequestNanosHist, things are first
+		//   fetched with some limited concurrency. We're interested in both the
+		//   total amount of time fetching as well as outliers, so we need both
+		//   the counter and the histogram.
+		// - N/A. Each change is put into a buffer. Right now nothing measures
+		//   this since the buffer doesn't actually buffer and so it just tracks
+		//   the poll sleep time.
+		// - ProcessingNanos. Everything from the buffer until the SQL row is
+		//   about to be emitted. This includes TableMetadataNanos, which is
+		//   dependent on network calls, so also tracked in case it's ever the
+		//   cause of a ProcessingNanos blowup.
+		// - EmitNanos and FlushNanos. All of our interactions with the sink.
+		PollRequestNanosHist: metric.NewHistogram(
+			metaChangefeedPollRequestNanos, histogramWindow,
+			pollRequestNanosHistMaxLatency.Nanoseconds(), 1),
 	}
 }
 
