@@ -27,14 +27,15 @@ func TestFormatMVCCMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	ts := hlc.Timestamp{Logical: 1}
+	legTs := ts.ToLegacyTimestamp()
+	writtenTs := hlc.Timestamp{Logical: 2}
 	txnDidNotUpdateMeta := true
 	tmeta := &enginepb.TxnMeta{
-		Key:               roachpb.Key("a"),
-		ID:                txnID,
-		Epoch:             1,
-		WriteTimestamp:    ts,
-		MinTimestamp:      ts,
-		CoordinatorNodeID: 6,
+		Key:            roachpb.Key("a"),
+		ID:             txnID,
+		Epoch:          1,
+		WriteTimestamp: ts,
+		MinTimestamp:   ts,
 	}
 	val1 := roachpb.Value{}
 	val1.SetString("foo")
@@ -43,20 +44,22 @@ func TestFormatMVCCMetadata(t *testing.T) {
 	val3 := roachpb.Value{}
 	val3.SetString("baz")
 	meta := &enginepb.MVCCMetadata{
-		Txn:       tmeta,
-		Timestamp: ts.ToLegacyTimestamp(),
-		KeyBytes:  123,
-		ValBytes:  456,
-		RawBytes:  val1.RawBytes,
+		Txn:            tmeta,
+		Timestamp:      legTs,
+		KeyBytes:       123,
+		ValBytes:       456,
+		RawBytes:       val1.RawBytes,
+		MergeTimestamp: &legTs,
 		IntentHistory: []enginepb.MVCCMetadata_SequencedIntent{
 			{Sequence: 11, Value: val2.RawBytes},
 			{Sequence: 22, Value: val3.RawBytes},
 		},
 		TxnDidNotUpdateMeta: &txnDidNotUpdateMeta,
+		WrittenTimestamp:    &writtenTs,
 	}
 
 	const expStr = `txn={id=d7aa0f5e key="a" pri=0.00000000 epo=1 ts=0,1 min=0,1 seq=0}` +
-		` ts=0,1 del=false klen=123 vlen=456 rawlen=8 nih=2 mergeTs=<nil> txnDidNotUpdateMeta=true`
+		` ts=0,1 del=false klen=123 vlen=456 rawlen=8 mergeTs=0,1 nih=2 txnDidNotUpdateMeta=true writtenTs=0,2`
 
 	if str := meta.String(); str != expStr {
 		t.Errorf(
@@ -66,8 +69,8 @@ func TestFormatMVCCMetadata(t *testing.T) {
 	}
 
 	const expV = `txn={id=d7aa0f5e key=‹"a"› pri=0.00000000 epo=1 ts=0,1 min=0,1 seq=0}` +
-		` ts=0,1 del=false klen=123 vlen=456 raw=‹/BYTES/foo› ih={{11 ‹/BYTES/bar›}{22 ‹/BYTES/baz›}}` +
-		` mergeTs=<nil> txnDidNotUpdateMeta=true`
+		` ts=0,1 del=false klen=123 vlen=456 raw=‹/BYTES/foo› mergeTs=0,1` +
+		` ih={{11 ‹/BYTES/bar›}{22 ‹/BYTES/baz›}} txnDidNotUpdateMeta=true writtenTs=0,2`
 
 	if str := redact.Sprintf("%+v", meta); str != expV {
 		t.Errorf(

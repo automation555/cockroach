@@ -18,11 +18,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/observedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/kr/pretty"
@@ -46,10 +47,11 @@ func (r *Replica) executeReadOnlyBatch(
 
 	// Compute the transaction's local uncertainty limit using observed
 	// timestamps, which can help avoid uncertainty restarts.
-	ui := uncertainty.ComputeInterval(&ba.Header, st, r.Clock().MaxOffset())
+	localUncertaintyLimit := observedts.ComputeLocalUncertaintyLimit(ba.Txn, st)
 
 	// Evaluate read-only batch command.
-	rec := NewReplicaEvalContext(r, g.LatchSpans())
+	spans := g.LatchSpans()
+	rec := NewReplicaEvalContext(r, spans)
 
 	// TODO(irfansharif): It's unfortunate that in this read-only code path,
 	// we're stuck with a ReadWriter because of the way evaluateBatch is
@@ -61,7 +63,7 @@ func (r *Replica) executeReadOnlyBatch(
 		panic("expected consistent iterators")
 	}
 	if util.RaceEnabled {
-		rw = spanset.NewReadWriterAt(rw, g.LatchSpans(), ba.Timestamp)
+		rw = spanset.NewReadWriterAt(rw, spans, ba.Timestamp)
 	}
 	defer rw.Close()
 
@@ -80,7 +82,9 @@ func (r *Replica) executeReadOnlyBatch(
 	// the latches are released.
 
 	var result result.Result
-	br, result, pErr = r.executeReadOnlyBatchWithServersideRefreshes(ctx, rw, rec, ba, ui, g)
+	br, result, pErr = r.executeReadOnlyBatchWithServersideRefreshes(
+		ctx, rw, rec, ba, localUncertaintyLimit, spans,
+	)
 
 	// If the request hit a server-side concurrency retry error, immediately
 	// propagate the error. Don't assume ownership of the concurrency guard.
@@ -233,8 +237,8 @@ func (r *Replica) executeReadOnlyBatchWithServersideRefreshes(
 	rw storage.ReadWriter,
 	rec batcheval.EvalContext,
 	ba *roachpb.BatchRequest,
-	ui uncertainty.Interval,
-	g *concurrency.Guard,
+	lul hlc.Timestamp,
+	latchSpans *spanset.SpanSet,
 ) (br *roachpb.BatchResponse, res result.Result, pErr *roachpb.Error) {
 	log.Event(ctx, "executing read-only batch")
 
@@ -284,10 +288,10 @@ func (r *Replica) executeReadOnlyBatchWithServersideRefreshes(
 			boundAccount.Clear(ctx)
 			log.VEventf(ctx, 2, "server-side retry of batch")
 		}
-		br, res, pErr = evaluateBatch(ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, ba, ui, true /* readOnly */)
+		br, res, pErr = evaluateBatch(ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, ba, lul, true /* readOnly */)
 		// If we can retry, set a higher batch timestamp and continue.
 		// Allow one retry only.
-		if pErr == nil || retries > 0 || !canDoServersideRetry(ctx, pErr, ba, br, g, nil /* deadline */) {
+		if pErr == nil || retries > 0 || !canDoServersideRetry(ctx, pErr, ba, br, latchSpans, nil /* deadline */, r.Clock()) {
 			break
 		}
 	}

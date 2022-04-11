@@ -8,6 +8,10 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package hlc implements the Hybrid Logical Clock outlined in
+// "Logical Physical Clocks and Consistent Snapshots in Globally
+// Distributed Databases", available online at
+// http://www.cse.buffalo.edu/tech-reports/2014-04.pdf.
 package hlc
 
 import (
@@ -157,16 +161,6 @@ func (m *HybridManualClock) UnixNano() int64 {
 func (m *HybridManualClock) Increment(nanos int64) {
 	m.mu.Lock()
 	m.mu.nanos += nanos
-	m.mu.Unlock()
-}
-
-// Forward sets the wall time to the supplied timestamp this moves the clock
-// forward in time.
-func (m *HybridManualClock) Forward(nanos int64) {
-	m.mu.Lock()
-	if nanos > m.mu.nanos {
-		m.mu.nanos = nanos
-	}
 	m.mu.Unlock()
 }
 
@@ -568,4 +562,16 @@ func (c *Clock) SleepUntil(ctx context.Context, t Timestamp) error {
 			}
 		}
 	}
+}
+
+// TryStripSynthetic uses the clock to try to strip the synthetic bit from the
+// provided timestamp, if the bit is set. This is possible if the clock leads
+// the provided timestamp, because in that case we know that the timestamp is a
+// representation of real time.
+func (c *Clock) TryStripSynthetic(t Timestamp) Timestamp {
+	if !t.Synthetic {
+		// Fast-path.
+		return t
+	}
+	return t.WithSynthetic(c.Now().Less(t))
 }

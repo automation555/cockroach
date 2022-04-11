@@ -16,9 +16,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -148,7 +147,7 @@ func evaluateBatch(
 	rec batcheval.EvalContext,
 	ms *enginepb.MVCCStats,
 	ba *roachpb.BatchRequest,
-	ui uncertainty.Interval,
+	lul hlc.Timestamp,
 	readOnly bool,
 ) (_ *roachpb.BatchResponse, _ result.Result, retErr *roachpb.Error) {
 
@@ -267,7 +266,7 @@ func evaluateBatch(
 		// may carry a response transaction and in the case of WriteTooOldError
 		// (which is sometimes deferred) it is fully populated.
 		curResult, err := evaluateCommand(
-			ctx, readWriter, rec, ms, baHeader, args, reply, ui)
+			ctx, readWriter, rec, ms, baHeader, args, reply, lul)
 
 		if filter := rec.EvalKnobs().TestingPostEvalFilter; filter != nil {
 			filterArgs := kvserverbase.FilterArgs{
@@ -474,18 +473,18 @@ func evaluateCommand(
 	h roachpb.Header,
 	args roachpb.Request,
 	reply roachpb.Response,
-	ui uncertainty.Interval,
+	lul hlc.Timestamp,
 ) (result.Result, error) {
 	var err error
 	var pd result.Result
 
 	if cmd, ok := batcheval.LookupCommand(args.Method()); ok {
 		cArgs := batcheval.CommandArgs{
-			EvalCtx:     rec,
-			Header:      h,
-			Args:        args,
-			Stats:       ms,
-			Uncertainty: ui,
+			EvalCtx:               rec,
+			Header:                h,
+			Args:                  args,
+			Stats:                 ms,
+			LocalUncertaintyLimit: lul,
 		}
 
 		if cmd.EvalRW != nil {
@@ -518,16 +517,8 @@ func evaluateCommand(
 // for transactional requests, retrying is possible if the transaction had not
 // performed any prior reads that need refreshing.
 //
-// This function is called both below and above latching, which is indicated by
-// the concurrency guard argument. The concurrency guard, if not nil, indicates
-// that the caller is holding latches and cannot adjust its timestamp beyond the
-// limits of what is protected by those latches. If the concurrency guard is
-// nil, the caller indicates that it is not holding latches and can therefore
-// more freely adjust its timestamp because it will re-acquire latches at
-// whatever timestamp the batch is bumped to.
-//
 // deadline, if not nil, specifies the highest timestamp (exclusive) at which
-// the request can be evaluated. If ba is a transactional request, then deadline
+// the request can be evaluated. If ba is a transactional request, then dealine
 // cannot be specified; a transaction's deadline comes from it's EndTxn request.
 //
 // If true is returned, ba and ba.Txn will have been updated with the new
@@ -537,8 +528,9 @@ func canDoServersideRetry(
 	pErr *roachpb.Error,
 	ba *roachpb.BatchRequest,
 	br *roachpb.BatchResponse,
-	g *concurrency.Guard,
+	latchSpans *spanset.SpanSet,
 	deadline *hlc.Timestamp,
+	clock *hlc.Clock,
 ) bool {
 	if ba.Txn != nil {
 		if !ba.CanForwardReadTimestamp {
@@ -552,39 +544,45 @@ func canDoServersideRetry(
 			deadline = et.Deadline
 		}
 	}
-
 	var newTimestamp hlc.Timestamp
-	if ba.Txn != nil {
-		if pErr != nil {
-			var ok bool
-			ok, newTimestamp = roachpb.TransactionRefreshTimestamp(pErr)
-			if !ok {
-				return false
-			}
-		} else {
-			if !br.Txn.WriteTooOld {
-				log.Fatalf(ctx, "expected the WriteTooOld flag to be set")
-			}
-			newTimestamp = br.Txn.WriteTimestamp
-		}
-	} else {
-		if pErr == nil {
-			log.Fatalf(ctx, "canDoServersideRetry called for non-txn request without error")
-		}
+
+	if pErr != nil {
 		switch tErr := pErr.GetDetail().(type) {
 		case *roachpb.WriteTooOldError:
-			newTimestamp = tErr.RetryTimestamp()
-
-		case *roachpb.ReadWithinUncertaintyIntervalError:
-			newTimestamp = tErr.RetryTimestamp()
-
+			// Locking scans hit WriteTooOld errors if they encounter values at
+			// timestamps higher than their read timestamps. The encountered
+			// timestamps are guaranteed to be greater than the txn's read
+			// timestamp, but not its write timestamp. So, when determining what
+			// the new timestamp should be, we make sure to not regress the
+			// txn's write timestamp.
+			newTimestamp = tErr.ActualTimestamp
+			if ba.Txn != nil {
+				newTimestamp.Forward(pErr.GetTxn().WriteTimestamp)
+			}
+		case *roachpb.TransactionRetryError:
+			if ba.Txn == nil {
+				// TODO(andrei): I don't know if TransactionRetryError is possible for
+				// non-transactional batches, but some tests inject them for 1PC
+				// transactions. I'm not sure how to deal with them, so let's not retry.
+				return false
+			}
+			newTimestamp = pErr.GetTxn().WriteTimestamp
 		default:
+			// TODO(andrei): Handle other retriable errors too.
 			return false
 		}
+	} else {
+		if !br.Txn.WriteTooOld {
+			log.Fatalf(ctx, "programming error: expected the WriteTooOld flag to be set")
+		}
+		newTimestamp = br.Txn.WriteTimestamp
 	}
 
-	if batcheval.IsEndTxnExceedingDeadline(newTimestamp, deadline) {
+	if deadline != nil && deadline.LessEq(newTimestamp) {
 		return false
 	}
-	return tryBumpBatchTimestamp(ctx, ba, g, newTimestamp)
+	// Use the clock to try to strip a synthetic bit from the transaction
+	// timestamp before bumping the batch timestamp, if necessary.
+	newTimestamp = clock.TryStripSynthetic(newTimestamp)
+	return tryBumpBatchTimestamp(ctx, ba, newTimestamp, latchSpans)
 }

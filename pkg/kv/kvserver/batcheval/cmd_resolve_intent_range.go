@@ -12,8 +12,8 @@ package batcheval
 
 import (
 	"context"
-	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -25,11 +25,7 @@ func init() {
 }
 
 func declareKeysResolveIntentRange(
-	rs ImmutableRangeState,
-	_ *roachpb.Header,
-	req roachpb.Request,
-	latchSpans, _ *spanset.SpanSet,
-	_ time.Duration,
+	rs ImmutableRangeState, _ roachpb.Header, req roachpb.Request, latchSpans, _ *spanset.SpanSet,
 ) {
 	declareKeysResolveIntentCombined(rs, req, latchSpans)
 }
@@ -48,8 +44,15 @@ func ResolveIntentRange(
 	}
 
 	update := args.AsLockUpdate()
+
+	// This intent resolution operation is asynchronous with its transaction and
+	// may be occurring after the transaction has already committed.
+	const asyncResolution = true
+	onlySeparatedIntents :=
+		cArgs.EvalCtx.ClusterSettings().Version.ActiveVersionOrEmpty(ctx).IsActive(
+			clusterversion.PostSeparatedIntentsMigration)
 	numKeys, resumeSpan, err := storage.MVCCResolveWriteIntentRange(
-		ctx, readWriter, ms, update, h.MaxSpanRequestKeys)
+		ctx, readWriter, ms, update, h.MaxSpanRequestKeys, asyncResolution, onlySeparatedIntents)
 	if err != nil {
 		return result.Result{}, err
 	}

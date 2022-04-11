@@ -12,7 +12,6 @@ package batcheval
 
 import (
 	"context"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -52,11 +51,7 @@ func declareKeysResolveIntentCombined(
 }
 
 func declareKeysResolveIntent(
-	rs ImmutableRangeState,
-	_ *roachpb.Header,
-	req roachpb.Request,
-	latchSpans, _ *spanset.SpanSet,
-	_ time.Duration,
+	rs ImmutableRangeState, _ roachpb.Header, req roachpb.Request, latchSpans, _ *spanset.SpanSet,
 ) {
 	declareKeysResolveIntentCombined(rs, req, latchSpans)
 }
@@ -89,7 +84,10 @@ func ResolveIntent(
 	}
 
 	update := args.AsLockUpdate()
-	ok, err := storage.MVCCResolveWriteIntent(ctx, readWriter, ms, update)
+	// This intent resolution operation is asynchronous with its transaction and
+	// may be occurring after the transaction has already committed.
+	const asyncResolution = true
+	ok, err := storage.MVCCResolveWriteIntent(ctx, readWriter, ms, update, asyncResolution)
 	if err != nil {
 		return result.Result{}, err
 	}
