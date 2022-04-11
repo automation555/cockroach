@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -89,7 +89,7 @@ func New(
 		settings:          cfg.Settings,
 		targets:           targets,
 		leaseMgr:          cfg.LeaseManager.(*lease.Manager),
-		ie:                cfg.SessionBoundInternalExecutorFactory(ctx, &sessiondata.SessionData{}),
+		ie:                cfg.SessionBoundInternalExecutorFactory(ctx, sessiondata.NewSessionData()),
 		collectionFactory: cfg.CollectionFactory,
 		metrics:           metrics,
 	}
@@ -280,7 +280,7 @@ func (tf *schemaFeed) primeInitialTableDescs(ctx context.Context) error {
 		// Note that all targets are currently guaranteed to be tables.
 		for tableID := range tf.targets {
 			flags := tree.ObjectLookupFlagsWithRequired()
-			flags.AvoidLeased = true
+			flags.AvoidCached = true
 			tableDesc, err := descriptors.GetImmutableTableByID(ctx, txn, tableID, flags)
 			if err != nil {
 				return err
@@ -613,7 +613,7 @@ func (tf *schemaFeed) fetchDescriptorVersions(
 	tf.mu.Lock()
 	defer tf.mu.Unlock()
 
-	var descriptors []catalog.Descriptor
+	var descs []catalog.Descriptor
 	for _, file := range res.(*roachpb.ExportResponse).Files {
 		if err := func() error {
 			it, err := storage.NewMemSSTIterator(file.SST, false /* verify */)
@@ -661,16 +661,16 @@ func (tf *schemaFeed) fetchDescriptorVersions(
 					return err
 				}
 
-				b := descbuilder.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
+				b := catalogkv.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
 				if b != nil && (b.DescriptorType() == catalog.Table || b.DescriptorType() == catalog.Type) {
-					descriptors = append(descriptors, b.BuildImmutable())
+					descs = append(descs, b.BuildImmutable())
 				}
 			}
 		}(); err != nil {
 			return nil, err
 		}
 	}
-	return descriptors, nil
+	return descs, nil
 }
 
 type doNothingSchemaFeed struct{}

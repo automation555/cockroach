@@ -15,7 +15,6 @@ import (
 	"math"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
@@ -24,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -36,11 +34,7 @@ import (
 )
 
 func descForTable(
-	ctx context.Context,
-	t *testing.T,
-	create string,
-	parent, parentSchemaID, id descpb.ID,
-	fks fkHandler,
+	ctx context.Context, t *testing.T, create string, parent, id descpb.ID, fks fkHandler,
 ) *tabledesc.Mutable {
 	t.Helper()
 	parsed, err := parser.Parse(create)
@@ -58,19 +52,18 @@ func descForTable(
 		name := parsed[0].AST.(*tree.CreateSequence).Name.String()
 
 		ts := hlc.Timestamp{WallTime: nanos}
-		priv := catpb.NewBasePrivilegeDescriptor(security.AdminRoleName())
+		priv := descpb.NewBasePrivilegeDescriptor(security.AdminRoleName())
 		desc, err := sql.NewSequenceTableDesc(
 			ctx,
-			nil, /* planner */
-			settings,
 			name,
 			tree.SequenceOptions{},
 			parent,
-			keys.PublicSchemaIDForBackup,
+			keys.PublicSchemaID,
 			id-1,
 			ts,
 			priv,
 			tree.PersistencePermanent,
+			nil,   /* params */
 			false, /* isMultiRegion */
 		)
 		if err != nil {
@@ -81,7 +74,7 @@ func descForTable(
 		stmt = parsed[0].AST.(*tree.CreateTable)
 	}
 	semaCtx := tree.MakeSemaContext()
-	table, err := MakeTestingSimpleTableDescriptor(context.Background(), &semaCtx, settings, stmt, parent, parentSchemaID, id, fks, nanos)
+	table, err := MakeTestingSimpleTableDescriptor(context.Background(), &semaCtx, settings, stmt, parent, keys.PublicSchemaID, id, fks, nanos)
 	if err != nil {
 		t.Fatalf("could not interpret %q: %v", create, err)
 	}
@@ -92,14 +85,10 @@ func descForTable(
 }
 
 var testEvalCtx = &tree.EvalContext{
-	SessionDataStack: sessiondata.NewStack(
-		&sessiondata.SessionData{
-			Location: time.UTC,
-		},
-	),
-	StmtTimestamp: timeutil.Unix(100000000, 0),
-	Settings:      cluster.MakeTestingClusterSettings(),
-	Codec:         keys.SystemSQLCodec,
+	SessionDataStack: sessiondata.NewStack(sessiondata.NewSessionData()),
+	StmtTimestamp:    timeutil.Unix(100000000, 0),
+	Settings:         cluster.MakeTestingClusterSettings(),
+	Codec:            keys.SystemSQLCodec,
 }
 
 // Value generator represents a value of some data at specified row/col.

@@ -13,14 +13,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -34,9 +32,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
+)
+
+const (
+	// We need to choose arbitrary database and table IDs. These aren't important,
+	// but they do match what would happen when creating a new database and
+	// table on an empty cluster.
+	defaultCSVParentID descpb.ID = keys.MinNonPredefinedUserDescID
+	defaultCSVTableID  descpb.ID = defaultCSVParentID + 1
 )
 
 type fkHandler struct {
@@ -63,11 +68,7 @@ func MakeTestingSimpleTableDescriptor(
 ) (*tabledesc.Mutable, error) {
 	db := dbdesc.NewInitial(parentID, "foo", security.RootUserName())
 	var sc catalog.SchemaDescriptor
-	if !st.Version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) && parentSchemaID == keys.PublicSchemaIDForBackup {
-		// If we're not on version PublicSchemasWithDescriptors, continue to
-		// use a synthetic public schema, the migration when we update to
-		// PublicSchemasWithDescriptors will handle creating the explicit public
-		// schema.
+	if parentSchemaID == keys.PublicSchemaID {
 		sc = schemadesc.GetPublicSchema()
 	} else {
 		sc = schemadesc.NewBuilder(&descpb.SchemaDescriptor{
@@ -75,10 +76,9 @@ func MakeTestingSimpleTableDescriptor(
 			ID:       parentSchemaID,
 			Version:  1,
 			ParentID: parentID,
-			Privileges: catpb.NewPrivilegeDescriptor(
+			Privileges: descpb.NewPrivilegeDescriptor(
 				security.PublicRoleName(),
 				privilege.SchemaPrivileges,
-				privilege.List{},
 				security.RootUserName(),
 			),
 		}).BuildCreatedMutableSchema()
@@ -167,9 +167,8 @@ func MakeSimpleTableDescriptor(
 		Context:            ctx,
 		Sequence:           &importSequenceOperators{},
 		Regions:            makeImportRegionOperator(""),
-		SessionDataStack:   sessiondata.NewStack(&sessiondata.SessionData{}),
+		SessionDataStack:   sessiondata.NewStack(sessiondata.NewSessionData()),
 		ClientNoticeSender: &faketreeeval.DummyClientNoticeSender{},
-		TxnTimestamp:       timeutil.Unix(0, walltime),
 		Settings:           st,
 	}
 	affected := make(map[descpb.ID]*tabledesc.Mutable)
@@ -185,7 +184,7 @@ func MakeSimpleTableDescriptor(
 		tableID,
 		nil, /* regionConfig */
 		hlc.Timestamp{WallTime: walltime},
-		catpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
+		descpb.NewBasePrivilegeDescriptor(security.AdminRoleName()),
 		affected,
 		semaCtx,
 		&evalCtx,
@@ -227,17 +226,17 @@ var (
 
 // Implements the tree.RegionOperator interface.
 type importRegionOperator struct {
-	primaryRegion catpb.RegionName
+	primaryRegion descpb.RegionName
 }
 
-func makeImportRegionOperator(primaryRegion catpb.RegionName) *importRegionOperator {
+func makeImportRegionOperator(primaryRegion descpb.RegionName) *importRegionOperator {
 	return &importRegionOperator{primaryRegion: primaryRegion}
 }
 
 // importDatabaseRegionConfig is a stripped down version of
 // multiregion.RegionConfig that is used by import.
 type importDatabaseRegionConfig struct {
-	primaryRegion catpb.RegionName
+	primaryRegion descpb.RegionName
 }
 
 // IsValidRegionNameString implements the tree.DatabaseRegionConfig interface.
@@ -331,14 +330,14 @@ func (so *importSequenceOperators) IsTypeVisible(
 	return false, false, errors.WithStack(errSequenceOperators)
 }
 
-// HasAnyPrivilege is part of the tree.EvalDatabase interface.
-func (so *importSequenceOperators) HasAnyPrivilege(
+// HasPrivilege is part of the tree.EvalDatabase interface.
+func (so *importSequenceOperators) HasPrivilege(
 	ctx context.Context,
 	specifier tree.HasPrivilegeSpecifier,
 	user security.SQLUsername,
-	privs []privilege.Privilege,
-) (tree.HasAnyPrivilegeResult, error) {
-	return tree.HasNoPrivilege, errors.WithStack(errSequenceOperators)
+	kind privilege.Kind,
+) (bool, error) {
+	return false, errors.WithStack(errSequenceOperators)
 }
 
 // IncrementSequenceByID implements the tree.SequenceOperators interface.

@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -89,9 +91,7 @@ type extendedEvalContext struct {
 	// jobsCollection.
 	Jobs *jobsCollection
 
-	// SchemaChangeJobRecords refers to schemaChangeJobsCache in extraTxnState of
-	// in sql.connExecutor. sql.connExecutor.createJobs() enqueues jobs with these
-	// records when transaction is committed.
+	// SchemaChangeJobRecords refers to schemaChangeJobsCache in extraTxnState.
 	SchemaChangeJobRecords map[descpb.ID]*jobs.Record
 
 	statsProvider *persistedsqlstats.PersistedSQLStats
@@ -99,27 +99,8 @@ type extendedEvalContext struct {
 	indexUsageStats *idxusage.LocalIndexUsageStats
 
 	SchemaChangerState *SchemaChangerState
-}
 
-// copyFromExecCfg copies relevant fields from an ExecutorConfig.
-func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
-	evalCtx.ExecCfg = execCfg
-	evalCtx.Settings = execCfg.Settings
-	evalCtx.Codec = execCfg.Codec
-	evalCtx.Tracer = execCfg.AmbientCtx.Tracer
-	evalCtx.DB = execCfg.DB
-	evalCtx.SQLLivenessReader = execCfg.SQLLiveness
-	evalCtx.CompactEngineSpan = execCfg.CompactEngineSpanFunc
-	evalCtx.TestingKnobs = execCfg.EvalContextTestingKnobs
-	evalCtx.ClusterID = execCfg.ClusterID()
-	evalCtx.ClusterName = execCfg.RPCContext.ClusterName()
-	evalCtx.NodeID = execCfg.NodeID
-	evalCtx.Locality = execCfg.Locality
-	evalCtx.NodesStatusServer = execCfg.NodesStatusServer
-	evalCtx.RegionsServer = execCfg.RegionsServer
-	evalCtx.SQLStatusServer = execCfg.SQLStatusServer
-	evalCtx.DistSQLPlanner = execCfg.DistSQLPlanner
-	evalCtx.VirtualSchemas = execCfg.VirtualSchemas
+	SchemaChangeInternalExecutor *InternalExecutor
 }
 
 // copy returns a deep copy of ctx.
@@ -144,7 +125,7 @@ func (evalCtx *extendedEvalContext) QueueJob(
 	if err != nil {
 		return nil, err
 	}
-	evalCtx.Jobs.add(jobID)
+	*evalCtx.Jobs = append(*evalCtx.Jobs, jobID)
 	return job, nil
 }
 
@@ -181,14 +162,18 @@ type planner struct {
 
 	preparedStatements preparedStatementsAccessor
 
-	// avoidLeasedDescriptors, when true, instructs all code that
+	// avoidCachedDescriptors, when true, instructs all code that
 	// accesses table/view descriptors to force reading the descriptors
 	// within the transaction. This is necessary to read descriptors
 	// from the store for:
 	// 1. Descriptors that are part of a schema change but are not
 	// modified by the schema change. (reading a table in CREATE VIEW)
 	// 2. Disable the use of the table cache in tests.
-	avoidLeasedDescriptors bool
+	avoidCachedDescriptors bool
+
+	// If set, the planner should skip checking for the SELECT privilege when
+	// initializing plans to read from a table. This should be used with care.
+	skipSelectPrivilegeChecks bool
 
 	// autoCommit indicates whether we're planning for an implicit transaction.
 	// If autoCommit is true, the plan is allowed (but not required) to commit the
@@ -219,7 +204,7 @@ type planner struct {
 	// Use a common datum allocator across all the plan nodes. This separates the
 	// plan lifetime from the lifetime of returned results allowing plan nodes to
 	// be pool allocated.
-	alloc *tree.DatumAlloc
+	alloc *rowenc.DatumAlloc
 
 	// optPlanningCtx stores the optimizer planning context, which contains
 	// data structures that can be reused between queries (for efficiency).
@@ -313,19 +298,19 @@ func newInternalPlanner(
 	// suitable contexts.
 	ctx := logtags.AddTag(context.Background(), opName, "")
 
-	sd := &sessiondata.SessionData{
-		SessionData:   sessionData,
-		SearchPath:    sessiondata.DefaultSearchPathForUser(user),
-		SequenceState: sessiondata.NewSequenceState(),
-		Location:      time.UTC,
-	}
+	sd := sessiondata.NewSessionData()
+	sd.SessionData = sessionData
+	sd.SearchPath = sessiondata.DefaultSearchPathForUser(user)
+	sd.SequenceState = sessiondata.NewSequenceState()
+	sd.Location = time.UTC
 	sd.SessionData.Database = "system"
 	sd.SessionData.UserProto = user.EncodeProto()
 	sd.SessionData.Internal = true
+
 	sds := sessiondata.NewStack(sd)
 
 	if params.collection == nil {
-		params.collection = execCfg.CollectionFactory.NewCollection(ctx, descs.NewTemporarySchemaProvider(sds))
+		params.collection = execCfg.CollectionFactory.NewCollection(descs.NewTemporarySchemaProvider(sds))
 	}
 
 	var ts time.Time
@@ -337,7 +322,7 @@ func newInternalPlanner(
 		ts = readTimestamp.GoTime()
 	}
 
-	p := &planner{execCfg: execCfg, alloc: &tree.DatumAlloc{}}
+	p := &planner{execCfg: execCfg, alloc: &rowenc.DatumAlloc{}}
 
 	p.txn = txn
 	p.stmt = Statement{}
@@ -451,12 +436,15 @@ func internalExtendedEvalCtx(
 			indexUsageStatsController = &idxusage.Controller{}
 		}
 	}
-	ret := extendedEvalContext{
+	return extendedEvalContext{
 		EvalContext: tree.EvalContext{
 			Txn:                       txn,
 			SessionDataStack:          sds,
 			TxnReadOnly:               false,
 			TxnImplicit:               true,
+			Settings:                  execCfg.Settings,
+			Codec:                     execCfg.Codec,
+			Tracer:                    execCfg.AmbientCtx.Tracer,
 			Context:                   ctx,
 			Mon:                       plannerMon,
 			TestingKnobs:              evalContextTestingKnobs,
@@ -465,12 +453,15 @@ func internalExtendedEvalCtx(
 			SQLStatsController:        sqlStatsController,
 			IndexUsageStatsController: indexUsageStatsController,
 		},
-		Tracing:         &SessionTracing{},
-		Descs:           tables,
-		indexUsageStats: indexUsageStats,
+		VirtualSchemas:    execCfg.VirtualSchemas,
+		Tracing:           &SessionTracing{},
+		NodesStatusServer: execCfg.NodesStatusServer,
+		RegionsServer:     execCfg.RegionsServer,
+		Descs:             tables,
+		ExecCfg:           execCfg,
+		DistSQLPlanner:    execCfg.DistSQLPlanner,
+		indexUsageStats:   indexUsageStats,
 	}
-	ret.copyFromExecCfg(execCfg)
-	return ret
 }
 
 // LogicalSchemaAccessor is part of the resolver.SchemaResolver interface.
@@ -556,9 +547,9 @@ func (p *planner) MigrationJobDeps() migration.JobDeps {
 	return p.execCfg.MigrationJobDeps
 }
 
-// SpanConfigReconciler returns the spanconfig.Reconciler.
-func (p *planner) SpanConfigReconciler() spanconfig.Reconciler {
-	return p.execCfg.SpanConfigReconciler
+// SpanConfigReconciliationJobDeps returns the spanconfig.ReconciliationJobDeps.
+func (p *planner) SpanConfigReconciliationJobDeps() spanconfig.ReconciliationDependencies {
+	return p.execCfg.SpanConfigReconciliationJobDeps
 }
 
 // GetTypeFromValidSQLSyntax implements the tree.EvalPlanner interface.
@@ -602,6 +593,10 @@ func (p *planner) LookupTableByID(
 		return nil, err
 	}
 	return table, nil
+}
+
+func (p *planner) JobRegistry() interface{} {
+	return p.ExecCfg().JobRegistry
 }
 
 // TypeAsString enforces (not hints) that the given expression typechecks as a
@@ -801,30 +796,20 @@ func (p *planner) Ann() *tree.Annotations {
 	return p.ExtendedEvalContext().EvalContext.Annotations
 }
 
-// ExecutorConfig implements EvalPlanner interface.
-func (p *planner) ExecutorConfig() interface{} {
-	return p.execCfg
-}
-
 // txnModesSetter is an interface used by SQL execution to influence the current
 // transaction.
 type txnModesSetter interface {
 	// setTransactionModes updates some characteristics of the current
 	// transaction.
 	// asOfTs, if not empty, is the evaluation of modes.AsOf.
-	setTransactionModes(ctx context.Context, modes tree.TransactionModes, asOfTs hlc.Timestamp) error
+	setTransactionModes(modes tree.TransactionModes, asOfTs hlc.Timestamp) error
 }
 
 // validateDescriptor is a convenience function for validating
 // descriptors in the context of a planner.
 func validateDescriptor(ctx context.Context, p *planner, descriptor catalog.Descriptor) error {
-	return p.Descriptors().Validate(
-		ctx,
-		p.Txn(),
-		catalog.NoValidationTelemetry,
-		catalog.ValidationLevelCrossReferences,
-		descriptor,
-	)
+	bdg := catalogkv.NewOneLevelUncachedDescGetter(p.Txn(), p.ExecCfg().Codec)
+	return catalog.ValidateSelfAndCrossReferences(ctx, bdg, descriptor)
 }
 
 // QueryRowEx executes the supplied SQL statement and returns a single row, or
