@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -80,6 +79,15 @@ DROP TABLE test.t;
 	`),
 }
 
+// setupPersistentDB is a test step when running on a new cluster to
+// make it look like the fixtures.
+var setupPersistentDB = versionFeatureStep{
+	stmtFeatureTest("Create database and table", v201, `
+	create database persistent_db;
+	create table persistent_db.persistent_table(a int);
+	show tables from persistent_db;`),
+}
+
 func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	predecessorVersion, err := PredecessorVersion(*t.BuildVersion())
 	if err != nil {
@@ -122,9 +130,15 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// of #58489 is being addressed.
 	_ = schemaChangeStep
 	backupStep := func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		// Verify that backups can be created in various configurations. This is
-		// important to test because changes in system tables might cause backups to
-		// fail in mixed-version clusters.
+		// This check was introduced for the system.tenants table and the associated
+		// changes to full-cluster backup to include tenants. It mostly wants to
+		// check that 20.1 (which does not have system.tenants) and 20.2 (which
+		// does have the table) can both run full cluster backups.
+		//
+		// This step can be removed once 20.2 is released.
+		if u.binaryVersion(ctx, t, 1).Major != 20 {
+			return
+		}
 		dest := fmt.Sprintf("nodelocal://0/%d", timeutil.Now().UnixNano())
 		_, err := u.conn(ctx, t, 1).ExecContext(ctx, `BACKUP TO $1`, dest)
 		require.NoError(t, err)
@@ -235,7 +249,7 @@ func checkpointName(binaryVersion string) string { return "checkpoint-v" + binar
 func (u *versionUpgradeTest) conn(ctx context.Context, t test.Test, i int) *gosql.DB {
 	if u.conns == nil {
 		for _, i := range u.c.All() {
-			u.conns = append(u.conns, u.c.Conn(ctx, t.L(), i))
+			u.conns = append(u.conns, u.c.Conn(ctx, i))
 		}
 	}
 	db := u.conns[i-1]
@@ -296,8 +310,8 @@ func binaryPathFromVersion(v string) string {
 
 func (u *versionUpgradeTest) uploadVersion(
 	ctx context.Context, t test.Test, nodes option.NodeListOption, newVersion string,
-) string {
-	return uploadVersion(ctx, t, u.c, nodes, newVersion)
+) option.Option {
+	return option.StartArgs("--binary=" + uploadVersion(ctx, t, u.c, nodes, newVersion))
 }
 
 // binaryVersion returns the binary running on the (one-indexed) node.
@@ -367,13 +381,19 @@ func uploadAndStartFromCheckpointFixture(nodes option.NodeListOption, v string) 
 		u.c.Run(ctx, nodes, "cd {store-dir} && [ ! -f {store-dir}/CURRENT ] && tar -xf fixture.tgz")
 
 		// Put and start the binary.
-		binary := u.uploadVersion(ctx, t, nodes, v)
-		settings := install.MakeClusterSettings(install.BinaryOption(binary))
-		startOpts := option.DefaultStartOpts()
+		args := u.uploadVersion(ctx, t, nodes, v)
 		// NB: can't start sequentially since cluster already bootstrapped.
-		startOpts.RoachprodOpts.Sequential = false
-		startOpts.RoachtestOpts.DontEncrypt = true
-		u.c.Start(ctx, t.L(), startOpts, settings, nodes)
+		u.c.Start(ctx, nodes, args, option.StartArgsDontEncrypt, option.RoachprodArgOption{"--sequential=false"})
+	}
+}
+
+func uploadAndStartEmptyCluster(nodes option.NodeListOption, v string) versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		u.c.Run(ctx, nodes, "mkdir", "-p", "{store-dir}")
+
+		// Put and start the binary.
+		args := u.uploadVersion(ctx, t, nodes, v)
+		u.c.Start(ctx, nodes, args)
 	}
 }
 
@@ -416,13 +436,9 @@ func upgradeNodes(
 			newVersionMsg = "<current>"
 		}
 		t.L().Printf("restarting node %d into version %s", node, newVersionMsg)
-		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Node(node))
-
-		binary := uploadVersion(ctx, t, c, c.Node(node), newVersion)
-		settings := install.MakeClusterSettings(install.BinaryOption(binary))
-		startOpts := option.DefaultStartOpts()
-		startOpts.RoachtestOpts.DontEncrypt = true
-		c.Start(ctx, t.L(), startOpts, settings, c.Node(node))
+		c.Stop(ctx, c.Node(node))
+		args := option.StartArgs("--binary=" + uploadVersion(ctx, t, c, c.Node(node), newVersion))
+		c.Start(ctx, c.Node(node), args, option.StartArgsDontEncrypt)
 	}
 }
 
@@ -470,7 +486,7 @@ func waitForUpgradeStep(nodes option.NodeListOption) versionStep {
 		t.L().Printf("%s: waiting for cluster to auto-upgrade\n", newVersion)
 
 		for _, i := range nodes {
-			err := retry.ForDuration(5*time.Minute, func() error {
+			err := retry.ForDuration(30*time.Second, func() error {
 				currentVersion := u.clusterVersion(ctx, t, i).String()
 				if currentVersion != newVersion {
 					return fmt.Errorf("%d: expected version %s, got %s", i, newVersion, currentVersion)
@@ -562,8 +578,8 @@ func makeVersionFixtureAndFatal(
 ) {
 	var useLocalBinary bool
 	if makeFixtureVersion == "" {
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Node(1))
-		require.NoError(t, c.Conn(ctx, t.L(), 1).QueryRowContext(
+		c.Start(ctx, c.Node(1))
+		require.NoError(t, c.Conn(ctx, 1).QueryRowContext(
 			ctx,
 			`select regexp_extract(value, '^v([0-9]+\.[0-9]+\.[0-9]+)') from crdb_internal.node_build_info where field = 'Version';`,
 		).Scan(&makeFixtureVersion))
@@ -621,7 +637,7 @@ func makeVersionFixtureAndFatal(
 			// 2.1 binary, but not the 19.1 binary (as 19.1 and 2.0 are not
 			// compatible).
 			name := checkpointName(u.binaryVersion(ctx, t, 1).String())
-			u.c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.All())
+			u.c.Stop(ctx, c.All())
 
 			c.Run(ctx, c.All(), binaryPathFromVersion(makeFixtureVersion), "debug", "pebble", "db", "checkpoint",
 				"{store-dir}", "{store-dir}/"+name)
@@ -694,4 +710,53 @@ func importLargeBankStep(oldV string, rows int, crdbNodes option.NodeListOption)
 		})
 		m.Wait()
 	}
+}
+
+func runPatchUpgrade(ctx context.Context, t test.Test, c cluster.Cluster, offset int) {
+	predecessorVersions := RecentPatchVersions(*t.BuildVersion(), offset+1)
+	if len(predecessorVersions) < offset+1 {
+		t.L().Printf("No recent patch versions for this version")
+		return
+	}
+
+	testFeaturesStep := versionUpgradeTestFeatures.step(c.All())
+
+	predecessorVersion := predecessorVersions[offset]
+
+	// The steps below start a cluster at predecessorVersion,
+	// then fully upgrade to the current version,
+	// then roll back, then roll one node forward again.
+	// Between each step, we run the feature tests defined in
+	// versionUpgradeTestFeatures (which aren't particularly
+	// appropriate here, but we just need arbitrary operations.)
+	u := newVersionUpgradeTest(c,
+		// Start a cluster from a previous patch version.
+		uploadAndStartEmptyCluster(c.All(), predecessorVersion),
+		setupPersistentDB.step(c.All().RandNode()),
+		uploadAndInitSchemaChangeWorkload(),
+		waitForUpgradeStep(c.All()),
+		testFeaturesStep,
+
+		// Roll nodes forward to the current build being tested.
+		binaryUpgradeStep(c.All(), ""),
+		testFeaturesStep,
+		// Since we've done nothing to stop it, the cluster version
+		// should be updated if it's going to, but let's make sure.
+		waitForUpgradeStep(c.All()),
+		// Roll back again. That this is allowed for patch versions
+		// is the key invariant being tested (and a regression test for 21.1.8).
+		binaryUpgradeStep(c.All(), predecessorVersion),
+		testFeaturesStep,
+		// Roll a single node forward so we can spend more time in a mixed state.
+		binaryUpgradeStep(c.All().RandNode(), ""),
+		testFeaturesStep,
+		// Turn tracing on globally to give it a fighting chance at exposing any
+		// crash-inducing incompatibilities or horrendous memory leaks. (It won't
+		// catch most memory leaks since this test doesn't run for too long or do
+		// too much work). Then, run the previous tests again.
+		enableTracingGloballyStep,
+		testFeaturesStep,
+	)
+
+	u.run(ctx, t)
 }
