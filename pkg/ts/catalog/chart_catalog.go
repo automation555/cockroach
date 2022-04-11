@@ -614,6 +614,44 @@ var charts = []sectionDescription{
 	},
 	{
 		Organization: [][]string{
+			{DistributionLayer, "Rebalancing"},
+			{ReplicationLayer, "Leases"},
+		},
+		Charts: []chartDescription{
+			{
+				Title: "Allocator Load-Based Lease Transfer Decisions",
+				Metrics: []string{
+					"kv.allocator.load_based_lease_transfers.should_transfer",
+					"kv.allocator.load_based_lease_transfers.significantly_switches_relative_disposition",
+					"kv.allocator.load_based_lease_transfers.missing_stats_for_existing_stores",
+					"kv.allocator.load_based_lease_transfers.delta_not_significant",
+					"kv.allocator.load_based_lease_transfers.existing_not_overfull",
+					"kv.allocator.load_based_lease_transfers.cannot_find_better_candidate",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{
+			{DistributionLayer, "Rebalancing"},
+			{ReplicationLayer, "Replicas"},
+		},
+		Charts: []chartDescription{
+			{
+				Title: "Allocator Load-Based Lease Transfer Decisions",
+				Metrics: []string{
+					"kv.allocator.load_based_replica_rebalancing.should_transfer",
+					"kv.allocator.load_based_replica_rebalancing.significantly_switches_relative_disposition",
+					"kv.allocator.load_based_replica_rebalancing.missing_stats_for_existing_store",
+					"kv.allocator.load_based_replica_rebalancing.delta_not_significant",
+					"kv.allocator.load_based_replica_rebalancing.existing_not_overfull",
+					"kv.allocator.load_based_replica_rebalancing.cannot_find_better_candidate",
+				},
+			},
+		},
+	},
+	{
+		Organization: [][]string{
 			{DistributionLayer, "Split Queue"},
 			{ReplicationLayer, "Split Queue"},
 		},
@@ -1938,37 +1976,6 @@ var charts = []sectionDescription{
 		},
 	},
 	{
-		Organization: [][]string{{SQLLayer, "Row-Level TTL"}},
-		Charts: []chartDescription{
-			{
-				Title: "Jobs Running",
-				Metrics: []string{
-					"jobs.row_level_ttl.currently_running",
-					"jobs.row_level_ttl.currently_idle",
-				},
-			},
-			{
-				Title: "Jobs Statistics",
-				Metrics: []string{
-					"jobs.row_level_ttl.fail_or_cancel_completed",
-					"jobs.row_level_ttl.fail_or_cancel_failed",
-					"jobs.row_level_ttl.fail_or_cancel_retry_error",
-					"jobs.row_level_ttl.resume_completed",
-					"jobs.row_level_ttl.resume_failed",
-					"jobs.row_level_ttl.resume_retry_error",
-				},
-			},
-			{
-				Title: "Scheduled Jobs Statistics",
-				Metrics: []string{
-					"schedules.scheduled-row-level-ttl-executor.succeeded",
-					"schedules.scheduled-row-level-ttl-executor.started",
-					"schedules.scheduled-row-level-ttl-executor.failed",
-				},
-			},
-		},
-	},
-	{
 		Organization: [][]string{{SQLLayer, "SQL Memory", "Admin"}},
 		Charts: []chartDescription{
 			{
@@ -2208,15 +2215,6 @@ var charts = []sectionDescription{
 					"sql.txn.latency.internal",
 				},
 				AxisLabel: "Latency",
-			},
-			{
-				Title: "Cancel Requests (Postgres Protocol)",
-				Metrics: []string{
-					"sql.pgwire_cancel.total",
-					"sql.pgwire_cancel.ignored",
-					"sql.pgwire_cancel.successful",
-				},
-				AxisLabel: "Count",
 			},
 		},
 	},

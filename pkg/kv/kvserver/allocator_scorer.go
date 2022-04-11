@@ -87,16 +87,10 @@ var rangeRebalanceThreshold = func() *settings.FloatSetting {
 	return s
 }()
 
-// CockroachDB has two heuristics that trigger replica rebalancing: range count
-// convergence and QPS convergence. scorerOptions defines the interface that
-// both of these heuristics must implement.
+// CockroachDB's has two heuristics that trigger replica rebalancing: range
+// count convergence and QPS convergence. scorerOptions defines the interface
+// that both of these heuristics must implement.
 type scorerOptions interface {
-	// maybeJitterStoreStats returns a `StoreList` that's identical to the
-	// parameter `sl`, but may have jittered stats on the stores.
-	//
-	// This is to ensure that, when scattering via `AdminScatterRequest`, we will
-	// be more likely to find a rebalance opportunity.
-	maybeJitterStoreStats(sl StoreList, allocRand allocatorRand) StoreList
 	// deterministic is set by tests to have the allocator methods sort their
 	// results by constraints score as well as by store IDs, as opposed to just
 	// the score.
@@ -111,7 +105,9 @@ type scorerOptions interface {
 	// the `eqClass`'s current stats are divergent enough to justify rebalancing
 	// replicas.
 	shouldRebalanceBasedOnThresholds(
-		ctx context.Context, eqClass equivalenceClass,
+		ctx context.Context,
+		eqClass equivalenceClass,
+		metrics AllocatorMetrics,
 	) bool
 	// balanceScore returns a discrete score (`balanceStatus`) based on whether
 	// the store represented by `sc` classifies as underfull, aroundTheMean, or
@@ -140,40 +136,6 @@ type scorerOptions interface {
 	removalMaximallyConvergesScore(removalCandStoreList StoreList, existing roachpb.StoreDescriptor) int
 }
 
-func jittered(val float64, jitter float64, rand allocatorRand) float64 {
-	rand.Lock()
-	defer rand.Unlock()
-	result := val * jitter * (rand.Float64())
-	if rand.Int31()%2 == 0 {
-		result *= -1
-	}
-	return result
-}
-
-// scatterScorerOptions is used by the replicateQueue when called via the
-// `AdminScatterRequest`. It is like `rangeCountScorerOptions` but with the
-// rangeRebalanceThreshold set to zero (i.e. with all padding disabled). It also
-// perturbs the stats on existing stores to add a bit of random jitter.
-type scatterScorerOptions struct {
-	rangeCountScorerOptions
-	// jitter specifies the degree to which we will perturb existing store stats.
-	jitter float64
-}
-
-func (o *scatterScorerOptions) maybeJitterStoreStats(
-	sl StoreList, allocRand allocatorRand,
-) (perturbedSL StoreList) {
-	perturbedStoreDescs := make([]roachpb.StoreDescriptor, 0, len(sl.stores))
-	for _, store := range sl.stores {
-		store.Capacity.RangeCount += int32(jittered(
-			float64(store.Capacity.RangeCount), o.jitter, allocRand,
-		))
-		perturbedStoreDescs = append(perturbedStoreDescs, store)
-	}
-
-	return makeStoreList(perturbedStoreDescs)
-}
-
 // rangeCountScorerOptions is used by the replicateQueue to tell the Allocator's
 // rebalancing machinery to base its balance/convergence scores on range counts.
 // This means that the resulting rebalancing decisions will further the goal of
@@ -183,18 +145,12 @@ type rangeCountScorerOptions struct {
 	rangeRebalanceThreshold float64
 }
 
-func (o *rangeCountScorerOptions) maybeJitterStoreStats(
-	sl StoreList, _ allocatorRand,
-) (perturbedSL StoreList) {
-	return sl
-}
-
-func (o *rangeCountScorerOptions) deterministicForTesting() bool {
+func (o rangeCountScorerOptions) deterministicForTesting() bool {
 	return o.deterministic
 }
 
-func (o *rangeCountScorerOptions) shouldRebalanceBasedOnThresholds(
-	ctx context.Context, eqClass equivalenceClass,
+func (o rangeCountScorerOptions) shouldRebalanceBasedOnThresholds(
+	ctx context.Context, eqClass equivalenceClass, metrics AllocatorMetrics,
 ) bool {
 	store := eqClass.existing
 	sl := eqClass.candidateSL
@@ -231,7 +187,7 @@ func (o *rangeCountScorerOptions) shouldRebalanceBasedOnThresholds(
 	return false
 }
 
-func (o *rangeCountScorerOptions) balanceScore(
+func (o rangeCountScorerOptions) balanceScore(
 	sl StoreList, sc roachpb.StoreCapacity,
 ) balanceStatus {
 	maxRangeCount := overfullRangeThreshold(o, sl.candidateRanges.mean)
@@ -251,7 +207,7 @@ func (o *rangeCountScorerOptions) balanceScore(
 // rebalance a replica away from a store or not, we want to give it a "boost"
 // (i.e. make it a less likely candidate for removal) if it doesn't further our
 // goal to converge range count towards the mean.
-func (o *rangeCountScorerOptions) rebalanceFromConvergesScore(eqClass equivalenceClass) int {
+func (o rangeCountScorerOptions) rebalanceFromConvergesScore(eqClass equivalenceClass) int {
 	if !rebalanceConvergesRangeCountOnMean(
 		eqClass.candidateSL, eqClass.existing.Capacity, eqClass.existing.Capacity.RangeCount-1,
 	) {
@@ -263,7 +219,7 @@ func (o *rangeCountScorerOptions) rebalanceFromConvergesScore(eqClass equivalenc
 // rebalanceToConvergesScore returns 1 if rebalancing a replica to `sd` will
 // converge its range count towards the mean of the candidate stores inside
 // `eqClass`.
-func (o *rangeCountScorerOptions) rebalanceToConvergesScore(
+func (o rangeCountScorerOptions) rebalanceToConvergesScore(
 	eqClass equivalenceClass, candidate roachpb.StoreDescriptor,
 ) int {
 	if rebalanceConvergesRangeCountOnMean(eqClass.candidateSL, candidate.Capacity, candidate.Capacity.RangeCount+1) {
@@ -277,7 +233,7 @@ func (o *rangeCountScorerOptions) rebalanceToConvergesScore(
 // the mean (this low score makes it more likely to be picked for removal).
 // Otherwise, a high convergesScore is assigned (which would make this store
 // less likely to be picked for removal).
-func (o *rangeCountScorerOptions) removalMaximallyConvergesScore(
+func (o rangeCountScorerOptions) removalMaximallyConvergesScore(
 	removalCandStoreList StoreList, existing roachpb.StoreDescriptor,
 ) int {
 	if !rebalanceConvergesRangeCountOnMean(
@@ -313,11 +269,7 @@ type qpsScorerOptions struct {
 	qpsPerReplica float64
 }
 
-func (o *qpsScorerOptions) maybeJitterStoreStats(sl StoreList, _ allocatorRand) StoreList {
-	return sl
-}
-
-func (o *qpsScorerOptions) deterministicForTesting() bool {
+func (o qpsScorerOptions) deterministicForTesting() bool {
 	return o.deterministic
 }
 
@@ -325,8 +277,8 @@ func (o *qpsScorerOptions) deterministicForTesting() bool {
 // equivalenceClass `eqClass`, rebalancing a replica from one of the existing
 // stores to one of the candidate stores will lead to QPS convergence among the
 // stores in the equivalence class.
-func (o *qpsScorerOptions) shouldRebalanceBasedOnThresholds(
-	ctx context.Context, eqClass equivalenceClass,
+func (o qpsScorerOptions) shouldRebalanceBasedOnThresholds(
+	ctx context.Context, eqClass equivalenceClass, metrics AllocatorMetrics,
 ) bool {
 	if len(eqClass.candidateSL.stores) == 0 {
 		return false
@@ -335,26 +287,32 @@ func (o *qpsScorerOptions) shouldRebalanceBasedOnThresholds(
 	bestStore, declineReason := o.getRebalanceTargetToMinimizeDelta(eqClass)
 	switch declineReason {
 	case noBetterCandidate:
+		metrics.loadBasedReplicaRebalancingMetrics.CannotFindBetterCandidate.Inc(1)
 		log.VEventf(
 			ctx, 4, "could not find a better candidate to replace s%d", eqClass.existing.StoreID,
 		)
 	case existingNotOverfull:
+		metrics.loadBasedReplicaRebalancingMetrics.ExistingNotOverfull.Inc(1)
 		log.VEventf(ctx, 4, "existing store s%d is not overfull", eqClass.existing.StoreID)
 	case deltaNotSignificant:
+		metrics.loadBasedReplicaRebalancingMetrics.DeltaNotSignificant.Inc(1)
 		log.VEventf(
 			ctx, 4,
 			"delta between s%d and the next best candidate is not significant enough",
 			eqClass.existing.StoreID,
 		)
 	case significantlySwitchesRelativeDisposition:
+		metrics.loadBasedReplicaRebalancingMetrics.SignificantlySwitchesRelativeDisposition.Inc(1)
 		log.VEventf(
 			ctx, 4,
 			"rebalancing from s%[1]d to the next best candidate could make it significantly hotter than s%[1]d",
 			eqClass.existing.StoreID,
 		)
 	case missingStatsForExistingStore:
+		metrics.loadBasedReplicaRebalancingMetrics.MissingStatsForExistingStore.Inc(1)
 		log.VEventf(ctx, 4, "missing QPS stats for s%d", eqClass.existing.StoreID)
 	case shouldRebalance:
+		metrics.loadBasedReplicaRebalancingMetrics.ShouldRebalance.Inc(1)
 		var bestStoreQPS float64
 		for _, store := range eqClass.candidateSL.stores {
 			if bestStore == store.StoreID {
@@ -375,7 +333,7 @@ func (o *qpsScorerOptions) shouldRebalanceBasedOnThresholds(
 	return declineReason == shouldRebalance
 }
 
-func (o *qpsScorerOptions) balanceScore(sl StoreList, sc roachpb.StoreCapacity) balanceStatus {
+func (o qpsScorerOptions) balanceScore(sl StoreList, sc roachpb.StoreCapacity) balanceStatus {
 	maxQPS := overfullQPSThreshold(o, sl.candidateQueriesPerSecond.mean)
 	minQPS := underfullQPSThreshold(o, sl.candidateQueriesPerSecond.mean)
 	curQPS := sc.QueriesPerSecond
@@ -390,7 +348,7 @@ func (o *qpsScorerOptions) balanceScore(sl StoreList, sc roachpb.StoreCapacity) 
 // rebalanceFromConvergesScore returns a score of -1 if the existing store in
 // eqClass needs to be rebalanced away in order to minimize the QPS delta
 // between the stores in the equivalence class `eqClass`.
-func (o *qpsScorerOptions) rebalanceFromConvergesScore(eqClass equivalenceClass) int {
+func (o qpsScorerOptions) rebalanceFromConvergesScore(eqClass equivalenceClass) int {
 	_, declineReason := o.getRebalanceTargetToMinimizeDelta(eqClass)
 	// If there are any rebalance opportunities that minimize the QPS delta in
 	// this equivalence class, we return a score of -1 to make the existing store
@@ -404,7 +362,7 @@ func (o *qpsScorerOptions) rebalanceFromConvergesScore(eqClass equivalenceClass)
 // rebalanceToConvergesScore returns a score of 1 if `candidate` needs to be
 // rebalanced to in order to minimize the QPS delta between the stores in the
 // equivalence class `eqClass`
-func (o *qpsScorerOptions) rebalanceToConvergesScore(
+func (o qpsScorerOptions) rebalanceToConvergesScore(
 	eqClass equivalenceClass, candidate roachpb.StoreDescriptor,
 ) int {
 	bestTarget, declineReason := o.getRebalanceTargetToMinimizeDelta(eqClass)
@@ -417,7 +375,7 @@ func (o *qpsScorerOptions) rebalanceToConvergesScore(
 // removalMaximallyConvergesScore returns a score of -1 `existing` is the
 // hottest store (based on QPS) among the stores inside
 // `removalCandidateStores`.
-func (o *qpsScorerOptions) removalMaximallyConvergesScore(
+func (o qpsScorerOptions) removalMaximallyConvergesScore(
 	removalCandStoreList StoreList, existing roachpb.StoreDescriptor,
 ) int {
 	maxQPS := float64(-1)
@@ -737,7 +695,7 @@ func rankedCandidateListForAllocation(
 	existingStoreLocalities map[roachpb.StoreID]roachpb.Locality,
 	isStoreValidForRoutineReplicaTransfer func(context.Context, roachpb.StoreID) bool,
 	allowMultipleReplsPerNode bool,
-	options *rangeCountScorerOptions,
+	options rangeCountScorerOptions,
 ) candidateList {
 	var candidates candidateList
 	existingReplTargets := roachpb.MakeReplicaSet(existingReplicas).ReplicationTargets()
@@ -1027,7 +985,7 @@ func bestStoreToMinimizeQPSDelta(
 	// the equivalence class.
 	mean := domainStoreList.candidateQueriesPerSecond.mean
 	overfullThreshold := overfullQPSThreshold(
-		&qpsScorerOptions{qpsRebalanceThreshold: rebalanceThreshold},
+		qpsScorerOptions{qpsRebalanceThreshold: rebalanceThreshold},
 		mean,
 	)
 	if existingQPS < overfullThreshold {
@@ -1106,6 +1064,7 @@ func rankedCandidateListForRebalancing(
 	existingStoreLocalities map[roachpb.StoreID]roachpb.Locality,
 	isStoreValidForRoutineReplicaTransfer func(context.Context, roachpb.StoreID) bool,
 	options scorerOptions,
+	metrics AllocatorMetrics,
 ) []rebalanceOptions {
 	// 1. Determine whether existing replicas are valid and/or necessary.
 	existingStores := make(map[roachpb.StoreID]candidate)
@@ -1262,7 +1221,11 @@ func rankedCandidateListForRebalancing(
 	var shouldRebalanceCheck bool
 	if !needRebalance {
 		for _, eqClass := range equivalenceClasses {
-			if options.shouldRebalanceBasedOnThresholds(ctx, eqClass) {
+			if options.shouldRebalanceBasedOnThresholds(
+				ctx,
+				eqClass,
+				metrics,
+			) {
 				shouldRebalanceCheck = true
 				break
 			}
@@ -1817,19 +1780,19 @@ const (
 	underfull     balanceStatus = 1
 )
 
-func overfullRangeThreshold(options *rangeCountScorerOptions, mean float64) float64 {
+func overfullRangeThreshold(options rangeCountScorerOptions, mean float64) float64 {
 	return mean + math.Max(mean*options.rangeRebalanceThreshold, minRangeRebalanceThreshold)
 }
 
-func underfullRangeThreshold(options *rangeCountScorerOptions, mean float64) float64 {
+func underfullRangeThreshold(options rangeCountScorerOptions, mean float64) float64 {
 	return mean - math.Max(mean*options.rangeRebalanceThreshold, minRangeRebalanceThreshold)
 }
 
-func overfullQPSThreshold(options *qpsScorerOptions, mean float64) float64 {
+func overfullQPSThreshold(options qpsScorerOptions, mean float64) float64 {
 	return mean + math.Max(mean*options.qpsRebalanceThreshold, minQPSThresholdDifference)
 }
 
-func underfullQPSThreshold(options *qpsScorerOptions, mean float64) float64 {
+func underfullQPSThreshold(options qpsScorerOptions, mean float64) float64 {
 	return mean - math.Max(mean*options.qpsRebalanceThreshold, minQPSThresholdDifference)
 }
 
