@@ -348,6 +348,17 @@ message DeleteRangeRequest {
   // Inline values cannot be deleted transactionally; a DeleteRange with
   // "inline" set to true will fail if it is executed within a transaction.
   bool inline = 4;
+  // If enabled, the range is deleted using an MVCC range tombstone, which is a
+  // cheap constant-time operation. This option cannot be used in a transaction,
+  // and it cannot be combined with Inline or ReturnKeys.
+  //
+  // The caller must check storage.CanUseExperimentalMVCCRangeTombstones()
+  // before enabling this parameter.
+  //
+  // This parameter is EXPERIMENTAL: range tombstones are under active
+  // development, and have severe limitations including being ignored by all
+  // KV and MVCC APIs and only being stored in memory.
+  bool use_experimental_range_tombstone = 5;
 }
 
 // A DeleteRangeResponse is the return value from the DeleteRange()
@@ -2641,15 +2652,24 @@ message RangeFeedSSTable {
   util.hlc.Timestamp write_ts = 3 [(gogoproto.nullable) = false, (gogoproto.customname) = "WriteTS"];
 }
 
+// RangeFeedDeleteRange is a variant of RangeFeedEvent that represents a
+// deletion of the specified key range at the given timestamp using an MVCC
+// range tombstone.
+message RangeFeedDeleteRange {
+  Span               span        = 1 [(gogoproto.nullable) = false];
+  util.hlc.Timestamp timestamp   = 2 [(gogoproto.nullable) = false];
+}
+
 // RangeFeedEvent is a union of all event types that may be returned on a
 // RangeFeed response stream.
 message RangeFeedEvent {
   option (gogoproto.onlyone) = true;
 
-  RangeFeedValue      val        = 1;
-  RangeFeedCheckpoint checkpoint = 2;
-  RangeFeedError      error      = 3;
-  RangeFeedSSTable    sst        = 4 [(gogoproto.customname) = "SST"];
+  RangeFeedValue       val        = 1;
+  RangeFeedCheckpoint  checkpoint = 2;
+  RangeFeedError       error      = 3;
+  RangeFeedSSTable     sst        = 4 [(gogoproto.customname) = "SST"];
+  RangeFeedDeleteRange del_range  = 5;
 }
 
 

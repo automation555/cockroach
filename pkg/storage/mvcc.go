@@ -20,10 +20,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -84,6 +86,19 @@ var rocksdbConcurrency = envutil.EnvOrDefaultInt(
 		return max
 	}())
 
+// CanUseExperimentalMVCCRangeTombstones returns true if MVCC range tombstones
+// are enabled. Callers must check this before using range tombstones.
+//
+// These are EXPERIMENTAL: range tombstones are under active
+// development, and have severe limitations including being ignored by all
+// KV and MVCC APIs and only being stored in memory.
+func CanUseExperimentalMVCCRangeTombstones(ctx context.Context, st *cluster.Settings) bool {
+	// TODO(erikgrinaker): Consider using a cluster setting rather than an
+	// environment variable once range tombstones are fully implemented.
+	return st.Version.IsActive(ctx, clusterversion.ExperimentalMVCCRangeTombstones) &&
+		envutil.EnvOrDefaultBool("COCKROACH_EXPERIMENTAL_MVCC_RANGE_TOMBSTONES", false)
+}
+
 // MakeValue returns the inline value.
 func MakeValue(meta enginepb.MVCCMetadata) roachpb.Value {
 	return roachpb.Value{RawBytes: meta.RawBytes}
@@ -96,6 +111,12 @@ func emptyKeyError() error {
 // MVCCKeyValue contains the raw bytes of the value for a key.
 type MVCCKeyValue struct {
 	Key   MVCCKey
+	Value []byte
+}
+
+// MVCCRangeKeyValue represents a ranged key/value pair.
+type MVCCRangeKeyValue struct {
+	Key   MVCCRangeKey
 	Value []byte
 }
 
@@ -2200,6 +2221,48 @@ func MVCCDeleteRange(
 		}
 	}
 	return keys, res.ResumeSpan, res.NumKeys, nil
+}
+
+// ExperimentalMVCCDeleteRangeUsingTombstone deletes the given MVCC keyspan at
+// the given timestamp using a range tombstone (rather than point tombstones).
+// This operation is non-transactional, but will check for existing intents and
+// return a WriteIntentError containing up to maxIntents intents.
+//
+// This function is EXPERIMENTAL. Range tombstones are not supported throughout
+// the MVCC API, and the on-disk format is unstable.
+//
+// TODO(erikgrinaker): Needs conflict handling, e.g. WriteTooOldError.
+// TODO(erikgrinaker): Needs MVCCStats handling.
+func ExperimentalMVCCDeleteRangeUsingTombstone(
+	ctx context.Context,
+	rw ReadWriter,
+	ms *enginepb.MVCCStats,
+	startKey, endKey roachpb.Key,
+	timestamp hlc.Timestamp,
+	maxIntents int64,
+) error {
+	if intents, err := ScanIntents(ctx, rw, startKey, endKey, maxIntents, 0); err != nil {
+		return err
+	} else if len(intents) > 0 {
+		return &roachpb.WriteIntentError{Intents: intents}
+	}
+	err := rw.ExperimentalPutMVCCRangeKey(MVCCRangeKey{
+		StartKey:  startKey,
+		EndKey:    endKey,
+		Timestamp: timestamp,
+	}, nil)
+	if err != nil {
+		return err
+	}
+
+	rw.LogLogicalOp(MVCCDeleteRangeOpType, MVCCLogicalOpDetails{
+		Safe:      true,
+		Key:       startKey,
+		EndKey:    endKey,
+		Timestamp: timestamp,
+	})
+
+	return nil
 }
 
 func recordIteratorStats(traceSpan *tracing.Span, iteratorStats IteratorStats) {

@@ -1225,6 +1225,11 @@ func (*DeleteRequest) flags() flag {
 }
 
 func (drr *DeleteRangeRequest) flags() flag {
+	// DeleteRangeRequest using MVCC range tombstones cannot be transactional,
+	// and thus cannot span ranges.
+	if drr.UseExperimentalRangeTombstone {
+		return isWrite | isRange | isAlone | appliesTSCache
+	}
 	// DeleteRangeRequest has different properties if the "inline" flag is set.
 	// This flag indicates that the request is deleting inline MVCC values,
 	// which cannot be deleted transactionally - inline DeleteRange will thus
@@ -1452,6 +1457,9 @@ func (e *RangeFeedEvent) ShallowCopy() *RangeFeedEvent {
 	case *RangeFeedSSTable:
 		cpySST := *t
 		cpy.MustSetValue(&cpySST)
+	case *RangeFeedDeleteRange:
+		cpyDelRange := *t
+		cpy.MustSetValue(&cpyDelRange)
 	case *RangeFeedError:
 		cpyErr := *t
 		cpy.MustSetValue(&cpyErr)
