@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -85,11 +86,6 @@ func (p *rangefeed) addEventsToBuffer(ctx context.Context) error {
 			switch t := e.GetValue().(type) {
 			case *roachpb.RangeFeedValue:
 				kv := roachpb.KeyValue{Key: t.Key, Value: t.Value}
-				if p.cfg.Knobs.OnRangeFeedValue != nil {
-					if err := p.cfg.Knobs.OnRangeFeedValue(kv); err != nil {
-						return err
-					}
-				}
 				var prevVal roachpb.Value
 				if p.cfg.WithDiff {
 					prevVal = t.PrevValue
@@ -105,19 +101,16 @@ func (p *rangefeed) addEventsToBuffer(ctx context.Context) error {
 					// RangeFeed happily forwards any closed timestamps it receives as
 					// soon as there are no outstanding intents under them.
 					// Changefeeds don't care about these at all, so throw them out.
+					log.Infof(ctx, "KVF: Skipping resolved ts %s@%s", t.Span, t.ResolvedTS)
 					continue
 				}
+				log.Infof(ctx, "KVF: Emitting resolved ts %s@%s", t.Span, t.ResolvedTS)
 				if err := p.memBuf.Add(
 					ctx,
 					kvevent.MakeResolvedEvent(t.Span, t.ResolvedTS, jobspb.ResolvedSpan_NONE),
 				); err != nil {
 					return err
 				}
-			case *roachpb.RangeFeedSSTable:
-				// For now, we just error on SST ingestion, since we currently don't
-				// expect SST ingestion into spans with active changefeeds.
-				return errors.Errorf("unexpected SST ingestion: %v", t)
-
 			default:
 				return errors.Errorf("unexpected RangeFeedEvent variant %v", t)
 			}
