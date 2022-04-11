@@ -234,34 +234,39 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 		if !t.Cols.SubsetOf(requiredCols) {
 			panic(errors.AssertionFailedf("lookup join with columns that are not required"))
 		}
-		if t.IsFirstJoinInPairedJoiner {
-			switch t.JoinType {
-			case opt.InnerJoinOp, opt.LeftJoinOp:
-			default:
+		if t.IsSecondJoinInPairedJoiner {
+			ij, ok := t.Input.(*InvertedJoinExpr)
+			if !ok {
 				panic(errors.AssertionFailedf(
-					"first join in paired joiner must be an inner or left join. found %s",
-					t.JoinType.String(),
-				))
+					"lookup paired-join is paired with %T instead of inverted join", t.Input))
 			}
-			if t.ContinuationCol == 0 {
-				panic(errors.AssertionFailedf("first join in paired joiner must have a continuation column"))
+			if !ij.IsFirstJoinInPairedJoiner {
+				panic(errors.AssertionFailedf(
+					"lookup paired-join is paired with inverted join that thinks it is unpaired"))
 			}
 		}
-		if t.IsSecondJoinInPairedJoiner {
-			switch firstJoin := t.Input.(type) {
-			case *InvertedJoinExpr:
-				if !firstJoin.IsFirstJoinInPairedJoiner {
-					panic(errors.AssertionFailedf(
-						"lookup paired-join is paired with inverted join that thinks it is unpaired"))
-				}
-			case *LookupJoinExpr:
-				if !firstJoin.IsFirstJoinInPairedJoiner {
-					panic(errors.AssertionFailedf(
-						"lookup paired-join is paired with lookup join that thinks it is unpaired"))
-				}
-			default:
-				panic(errors.AssertionFailedf("lookup paired-join is paired with %T", t.Input))
-			}
+		checkFilters(t.On)
+		var allowedFilterCols opt.ColSet
+		switch t.JoinType {
+		case opt.InnerJoinOp, opt.LeftJoinOp:
+			// Inner and left join ON conditions can only reference their output
+			// columns.
+			allowedFilterCols = t.Cols
+		case opt.AntiJoinOp, opt.SemiJoinOp:
+			// Semi and anti join ON conditions can reference their input's
+			// columns and index columns in the lookup index.
+			inputCols := t.Input.Relational().OutputCols
+			keyCols := m.Metadata().TableMeta(t.Table).IndexColumns(t.Index)
+			allowedFilterCols = inputCols.Union(keyCols)
+		default:
+			panic(errors.AssertionFailedf("lookup joins are not support for join type %s", t.JoinType))
+		}
+		if !t.On.OuterCols().SubsetOf(allowedFilterCols) {
+			panic(errors.AssertionFailedf(
+				"lookup on condition references unknown columns (known cols: %v, unknown: %v)",
+				log.Safe(allowedFilterCols),
+				log.Safe(t.On.OuterCols().Difference(allowedFilterCols)),
+			))
 		}
 
 	case *InsertExpr:
