@@ -41,7 +41,12 @@ type replicaInCircuitBreaker interface {
 }
 
 var defaultReplicaCircuitBreakerSlowReplicationThreshold = envutil.EnvOrDefaultDuration(
-	"COCKROACH_REPLICA_CIRCUIT_BREAKER_SLOW_REPLICATION_THRESHOLD", 0,
+	// Set a very conservative threshold here. In most production settings one may
+	// want something closer to 1m or even lower, but we need to gather experience
+	// with this first before lowering the default. Certainly nightly tests routinely
+	// trip the breakers at a 15s threshold, see:
+	// https://github.com/cockroachdb/cockroach/pull/76146#issuecomment-1034811922
+	"COCKROACH_REPLICA_CIRCUIT_BREAKER_SLOW_REPLICATION_THRESHOLD", 5*time.Minute,
 )
 
 var replicaCircuitBreakerSlowReplicationThreshold = settings.RegisterPublicDurationSettingWithExplicitUnit(
@@ -49,19 +54,7 @@ var replicaCircuitBreakerSlowReplicationThreshold = settings.RegisterPublicDurat
 	"kv.replica_circuit_breaker.slow_replication_threshold",
 	"duration after which slow proposals trip the per-Replica circuit breaker (zero duration disables breakers)",
 	defaultReplicaCircuitBreakerSlowReplicationThreshold,
-	func(d time.Duration) error {
-		// Setting the breaker duration too low could be very dangerous to cluster
-		// health (breaking things to the point where the cluster setting can't be
-		// changed), so enforce a sane minimum.
-		const min = 500 * time.Millisecond
-		if d == 0 {
-			return nil
-		}
-		if d <= min {
-			return errors.Errorf("must specify a minimum of %s", min)
-		}
-		return nil
-	},
+	settings.NonNegativeDuration,
 )
 
 // Telemetry counter to count number of trip events.
