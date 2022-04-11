@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql/driver"
+	"encoding/base64"
 	hx "encoding/hex"
 	"fmt"
 	"io"
@@ -23,21 +24,19 @@ import (
 	"strings"
 	"time"
 
-	apd "github.com/cockroachdb/apd/v3"
+	apd "github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
-	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/doctor"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -75,42 +74,26 @@ tables are queried either from a live cluster or from an unzipped debug.zip.
 `,
 }
 
-type doctorFn = func(
-	version *clusterversion.ClusterVersion,
-	descTable doctor.DescriptorTable,
-	namespaceTable doctor.NamespaceTable,
-	jobsTable doctor.JobsTable,
-	out io.Writer,
-) (err error)
-
-func makeZipDirCommand(fn doctorFn) *cobra.Command {
+func makeZipDirCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "zipdir <debug_zip_dir> [version]",
+		Use:   "zipdir <debug_zip_dir>",
 		Short: "run doctor tool on data from an unzipped debug.zip",
 		Long: `
 Run the doctor tool on system data from an unzipped debug.zip. This command
-requires the path of the unzipped 'debug' directory as its argument. A version
-can be optionally specified, which will be used enable / disable validation
-that may not exist on downlevel versions.
+requires the path of the unzipped 'debug' directory as its argument.
 `,
-		Args: cobra.RangeArgs(1, 2),
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			descs, ns, jobs, err := fromZipDir(args[0])
-			var version *clusterversion.ClusterVersion
-			if len(args) == 2 {
-				version = &clusterversion.ClusterVersion{
-					Version: roachpb.MustParseVersion(args[1]),
-				}
-			}
 			if err != nil {
 				return err
 			}
-			return fn(version, descs, ns, jobs, os.Stdout)
+			return runDoctor(cmd.Parent().Name(), descs, ns, jobs, os.Stdout)
 		},
 	}
 }
 
-func makeClusterCommand(fn doctorFn) *cobra.Command {
+func makeClusterCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "cluster --url=<cluster connection string>",
 		Short: "run doctor tool on live cockroach cluster",
@@ -118,7 +101,7 @@ func makeClusterCommand(fn doctorFn) *cobra.Command {
 Run the doctor tool system data from a live cluster specified by --url.
 `,
 		Args: cobra.NoArgs,
-		RunE: clierrorplus.MaybeDecorateError(
+		RunE: MaybeDecorateGRPCError(
 			func(cmd *cobra.Command, args []string) (resErr error) {
 				sqlConn, err := makeSQLClient("cockroach doctor", useSystemDb)
 				if err != nil {
@@ -129,7 +112,7 @@ Run the doctor tool system data from a live cluster specified by --url.
 				if err != nil {
 					return err
 				}
-				return fn(nil, descs, ns, jobs, os.Stdout)
+				return runDoctor(cmd.Parent().Name(), descs, ns, jobs, os.Stdout)
 			}),
 	}
 }
@@ -140,53 +123,48 @@ func deprecateCommand(cmd *cobra.Command) *cobra.Command {
 	return cmd
 }
 
-var doctorExamineClusterCmd = makeClusterCommand(runDoctorExamine)
-var doctorExamineZipDirCmd = makeZipDirCommand(runDoctorExamine)
-var doctorExamineFallbackClusterCmd = deprecateCommand(makeClusterCommand(runDoctorExamine))
-var doctorExamineFallbackZipDirCmd = deprecateCommand(makeZipDirCommand(runDoctorExamine))
-var doctorRecreateClusterCmd = makeClusterCommand(runDoctorRecreate)
-var doctorRecreateZipDirCmd = makeZipDirCommand(runDoctorRecreate)
+var doctorExamineClusterCmd = makeClusterCommand()
+var doctorExamineZipDirCmd = makeZipDirCommand()
+var doctorExamineFallbackClusterCmd = deprecateCommand(makeClusterCommand())
+var doctorExamineFallbackZipDirCmd = deprecateCommand(makeZipDirCommand())
+var doctorRecreateClusterCmd = makeClusterCommand()
+var doctorRecreateZipDirCmd = makeZipDirCommand()
 
-func runDoctorRecreate(
-	_ *clusterversion.ClusterVersion,
+func runDoctor(
+	commandName string,
 	descTable doctor.DescriptorTable,
 	namespaceTable doctor.NamespaceTable,
 	jobsTable doctor.JobsTable,
 	out io.Writer,
 ) (err error) {
-	return doctor.DumpSQL(out, descTable, namespaceTable)
-}
-
-func runDoctorExamine(
-	version *clusterversion.ClusterVersion,
-	descTable doctor.DescriptorTable,
-	namespaceTable doctor.NamespaceTable,
-	jobsTable doctor.JobsTable,
-	out io.Writer,
-) (err error) {
-	if version == nil {
-		version = &clusterversion.ClusterVersion{
-			Version: clusterversion.DoctorBinaryVersion,
+	switch commandName {
+	case "recreate":
+		err = doctor.DumpSQL(out, descTable, namespaceTable)
+	case "doctor":
+		fallthrough // Default to "examine".
+	case "examine":
+		var valid bool
+		valid, err = doctor.Examine(
+			context.Background(), descTable, namespaceTable, jobsTable, debugCtx.verbose, out)
+		if err == nil {
+			if !valid {
+				return clierror.NewError(errors.New("validation failed"),
+					exit.DoctorValidationFailed())
+			}
+			fmt.Fprintln(out, "No problems found!")
 		}
+	default:
+		log.Fatalf(context.Background(), "Unexpected doctor command %q.", commandName)
 	}
-	var valid bool
-	valid, err = doctor.Examine(
-		context.Background(),
-		*version,
-		descTable,
-		namespaceTable,
-		jobsTable,
-		debugCtx.verbose,
-		out)
-	if err != nil {
-		return err
+	if err == nil {
+		return nil
 	}
-	if !valid {
-		return clierror.NewError(errors.New("validation failed"),
-			exit.DoctorValidationFailed())
-	}
-	fmt.Fprintln(out, "No problems found!")
-	return nil
+	return clierror.NewError(
+		errors.Wrapf(err, "doctor command %q failed", commandName),
+		// Note: we are using "unspecified" here because the error
+		// return does not distinguish errors like connection errors
+		// etc, from errors during extraction.
+		exit.UnspecifiedError())
 }
 
 // fromCluster collects system table data from a live cluster.
@@ -198,18 +176,23 @@ func fromCluster(
 	jobsTable doctor.JobsTable,
 	retErr error,
 ) {
-	ctx := context.Background()
+	maybePrint := func(stmt string) string {
+		if debugCtx.verbose {
+			fmt.Println("querying " + stmt)
+		}
+		return stmt
+	}
 	if timeout != 0 {
-		if err := sqlConn.Exec(ctx,
-			`SET statement_timeout = $1`, timeout.String()); err != nil {
+		stmt := fmt.Sprintf(`SET statement_timeout = '%s'`, timeout)
+		if err := sqlConn.Exec(maybePrint(stmt), nil); err != nil {
 			return nil, nil, nil, err
 		}
 	}
 	stmt := `
 SELECT id, descriptor, crdb_internal_mvcc_timestamp AS mod_time_logical
 FROM system.descriptor ORDER BY id`
-	checkColumnExistsStmt := "SELECT crdb_internal_mvcc_timestamp FROM system.descriptor LIMIT 1"
-	_, err := sqlConn.QueryRow(ctx, checkColumnExistsStmt)
+	checkColumnExistsStmt := "SELECT crdb_internal_mvcc_timestamp"
+	_, err := sqlConn.Query(maybePrint(checkColumnExistsStmt), nil)
 	// On versions before 20.2, the system.descriptor won't have the builtin
 	// crdb_internal_mvcc_timestamp. If we can't find it, use NULL instead.
 	if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
@@ -218,12 +201,10 @@ FROM system.descriptor ORDER BY id`
 SELECT id, descriptor, NULL AS mod_time_logical
 FROM system.descriptor ORDER BY id`
 		}
-	} else if err != nil {
-		return nil, nil, nil, err
 	}
 	descTable = make([]doctor.DescriptorTableRow, 0)
 
-	if err := selectRowsMap(sqlConn, stmt, make([]driver.Value, 3), func(vals []driver.Value) error {
+	if err := selectRowsMap(sqlConn, maybePrint(stmt), make([]driver.Value, 3), func(vals []driver.Value) error {
 		var row doctor.DescriptorTableRow
 		if id, ok := vals[0].(int64); ok {
 			row.ID = id
@@ -258,8 +239,8 @@ FROM system.descriptor ORDER BY id`
 
 	stmt = `SELECT "parentID", "parentSchemaID", name, id FROM system.namespace`
 
-	checkColumnExistsStmt = `SELECT "parentSchemaID" FROM system.namespace LIMIT 1`
-	_, err = sqlConn.QueryRow(ctx, checkColumnExistsStmt)
+	checkColumnExistsStmt = `SELECT "parentSchemaID" FROM system.namespace LIMIT 0`
+	_, err = sqlConn.Query(maybePrint(checkColumnExistsStmt), nil)
 	// On versions before 20.1, table system.namespace does not have this column.
 	// In that case the ParentSchemaID for tables is 29 and for databases is 0.
 	if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
@@ -268,12 +249,10 @@ FROM system.descriptor ORDER BY id`
 SELECT "parentID", CASE WHEN "parentID" = 0 THEN 0 ELSE 29 END AS "parentSchemaID", name, id
 FROM system.namespace`
 		}
-	} else if err != nil {
-		return nil, nil, nil, err
 	}
 
 	namespaceTable = make([]doctor.NamespaceTableRow, 0)
-	if err := selectRowsMap(sqlConn, stmt, make([]driver.Value, 4), func(vals []driver.Value) error {
+	if err := selectRowsMap(sqlConn, maybePrint(stmt), make([]driver.Value, 4), func(vals []driver.Value) error {
 		var row doctor.NamespaceTableRow
 		if parentID, ok := vals[0].(int64); ok {
 			row.ParentID = descpb.ID(parentID)
@@ -304,7 +283,7 @@ FROM system.namespace`
 	stmt = `SELECT id, status, payload, progress FROM system.jobs`
 	jobsTable = make(doctor.JobsTable, 0)
 
-	if err := selectRowsMap(sqlConn, stmt, make([]driver.Value, 4), func(vals []driver.Value) error {
+	if err := selectRowsMap(sqlConn, maybePrint(stmt), make([]driver.Value, 4), func(vals []driver.Value) error {
 		md := jobs.JobMetadata{}
 		md.ID = jobspb.JobID(vals[0].(int64))
 		md.Status = jobs.Status(vals[1].(string))
@@ -342,19 +321,56 @@ func fromZipDir(
 	// To make parsing user functions code happy.
 	_ = builtins.AllBuiltinNames
 
+	maybePrint := func(fileName string) string {
+		path := path.Join(zipDirPath, fileName)
+		if debugCtx.verbose {
+			fmt.Println("reading " + path)
+		}
+		return path
+	}
+
+	descFile, err := os.Open(maybePrint("system.descriptor.txt"))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer descFile.Close()
 	descTable = make(doctor.DescriptorTable, 0)
-	if err := slurp(zipDirPath, "system.descriptor.txt", func(row string) error {
-		fields := strings.Fields(row)
-		last := len(fields) - 1
-		i, err := strconv.Atoi(fields[0])
+
+	if err := tableMap(descFile, func(cols colInfo, fields []string) error {
+		idCol := cols.get("id")
+		i, err := strconv.Atoi(fields[idCol])
 		if err != nil {
-			return errors.Wrapf(err, "failed to parse descriptor id %s", fields[0])
+			return errors.Errorf("failed to parse descriptor id %s: %v", fields[idCol], err)
 		}
 
-		descBytes, err := hx.DecodeString(fields[last])
-		if err != nil {
-			return errors.Wrapf(err, "failed to decode hex descriptor %d", i)
+		var descBytes []byte
+		if hexDescCol := cols.get("hex_descriptor"); hexDescCol >= 0 {
+			if hexDescCol == len(cols)-1 {
+				// TODO(knz): This assignment is for compatibility with
+				// previous-version zip files, which were capturing the
+				// descriptor data using the "escape" byte encoding, thereby
+				// introducing spaces and breaking the alignment between
+				// "fields" and "cols".
+				// Until we drop compatibility with those previous versions,
+				// we need to realign the column index with the field,
+				// with knowledge that the hex column was the last one.
+				// This logic can be dropped at some later release.
+				hexDescCol = len(fields) - 1
+			}
+			descBytes, err = hx.DecodeString(fields[hexDescCol])
+			if err != nil {
+				return errors.Errorf("failed to decode hex descriptor %d: %v", i, err)
+			}
+		} else {
+			// No hex_descriptor column: descriptor is encoded as base64.
+			// TODO(knz): Remove the other branch when only base64 columns are supported.
+			descCol := cols.get("descriptor")
+			descBytes, err = base64.StdEncoding.DecodeString(fields[descCol])
+			if err != nil {
+				return errors.Errorf("failed to decode base64 descriptor %d: %v", i, err)
+			}
 		}
+
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		descTable = append(descTable, doctor.DescriptorTableRow{ID: int64(i), DescBytes: descBytes, ModTime: ts})
 		return nil
@@ -365,36 +381,41 @@ func fromZipDir(
 	// Handle old debug zips where the namespace table dump is from namespace2.
 	namespaceFileName := "system.namespace2.txt"
 	if _, err := os.Stat(namespaceFileName); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			// Handle unexpected errors.
-			return nil, nil, nil, err
-		}
 		namespaceFileName = "system.namespace.txt"
 	}
 
+	namespaceFile, err := os.Open(maybePrint(namespaceFileName))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer namespaceFile.Close()
+
 	namespaceTable = make(doctor.NamespaceTable, 0)
-	if err := slurp(zipDirPath, namespaceFileName, func(row string) error {
-		fields := strings.Fields(row)
-		parID, err := strconv.Atoi(fields[0])
+	if err := tableMap(namespaceFile, func(cols colInfo, fields []string) error {
+		parentIDCol := cols.get("parentID")
+		scIDCol := cols.get("parentSchemaID")
+		idCol := cols.get("id")
+		parID, err := strconv.Atoi(fields[parentIDCol])
 		if err != nil {
-			return errors.Wrapf(err, "failed to parse parent id %s", fields[0])
+			return errors.Errorf("failed to parse parent id %s: %v", fields[parentIDCol], err)
 		}
-		parSchemaID, err := strconv.Atoi(fields[1])
+		parSchemaID, err := strconv.Atoi(fields[scIDCol])
 		if err != nil {
-			return errors.Wrapf(err, "failed to parse parent schema id %s", fields[1])
+			return errors.Errorf("failed to parse parent schema id %s: %v", fields[scIDCol], err)
 		}
-		id, err := strconv.Atoi(fields[3])
+		id, err := strconv.Atoi(fields[idCol])
 		if err != nil {
-			if fields[3] == "NULL" {
+			if fields[idCol] == "NULL" {
 				id = int(descpb.InvalidID)
 			} else {
-				return errors.Wrapf(err, "failed to parse id %s", fields[3])
+				return errors.Errorf("failed to parse id %s: %v", fields[idCol], err)
 			}
 		}
 
+		nameCol := cols.get("name")
 		namespaceTable = append(namespaceTable, doctor.NamespaceTableRow{
 			NameInfo: descpb.NameInfo{
-				ParentID: descpb.ID(parID), ParentSchemaID: descpb.ID(parSchemaID), Name: fields[2],
+				ParentID: descpb.ID(parID), ParentSchemaID: descpb.ID(parSchemaID), Name: fields[nameCol],
 			},
 			ID: int64(id),
 		})
@@ -403,31 +424,79 @@ func fromZipDir(
 		return nil, nil, nil, err
 	}
 
+	jobsFile, err := os.Open(maybePrint("system.jobs.txt"))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer jobsFile.Close()
 	jobsTable = make(doctor.JobsTable, 0)
-	if err := slurp(zipDirPath, "system.jobs.txt", func(row string) error {
-		fields := strings.Fields(row)
-		md := jobs.JobMetadata{}
-		md.Status = jobs.Status(fields[1])
 
-		id, err := strconv.Atoi(fields[0])
+	if err := tableMap(jobsFile, func(cols colInfo, fields []string) error {
+		idCol := cols.get("id")
+		statusCol := cols.get("status")
+		md := jobs.JobMetadata{}
+		md.Status = jobs.Status(fields[statusCol])
+
+		id, err := strconv.Atoi(fields[idCol])
 		if err != nil {
-			return errors.Wrapf(err, "failed to parse job id %s", fields[0])
+			return errors.Errorf("failed to parse job id %s: %v", fields[idCol], err)
 		}
 		md.ID = jobspb.JobID(id)
 
-		last := len(fields) - 1
-		payloadBytes, err := hx.DecodeString(fields[last-1])
-		if err != nil {
-			return errors.Wrapf(err, "job %d: failed to decode hex payload", id)
+		var payloadBytes []byte
+		if hexPayloadCol := cols.get("hex_payload"); hexPayloadCol >= 0 {
+			if hexPayloadCol == len(cols)-2 {
+				// TODO(knz): This assignment is for compatibility with
+				// previous-version zip files, which were capturing the
+				// descriptor data using the "escape" byte encoding, thereby
+				// introducing spaces and breaking the alignment between
+				// "fields" and "cols".
+				// Until we drop compatibility with those previous versions,
+				// we need to realign the column index with the field,
+				// with knowledge that the hex column was the next-to-last one.
+				// This logic can be dropped at some later release.
+				hexPayloadCol = len(fields) - 2
+			}
+			payloadBytes, err = hx.DecodeString(fields[hexPayloadCol])
+			if err != nil {
+				return errors.Errorf("job %d: failed to decode hex payload: %v", id, err)
+			}
+		} else {
+			// No hex_payload column: payload is encoded as base64.
+			// TODO(knz): Remove the other branch when only base64 columns are supported.
+			payloadCol := cols.get("payload")
+			payloadBytes, err = base64.StdEncoding.DecodeString(fields[payloadCol])
+			if err != nil {
+				return errors.Errorf("job %d: failed to decode base64 payload: %v", id, err)
+			}
 		}
+
 		md.Payload = &jobspb.Payload{}
 		if err := protoutil.Unmarshal(payloadBytes, md.Payload); err != nil {
 			return errors.Wrap(err, "failed unmarshalling job payload")
 		}
-		progressBytes, err := hx.DecodeString(fields[last])
-		if err != nil {
-			return errors.Wrapf(err, "job %d: failed to decode hex progress", id)
+
+		var progressBytes []byte
+		if hexProgressCol := cols.get("hex_progress"); hexProgressCol >= 0 {
+			if hexProgressCol == len(cols)-1 {
+				// TODO(knz): See comment above.
+				// This logic can be dropped at some later release.
+				hexProgressCol = len(fields) - 1
+			}
+			progressBytes, err = hx.DecodeString(fields[hexProgressCol])
+			if err != nil {
+				return errors.Errorf("job %d: failed to decode hex progress: %v", id, err)
+			}
+		} else {
+			// No hex_progress column: progress is encoded as base64.
+			// TODO(knz): Remove the other branch when only base64 columns are supported.
+			progressCol := cols.get("progress")
+			progressBytes, err = base64.StdEncoding.DecodeString(fields[progressCol])
+			if err != nil {
+				return errors.Errorf("job %d: failed to decode base64 payload: %v", id, err)
+			}
 		}
+
 		md.Progress = &jobspb.Progress{}
 		if err := protoutil.Unmarshal(progressBytes, md.Progress); err != nil {
 			return errors.Wrap(err, "failed unmarshalling job progress")
@@ -442,43 +511,44 @@ func fromZipDir(
 	return descTable, namespaceTable, jobsTable, nil
 }
 
-// slurp reads a file in zipDirPath and processes its contents.
-func slurp(zipDirPath string, fileName string, tableMapFn func(row string) error) error {
-	filePath := path.Join(zipDirPath, fileName)
+type colInfo map[string]int
 
-	// Check for existence of companion .err.txt file.
-	_, err := os.Stat(filePath + ".err.txt")
-	if err == nil {
-		// A .err.txt file exists.
-		fmt.Printf("WARNING: errors occurred during the production of %s, contents may be missing or incomplete.\n", fileName)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		// Handle unexpected errors.
-		return err
+func (c colInfo) get(colName string) int {
+	res, ok := c[colName]
+	if !ok {
+		return -1 // cause a panic: column does not exist.
 	}
+	return res
+}
 
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
+func toColInfo(colRow string) colInfo {
+	colNames := strings.Fields(colRow)
+	res := make(colInfo, len(colNames))
+	for i, colName := range colNames {
+		if _, ok := res[colName]; !ok {
+			// Only remember the first mention of this column's name.  This
+			// way, if the column is repeated, uses of the name will select
+			// the first occurrence.
+			res[colName] = i
+		}
 	}
-	defer f.Close()
-	if debugCtx.verbose {
-		fmt.Println("reading " + filePath)
-	}
-	return tableMap(f, tableMapFn)
+	return res
 }
 
 // tableMap applies `fn` to all rows in `in`.
-func tableMap(in io.Reader, fn func(string) error) error {
+func tableMap(in io.Reader, fn func(colInfo, []string) error) error {
 	firstLine := true
 	sc := bufio.NewScanner(in)
 	// Read lines up to 50 MB in size.
 	sc.Buffer(make([]byte, 64*1024), 50*1024*1024)
+	var cols colInfo
 	for sc.Scan() {
 		if firstLine {
+			cols = toColInfo(sc.Text())
 			firstLine = false
 			continue
 		}
-		if err := fn(sc.Text()); err != nil {
+		if err := fn(cols, strings.Fields(sc.Text())); err != nil {
 			return err
 		}
 	}
@@ -489,7 +559,7 @@ func tableMap(in io.Reader, fn func(string) error) error {
 func selectRowsMap(
 	conn clisqlclient.Conn, stmt string, vals []driver.Value, fn func([]driver.Value) error,
 ) error {
-	rows, err := conn.Query(context.Background(), stmt)
+	rows, err := conn.Query(stmt, nil)
 	if err != nil {
 		return errors.Wrapf(err, "query '%s'", stmt)
 	}
