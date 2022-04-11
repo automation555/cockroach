@@ -296,8 +296,8 @@ func FmtPlaceholderFormat(placeholderFn func(_ *FmtCtx, _ *Placeholder)) FmtCtxO
 	}
 }
 
-// FmtReformatTableNames modifies FmtCtx to to substitute the printing of table
-// naFmtParsable using the provided function.
+// FmtReformatTableNames modifies FmtCtx to to substitute the printing of
+// tableNameFmtParsable using the provided function.
 func FmtReformatTableNames(tableNameFmt func(*FmtCtx, *TableName)) FmtCtxOption {
 	return func(ctx *FmtCtx) {
 		ctx.tableNameFormatter = tableNameFmt
@@ -625,9 +625,12 @@ var fmtCtxPool = sync.Pool{
 // recommended for performance-sensitive paths.
 func (ctx *FmtCtx) Close() {
 	ctx.Buffer.Reset()
-	*ctx = FmtCtx{
-		Buffer: ctx.Buffer,
-	}
+	ctx.flags = 0
+	ctx.ann = nil
+	ctx.indexedVarFormat = nil
+	ctx.tableNameFormatter = nil
+	ctx.placeholderFormat = nil
+	ctx.dataConversionConfig = sessiondatapb.DataConversionConfig{}
 	fmtCtxPool.Put(ctx)
 }
 
