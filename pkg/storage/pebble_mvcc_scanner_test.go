@@ -17,7 +17,6 @@ import (
 	"math"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -68,7 +67,8 @@ func TestMVCCScanWithManyVersionsAndSeparatedIntents(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, k := range keys {
-		err = eng.PutIntent(context.Background(), k, metaBytes, uuid)
+		_, err = eng.PutIntent(
+			context.Background(), k, metaBytes, NoExistingIntent, true /* txnDidNotUpdateMeta */, uuid)
 		require.NoError(t, err)
 	}
 
@@ -92,8 +92,8 @@ func TestMVCCScanWithManyVersionsAndSeparatedIntents(t *testing.T) {
 		tombstones:       false,
 		failOnMoreRecent: false,
 	}
-	mvccScanner.init(nil /* txn */, uncertainty.Interval{}, 0 /* trackLastOffsets */)
-	_, _, _, err = mvccScanner.scan(context.Background())
+	mvccScanner.init(nil /* txn */, hlc.Timestamp{})
+	_, err = mvccScanner.scan(context.Background())
 	require.NoError(t, err)
 
 	kvData := mvccScanner.results.finish()
@@ -151,8 +151,8 @@ func TestMVCCScanWithLargeKeyValue(t *testing.T) {
 		end:     roachpb.Key("e"),
 		ts:      ts,
 	}
-	mvccScanner.init(nil /* txn */, uncertainty.Interval{}, 0 /* trackLastOffsets */)
-	_, _, _, err := mvccScanner.scan(context.Background())
+	mvccScanner.init(nil /* txn */, hlc.Timestamp{})
+	_, err := mvccScanner.scan(context.Background())
 	require.NoError(t, err)
 
 	kvData := mvccScanner.results.finish()
@@ -204,7 +204,6 @@ func TestMVCCScanWithMemoryAccounting(t *testing.T) {
 		ReadTimestamp:          ts1,
 		GlobalUncertaintyLimit: ts1,
 	}
-	ui1 := uncertainty.Interval{GlobalLimit: txn1.GlobalUncertaintyLimit}
 	val := roachpb.Value{RawBytes: bytes.Repeat([]byte("v"), 1000)}
 	func() {
 		batch := eng.NewBatch()
@@ -228,12 +227,10 @@ func TestMVCCScanWithMemoryAccounting(t *testing.T) {
 		end:    makeKey(nil, 11),
 		ts:     hlc.Timestamp{WallTime: 50},
 	}
-	scanner.init(&txn1, ui1, 0 /* trackLastOffsets */)
+	scanner.init(&txn1, hlc.Timestamp{})
 	cleanup := scannerWithAccount(ctx, st, scanner, 6000)
-	resumeSpan, resumeReason, resumeNextBytes, err := scanner.scan(ctx)
+	resumeSpan, err := scanner.scan(ctx)
 	require.Nil(t, resumeSpan)
-	require.Zero(t, resumeReason)
-	require.Zero(t, resumeNextBytes)
 	require.Nil(t, err)
 	cleanup()
 
@@ -244,12 +241,10 @@ func TestMVCCScanWithMemoryAccounting(t *testing.T) {
 		end:    makeKey(nil, 11),
 		ts:     hlc.Timestamp{WallTime: 50},
 	}
-	scanner.init(&txn1, ui1, 0 /* trackLastOffsets */)
+	scanner.init(&txn1, hlc.Timestamp{})
 	cleanup = scannerWithAccount(ctx, st, scanner, 6000)
-	resumeSpan, resumeReason, resumeNextBytes, err = scanner.scan(ctx)
+	resumeSpan, err = scanner.scan(ctx)
 	require.Nil(t, resumeSpan)
-	require.Zero(t, resumeReason)
-	require.Zero(t, resumeNextBytes)
 	require.NotNil(t, err)
 	require.Contains(t, err.Error(), "memory budget exceeded")
 	cleanup()
@@ -264,12 +259,10 @@ func TestMVCCScanWithMemoryAccounting(t *testing.T) {
 			ts:           hlc.Timestamp{WallTime: 50},
 			inconsistent: inconsistent,
 		}
-		scanner.init(nil, uncertainty.Interval{}, 0 /* trackLastOffsets */)
+		scanner.init(nil, hlc.Timestamp{})
 		cleanup = scannerWithAccount(ctx, st, scanner, 100)
-		resumeSpan, resumeReason, resumeNextBytes, err = scanner.scan(ctx)
+		resumeSpan, err = scanner.scan(ctx)
 		require.Nil(t, resumeSpan)
-		require.Zero(t, resumeReason)
-		require.Zero(t, resumeNextBytes)
 		require.NotNil(t, err)
 		require.Contains(t, err.Error(), "memory budget exceeded")
 		cleanup()

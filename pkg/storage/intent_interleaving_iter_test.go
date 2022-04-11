@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -109,7 +108,11 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 		return
 	}
 	rawMVCCKey := iter.UnsafeRawMVCCKey()
-	if engineKey.IsLockTableKey() {
+	if iter.IsCurIntentSeparated() {
+		if !engineKey.IsLockTableKey() {
+			fmt.Fprintf(b, "output: engineKey should be a lock table key: %s\n", engineKey)
+			return
+		}
 		ltKey, err := engineKey.ToLockTableKey()
 		if err != nil {
 			fmt.Fprintf(b, "output: engineKey should be a lock table key: %s\n", err.Error())
@@ -141,7 +144,6 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 			return
 		}
 	}
-
 	v1 := iter.UnsafeValue()
 	v2 := iter.Value()
 	if !bytes.Equal(v1, v2) {
@@ -191,10 +193,6 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 // - starting with Y is interpreted as a local key starting immediately after
 //   the lock table key space. This is for testing edge cases wrt bounds.
 // - a single Z is interpreted as LocalMax
-//
-// Note: This test still manually writes interleaved intents. Even though
-// we've removed codepaths to write interleaved intents, intentInterleavingIter
-// can still allows physically interleaved intents.
 func TestIntentInterleavingIter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -205,7 +203,7 @@ func TestIntentInterleavingIter(t *testing.T) {
 		}
 	}()
 
-	datadriven.Walk(t, testutils.TestDataPath(t, "intent_interleaving_iter"), func(t *testing.T, path string) {
+	datadriven.Walk(t, "testdata/intent_interleaving_iter", func(t *testing.T, path string) {
 		if (util.RaceEnabled && strings.HasSuffix(path, "race_off")) ||
 			(!util.RaceEnabled && strings.HasSuffix(path, "race")) {
 			return
