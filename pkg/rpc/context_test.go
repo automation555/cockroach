@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -270,6 +271,18 @@ func (*internalServer) GetSpanConfigs(
 	panic("unimplemented")
 }
 
+func (*internalServer) UpdateSystemSpanConfigs(
+	context.Context, *roachpb.UpdateSystemSpanConfigsRequest,
+) (*roachpb.UpdateSystemSpanConfigsResponse, error) {
+	panic("unimplemented")
+}
+
+func (*internalServer) GetSystemSpanConfigs(
+	context.Context, *roachpb.GetSystemSpanConfigsRequest,
+) (*roachpb.GetSystemSpanConfigsResponse, error) {
+	panic("unimplemented")
+}
+
 func (*internalServer) UpdateSpanConfigs(
 	context.Context, *roachpb.UpdateSpanConfigsRequest,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
@@ -301,11 +314,83 @@ func TestInternalServerAddress(t *testing.T) {
 	serverCtx.NodeID.Set(context.Background(), 1)
 
 	internal := &internalServer{}
-	serverCtx.SetLocalInternalServer(internal)
+	serverCtx.SetLocalInternalServer(internal, ServerInterceptorInfo{})
 
-	exp := internalClientAdapter{internal}
-	if ic := serverCtx.GetLocalInternalClientForAddr(serverCtx.Config.AdvertiseAddr, 1); ic != exp {
-		t.Fatalf("expected %+v, got %+v", exp, ic)
+	ic := serverCtx.GetLocalInternalClientForAddr(serverCtx.Config.AdvertiseAddr, 1)
+	lic, ok := ic.(*internalClientAdapter)
+	require.True(t, ok)
+	require.Equal(t, internal, lic.server)
+}
+
+// Test that the internalClientAdapter runs the gRPC server interceptors.
+func TestInternalClientAdapterRunsServerInterceptors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.Background())
+	stopper.SetTracer(tracing.NewTracer())
+
+	// Can't be zero because that'd be an empty offset.
+	clock := hlc.NewClock(timeutil.Unix(0, 1).UnixNano, time.Nanosecond)
+
+	serverCtx := newTestContext(uuid.MakeV4(), clock, stopper)
+	serverCtx.Config.Addr = "127.0.0.1:9999"
+	serverCtx.Config.AdvertiseAddr = "127.0.0.1:8888"
+	serverCtx.NodeID.Set(context.Background(), 1)
+
+	_, interceptors := NewServerEx(serverCtx)
+
+	// Pile on one more interceptor to make sure it's called.
+	interceptorCalled := false
+	interceptors.UnaryInterceptors = append(interceptors.UnaryInterceptors, func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+		interceptorCalled = true
+		return handler(ctx, req)
+	})
+
+	internal := &internalServer{}
+	serverCtx.SetLocalInternalServer(internal, interceptors)
+	ic := serverCtx.GetLocalInternalClientForAddr(serverCtx.Config.AdvertiseAddr, 1)
+	lic, ok := ic.(*internalClientAdapter)
+	require.True(t, ok)
+	require.Equal(t, internal, lic.server)
+
+	ba := &roachpb.BatchRequest{}
+	_, err := lic.Batch(ctx, ba)
+	require.NoError(t, err)
+	require.True(t, interceptorCalled)
+}
+
+func BenchmarkInternalClientAdapter(b *testing.B) {
+	ctx := context.Background()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.Background())
+
+	// Can't be zero because that'd be an empty offset.
+	clock := hlc.NewClock(timeutil.Unix(0, 1).UnixNano, time.Nanosecond)
+
+	serverCtx := newTestContext(uuid.MakeV4(), clock, stopper)
+	serverCtx.Config.Addr = "127.0.0.1:9999"
+	serverCtx.Config.AdvertiseAddr = "127.0.0.1:8888"
+	serverCtx.NodeID.Set(context.Background(), 1)
+
+	_, interceptors := NewServerEx(serverCtx)
+
+	internal := &internalServer{}
+	serverCtx.SetLocalInternalServer(internal, interceptors)
+	ic := serverCtx.GetLocalInternalClientForAddr(serverCtx.Config.AdvertiseAddr, 1)
+	lic, ok := ic.(*internalClientAdapter)
+	require.True(b, ok)
+	require.Equal(b, internal, lic.server)
+	ba := &roachpb.BatchRequest{}
+	_, err := lic.Batch(ctx, ba)
+	require.NoError(b, err)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = lic.Batch(ctx, ba)
 	}
 }
 
@@ -468,7 +553,7 @@ func TestHeartbeatHealth(t *testing.T) {
 	// Ensure that the local Addr returns ErrNotHeartbeated without having dialed
 	// a connection but the local AdvertiseAddr successfully returns no error when
 	// an internal server has been registered.
-	clientCtx.SetLocalInternalServer(&internalServer{})
+	clientCtx.SetLocalInternalServer(&internalServer{}, ServerInterceptorInfo{})
 
 	if err := clientCtx.TestingConnHealth(clientCtx.Config.Addr, clientNodeID); !errors.Is(err, ErrNotHeartbeated) {
 		t.Errorf("wanted ErrNotHeartbeated, not %v", err)
@@ -999,13 +1084,13 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 
 	for i, nodeCtx := range nodeCtxs {
 		if nodeOffset := nodeCtx.offset; nodeOffset > maxOffset {
-			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.MasterCtx); testutils.IsError(err, errOffsetGreaterThanMaxOffset) {
+			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.masterCtx); testutils.IsError(err, errOffsetGreaterThanMaxOffset) {
 				t.Logf("max offset: %s - node %d with excessive clock offset of %s returned expected error: %s", maxOffset, i, nodeOffset, err)
 			} else {
 				t.Errorf("max offset: %s - node %d with excessive clock offset of %s returned unexpected error: %v", maxOffset, i, nodeOffset, err)
 			}
 		} else {
-			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.MasterCtx); err != nil {
+			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.masterCtx); err != nil {
 				t.Errorf("max offset: %s - node %d with acceptable clock offset of %s returned unexpected error: %s", maxOffset, i, nodeOffset, err)
 			} else {
 				t.Logf("max offset: %s - node %d with acceptable clock offset of %s did not return an error, as expected", maxOffset, i, nodeOffset)
@@ -1889,13 +1974,13 @@ func TestRunHeartbeatSetsHeartbeatStateWhenExitingBeforeFirstHeartbeat(t *testin
 	redialChan := make(chan struct{})
 	close(redialChan)
 
-	c.grpcConn, _, c.dialErr = rpcCtx.grpcDialRaw(rpcCtx.MasterCtx, remoteAddr, serverNodeID, DefaultClass)
+	c.grpcConn, _, c.dialErr = rpcCtx.grpcDialRaw(rpcCtx.masterCtx, remoteAddr, serverNodeID, DefaultClass)
 	require.NoError(t, c.dialErr)
 	// It is possible that the redial chan being closed is not seen on the first
 	// pass through the loop.
 	// NB: we use rpcCtx.masterCtx and not just ctx because we need
 	// this to be cancelled when the RPC context is closed.
-	err = rpcCtx.runHeartbeat(rpcCtx.MasterCtx, c, "", redialChan)
+	err = rpcCtx.runHeartbeat(rpcCtx.masterCtx, c, "", redialChan)
 	require.EqualError(t, err, grpcutil.ErrCannotReuseClientConn.Error())
 	// Even when the runHeartbeat returns, we could have heartbeated successfully.
 	// If we did not, then we expect the `not yet heartbeated` error.
