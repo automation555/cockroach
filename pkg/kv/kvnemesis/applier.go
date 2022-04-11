@@ -55,7 +55,7 @@ func (a *Applier) Apply(ctx context.Context, step *Step) (trace tracing.Recordin
 	db, step.DBID = a.getNextDBRoundRobin()
 
 	step.Before = db.Clock().Now()
-	recCtx, collectAndFinish := tracing.ContextWithRecordingSpan(ctx, db.Tracer, "txn step")
+	recCtx, collectAndFinish := tracing.ContextWithRecordingSpan(ctx, db.Tracer(), "txn step")
 	defer func() {
 		step.After = db.Clock().Now()
 		if p := recover(); p != nil {
@@ -379,7 +379,7 @@ func updateZoneConfig(zone *zonepb.ZoneConfig, change ChangeZoneType) {
 }
 
 func updateZoneConfigInEnv(ctx context.Context, env *Env, change ChangeZoneType) error {
-	return env.UpdateZoneConfig(ctx, int(GeneratorDataTableID), func(zone *zonepb.ZoneConfig) {
+	return env.UpdateZoneConfig(ctx, GeneratorDataTableID, func(zone *zonepb.ZoneConfig) {
 		updateZoneConfig(zone, change)
 	})
 }

@@ -268,7 +268,7 @@ func startConnExecutor(
 		) (*roachpb.BatchResponse, *roachpb.Error) {
 			return nil, nil
 		})
-	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientContext(), factory, clock, stopper)
 	st := cluster.MakeTestingClusterSettings()
 	nodeID := base.TestingIDContainer
 	distSQLMetrics := execinfra.MakeDistSQLMetrics(time.Hour /* histogramWindow */)
@@ -278,7 +278,7 @@ func startConnExecutor(
 		return nil, nil, nil, nil, nil, err
 	}
 	defer tempEngine.Close()
-	ambientCtx := log.MakeTestingAmbientCtxWithNewTracer()
+	ambientCtx := log.MakeTestingAmbientContext()
 	cfg := &ExecutorConfig{
 		AmbientCtx:      ambientCtx,
 		Settings:        st,
@@ -292,7 +292,7 @@ func startConnExecutor(
 		},
 		Codec: keys.SystemSQLCodec,
 		DistSQLPlanner: NewDistSQLPlanner(
-			ctx, execinfra.Version, st, 1, /* sqlInstanceID */
+			ctx, execinfra.Version, st, roachpb.NodeID(1),
 			nil, /* rpcCtx */
 			distsql.NewServer(
 				ctx,
@@ -311,15 +311,14 @@ func startConnExecutor(
 			nil, /* nodeDescs */
 			gw,
 			stopper,
-			func(base.SQLInstanceID) bool { return true }, // everybody is available
+			func(roachpb.NodeID) bool { return true }, // everybody is available
 			nil, /* nodeDialer */
-			nil, /* podNodeDialer */
 		),
 		QueryCache:              querycache.New(0),
 		TestingKnobs:            ExecutorTestingKnobs{},
 		StmtDiagnosticsRecorder: stmtdiagnostics.NewRegistry(nil, nil, gw, st),
 		HistogramWindowInterval: base.DefaultHistogramWindowInterval(),
-		CollectionFactory:       descs.NewBareBonesCollectionFactory(st, keys.SystemSQLCodec),
+		CollectionFactory:       descs.NewCollectionFactory(st, nil, nil, nil),
 	}
 	pool := mon.NewUnlimitedMonitor(
 		context.Background(), "test", mon.MemoryResource,

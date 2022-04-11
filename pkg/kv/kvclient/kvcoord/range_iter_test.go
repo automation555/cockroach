@@ -46,7 +46,7 @@ func init() {
 		lastKey = key
 	}
 	alphaRangeDescriptorDB = mockRangeDescriptorDBForDescs(
-		append(alphaRangeDescriptors, TestMetaRangeDescriptor)...,
+		append(alphaRangeDescriptors, testMetaRangeDescriptor)...,
 	)
 }
 
@@ -61,7 +61,7 @@ func TestRangeIterForward(t *testing.T) {
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	g := makeGossip(t, stopper, rpcContext)
 	ds := NewDistSender(DistSenderConfig{
-		AmbientCtx:        log.MakeTestingAmbientCtxWithNewTracer(),
+		AmbientCtx:        log.MakeTestingAmbientContext(),
 		Clock:             clock,
 		NodeDescs:         g,
 		RPCContext:        rpcContext,
@@ -69,7 +69,7 @@ func TestRangeIterForward(t *testing.T) {
 		Settings:          cluster.MakeTestingClusterSettings(),
 	})
 
-	ri := MakeRangeIterator(ds)
+	ri := NewRangeIterator(ds)
 	i := 0
 	span := roachpb.RSpan{
 		Key:    testMetaEndKey,
@@ -97,7 +97,7 @@ func TestRangeIterSeekForward(t *testing.T) {
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	g := makeGossip(t, stopper, rpcContext)
 	ds := NewDistSender(DistSenderConfig{
-		AmbientCtx:        log.MakeTestingAmbientCtxWithNewTracer(),
+		AmbientCtx:        log.MakeTestingAmbientContext(),
 		Clock:             clock,
 		NodeDescs:         g,
 		RPCContext:        rpcContext,
@@ -105,7 +105,7 @@ func TestRangeIterSeekForward(t *testing.T) {
 		Settings:          cluster.MakeTestingClusterSettings(),
 	})
 
-	ri := MakeRangeIterator(ds)
+	ri := NewRangeIterator(ds)
 	i := 0
 	for ri.Seek(ctx, testMetaEndKey, Ascending); ri.Valid(); {
 		if !reflect.DeepEqual(alphaRangeDescriptors[i], *ri.Desc()) {
@@ -136,7 +136,7 @@ func TestRangeIterReverse(t *testing.T) {
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	g := makeGossip(t, stopper, rpcContext)
 	ds := NewDistSender(DistSenderConfig{
-		AmbientCtx:        log.MakeTestingAmbientCtxWithNewTracer(),
+		AmbientCtx:        log.MakeTestingAmbientContext(),
 		Clock:             clock,
 		NodeDescs:         g,
 		RPCContext:        rpcContext,
@@ -144,7 +144,7 @@ func TestRangeIterReverse(t *testing.T) {
 		Settings:          cluster.MakeTestingClusterSettings(),
 	})
 
-	ri := MakeRangeIterator(ds)
+	ri := NewRangeIterator(ds)
 	i := len(alphaRangeDescriptors) - 1
 	span := roachpb.RSpan{
 		Key:    testMetaEndKey,
@@ -172,7 +172,7 @@ func TestRangeIterSeekReverse(t *testing.T) {
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	g := makeGossip(t, stopper, rpcContext)
 	ds := NewDistSender(DistSenderConfig{
-		AmbientCtx:        log.MakeTestingAmbientCtxWithNewTracer(),
+		AmbientCtx:        log.MakeTestingAmbientContext(),
 		Clock:             clock,
 		NodeDescs:         g,
 		RPCContext:        rpcContext,
@@ -180,7 +180,7 @@ func TestRangeIterSeekReverse(t *testing.T) {
 		Settings:          cluster.MakeTestingClusterSettings(),
 	})
 
-	ri := MakeRangeIterator(ds)
+	ri := NewRangeIterator(ds)
 	i := len(alphaRangeDescriptors) - 1
 	for ri.Seek(ctx, roachpb.RKey([]byte{'z'}), Descending); ri.Valid(); {
 		if !reflect.DeepEqual(alphaRangeDescriptors[i], *ri.Desc()) {

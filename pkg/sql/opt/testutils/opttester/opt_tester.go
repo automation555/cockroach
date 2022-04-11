@@ -2137,7 +2137,6 @@ func (ot *OptTester) optimizeExpr(
 		return nil, err
 	}
 	if ot.Flags.PerturbCost != 0 {
-		o.Memo().ResetLogProps(&ot.evalCtx)
 		o.RecomputeCost()
 	}
 	return root, nil
@@ -2182,7 +2181,7 @@ func (ot *OptTester) ExecBuild(f exec.Factory, mem *memo.Memo, expr opt.Expr) (e
 		factory := kv.MockTxnSenderFactory{}
 		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 		stopper := stop.NewStopper()
-		db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
+		db := kv.NewDB(log.MakeTestingAmbientContext(), factory, clock, stopper)
 		ot.evalCtx.Txn = kv.NewTxn(context.Background(), db, 1)
 	}
 	bld := execbuilder.New(f, ot.makeOptimizer(), mem, ot.catalog, expr, &ot.evalCtx, true)

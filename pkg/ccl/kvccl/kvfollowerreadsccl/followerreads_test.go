@@ -113,7 +113,7 @@ func TestCanSendToFollower(t *testing.T) {
 	}
 	withServerSideBatchTimestamp := func(ba roachpb.BatchRequest, ts hlc.Timestamp) roachpb.BatchRequest {
 		ba = withBatchTimestamp(ba, ts)
-		ba.TimestampFromServerClock = (*hlc.ClockTimestamp)(&ts)
+		ba.TimestampFromServerClock = true
 		return ba
 	}
 
@@ -384,7 +384,7 @@ func TestOracle(t *testing.T) {
 	current := clock.Now()
 	future := clock.Now().Add(2*clock.MaxOffset().Nanoseconds(), 0)
 
-	c := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), kv.MockTxnSenderFactory{}, clock, stopper)
+	c := kv.NewDB(log.MakeTestingAmbientContext(), kv.MockTxnSenderFactory{}, clock, stopper)
 	staleTxn := kv.NewTxn(ctx, c, 0)
 	require.NoError(t, staleTxn.SetFixedTimestamp(ctx, stale))
 	currentTxn := kv.NewTxn(ctx, c, 0)

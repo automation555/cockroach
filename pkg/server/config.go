@@ -174,21 +174,13 @@ type BaseConfig struct {
 	// instantiate stores.
 	StorageEngine enginepb.EngineType
 
-	// SpanConfigsDisabled disables the use of the span configs infrastructure.
+	// Enables the use of the (experimental) span configs infrastructure.
 	//
-	// Environment Variable: COCKROACH_DISABLE_SPAN_CONFIGS
-	SpanConfigsDisabled bool
+	// Environment Variable: COCKROACH_EXPERIMENTAL_SPAN_CONFIGS
+	SpanConfigsEnabled bool
 
 	// TestingKnobs is used for internal test controls only.
 	TestingKnobs base.TestingKnobs
-
-	// EnableWebSessionAuthentication enables session-based authentication for
-	// the Admin API's HTTP endpoints.
-	EnableWebSessionAuthentication bool
-
-	// EnableDemoLoginEndpoint enables the HTTP GET endpoint for user logins,
-	// which a feature unique to the demo shell.
-	EnableDemoLoginEndpoint bool
 }
 
 // MakeBaseConfig returns a BaseConfig with default values.
@@ -200,19 +192,17 @@ func MakeBaseConfig(st *cluster.Settings, tr *tracing.Tracer) BaseConfig {
 		clusterID: &base.ClusterIDContainer{},
 		serverID:  &base.NodeIDContainer{},
 	}
-	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
 	baseCfg := BaseConfig{
-		Tracer:                         tr,
-		idProvider:                     idsProvider,
-		IDContainer:                    idsProvider.serverID,
-		ClusterIDContainer:             idsProvider.clusterID,
-		AmbientCtx:                     log.MakeServerAmbientContext(tr, idsProvider),
-		Config:                         new(base.Config),
-		Settings:                       st,
-		MaxOffset:                      MaxOffsetType(base.DefaultMaxClockOffset),
-		DefaultZoneConfig:              zonepb.DefaultZoneConfig(),
-		StorageEngine:                  storage.DefaultStorageEngine,
-		EnableWebSessionAuthentication: !disableWebLogin,
+		Tracer:             tr,
+		idProvider:         idsProvider,
+		IDContainer:        idsProvider.serverID,
+		ClusterIDContainer: idsProvider.clusterID,
+		AmbientCtx:         log.MakeServerAmbientContext(idsProvider),
+		Config:             new(base.Config),
+		Settings:           st,
+		MaxOffset:          MaxOffsetType(base.DefaultMaxClockOffset),
+		DefaultZoneConfig:  zonepb.DefaultZoneConfig(),
+		StorageEngine:      storage.DefaultStorageEngine,
 	}
 	// We use the tag "n" here for both KV nodes and SQL instances,
 	// using the knowledge that the value part of a SQL instance ID
@@ -331,18 +321,28 @@ type KVConfig struct {
 	// in a timely fashion, typically 30s after the server starts listening.
 	DelayedBootstrapFn func()
 
+	// EnableWebSessionAuthentication enables session-based authentication for
+	// the Admin API's HTTP endpoints.
+	EnableWebSessionAuthentication bool
+
+	// EnableDemoLoginEndpoint enables the HTTP GET endpoint for user logins,
+	// which a feature unique to the demo shell.
+	EnableDemoLoginEndpoint bool
+
 	enginesCreated bool
 }
 
 // MakeKVConfig returns a KVConfig with default values.
 func MakeKVConfig(storeSpec base.StoreSpec) KVConfig {
+	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
 	kvCfg := KVConfig{
-		DefaultSystemZoneConfig: zonepb.DefaultSystemZoneConfig(),
-		CacheSize:               DefaultCacheSize,
-		ScanInterval:            defaultScanInterval,
-		ScanMinIdleTime:         defaultScanMinIdleTime,
-		ScanMaxIdleTime:         defaultScanMaxIdleTime,
-		EventLogEnabled:         defaultEventLogEnabled,
+		DefaultSystemZoneConfig:        zonepb.DefaultSystemZoneConfig(),
+		CacheSize:                      DefaultCacheSize,
+		ScanInterval:                   defaultScanInterval,
+		ScanMinIdleTime:                defaultScanMinIdleTime,
+		ScanMaxIdleTime:                defaultScanMaxIdleTime,
+		EventLogEnabled:                defaultEventLogEnabled,
+		EnableWebSessionAuthentication: !disableWebLogin,
 		Stores: base.StoreSpecList{
 			Specs: []base.StoreSpec{storeSpec},
 		},
@@ -469,8 +469,8 @@ func (cfg *Config) String() string {
 	if cfg.Linearizable {
 		fmt.Fprintln(w, "linearizable\t", cfg.Linearizable)
 	}
-	if !cfg.SpanConfigsDisabled {
-		fmt.Fprintln(w, "span configs enabled\t", !cfg.SpanConfigsDisabled)
+	if cfg.SpanConfigsEnabled {
+		fmt.Fprintln(w, "span configs enabled\t", cfg.SpanConfigsEnabled)
 	}
 	_ = w.Flush()
 
@@ -707,7 +707,7 @@ func (cfg *Config) FilterGossipBootstrapAddresses(ctx context.Context) []util.Un
 
 // RequireWebSession indicates whether the server should require authentication
 // sessions when serving admin API requests.
-func (cfg *BaseConfig) RequireWebSession() bool {
+func (cfg *Config) RequireWebSession() bool {
 	return !cfg.Insecure && cfg.EnableWebSessionAuthentication
 }
 
@@ -715,7 +715,7 @@ func (cfg *BaseConfig) RequireWebSession() bool {
 // variable based. Note that this only happens when initializing a node and not
 // when NewContext is called.
 func (cfg *Config) readEnvironmentVariables() {
-	cfg.SpanConfigsDisabled = envutil.EnvOrDefaultBool("COCKROACH_DISABLE_SPAN_CONFIGS", cfg.SpanConfigsDisabled)
+	cfg.SpanConfigsEnabled = envutil.EnvOrDefaultBool("COCKROACH_EXPERIMENTAL_SPAN_CONFIGS", cfg.SpanConfigsEnabled)
 	cfg.Linearizable = envutil.EnvOrDefaultBool("COCKROACH_EXPERIMENTAL_LINEARIZABLE", cfg.Linearizable)
 	cfg.ScanInterval = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_INTERVAL", cfg.ScanInterval)
 	cfg.ScanMinIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MIN_IDLE_TIME", cfg.ScanMinIdleTime)

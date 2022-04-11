@@ -318,7 +318,8 @@ func TestAdminAPIDatabases(t *testing.T) {
 	ts := s.(*TestServer)
 
 	ac := ts.AmbientCtx()
-	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
+	ctx := ac.AnnotateCtx(context.Background())
+	ctx, span := s.Stopper().Tracer().EnsureChildSpan(ctx, "test")
 	defer span.Finish()
 
 	const testdb = "test"
@@ -656,7 +657,8 @@ func TestAdminAPITableDetails(t *testing.T) {
 			schemaName := "testschema"
 
 			ac := ts.AmbientCtx()
-			ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
+			ctx := ac.AnnotateCtx(context.Background())
+			ctx, span := s.Stopper().Tracer().EnsureChildSpan(ctx, "test")
 			defer span.Finish()
 
 			tableSchema := `nulls_allowed INT8,
@@ -673,7 +675,6 @@ func TestAdminAPITableDetails(t *testing.T) {
 				"CREATE USER app",
 				fmt.Sprintf("GRANT SELECT ON %s.%s TO readonly", escDBName, tblName),
 				fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, tblName),
-				fmt.Sprintf("CREATE STATISTICS test_stats FROM %s.%s", escDBName, tblName),
 			}
 			pgURL, cleanupGoDB := sqlutils.PGUrl(
 				t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(security.RootUser))
@@ -780,22 +781,6 @@ func TestAdminAPITableDetails(t *testing.T) {
 				}
 			}
 
-			// Verify statistics last updated.
-			{
-
-				showStatisticsForTableQuery := fmt.Sprintf("SELECT max(created) AS created FROM [SHOW STATISTICS FOR TABLE %s.%s]", escDBName, tblName)
-
-				row := db.QueryRow(showStatisticsForTableQuery)
-				var createdTs time.Time
-				if err := row.Scan(&createdTs); err != nil {
-					t.Fatal(err)
-				}
-
-				if a, e := resp.StatsLastCreatedAt, createdTs; reflect.DeepEqual(a, e) {
-					t.Fatalf("mismatched statistics creation timestamp; expected %s, got %s", e, a)
-				}
-			}
-
 			// Verify Descriptor ID.
 			tableID, err := ts.admin.queryTableID(ctx, security.RootUserName(), tc.dbName, tc.tblName)
 			if err != nil {
@@ -819,7 +804,8 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 
 	// Create database and table.
 	ac := ts.AmbientCtx()
-	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
+	ctx := ac.AnnotateCtx(context.Background())
+	ctx, span := s.Stopper().Tracer().EnsureChildSpan(ctx, "test")
 	defer span.Finish()
 	setupQueries := []string{
 		"CREATE DATABASE test",
@@ -1091,10 +1077,10 @@ func TestAdminAPISettings(t *testing.T) {
 	// Any bool that defaults to true will work here.
 	const settingKey = "sql.metrics.statement_details.enabled"
 	st := s.ClusterSettings()
-	allKeys := settings.Keys(settings.ForSystemTenant)
+	allKeys := settings.Keys()
 
 	checkSetting := func(t *testing.T, k string, v serverpb.SettingsResponse_Value) {
-		ref, ok := settings.Lookup(k, settings.LookupForReporting, settings.ForSystemTenant)
+		ref, ok := settings.Lookup(k, settings.LookupForReporting)
 		if !ok {
 			t.Fatalf("%s: not found after initial lookup", k)
 		}
@@ -1645,52 +1631,26 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 	retryRunningIds := []int64{7}
 	retryRevertingIds := []int64{8}
 
-	now := timeutil.Now()
-
-	encodedError := func(err error) *errors.EncodedError {
-		ee := errors.EncodeError(context.Background(), err)
-		return &ee
-	}
 	testJobs := []struct {
-		id           int64
-		status       jobs.Status
-		details      jobspb.Details
-		progress     jobspb.ProgressDetails
-		username     security.SQLUsername
-		numRuns      int64
-		lastRun      time.Time
-		executionLog []*jobspb.RetriableExecutionFailure
+		id       int64
+		status   jobs.Status
+		details  jobspb.Details
+		progress jobspb.ProgressDetails
+		username security.SQLUsername
+		numRuns  int64
+		lastRun  time.Time
 	}{
-		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}, security.RootUserName(), 1, time.Time{}, nil},
-		{2, jobs.StatusReverting, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 1, time.Time{}, nil},
-		{3, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 1, now.Add(10 * time.Minute), nil},
-		{4, jobs.StatusReverting, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 1, now.Add(10 * time.Minute), nil},
-		{5, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 2, time.Time{}, nil},
-		{6, jobs.StatusReverting, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 2, time.Time{}, nil},
-		{7, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 2, now.Add(10 * time.Minute), nil},
-		{8, jobs.StatusReverting, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 2, now.Add(10 * time.Minute), []*jobspb.RetriableExecutionFailure{
-			{
-				Status:               string(jobs.StatusRunning),
-				ExecutionStartMicros: now.Add(-time.Minute).UnixMicro(),
-				ExecutionEndMicros:   now.Add(-30 * time.Second).UnixMicro(),
-				InstanceID:           1,
-				Error:                encodedError(errors.New("foo")),
-			},
-			{
-				Status:               string(jobs.StatusReverting),
-				ExecutionStartMicros: now.Add(-29 * time.Minute).UnixMicro(),
-				ExecutionEndMicros:   now.Add(-time.Second).UnixMicro(),
-				InstanceID:           1,
-				TruncatedError:       "bar",
-			},
-		}},
+		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}, security.RootUserName(), 1, time.Time{}},
+		{2, jobs.StatusReverting, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 1, time.Time{}},
+		{3, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 1, timeutil.Now().Add(10 * time.Minute)},
+		{4, jobs.StatusReverting, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 1, timeutil.Now().Add(10 * time.Minute)},
+		{5, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 2, time.Time{}},
+		{6, jobs.StatusReverting, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 2, time.Time{}},
+		{7, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUserName(), 2, timeutil.Now().Add(10 * time.Minute)},
+		{8, jobs.StatusReverting, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUserName(), 2, timeutil.Now().Add(10 * time.Minute)},
 	}
 	for _, job := range testJobs {
-		payload := jobspb.Payload{
-			UsernameProto:                job.username.EncodeProto(),
-			Details:                      jobspb.WrapPayloadDetails(job.details),
-			RetriableExecutionFailureLog: job.executionLog,
-		}
+		payload := jobspb.Payload{UsernameProto: job.username.EncodeProto(), Details: jobspb.WrapPayloadDetails(job.details)}
 		payloadBytes, err := protoutil.Marshal(&payload)
 		if err != nil {
 			t.Fatal(err)
@@ -1717,6 +1677,7 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 			`INSERT INTO system.jobs (id, status, payload, progress, num_runs, last_run) VALUES ($1, $2, $3, $4, $5, $6)`,
 			job.id, job.status, payloadBytes, progressBytes, job.numRuns, job.lastRun,
 		)
+
 	}
 
 	var res serverpb.JobsResponse
@@ -1735,7 +1696,7 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 		{"retry-reverting", retryRevertingIds},
 	}
 	for _, expected := range expectedStatuses {
-		var jobsWithStatus []serverpb.JobResponse
+		jobsWithStatus := []serverpb.JobResponse{}
 		for _, job := range res.Jobs {
 			for _, expectedID := range expected.ids {
 				if job.ID == expectedID {
@@ -1744,34 +1705,8 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 			}
 		}
 
-		require.Len(t, jobsWithStatus, len(expected.ids))
 		for _, job := range jobsWithStatus {
 			assert.Equal(t, expected.status, job.Status)
-		}
-	}
-
-	// Trim down our result set to the jobs we injected.
-	resJobs := append([]serverpb.JobResponse(nil), res.Jobs...)
-	sort.Slice(resJobs, func(i, j int) bool {
-		return resJobs[i].ID < resJobs[j].ID
-	})
-	resJobs = resJobs[:len(testJobs)]
-
-	for i, job := range resJobs {
-		require.Equal(t, testJobs[i].id, job.ID)
-		require.Equal(t, len(testJobs[i].executionLog), len(job.ExecutionFailures))
-		for j, f := range job.ExecutionFailures {
-			tf := testJobs[i].executionLog[j]
-			require.Equal(t, tf.Status, f.Status)
-			require.Equal(t, tf.ExecutionStartMicros, f.Start.UnixMicro())
-			require.Equal(t, tf.ExecutionEndMicros, f.End.UnixMicro())
-			var expErr string
-			if tf.Error != nil {
-				expErr = errors.DecodeError(context.Background(), *tf.Error).Error()
-			} else {
-				expErr = tf.TruncatedError
-			}
-			require.Equal(t, expErr, f.Error)
 		}
 	}
 }
@@ -1833,8 +1768,8 @@ func TestAdminAPIQueryPlan(t *testing.T) {
 		query string
 		exp   []string
 	}{
-		{"SELECT sum(id) FROM api_test.t1", []string{"nodeNames\":[\"1\"]", "Columns: id"}},
-		{"SELECT sum(1) FROM api_test.t1 JOIN api_test.t2 on t1.id = t2.id", []string{"nodeNames\":[\"1\"]", "Columns: id"}},
+		{"SELECT sum(id) FROM api_test.t1", []string{"nodeNames\":[\"1\"]", "Out: @1"}},
+		{"SELECT sum(1) FROM api_test.t1 JOIN api_test.t2 on t1.id = t2.id", []string{"nodeNames\":[\"1\"]", "Out: @1"}},
 	}
 	for i, testCase := range testCases {
 		var res serverpb.QueryPlanResponse
@@ -2412,14 +2347,14 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			_, err := c.DataDistribution(ctx, &serverpb.DataDistributionRequest{})
 			return err
 		}},
-		{"Decommission", codes.Internal, func(c serverpb.AdminClient) error {
+		{"Decommission", codes.Unknown, func(c serverpb.AdminClient) error {
 			_, err := c.Decommission(ctx, &serverpb.DecommissionRequest{
 				NodeIDs:          []roachpb.NodeID{srv.NodeID(), decomSrv.NodeID()},
 				TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONED,
 			})
 			return err
 		}},
-		{"DecommissionStatus", codes.Internal, func(c serverpb.AdminClient) error {
+		{"DecommissionStatus", codes.Unknown, func(c serverpb.AdminClient) error {
 			_, err := c.DecommissionStatus(ctx, &serverpb.DecommissionStatusRequest{
 				NodeIDs: []roachpb.NodeID{srv.NodeID(), decomSrv.NodeID()},
 			})

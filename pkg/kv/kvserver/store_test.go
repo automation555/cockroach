@@ -57,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 	raft "go.etcd.io/etcd/raft/v3"
@@ -164,7 +165,6 @@ func createTestStoreWithoutStart(
 			Stopper:  stopper,
 			Settings: cfg.Settings,
 		})
-	stopper.SetTracer(cfg.AmbientCtx.Tracer)
 	server := rpc.NewServer(rpcContext) // never started
 
 	// Some tests inject their own Gossip and StorePool, via
@@ -188,16 +188,10 @@ func createTestStoreWithoutStart(
 	// and merge queues separately to cover event-driven splits and merges.
 	cfg.TestingKnobs.DisableSplitQueue = true
 	cfg.TestingKnobs.DisableMergeQueue = true
-	// When using the span configs infrastructure, we initialize dependencies
-	// (spanconfig.KVSubscriber) outside of pkg/kv/kvserver due to circular
-	// dependency reasons. Tests using this harness can probably be refactored
-	// to do the same (with some effort). That's unlikely to happen soon, so
-	// let's continue to use the system config span.
-	cfg.SpanConfigsDisabled = true
 	eng := storage.NewDefaultInMemForTesting()
 	stopper.AddCloser(eng)
 	require.Nil(t, cfg.Transport)
-	cfg.Transport = NewDummyRaftTransport(cfg.Settings, cfg.AmbientCtx.Tracer)
+	cfg.Transport = NewDummyRaftTransport(cfg.Settings, stopper.Tracer())
 	stores := NewStores(cfg.AmbientCtx, cfg.Clock)
 	nodeDesc := &roachpb.NodeDescriptor{NodeID: 1}
 
@@ -213,7 +207,7 @@ func createTestStoreWithoutStart(
 		NodeDialer:         nodedialer.New(rpcContext, gossip.AddressResolver(cfg.Gossip)), // TODO
 		FirstRangeProvider: rangeProv,
 		TestingKnobs: kvcoord.ClientTestingKnobs{
-			TransportFactory: kvcoord.SenderTransportFactory(cfg.AmbientCtx.Tracer, &storeSender),
+			TransportFactory: kvcoord.SenderTransportFactory(stopper.Tracer(), &storeSender),
 		},
 	})
 
@@ -298,7 +292,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 	stopper.AddCloser(eng)
 
 	seed := randutil.NewPseudoSeed()
-	// const seed = -1666367124291055473
+	//const seed = -1666367124291055473
 	t.Logf("seed is %d", seed)
 	rng := rand.New(rand.NewSource(seed))
 
@@ -467,7 +461,7 @@ func TestInitializeEngineErrors(t *testing.T) {
 	require.NoError(t, eng.PutUnversioned(roachpb.Key("foo"), []byte("bar")))
 
 	cfg := TestStoreConfig(nil)
-	cfg.Transport = NewDummyRaftTransport(cfg.Settings, cfg.AmbientCtx.Tracer)
+	cfg.Transport = NewDummyRaftTransport(cfg.Settings, stopper.Tracer())
 	store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 
 	// Can't init as haven't bootstrapped.
@@ -1133,6 +1127,22 @@ func TestStoreSendWithClockOffset(t *testing.T) {
 	}
 }
 
+// TestStoreSendBadRange passes a bad range.
+func TestStoreSendBadRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
+	args := getArgs([]byte("0"))
+	if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
+		RangeID: 2, // no such range
+	}, &args); pErr == nil {
+		t.Error("expected invalid range")
+	}
+}
+
 // splitTestRange splits a range. This does *not* fully emulate a real split
 // and should not be used in new tests. Tests that need splits should either live in
 // client_split_test.go and use AdminSplit instead of this function or use the
@@ -1152,8 +1162,7 @@ func splitTestRange(store *Store, splitKey roachpb.RKey, t *testing.T) *Replica 
 }
 
 // TestStoreSendOutOfRange passes a key not contained
-// within the range's key range and not present in any
-// adjacent ranges on a store.
+// within the range's key range.
 func TestStoreSendOutOfRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1162,25 +1171,24 @@ func TestStoreSendOutOfRange(t *testing.T) {
 	defer stopper.Stop(ctx)
 	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
 
-	// key 'a' isn't in Range 1000 and Range 1000 doesn't exist
-	// adjacent on this store
-	args := getArgs([]byte("a"))
+	splitKey := roachpb.RKey("b")
+	repl2 := splitTestRange(store, splitKey, t)
+
+	// Range 1 is from KeyMin to "b", so reading "b" from range 1 should
+	// fail because it's just after the range boundary.
+	args := getArgs([]byte("b"))
 	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
-		RangeID: 1000, // doesn't exist
+		RangeID: 1,
 	}, &args); err == nil {
 		t.Error("expected key to be out of range")
 	}
 
-	splitKey := roachpb.RKey("b")
-	repl2 := splitTestRange(store, splitKey, t)
-
-	// Range 2 is from "b" to KeyMax, so reading "a"-"c" from range 2 should
-	// fail because it's before the start of the range and straddles multiple ranges
-	// so it cannot be server side retried.
-	scanArgs := scanArgs([]byte("a"), []byte("c"))
+	// Range 2 is from "b" to KeyMax, so reading "a" from range 2 should
+	// fail because it's before the start of the range.
+	args = getArgs([]byte("a"))
 	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
 		RangeID: repl2.RangeID,
-	}, scanArgs); err == nil {
+	}, &args); err == nil {
 		t.Error("expected key to be out of range")
 	}
 }
@@ -1260,6 +1268,69 @@ func TestStoreReplicasByKey(t *testing.T) {
 	if store.LookupReplica(roachpb.RKeyMax) != nil {
 		t.Errorf("expected roachpb.KeyMax to not have an associated replica")
 	}
+}
+
+// TestStoreSetRangesMaxBytes creates a set of ranges via splitting
+// and then sets the config zone to a custom max bytes value to
+// verify the ranges' max bytes are updated appropriately.
+func TestStoreSetRangesMaxBytes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	cfg := TestStoreConfig(nil)
+	cfg.TestingKnobs.DisableMergeQueue = true
+	store := createTestStoreWithConfig(ctx, t, stopper,
+		testStoreOpts{
+			// This test was written before test stores could start with more than one
+			// range and was not adapted.
+			createSystemRanges: false,
+		},
+		&cfg)
+
+	baseID := keys.TestingUserDescID(0)
+	testData := []struct {
+		repl        *Replica
+		expMaxBytes int64
+	}{
+		{store.LookupReplica(roachpb.RKeyMin),
+			store.cfg.DefaultSpanConfig.RangeMaxBytes},
+		{splitTestRange(store, roachpb.RKey(keys.SystemSQLCodec.TablePrefix(baseID)), t),
+			1 << 20},
+		{splitTestRange(store, roachpb.RKey(keys.SystemSQLCodec.TablePrefix(baseID+1)), t),
+			store.cfg.DefaultSpanConfig.RangeMaxBytes},
+		{splitTestRange(store, roachpb.RKey(keys.SystemSQLCodec.TablePrefix(baseID+2)), t),
+			2 << 20},
+	}
+
+	// Set zone configs.
+	zoneA := zonepb.DefaultZoneConfig()
+	zoneA.RangeMaxBytes = proto.Int64(1 << 20)
+	config.TestingSetZoneConfig(config.SystemTenantObjectID(baseID), zoneA)
+
+	zoneB := zonepb.DefaultZoneConfig()
+	zoneB.RangeMaxBytes = proto.Int64(2 << 20)
+	config.TestingSetZoneConfig(config.SystemTenantObjectID(baseID+2), zoneB)
+
+	// Despite faking the zone configs, we still need to have a system config
+	// entry so that the store picks up the new zone configs. This new system
+	// config needs to be non-empty so that it differs from the initial value
+	// which triggers the system config callback to be run.
+	sysCfg := &config.SystemConfigEntries{}
+	sysCfg.Values = []roachpb.KeyValue{{Key: roachpb.Key("a")}}
+	if err := store.Gossip().AddInfoProto(gossip.KeySystemConfig, sysCfg, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	testutils.SucceedsSoon(t, func() error {
+		for _, test := range testData {
+			if mb := test.repl.GetMaxBytes(); mb != test.expMaxBytes {
+				return errors.Errorf("range max bytes values did not change to %d; got %d", test.expMaxBytes, mb)
+			}
+		}
+		return nil
+	})
 }
 
 // TestStoreResolveWriteIntent adds a write intent and then verifies
@@ -2091,7 +2162,6 @@ func TestStoreScanInconsistentResolvesIntents(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var intercept atomic.Value
-	intercept.Store(uuid.Nil)
 	cfg := TestStoreConfig(nil)
 	cfg.TestingKnobs.EvalKnobs.TestingEvalFilter =
 		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
@@ -2634,7 +2704,7 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 
 	uninitDesc := roachpb.RangeDescriptor{RangeID: repl1.Desc().RangeID}
 	if err := stateloader.WriteInitialRangeState(
-		ctx, s.Engine(), uninitDesc, 2, roachpb.Version{},
+		ctx, s.Engine(), uninitDesc, roachpb.Version{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -2656,9 +2726,9 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 	// Wrap the snapshot in a minimal header. The request will be dropped
 	// because the Raft log index and term are less than the hard state written
 	// above.
-	req := &kvserverpb.SnapshotRequest_Header{
+	req := &SnapshotRequest_Header{
 		State: kvserverpb.ReplicaState{Desc: repl1.Desc()},
-		RaftMessageRequest: kvserverpb.RaftMessageRequest{
+		RaftMessageRequest: RaftMessageRequest{
 			RangeID: 1,
 			ToReplica: roachpb.ReplicaDescriptor{
 				NodeID:    1,
@@ -2721,15 +2791,15 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 }
 
 type fakeSnapshotStream struct {
-	nextResp *kvserverpb.SnapshotResponse
+	nextResp *SnapshotResponse
 	nextErr  error
 }
 
-func (c fakeSnapshotStream) Recv() (*kvserverpb.SnapshotResponse, error) {
+func (c fakeSnapshotStream) Recv() (*SnapshotResponse, error) {
 	return c.nextResp, c.nextErr
 }
 
-func (c fakeSnapshotStream) Send(request *kvserverpb.SnapshotRequest) error {
+func (c fakeSnapshotStream) Send(request *SnapshotRequest) error {
 	return nil
 }
 
@@ -2758,7 +2828,7 @@ func TestSendSnapshotThrottling(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 
-	header := kvserverpb.SnapshotRequest_Header{
+	header := SnapshotRequest_Header{
 		State: kvserverpb.ReplicaState{
 			Desc: &roachpb.RangeDescriptor{RangeID: 1},
 		},
@@ -2782,8 +2852,8 @@ func TestSendSnapshotThrottling(t *testing.T) {
 	// Test that an errored snapshot causes a fail throttle.
 	{
 		sp := &fakeStorePool{}
-		resp := &kvserverpb.SnapshotResponse{
-			Status: kvserverpb.SnapshotResponse_ERROR,
+		resp := &SnapshotResponse{
+			Status: SnapshotResponse_ERROR,
 		}
 		c := fakeSnapshotStream{resp, nil}
 		err := sendSnapshot(ctx, st, c, sp, header, nil, newBatch, nil)
@@ -2807,7 +2877,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	tc.Start(ctx, t, stopper)
 	s := tc.store
 
-	cleanupNonEmpty1, err := s.reserveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
+	cleanupNonEmpty1, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
 		RangeSize: 1,
 	})
 	if err != nil {
@@ -2818,7 +2888,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	}
 
 	// Ensure we allow a concurrent empty snapshot.
-	cleanupEmpty, err := s.reserveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{})
+	cleanupEmpty, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2844,7 +2914,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 		}
 	}()
 
-	cleanupNonEmpty3, err := s.reserveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
+	cleanupNonEmpty3, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
 		RangeSize: 1,
 	})
 	if err != nil {
@@ -2887,7 +2957,7 @@ func TestReserveSnapshotFullnessLimit(t *testing.T) {
 	}
 
 	// A snapshot should be allowed.
-	cleanupAccepted, err := s.reserveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
+	cleanupAccepted, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
 		RangeSize: 1,
 	})
 	if err != nil {
@@ -2961,7 +3031,7 @@ func TestReserveSnapshotQueueTimeoutAvoidsStarvation(t *testing.T) {
 				if err := func() error {
 					snapCtx, cancel := context.WithTimeout(ctx, timeout)
 					defer cancel()
-					cleanup, err := s.reserveSnapshot(snapCtx, &kvserverpb.SnapshotRequest_Header{RangeSize: 1})
+					cleanup, err := s.reserveSnapshot(snapCtx, &SnapshotRequest_Header{RangeSize: 1})
 					if err != nil {
 						if errors.Is(err, context.DeadlineExceeded) {
 							return nil
@@ -3004,13 +3074,13 @@ func TestSnapshotRateLimit(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
-		priority      kvserverpb.SnapshotRequest_Priority
+		priority      SnapshotRequest_Priority
 		expectedLimit rate.Limit
 		expectedErr   string
 	}{
-		{kvserverpb.SnapshotRequest_UNKNOWN, 0, "unknown snapshot priority"},
-		{kvserverpb.SnapshotRequest_RECOVERY, 32 << 20, ""},
-		{kvserverpb.SnapshotRequest_REBALANCE, 32 << 20, ""},
+		{SnapshotRequest_UNKNOWN, 0, "unknown snapshot priority"},
+		{SnapshotRequest_RECOVERY, 32 << 20, ""},
+		{SnapshotRequest_REBALANCE, 32 << 20, ""},
 	}
 	for _, c := range testCases {
 		t.Run(c.priority.String(), func(t *testing.T) {
@@ -3045,32 +3115,6 @@ func TestManuallyEnqueueUninitializedReplica(t *testing.T) {
 	_, _, err := tc.store.ManuallyEnqueue(ctx, "replicaGC", repl, true)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "not enqueueing uninitialized replica")
-}
-
-// TestStoreGetOrCreateReplicaWritesRaftReplicaID tests that an uninitialized
-// replica has a RaftReplicaID.
-func TestStoreGetOrCreateReplicaWritesRaftReplicaID(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	tc := testContext{}
-	tc.Start(ctx, t, stopper)
-
-	repl, created, err := tc.store.getOrCreateReplica(
-		ctx, 42, 7, &roachpb.ReplicaDescriptor{
-			NodeID:    tc.store.NodeID(),
-			StoreID:   tc.store.StoreID(),
-			ReplicaID: 7,
-		})
-	require.NoError(t, err)
-	require.True(t, created)
-	replicaID, found, err := repl.mu.stateLoader.LoadRaftReplicaID(ctx, tc.store.Engine())
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Equal(t, roachpb.RaftReplicaID{ReplicaID: 7}, replicaID)
 }
 
 func BenchmarkStoreGetReplica(b *testing.B) {

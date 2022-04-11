@@ -172,8 +172,6 @@ var rangeDescriptorCacheSize = settings.RegisterIntSetting(
 	1e6,
 )
 
-// senderConcurrencyLimit controls the maximum number of asynchronous send
-// requests.
 var senderConcurrencyLimit = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"kv.dist_sender.concurrency_limit",
@@ -279,10 +277,9 @@ type DistSender struct {
 	firstRangeProvider FirstRangeProvider
 	transportFactory   TransportFactory
 	rpcContext         *rpc.Context
-	// nodeDialer allows RPC calls from the SQL layer to the KV layer.
-	nodeDialer      *nodedialer.Dialer
-	rpcRetryOptions retry.Options
-	asyncSenderSem  *quotapool.IntPool
+	nodeDialer         *nodedialer.Dialer
+	rpcRetryOptions    retry.Options
+	asyncSenderSem     *quotapool.IntPool
 	// clusterID is used to verify access to enterprise features.
 	// It is copied out of the rpcContext at construction time and used in
 	// testing.
@@ -335,8 +332,7 @@ type DistSenderConfig struct {
 	nodeDescriptor  *roachpb.NodeDescriptor
 	RPCRetryOptions *retry.Options
 	RPCContext      *rpc.Context
-	// NodeDialer is the dialer from the SQL layer to the KV layer.
-	NodeDialer *nodedialer.Dialer
+	NodeDialer      *nodedialer.Dialer
 
 	// One of the following two must be provided, but not both.
 	//
@@ -380,8 +376,8 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 	}
 
 	ds.AmbientContext = cfg.AmbientCtx
-	if ds.AmbientContext.Tracer == nil {
-		panic("no tracer set in AmbientCtx")
+	if cfg.RPCContext.Stopper.Tracer() == nil {
+		panic("no tracer set in stopper")
 	}
 
 	if cfg.nodeDescriptor != nil {
@@ -402,7 +398,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 		return rangeDescriptorCacheSize.Get(&ds.st.SV)
 	}
 	ds.rangeCache = rangecache.NewRangeCache(ds.st, rdb, getRangeDescCacheSize,
-		cfg.RPCContext.Stopper, cfg.AmbientCtx.Tracer)
+		cfg.RPCContext.Stopper)
 	if tf := cfg.TestingKnobs.TransportFactory; tf != nil {
 		ds.transportFactory = tf
 	} else {
@@ -460,6 +456,11 @@ func (ds *DistSender) DisableFirstRangeUpdates() {
 // transmission of partial batch requests across ranges.
 func (ds *DistSender) DisableParallelBatches() {
 	ds.disableParallelBatches = true
+}
+
+// Tracer returns this distributer sender's tracer.
+func (ds *DistSender) Tracer() *tracing.Tracer {
+	return ds.rpcContext.Stopper.Tracer()
 }
 
 // Metrics returns a struct which contains metrics related to the distributed
@@ -559,7 +560,7 @@ func (ds *DistSender) getNodeDescriptor() *roachpb.NodeDescriptor {
 // CountRanges returns the number of ranges that encompass the given key span.
 func (ds *DistSender) CountRanges(ctx context.Context, rs roachpb.RSpan) (int64, error) {
 	var count int64
-	ri := MakeRangeIterator(ds)
+	ri := NewRangeIterator(ds)
 	for ri.Seek(ctx, rs.Key, Ascending); ri.Valid(); ri.Next(ctx) {
 		count++
 		if !ri.NeedAnother(rs) {
@@ -736,7 +737,7 @@ func (ds *DistSender) Send(
 	}
 
 	ctx = ds.AnnotateCtx(ctx)
-	ctx, sp := tracing.EnsureChildSpan(ctx, ds.AmbientContext.Tracer, "dist sender send")
+	ctx, sp := tracing.EnsureChildSpan(ctx, ds.Tracer(), "dist sender send")
 	defer sp.Finish()
 
 	var reqInfo tenantcostmodel.RequestInfo
@@ -1169,7 +1170,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 		scanDir = Descending
 		seekKey = rs.EndKey
 	}
-	ri := MakeRangeIterator(ds)
+	ri := NewRangeIterator(ds)
 	ri.Seek(ctx, seekKey, scanDir)
 	if !ri.Valid() {
 		return nil, roachpb.NewError(ri.Error())
@@ -1189,13 +1190,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	// turning single-range queries into multi-range queries for no good
 	// reason.
 	if ba.IsUnsplittable() {
-		mismatch := roachpb.NewRangeKeyMismatchErrorWithCTPolicy(ctx,
-			rs.Key.AsRawKey(),
-			rs.EndKey.AsRawKey(),
-			ri.Desc(),
-			nil, /* lease */
-			ri.ClosedTimestampPolicy(),
-		)
+		mismatch := roachpb.NewRangeKeyMismatchError(ctx, rs.Key.AsRawKey(), rs.EndKey.AsRawKey(), ri.Desc(), nil /* lease */)
 		return nil, roachpb.NewError(mismatch)
 	}
 	// If there's no transaction and ba spans ranges, possibly re-run as part of
@@ -1328,7 +1323,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 			// one, and unless both descriptors are stale, the next descriptor's
 			// StartKey would move us to the beginning of the current range,
 			// resulting in a duplicate scan.
-			seekKey, err = Next(ba.Requests, ri.Desc().EndKey)
+			seekKey, err = next(ba.Requests, ri.Desc().EndKey)
 			nextRS.Key = seekKey
 		}
 		if err != nil {
@@ -1377,8 +1372,11 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 				// might be passed recursively to further divideAndSendBatchToRanges()
 				// calls.
 				if ba.MaxSpanRequestKeys > 0 {
+					if replyKeys > ba.MaxSpanRequestKeys {
+						log.Fatalf(ctx, "received %d results, limit was %d", replyKeys, ba.MaxSpanRequestKeys)
+					}
 					ba.MaxSpanRequestKeys -= replyKeys
-					if ba.MaxSpanRequestKeys <= 0 {
+					if ba.MaxSpanRequestKeys == 0 {
 						couldHaveSkippedResponses = true
 						resumeReason = roachpb.RESUME_KEY_LIMIT
 						return
@@ -1516,7 +1514,7 @@ func (ds *DistSender) sendPartialBatch(
 		if err != nil {
 			return response{pErr: roachpb.NewError(err)}
 		}
-		ba.Requests, positions, err = Truncate(ba.Requests, rs)
+		ba.Requests, positions, err = truncate(ba.Requests, rs)
 		if len(positions) == 0 && err == nil {
 			// This shouldn't happen in the wild, but some tests exercise it.
 			return response{
@@ -1744,100 +1742,56 @@ func fillSkippedResponses(
 		scratchBA.Requests[0].MustSetInner(req)
 		br.Responses[i] = scratchBA.CreateReply().Responses[0]
 	}
-
-	// Set or correct the ResumeSpan as necessary.
+	// Set the ResumeSpan for future batch requests.
 	isReverse := ba.IsReverse()
 	for i, resp := range br.Responses {
 		req := ba.Requests[i].GetInner()
+		if !roachpb.IsRange(req) {
+			continue
+		}
 		hdr := resp.GetInner().Header()
-		maybeSetResumeSpan(req, &hdr, nextKey, isReverse)
+		origSpan := req.Header().Span()
+		if isReverse {
+			if hdr.ResumeSpan != nil {
+				// The ResumeSpan.Key might be set to the StartKey of a range;
+				// correctly set it to the Key of the original request span.
+				hdr.ResumeSpan.Key = origSpan.Key
+			} else if roachpb.RKey(origSpan.Key).Less(nextKey) {
+				// Some keys have yet to be processed.
+				hdr.ResumeSpan = new(roachpb.Span)
+				*hdr.ResumeSpan = origSpan
+				if nextKey.Less(roachpb.RKey(origSpan.EndKey)) {
+					// The original span has been partially processed.
+					hdr.ResumeSpan.EndKey = nextKey.AsRawKey()
+				}
+			}
+		} else {
+			if hdr.ResumeSpan != nil {
+				// The ResumeSpan.EndKey might be set to the EndKey of a range because
+				// that's what a store will set it to when the limit is reached; it
+				// doesn't know any better). In that case, we correct it to the EndKey
+				// of the original request span. Note that this doesn't touch
+				// ResumeSpan.Key, which is really the important part of the ResumeSpan.
+				hdr.ResumeSpan.EndKey = origSpan.EndKey
+			} else {
+				// The request might have been fully satisfied, in which case it doesn't
+				// need a ResumeSpan, or it might not have. Figure out if we're in the
+				// latter case.
+				if nextKey.Less(roachpb.RKey(origSpan.EndKey)) {
+					// Some keys have yet to be processed.
+					hdr.ResumeSpan = new(roachpb.Span)
+					*hdr.ResumeSpan = origSpan
+					if roachpb.RKey(origSpan.Key).Less(nextKey) {
+						// The original span has been partially processed.
+						hdr.ResumeSpan.Key = nextKey.AsRawKey()
+					}
+				}
+			}
+		}
 		if hdr.ResumeSpan != nil {
 			hdr.ResumeReason = resumeReason
 		}
 		br.Responses[i].GetInner().SetHeader(hdr)
-	}
-}
-
-// maybeSetResumeSpan sets or corrects the ResumeSpan in the response header, if
-// necessary.
-//
-// nextKey is the first key that was not processed.
-func maybeSetResumeSpan(
-	req roachpb.Request, hdr *roachpb.ResponseHeader, nextKey roachpb.RKey, isReverse bool,
-) {
-	if _, ok := req.(*roachpb.GetRequest); ok {
-		// This is a Get request. There are three possibilities:
-		//
-		//  1. The request was completed. In this case we don't want a ResumeSpan.
-		//
-		//  2. The request was not completed but it was part of a request that made
-		//     it to a kvserver (i.e. it was part of the last range we operated on).
-		//     In this case the ResumeSpan should be set by the kvserver and we can
-		//     leave it alone.
-		//
-		//  3. The request was not completed and was not sent to a kvserver (it was
-		//     beyond the last range we operated on). In this case we need to set
-		//     the ResumeSpan here.
-		if hdr.ResumeSpan != nil {
-			// Case 2.
-			return
-		}
-		key := req.Header().Span().Key
-		if isReverse {
-			if !nextKey.Less(roachpb.RKey(key)) {
-				// key <= nextKey, so this request was not completed (case 3).
-				hdr.ResumeSpan = &roachpb.Span{Key: key}
-			}
-		} else {
-			if !roachpb.RKey(key).Less(nextKey) {
-				// key >= nextKey, so this request was not completed (case 3).
-				hdr.ResumeSpan = &roachpb.Span{Key: key}
-			}
-		}
-		return
-	}
-
-	if !roachpb.IsRange(req) {
-		return
-	}
-
-	origSpan := req.Header().Span()
-	if isReverse {
-		if hdr.ResumeSpan != nil {
-			// The ResumeSpan.Key might be set to the StartKey of a range;
-			// correctly set it to the Key of the original request span.
-			hdr.ResumeSpan.Key = origSpan.Key
-		} else if roachpb.RKey(origSpan.Key).Less(nextKey) {
-			// Some keys have yet to be processed.
-			hdr.ResumeSpan = new(roachpb.Span)
-			*hdr.ResumeSpan = origSpan
-			if nextKey.Less(roachpb.RKey(origSpan.EndKey)) {
-				// The original span has been partially processed.
-				hdr.ResumeSpan.EndKey = nextKey.AsRawKey()
-			}
-		}
-	} else {
-		if hdr.ResumeSpan != nil {
-			// The ResumeSpan.EndKey might be set to the EndKey of a range because
-			// that's what a store will set it to when the limit is reached; it
-			// doesn't know any better). In that case, we correct it to the EndKey
-			// of the original request span. Note that this doesn't touch
-			// ResumeSpan.Key, which is really the important part of the ResumeSpan.
-			hdr.ResumeSpan.EndKey = origSpan.EndKey
-		} else {
-			// The request might have been fully satisfied, in which case it doesn't
-			// need a ResumeSpan, or it might not have. Figure out if we're in the
-			// latter case.
-			if nextKey.Less(roachpb.RKey(origSpan.EndKey)) {
-				// Some keys have yet to be processed.
-				hdr.ResumeSpan = new(roachpb.Span)
-				*hdr.ResumeSpan = origSpan
-				if roachpb.RKey(origSpan.Key).Less(nextKey) {
-					// The original span has been partially processed.
-					hdr.ResumeSpan.Key = nextKey.AsRawKey()
-				}
-			}
-		}
 	}
 }
 
@@ -2154,10 +2108,10 @@ func (ds *DistSender) sendToReplicas(
 
 					var updatedLeaseholder bool
 					if tErr.Lease != nil {
-						updatedLeaseholder = routing.UpdateLease(ctx, tErr.Lease, tErr.DescriptorGeneration)
+						updatedLeaseholder = routing.UpdateLease(ctx, tErr.Lease)
 					} else if tErr.LeaseHolder != nil {
 						// tErr.LeaseHolder might be set when tErr.Lease isn't.
-						routing.UpdateLeaseholder(ctx, *tErr.LeaseHolder, tErr.DescriptorGeneration)
+						routing.UpdateLeaseholder(ctx, *tErr.LeaseHolder)
 						updatedLeaseholder = true
 					}
 					// Move the new leaseholder to the head of the queue for the next
@@ -2293,11 +2247,6 @@ type sendError struct {
 // newSendError creates a sendError.
 func newSendError(msg string) error {
 	return sendError{message: msg}
-}
-
-// TestNewSendError creates a new sendError for the purpose of unit tests
-func TestNewSendError(msg string) error {
-	return newSendError(msg)
 }
 
 func (s sendError) Error() string {

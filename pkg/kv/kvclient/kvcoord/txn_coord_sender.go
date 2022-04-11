@@ -486,7 +486,8 @@ func (tc *TxnCoordSender) Send(
 		return nil, tc.finalizeNonLockingTxnLocked(ctx, ba)
 	}
 
-	ctx, sp := tc.AnnotateCtxWithSpan(ctx, OpTxnCoordSender)
+	ctx = tc.AnnotateCtx(ctx)
+	ctx, sp := tc.stopper.Tracer().EnsureChildSpan(ctx, OpTxnCoordSender)
 	defer sp.Finish()
 
 	// Associate the txnID with the trace.
@@ -1169,19 +1170,19 @@ func (tc *TxnCoordSender) Active() bool {
 // GetLeafTxnInputState is part of the client.TxnSender interface.
 func (tc *TxnCoordSender) GetLeafTxnInputState(
 	ctx context.Context, opt kv.TxnStatusOpt,
-) (*roachpb.LeafTxnInputState, error) {
-	tis := new(roachpb.LeafTxnInputState)
+) (roachpb.LeafTxnInputState, error) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
 	if err := tc.checkTxnStatusLocked(ctx, opt); err != nil {
-		return nil, err
+		return roachpb.LeafTxnInputState{}, err
 	}
 
 	// Copy mutable state so access is safe for the caller.
+	var tis roachpb.LeafTxnInputState
 	tis.Txn = tc.mu.txn
 	for _, reqInt := range tc.interceptorStack {
-		reqInt.populateLeafInputState(tis)
+		reqInt.populateLeafInputState(&tis)
 	}
 
 	// Also mark the TxnCoordSender as "active".  This prevents changing
@@ -1196,14 +1197,15 @@ func (tc *TxnCoordSender) GetLeafTxnInputState(
 // GetLeafTxnFinalState is part of the client.TxnSender interface.
 func (tc *TxnCoordSender) GetLeafTxnFinalState(
 	ctx context.Context, opt kv.TxnStatusOpt,
-) (*roachpb.LeafTxnFinalState, error) {
-	tfs := new(roachpb.LeafTxnFinalState)
+) (roachpb.LeafTxnFinalState, error) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
 	if err := tc.checkTxnStatusLocked(ctx, opt); err != nil {
-		return nil, err
+		return roachpb.LeafTxnFinalState{}, err
 	}
+
+	var tfs roachpb.LeafTxnFinalState
 
 	// For compatibility with pre-20.1 nodes: populate the command
 	// count.
@@ -1216,7 +1218,7 @@ func (tc *TxnCoordSender) GetLeafTxnFinalState(
 	// Copy mutable state so access is safe for the caller.
 	tfs.Txn = tc.mu.txn
 	for _, reqInt := range tc.interceptorStack {
-		reqInt.populateLeafFinalState(tfs)
+		reqInt.populateLeafFinalState(&tfs)
 	}
 
 	return tfs, nil
