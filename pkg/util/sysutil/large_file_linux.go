@@ -8,7 +8,6 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-//go:build linux
 // +build linux
 
 package sysutil
@@ -30,7 +29,7 @@ import (
 // On other platforms, it naively writes the specified number of bytes, which
 // can take a long time.
 func ResizeLargeFile(path string, bytes int64) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0666)
+	f, err := OpenFile(path, os.O_WRONLY|os.O_CREATE, 0666)
 	if err != nil {
 		return err
 	}
