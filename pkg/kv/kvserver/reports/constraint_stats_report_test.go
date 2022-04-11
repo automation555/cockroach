@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -341,7 +340,7 @@ type partition struct {
 	zone *zone
 }
 
-func (p partition) toPartitionDescriptor() catpb.PartitioningDescriptor_Range {
+func (p partition) toPartitionDescriptor() descpb.PartitioningDescriptor_Range {
 	var startKey roachpb.Key
 	for _, val := range p.start {
 		startKey = encoding.EncodeIntValue(startKey, encoding.NoColumnID, int64(val))
@@ -350,7 +349,7 @@ func (p partition) toPartitionDescriptor() catpb.PartitioningDescriptor_Range {
 	for _, val := range p.end {
 		endKey = encoding.EncodeIntValue(endKey, encoding.NoColumnID, int64(val))
 	}
-	return catpb.PartitioningDescriptor_Range{
+	return descpb.PartitioningDescriptor_Range{
 		Name:          p.name,
 		FromInclusive: startKey,
 		ToExclusive:   endKey,
@@ -1112,7 +1111,7 @@ func (b *systemConfigBuilder) addZoneInner(objectName string, id int, cfg zonepb
 		panic(err)
 	}
 	b.kv = append(b.kv, roachpb.KeyValue{Key: k, Value: v})
-	return b.addZoneToObjectMapping(MakeZoneKey(config.SystemTenantObjectID(id), NoSubzone), objectName)
+	return b.addZoneToObjectMapping(MakeZoneKey(config.ObjectID(id), NoSubzone), objectName)
 }
 
 func (b *systemConfigBuilder) addDatabaseZone(name string, id int, cfg zonepb.ZoneConfig) error {
@@ -1139,7 +1138,7 @@ func (b *systemConfigBuilder) addTableZone(t descpb.TableDescriptor, cfg zonepb.
 			object = fmt.Sprintf("%s.%s", idx, subzone.PartitionName)
 		}
 		if err := b.addZoneToObjectMapping(
-			MakeZoneKey(config.SystemTenantObjectID(t.ID), base.SubzoneIDFromIndex(i)), object,
+			MakeZoneKey(config.ObjectID(t.ID), base.SubzoneIDFromIndex(i)), object,
 		); err != nil {
 			return err
 		}

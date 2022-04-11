@@ -693,7 +693,7 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	// Check our config.
 	var sysCfg *config.SystemConfig
 	testutils.SucceedsSoon(t, func() error {
-		sysCfg = s.cfg.Gossip.GetSystemConfig()
+		sysCfg = s.cfg.Gossip.DeprecatedGetSystemConfig()
 		if sysCfg == nil {
 			return errors.New("system config not yet present")
 		}
@@ -732,7 +732,7 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	// which means keys.MaxReservedDescID+1.
 	zoneConfig := zonepb.DefaultZoneConfig()
 	zoneConfig.RangeMaxBytes = proto.Int64(1 << 20)
-	config.TestingSetZoneConfig(config.SystemTenantObjectID(bootstrap.TestingUserDescID(1)), zoneConfig)
+	config.TestingSetZoneConfig(config.ObjectID(bootstrap.TestingUserDescID(1)), zoneConfig)
 
 	// Check our config.
 	neverSplitsDesc = neverSplits.Desc()

@@ -15,6 +15,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -96,8 +97,8 @@ func updateStatusForGCElements(
 		if err != nil {
 			return err
 		}
-
-		zoneCfg, err := cfg.GetZoneConfigForObject(execCfg.Codec, uint32(tableID))
+		version := execCfg.Settings.Version.ActiveVersionOrEmpty(ctx)
+		zoneCfg, err := cfg.GetZoneConfigForObject(execCfg.Codec, version, config.ObjectID(tableID))
 		if err != nil {
 			log.Errorf(ctx, "zone config for desc: %d, err = %+v", tableID, err)
 			return nil
@@ -288,9 +289,11 @@ func refreshTenant(
 		return true, time.Time{}
 	}
 	tenantTTLSeconds := execCfg.DefaultZoneConfig.GC.TTLSeconds
-	tenID := details.Tenant.ID
 	cfg := execCfg.SystemConfig.GetSystemConfig()
-	zoneCfg, err := cfg.GetZoneConfigForObject(keys.MakeSQLCodec(roachpb.MakeTenantID(tenID)), 0)
+	version := execCfg.Settings.Version.ActiveVersionOrEmpty(ctx)
+	// Use the TenantRangesID to find the GC TTL which applies to all tenants from the
+	// perspective of the host.
+	zoneCfg, err := cfg.GetZoneConfigForObject(keys.SystemSQLCodec, version, keys.TenantsRangesID)
 	if err == nil {
 		tenantTTLSeconds = zoneCfg.GC.TTLSeconds
 	} else {
