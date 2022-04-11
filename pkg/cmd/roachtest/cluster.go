@@ -1296,21 +1296,35 @@ func (c *clusterImpl) FetchDebugZip(ctx context.Context, t test.Test) error {
 	})
 }
 
-// checkNoDeadNode reports an error (via `t.Error`) if nodes that have a populated
-// data dir are found to be not running. It prints both to t.L() and the test
-// output.
-func (c *clusterImpl) assertNoDeadNode(ctx context.Context, t test.Test) {
+// FailOnDeadNodes fails the test if nodes that have a populated data dir are
+// found to be not running. It prints both to t.L() and the test output.
+func (c *clusterImpl) FailOnDeadNodes(ctx context.Context, t test.Test) {
 	if c.spec.NodeCount == 0 {
 		// No nodes can happen during unit tests and implies nothing to do.
 		return
 	}
 
-	_, err := roachprod.Monitor(ctx, t.L(), c.name, install.MonitorOpts{OneShot: true, IgnoreEmptyNodes: true})
-	// If there's an error, it means either that the monitor command failed
-	// completely, or that it found a dead node worth complaining about.
-	if err != nil {
-		t.Errorf("dead node detection: %s", err)
-	}
+	// Don't hang forever.
+	_ = contextutil.RunWithTimeout(ctx, "detect dead nodes", time.Minute, func(ctx context.Context) error {
+		messages, err := roachprod.Monitor(ctx, t.L(), c.name, install.MonitorOpts{OneShot: true, IgnoreEmptyNodes: true})
+		// If there's an error, it means either that the monitor command failed
+		// completely, or that it found a dead node worth complaining about.
+		if err != nil {
+			if ctx.Err() != nil {
+				// Don't fail if we timed out.
+				return nil
+			}
+			// TODO(tbg): remove this type assertion.
+			t.(*testImpl).printfAndFail(0 /* skip */, "dead node detection: %s", err)
+		}
+		for msg := range messages {
+			if msg.Err != nil {
+				msg.Msg += "error: " + msg.Err.Error()
+				return errors.Newf("%d: %s", msg.Node, msg.Msg)
+			}
+		}
+		return nil
+	})
 }
 
 // CheckReplicaDivergenceOnDB runs a fast consistency check of the whole keyspace
@@ -1398,7 +1412,12 @@ func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t test.Test) 
 			return c.CheckReplicaDivergenceOnDB(ctx, t.L(), db)
 		},
 	); err != nil {
-		t.Errorf("consistency check failed: %v", err)
+		// NB: we don't call t.Fatal() here because this method is
+		// for use by the test harness beyond the point at which
+		// it can interpret `t.Fatal`.
+		//
+		// TODO(tbg): remove this type assertion.
+		t.(*testImpl).printAndFail(0, err)
 	}
 }
 
@@ -1655,7 +1674,7 @@ func (c *clusterImpl) PutE(
 
 	c.status("uploading file")
 	defer c.status("")
-	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, true /* useTreeDist */), "cluster.PutE")
+	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, false /* useTreeDist */), "cluster.PutE")
 }
 
 // PutLibraries inserts all available library files into all nodes on the cluster
@@ -1823,19 +1842,6 @@ func (c *clusterImpl) StartE(
 		}
 	}
 
-	// Set some env vars. The first two also the default for `roachprod start`,
-	// but we have to add them so that the third one doesn't wipe them out.
-	if !envExists(settings.Env, "COCKROACH_ENABLE_RPC_COMPRESSION") {
-		// RPC compressions costs around 5% on kv95, so we disable it. It might help
-		// when moving snapshots around, though.
-		settings.Env = append(settings.Env, "COCKROACH_ENABLE_RPC_COMPRESSION=false")
-	}
-
-	if !envExists(settings.Env, "COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED") {
-		// Get rid of an annoying popup in the UI.
-		settings.Env = append(settings.Env, "COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED=true")
-	}
-
 	if !envExists(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH") {
 		// Panic on span use-after-Finish, so we catch such bugs.
 		settings.Env = append(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH=true")
@@ -1913,9 +1919,6 @@ func (c *clusterImpl) StopE(
 ) error {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.StopE")
-	}
-	if c.spec.NodeCount == 0 {
-		return nil // unit tests
 	}
 	c.setStatusForClusterOpt("stopping", stopOpts.RoachtestOpts.Worker, nodes...)
 	defer c.clearStatusForClusterOpt(stopOpts.RoachtestOpts.Worker)
@@ -2366,28 +2369,6 @@ func (c *clusterImpl) ConnE(ctx context.Context, l *logger.Logger, node int) (*g
 		return nil, err
 	}
 	db, err := gosql.Open("postgres", urls[0])
-	if err != nil {
-		return nil, err
-	}
-	return db, nil
-}
-
-// ConnEAsUser returns a SQL connection to the specified node as a specific user
-func (c *clusterImpl) ConnEAsUser(
-	ctx context.Context, l *logger.Logger, node int, user string,
-) (*gosql.DB, error) {
-	urls, err := c.ExternalPGUrl(ctx, l, c.Node(node))
-	if err != nil {
-		return nil, err
-	}
-
-	u, err := url.Parse(urls[0])
-	if err != nil {
-		return nil, err
-	}
-	u.User = url.User(user)
-	dataSourceName := u.String()
-	db, err := gosql.Open("postgres", dataSourceName)
 	if err != nil {
 		return nil, err
 	}
