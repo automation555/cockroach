@@ -33,12 +33,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/contention/txnidcache"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -64,6 +62,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"golang.org/x/net/trace"
@@ -280,10 +279,6 @@ type Server struct {
 	// node as gateway node.
 	indexUsageStats *idxusage.LocalIndexUsageStats
 
-	// txnIDCache stores the mapping from transaction ID to transaction
-	// fingerprint IDs for all recently executed transactions.
-	txnIDCache *txnidcache.Cache
-
 	// Metrics is used to account normal queries.
 	Metrics Metrics
 
@@ -324,10 +319,6 @@ type Metrics struct {
 type ServerMetrics struct {
 	// StatsMetrics contains metrics for SQL statistics collection.
 	StatsMetrics StatsMetrics
-
-	// ContentionSubsystemMetrics contains metrics related to contention
-	// subsystem.
-	ContentionSubsystemMetrics txnidcache.Metrics
 }
 
 // NewServer creates a new Server. Start() needs to be called before the Server
@@ -370,9 +361,6 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 			ChannelSize: idxusage.DefaultChannelSize,
 			Setting:     cfg.Settings,
 		}),
-		txnIDCache: txnidcache.NewTxnIDCache(
-			cfg.Settings,
-			&serverMetrics.ContentionSubsystemMetrics),
 	}
 
 	telemetryLoggingMetrics := &TelemetryLoggingMetrics{}
@@ -417,8 +405,7 @@ func makeMetrics(internal bool) Metrics {
 				6*metricsSampleInterval),
 			SQLTxnLatency: metric.NewLatency(getMetricMeta(MetaSQLTxnLatency, internal),
 				6*metricsSampleInterval),
-			SQLTxnsOpen:         metric.NewGauge(getMetricMeta(MetaSQLTxnsOpen, internal)),
-			SQLActiveStatements: metric.NewGauge(getMetricMeta(MetaSQLActiveQueries, internal)),
+			SQLTxnsOpen: metric.NewGauge(getMetricMeta(MetaSQLTxnsOpen, internal)),
 
 			TxnAbortCount:                     metric.NewCounter(getMetricMeta(MetaTxnAbort, internal)),
 			FailureCount:                      metric.NewCounter(getMetricMeta(MetaFailure, internal)),
@@ -464,7 +451,6 @@ func makeServerMetrics(cfg *ExecutorConfig) ServerMetrics {
 				MetaSQLTxnStatsCollectionOverhead, 6*metricsSampleInterval,
 			),
 		},
-		ContentionSubsystemMetrics: txnidcache.NewMetrics(),
 	}
 }
 
@@ -476,8 +462,6 @@ func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
 	// accumulated in the reporter when the telemetry server fails.
 	// Usually it is telemetry's reporter's job to clear the reporting SQL Stats.
 	s.reportedStats.Start(ctx, stopper)
-
-	s.txnIDCache.Start(ctx, stopper)
 }
 
 // GetSQLStatsController returns the persistedsqlstats.Controller for current
@@ -501,11 +485,6 @@ func (s *Server) GetSQLStatsProvider() sqlstats.Provider {
 // sql.Server's reported SQL Stats.
 func (s *Server) GetReportedSQLStatsController() *sslocal.Controller {
 	return s.reportedStatsController
-}
-
-// GetTxnIDCache returns the txnidcache.Cache for the current sql.Server.
-func (s *Server) GetTxnIDCache() *txnidcache.Cache {
-	return s.txnIDCache
 }
 
 // GetScrubbedStmtStats returns the statement statistics by app, with the
@@ -687,12 +666,6 @@ func (h ConnectionHandler) GetParamStatus(ctx context.Context, varName string) s
 	return defVal
 }
 
-// GetQueryCancelKey returns the per-session identifier that can be used to
-// cancel a query using the pgwire cancel protocol.
-func (h ConnectionHandler) GetQueryCancelKey() pgwirecancel.BackendKeyData {
-	return h.ex.queryCancelKey
-}
-
 // ServeConn serves a client connection by reading commands from the stmtBuf
 // embedded in the ConnHandler.
 //
@@ -841,7 +814,6 @@ func (s *Server) newConnExecutor(
 		hasCreatedTemporarySchema: false,
 		stmtDiagnosticsRecorder:   s.cfg.StmtDiagnosticsRecorder,
 		indexUsageStats:           s.indexUsageStats,
-		txnIDCacheWriter:          s.txnIDCache,
 	}
 
 	ex.state.txnAbortCount = ex.metrics.EngineMetrics.TxnAbortCount
@@ -879,10 +851,11 @@ func (s *Server) newConnExecutor(
 		portals:   make(map[string]PreparedPortal),
 	}
 	ex.extraTxnState.prepStmtsNamespaceMemAcc = ex.sessionMon.MakeBoundAccount()
-	ex.extraTxnState.descCollection = s.cfg.CollectionFactory.MakeCollection(ctx, descs.NewTemporarySchemaProvider(sdMutIterator.sds))
+	ex.extraTxnState.descCollection = s.cfg.CollectionFactory.MakeCollection(
+		descs.NewTemporarySchemaProvider(sdMutIterator.sds),
+	)
 	ex.extraTxnState.txnRewindPos = -1
 	ex.extraTxnState.schemaChangeJobRecords = make(map[descpb.ID]*jobs.Record)
-	ex.queryCancelKey = pgwirecancel.MakeBackendKeyData(ex.rng, ex.server.cfg.NodeID.SQLInstanceID())
 	ex.mu.ActiveQueries = make(map[ClusterWideID]*queryMeta)
 	ex.machine = fsm.MakeMachine(TxnStateTransitions, stateNoTxn{}, &ex.state)
 
@@ -890,8 +863,6 @@ func (s *Server) newConnExecutor(
 	ex.transitionCtx.sessionTracing = &ex.sessionTracing
 
 	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
-
-	ex.extraTxnState.atomicAutoRetryCounter = new(int32)
 
 	ex.initPlanner(ctx, &ex.planner)
 
@@ -1014,9 +985,9 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	ex.sessionEventf(ctx, "finishing connExecutor")
 
-	txnEvType := noEvent
+	txnEv := noEvent
 	if _, noTxn := ex.machine.CurState().(stateNoTxn); !noTxn {
-		txnEvType = txnRollback
+		txnEv = txnRollback
 	}
 
 	if closeType == normalClose {
@@ -1048,7 +1019,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 		ex.state.finishExternalTxn()
 	}
 
-	if err := ex.resetExtraTxnState(ctx, txnEvent{eventType: txnEvType}); err != nil {
+	if err := ex.resetExtraTxnState(ctx, txnEv); err != nil {
 		log.Warningf(ctx, "error while cleaning up connExecutor: %s", err)
 	}
 
@@ -1074,7 +1045,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	}
 
 	if closeType != panicClose {
-		// Close all statements and prepared portals.
+		// Close all statements, prepared portals, and cursors.
 		ex.extraTxnState.prepStmtsNamespace.resetToEmpty(
 			ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 		)
@@ -1082,6 +1053,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 			ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 		)
 		ex.extraTxnState.prepStmtsNamespaceMemAcc.Close(ctx)
+		ex.extraTxnState.sqlCursors.closeAll()
 	}
 
 	if ex.sessionTracing.Enabled() {
@@ -1194,10 +1166,10 @@ type connExecutor struct {
 		// transaction and it is cleared after the transaction is committed.
 		schemaChangeJobRecords map[descpb.ID]*jobs.Record
 
-		// atomicAutoRetryCounter keeps track of the which iteration of a transaction
+		// autoRetryCounter keeps track of the which iteration of a transaction
 		// auto-retry we're currently in. It's 0 whenever the transaction state is not
 		// stateOpen.
-		atomicAutoRetryCounter *int32
+		autoRetryCounter int
 
 		// autoRetryReason records the error causing an auto-retryable error event if
 		// the current transaction is being automatically retried. This is used in
@@ -1258,6 +1230,12 @@ type connExecutor struct {
 		// tracks the memory usage of portals and should be closed upon
 		// connExecutor's closure.
 		prepStmtsNamespaceMemAcc mon.BoundAccount
+
+		// sqlCursors contains the list of SQL CURSORs the session currently has
+		// access to.
+		// Cursors are bound to an explicit transaction and they're all destroyed
+		// once the transaction finishes.
+		sqlCursors cursorMap
 
 		// shouldExecuteOnTxnFinish indicates that ex.onTxnFinish will be called
 		// when txn is finished (either committed or aborted). It is true when
@@ -1406,10 +1384,6 @@ type connExecutor struct {
 	// any. This is printed by high-level panic recovery.
 	curStmtAST tree.Statement
 
-	// queryCancelKey is a 64-bit identifier for the session used by the
-	// pgwire cancellation protocol.
-	queryCancelKey pgwirecancel.BackendKeyData
-
 	sessionID ClusterWideID
 
 	// activated determines whether activate() was called already.
@@ -1434,10 +1408,6 @@ type connExecutor struct {
 
 	// indexUsageStats is used to track index usage stats.
 	indexUsageStats *idxusage.LocalIndexUsageStats
-
-	// txnIDCacheWriter is used to write txnidcache.ResolvedTxnID to the
-	// Transaction ID Cache.
-	txnIDCacheWriter txnidcache.Writer
 }
 
 // ctxHolder contains a connection's context and, while session tracing is
@@ -1553,9 +1523,7 @@ func (ns *prepStmtNamespace) resetTo(
 }
 
 // resetExtraTxnState resets the fields of ex.extraTxnState when a transaction
-// finishes execution (either commits, rollbacks or restarts). Based on the
-// transaction event, resetExtraTxnState invokes corresponding callbacks
-// (e.g. onTxnFinish() and onTxnRestart()).
+// commits, rolls back or restarts.
 func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) error {
 	ex.extraTxnState.jobs = nil
 	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
@@ -1575,7 +1543,10 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) err
 		delete(ex.extraTxnState.prepStmtsNamespace.portals, name)
 	}
 
-	switch ev.eventType {
+	// Close all cursors.
+	ex.extraTxnState.sqlCursors.closeAll()
+
+	switch ev {
 	case txnCommit, txnRollback:
 		for name, p := range ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.portals {
 			p.close(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
@@ -1584,7 +1555,7 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) err
 		ex.extraTxnState.savepoints.clear()
 		ex.onTxnFinish(ctx, ev)
 	case txnRestart:
-		ex.onTxnRestart(ctx)
+		ex.onTxnRestart()
 		ex.state.mu.Lock()
 		defer ex.state.mu.Unlock()
 		ex.state.mu.stmtCount = 0
@@ -1702,9 +1673,9 @@ func (ex *connExecutor) run(
 	ex.onCancelSession = onCancel
 
 	ex.sessionID = ex.generateID()
-	ex.server.cfg.SessionRegistry.register(ex.sessionID, ex.queryCancelKey, ex)
+	ex.server.cfg.SessionRegistry.register(ex.sessionID, ex)
 	ex.planner.extendedEvalCtx.setSessionID(ex.sessionID)
-	defer ex.server.cfg.SessionRegistry.deregister(ex.sessionID, ex.queryCancelKey)
+	defer ex.server.cfg.SessionRegistry.deregister(ex.sessionID)
 	for {
 		ex.curStmtAST = nil
 		if err := ctx.Err(); err != nil {
@@ -1712,7 +1683,7 @@ func (ex *connExecutor) run(
 		}
 
 		var err error
-		if err = ex.execCmd(); err != nil {
+		if err = ex.execCmd(ex.Ctx()); err != nil {
 			if errors.IsAny(err, io.EOF, errDrainingComplete) {
 				return nil
 			}
@@ -1735,12 +1706,22 @@ var errDrainingComplete = fmt.Errorf("draining done. this is a good time to fini
 // Returns drainingComplete if the session should finish because draining is
 // complete (i.e. we received a DrainRequest - possibly previously - and the
 // connection is found to be idle).
-func (ex *connExecutor) execCmd() error {
-	ctx := ex.Ctx()
+func (ex *connExecutor) execCmd(ctx context.Context) error {
 	cmd, pos, err := ex.stmtBuf.CurCmd()
 	if err != nil {
 		return err // err could be io.EOF
 	}
+
+	// Ensure that every statement has a tracing span set up.
+	ctx, sp := tracing.EnsureChildSpan(
+		ctx, ex.server.cfg.AmbientCtx.Tracer,
+		// We print the type of command, not the String() which includes long
+		// statements.
+		cmd.command())
+	defer sp.Finish()
+	// We expect that the span is not used directly, so we'll overwrite the
+	// local variable.
+	sp = nil
 
 	if log.ExpensiveLogEnabled(ctx, 2) || ex.eventLog != nil {
 		ex.sessionEventf(ctx, "[%s pos:%d] executing %s",
@@ -1778,10 +1759,7 @@ func (ex *connExecutor) execCmd() error {
 			)
 			res = stmtRes
 
-			canAutoCommit := ex.implicitTxn()
-			ev, payload, err = ex.execStmt(
-				ctx, tcmd.Statement, nil /* prepared */, nil /* pinfo */, stmtRes, canAutoCommit,
-			)
+			ev, payload, err = ex.execStmt(ctx, tcmd.Statement, nil /* prepared */, nil /* pinfo */, stmtRes)
 			return err
 		}()
 		// Note: we write to ex.statsCollector.PhaseTimes, instead of ex.phaseTimes,
@@ -1849,15 +1827,7 @@ func (ex *connExecutor) execCmd() error {
 				ex.implicitTxn(),
 			)
 			res = stmtRes
-
-			// In the extended protocol, autocommit is not always allowed. The postgres
-			// docs say that commands in the extended protocol are all treated as an
-			// implicit transaction that does not get committed until a Sync message is
-			// received. However, if we are executing a statement that is immediately
-			// followed by Sync (which is the common case), then we still can auto-commit,
-			// which allows the 1PC txn fast path to be used.
-			canAutoCommit := ex.implicitTxn() && tcmd.FollowedBySync
-			ev, payload, err = ex.execPortal(ctx, portal, portalName, stmtRes, pinfo, canAutoCommit)
+			ev, payload, err = ex.execPortal(ctx, portal, portalName, stmtRes, pinfo)
 			return err
 		}()
 		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
@@ -1902,12 +1872,9 @@ func (ex *connExecutor) execCmd() error {
 		// message causes the backend to close the current transaction if it's not
 		// inside a BEGIN/COMMIT transaction block (“close” meaning to commit if no
 		// error, or roll back if error)."
-		// In other words, Sync is treated as commit for implicit transactions.
+		// In other words, Sync is treated as auto-commit for implicit transactions.
 		if op, ok := ex.machine.CurState().(stateOpen); ok {
 			if op.ImplicitTxn.Get() {
-				// Note that the handling of ev in the case of Sync is massaged a bit
-				// later - Sync is special in that, if it encounters an error, that does
-				// *not *cause the session to ignore all commands until the next Sync.
 				ev, payload = ex.handleAutoCommit(ctx, &tree.CommitTransaction{})
 			}
 		}
@@ -1958,35 +1925,11 @@ func (ex *connExecutor) execCmd() error {
 		if err != nil {
 			return err
 		}
-
-		// Massage the advancing for Sync, which is special.
-		if _, ok := cmd.(Sync); ok {
-			switch advInfo.code {
-			case skipBatch:
-				// An error on Sync doesn't cause us to skip commands (and errors are
-				// possible because Sync can trigger a commit). We generate the
-				// ErrorResponse and the ReadyForQuery responses, and we continue with
-				// the next command. From the Postgres docs:
-				// """
-				// Note that no skipping occurs if an error is detected while processing
-				// Sync — this ensures that there is one and only one ReadyForQuery sent for
-				// each Sync.
-				// """
-				advInfo = advanceInfo{code: advanceOne}
-			case advanceOne:
-			case rewind:
-			case stayInPlace:
-				return errors.AssertionFailedf("unexpected advance code stayInPlace when processing Sync")
-			}
-		}
-
-		// If a txn just started, we henceforth want to run in the context of the
-		// transaction. Similarly, if a txn just ended, we don't want to run in its
-		// context any more.
-		ctx = ex.Ctx()
 	} else {
 		// If no event was generated synthesize an advance code.
-		advInfo = advanceInfo{code: advanceOne}
+		advInfo = advanceInfo{
+			code: advanceOne,
+		}
 	}
 
 	// Decide if we need to close the result or not. We don't need to do it if
@@ -2081,7 +2024,7 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 	if _, ok := ex.machine.CurState().(stateOpen); !ok {
 		return nil
 	}
-	if advInfo.txnEvent.eventType == txnStart || advInfo.txnEvent.eventType == txnRestart {
+	if advInfo.txnEvent == txnStart || advInfo.txnEvent == txnRestart {
 		var nextPos CmdPos
 		switch advInfo.code {
 		case stayInPlace:
@@ -2263,7 +2206,7 @@ func (ex *connExecutor) execCopyIn(
 	} else {
 		txnOpt = copyTxnOpt{
 			resetExtraTxnState: func(ctx context.Context) error {
-				return ex.resetExtraTxnState(ctx, txnEvent{eventType: noEvent})
+				return ex.resetExtraTxnState(ctx, noEvent)
 			},
 		}
 	}
@@ -2451,7 +2394,7 @@ func (ex *connExecutor) makeErrEvent(err error, stmt tree.Statement) (fsm.Event,
 
 // setTransactionModes implements the txnModesSetter interface.
 func (ex *connExecutor) setTransactionModes(
-	ctx context.Context, modes tree.TransactionModes, asOfTs hlc.Timestamp,
+	modes tree.TransactionModes, asOfTs hlc.Timestamp,
 ) error {
 	// This method cheats and manipulates ex.state directly, not through an event.
 	// The alternative would be to create a special event, but it's unclear how
@@ -2474,7 +2417,7 @@ func (ex *connExecutor) setTransactionModes(
 		return errors.AssertionFailedf("expected an evaluated AS OF timestamp")
 	}
 	if !asOfTs.IsEmpty() {
-		if err := ex.state.setHistoricalTimestamp(ctx, asOfTs); err != nil {
+		if err := ex.state.setHistoricalTimestamp(ex.Ctx(), asOfTs); err != nil {
 			return err
 		}
 		ex.state.sqlTimestamp = asOfTs.GoTime()
@@ -2549,7 +2492,6 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			Planner:                   p,
 			PrivilegedAccessor:        p,
 			SessionAccessor:           p,
-			JobExecContext:            p,
 			ClientNoticeSender:        p,
 			Sequence:                  p,
 			Tenant:                    p,
@@ -2640,6 +2582,7 @@ func (ex *connExecutor) initPlanner(ctx context.Context, p *planner) {
 	p.sessionDataMutatorIterator = ex.dataMutatorIterator
 	p.noticeSender = nil
 	p.preparedStatements = ex.getPrepStmtsAccessor()
+	p.sqlCursors = ex.getCursorAccessor()
 
 	p.queryCacheSession.Init()
 	p.optPlanningCtx.init(p)
@@ -2700,7 +2643,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 
 	advInfo := ex.state.consumeAdvanceInfo()
 	if advInfo.code == rewind {
-		atomic.AddInt32(ex.extraTxnState.atomicAutoRetryCounter, 1)
+		ex.extraTxnState.autoRetryCounter++
 	}
 
 	// If we had an error from DDL statement execution due to the presence of
@@ -2708,14 +2651,14 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 	// the completion of those schema changes first.
 	if p, ok := payload.(payloadWithError); ok {
 		if descID := scerrors.ConcurrentSchemaChangeDescID(p.errorCause()); descID != descpb.InvalidID {
-			if err := ex.handleWaitingForConcurrentSchemaChanges(ex.Ctx(), descID); err != nil {
+			if err := ex.handleWaitingForConcurrentSchemaChanges(descID); err != nil {
 				return advanceInfo{}, err
 			}
 		}
 	}
 
 	// Handle transaction events which cause updates to txnState.
-	switch advInfo.txnEvent.eventType {
+	switch advInfo.txnEvent {
 	case noEvent:
 		_, nextStateIsAborted := ex.machine.CurState().(stateAborted)
 		// Update the deadline on the transaction based on the collections,
@@ -2729,9 +2672,9 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 			}
 		}
 	case txnStart:
-		atomic.StoreInt32(ex.extraTxnState.atomicAutoRetryCounter, 0)
+		ex.extraTxnState.autoRetryCounter = 0
 		ex.extraTxnState.autoRetryReason = nil
-		ex.recordTransactionStart(advInfo.txnEvent.txnID)
+		ex.recordTransactionStart()
 		// Bump the txn counter for logging.
 		ex.extraTxnState.txnCounter++
 		if !ex.server.cfg.Codec.ForSystemTenant() {
@@ -2754,7 +2697,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 			err := errorutil.UnexpectedWithIssueErrorf(
 				26687,
 				"programming error: non-error event %s generated even though res.Err() has been set to: %s",
-				errors.Safe(advInfo.txnEvent.eventType.String()),
+				errors.Safe(advInfo.txnEvent.String()),
 				res.Err())
 			log.Errorf(ex.Ctx(), "%v", err)
 			errorutil.SendReport(ex.Ctx(), &ex.server.cfg.Settings.SV, err)
@@ -2821,11 +2764,9 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 	return advInfo, nil
 }
 
-func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(
-	ctx context.Context, descID descpb.ID,
-) error {
+func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(descID descpb.ID) error {
 	if err := ex.planner.WaitForDescriptorSchemaChanges(
-		ctx, descID, ex.extraTxnState.schemaChangerState,
+		ex.Ctx(), descID, ex.extraTxnState.schemaChangerState,
 	); err != nil {
 		return err
 	}
@@ -2833,7 +2774,7 @@ func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(
 	ex.state.mu.Lock()
 	defer ex.state.mu.Unlock()
 	userPriority := ex.state.mu.txn.UserPriority()
-	ex.state.mu.txn = kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db, ex.transitionCtx.nodeIDOrZero)
+	ex.state.mu.txn = kv.NewTxnWithSteppingEnabled(ex.Ctx(), ex.transitionCtx.db, ex.transitionCtx.nodeIDOrZero)
 	return ex.state.mu.txn.SetUserPriority(userPriority)
 }
 
@@ -2869,18 +2810,6 @@ func (ex *connExecutor) cancelQuery(queryID ClusterWideID) bool {
 	return false
 }
 
-// cancelCurrentQueries is part of the registrySession interface.
-func (ex *connExecutor) cancelCurrentQueries() bool {
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
-	canceled := false
-	for _, queryMeta := range ex.mu.ActiveQueries {
-		queryMeta.cancel()
-		canceled = true
-	}
-	return canceled
-}
-
 // cancelSession is part of the registrySession interface.
 func (ex *connExecutor) cancelSession() {
 	if ex.onCancelSession == nil {
@@ -2911,7 +2840,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			Start:                 ex.state.mu.txnStart,
 			NumStatementsExecuted: int32(ex.state.mu.stmtCount),
 			NumRetries:            int32(txn.Epoch()),
-			NumAutoRetries:        atomic.LoadInt32(ex.extraTxnState.atomicAutoRetryCounter),
+			NumAutoRetries:        int32(ex.extraTxnState.autoRetryCounter),
 			TxnDescription:        txn.String(),
 			Implicit:              ex.implicitTxn(),
 			AllocBytes:            ex.state.mon.AllocBytes(),
@@ -2998,6 +2927,12 @@ func (ex *connExecutor) getPrepStmtsAccessor() preparedStatementsAccessor {
 	}
 }
 
+func (ex *connExecutor) getCursorAccessor() sqlCursors {
+	return connExCursorAccessor{
+		ex: ex,
+	}
+}
+
 // sessionEventf logs a message to the session event log (if any).
 func (ex *connExecutor) sessionEventf(ctx context.Context, format string, args ...interface{}) {
 	if log.ExpensiveLogEnabled(ctx, 2) {
@@ -3029,7 +2964,6 @@ func (ex *connExecutor) notifyStatsRefresherOfNewTables(ctx context.Context) {
 func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 	scs := &ex.extraTxnState.schemaChangerState
 	deps := newSchemaChangerTxnRunDependencies(
-		ex.planner.SessionData(),
 		ex.planner.User(),
 		ex.server.cfg,
 		ex.planner.txn,
