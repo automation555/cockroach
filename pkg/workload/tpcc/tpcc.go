@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadimpl"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx"
 	"github.com/spf13/pflag"
 	"golang.org/x/exp/rand"
 	"golang.org/x/sync/errgroup"
@@ -40,6 +40,7 @@ type tpcc struct {
 	seed             uint64
 	warehouses       int
 	activeWarehouses int
+	interleaved      bool
 	nowString        []byte
 	numConns         int
 
@@ -75,20 +76,11 @@ type tpcc struct {
 	clientPartitions   int
 	affinityPartitions []int
 	wPart              *partitioner
-	wMRPart            *partitioner
 	zoneCfg            zoneConfig
-	multiRegionCfg     multiRegionConfig
-
-	// localWarehouses determines whether or not we should force transactions to
-	// operate on a local warehouse (local to where the given transaction
-	// originated). This is only used for multi-region configurations, and is in
-	// violation of the TPC-C spec, so it should only be used for internal
-	// testing purposes.
-	localWarehouses bool
 
 	usePostgres  bool
 	serializable bool
-	txOpts       pgx.TxOptions
+	txOpts       *pgx.TxOptions
 
 	expensiveChecks bool
 
@@ -160,33 +152,33 @@ var tpccMeta = workload.Meta{
 		g := &tpcc{}
 		g.flags.FlagSet = pflag.NewFlagSet(`tpcc`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
-			`db`:                       {RuntimeOnly: true},
-			`mix`:                      {RuntimeOnly: true},
-			`partitions`:               {RuntimeOnly: true},
-			`client-partitions`:        {RuntimeOnly: true},
-			`partition-affinity`:       {RuntimeOnly: true},
-			`partition-strategy`:       {RuntimeOnly: true},
-			`zones`:                    {RuntimeOnly: true},
-			`active-warehouses`:        {RuntimeOnly: true},
-			`scatter`:                  {RuntimeOnly: true},
-			`serializable`:             {RuntimeOnly: true},
-			`split`:                    {RuntimeOnly: true},
-			`wait`:                     {RuntimeOnly: true},
-			`workers`:                  {RuntimeOnly: true},
-			`conns`:                    {RuntimeOnly: true},
-			`idle-conns`:               {RuntimeOnly: true},
-			`expensive-checks`:         {RuntimeOnly: true, CheckConsistencyOnly: true},
-			`local-warehouses`:         {RuntimeOnly: true},
-			`regions`:                  {RuntimeOnly: true},
-			`survival-goal`:            {RuntimeOnly: true},
-			`replicate-static-columns`: {RuntimeOnly: true},
-			`deprecated-fk-indexes`:    {RuntimeOnly: true},
+			`db`:                 {RuntimeOnly: true},
+			`mix`:                {RuntimeOnly: true},
+			`partitions`:         {RuntimeOnly: true},
+			`client-partitions`:  {RuntimeOnly: true},
+			`partition-affinity`: {RuntimeOnly: true},
+			`partition-strategy`: {RuntimeOnly: true},
+			`zones`:              {RuntimeOnly: true},
+			`active-warehouses`:  {RuntimeOnly: true},
+			`scatter`:            {RuntimeOnly: true},
+			`serializable`:       {RuntimeOnly: true},
+			`split`:              {RuntimeOnly: true},
+			`wait`:               {RuntimeOnly: true},
+			`workers`:            {RuntimeOnly: true},
+			`conns`:              {RuntimeOnly: true},
+			`idle-conns`:         {RuntimeOnly: true},
+			`expensive-checks`:   {RuntimeOnly: true, CheckConsistencyOnly: true},
+			`use-tx-for-init`:    {RuntimeOnly: true},
 		}
 
 		g.flags.Uint64Var(&g.seed, `seed`, 1, `Random number generator seed`)
 		g.flags.IntVar(&g.warehouses, `warehouses`, 1, `Number of warehouses for loading`)
 		g.flags.BoolVar(&g.fks, `fks`, true, `Add the foreign keys`)
 		g.flags.BoolVar(&g.deprecatedFkIndexes, `deprecated-fk-indexes`, false, `Add deprecated foreign keys (needed when running against v20.1 or below clusters)`)
+		g.flags.BoolVar(&g.interleaved, `interleaved`, false, `Use interleaved tables`)
+		if err := g.Flags().MarkHidden("interleaved"); err != nil {
+			panic(errors.Wrap(err, "no interleaved flag?"))
+		}
 
 		g.flags.StringVar(&g.mix, `mix`,
 			`newOrder=10,payment=10,orderStatus=1,delivery=1,stockLevel=1`,
@@ -196,7 +188,7 @@ var tpccMeta = workload.Meta{
 		g.flags.StringVar(&g.dbOverride, `db`, ``,
 			`Override for the SQL database to use. If empty, defaults to the generator name`)
 		g.flags.IntVar(&g.workers, `workers`, 0, fmt.Sprintf(
-			`Number of concurrent workers. Defaults to --warehouses * %d`, NumWorkersPerWarehouse,
+			`Number of concurrent workers. Defaults to --warehouses * %d`, numWorkersPerWarehouse,
 		))
 		g.flags.IntVar(&g.numConns, `conns`, 0, fmt.Sprintf(
 			`Number of connections. Defaults to --warehouses * %d (except in nowait mode, where it defaults to --workers`,
@@ -209,9 +201,7 @@ var tpccMeta = workload.Meta{
 			`Note that if one value is provided, the assumption is that all urls are associated with that partition. In all other cases the assumption `+
 			`is that the URLs are distributed evenly over the partitions`)
 		g.flags.Var(&g.zoneCfg.strategy, `partition-strategy`, `Partition tables according to which strategy [replication, leases]`)
-		g.flags.StringSliceVar(&g.zoneCfg.zones, "zones", []string{}, "Zones for legacy partitioning, the number of zones should match the number of partitions and the zones used to start cockroach. Does not work with --regions.")
-		g.flags.StringSliceVar(&g.multiRegionCfg.regions, "regions", []string{}, "Regions to use for multi-region partitioning. The first region is the PRIMARY REGION. Does not work with --zones.")
-		g.flags.Var(&g.multiRegionCfg.survivalGoal, "survival-goal", "Survival goal to use for multi-region setups. Allowed values: [zone, region].")
+		g.flags.StringSliceVar(&g.zoneCfg.zones, "zones", []string{}, "Zones for partitioning, the number of zones should match the number of partitions and the zones used to start cockroach.")
 		g.flags.IntVar(&g.activeWarehouses, `active-warehouses`, 0, `Run the load generator against a specific number of warehouses. Defaults to --warehouses'`)
 		g.flags.BoolVar(&g.scatter, `scatter`, false, `Scatter ranges`)
 		g.flags.BoolVar(&g.serializable, `serializable`, false, `Force serializable mode`)
@@ -219,7 +209,6 @@ var tpccMeta = workload.Meta{
 		g.flags.BoolVar(&g.expensiveChecks, `expensive-checks`, false, `Run expensive checks`)
 		g.flags.BoolVar(&g.separateColumnFamilies, `families`, false, `Use separate column families for dynamic and static columns`)
 		g.flags.BoolVar(&g.replicateStaticColumns, `replicate-static-columns`, false, "Create duplicate indexes for all static columns in district, items and warehouse tables, such that each zone or rack has them locally.")
-		g.flags.BoolVar(&g.localWarehouses, `local-warehouses`, false, `Force transactions to use a local warehouse in all cases (in violation of the TPC-C specification)`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 
 		// Hardcode this since it doesn't seem like anyone will want to change
@@ -227,31 +216,6 @@ var tpccMeta = workload.Meta{
 		g.nowString = []byte(`2006-01-02 15:04:05`)
 		return g
 	},
-}
-
-func queryDatabaseRegions(db *gosql.DB) (map[string]struct{}, error) {
-	regions := make(map[string]struct{})
-	rows, err := db.Query(`SELECT region FROM [SHOW REGIONS FROM DATABASE]`)
-	if err != nil {
-		return regions, err
-	}
-	defer func() {
-		_ = rows.Close()
-	}()
-	for rows.Next() {
-		if rows.Err() != nil {
-			return regions, err
-		}
-		var region string
-		if err := rows.Scan(&region); err != nil {
-			return regions, err
-		}
-		regions[region] = struct{}{}
-	}
-	if rows.Err() != nil {
-		return regions, err
-	}
-	return regions, nil
 }
 
 // Meta implements the Generator interface.
@@ -278,11 +242,8 @@ func (w *tpcc) Hooks() workload.Hooks {
 				return errors.Errorf(`--partitions must be positive`)
 			}
 
-			if len(w.zoneCfg.zones) > 0 && len(w.multiRegionCfg.regions) > 0 {
-				return errors.Errorf("cannot specify both --regions and --zones")
-			}
-
 			if w.clientPartitions > 0 {
+
 				if w.partitions > 1 {
 					return errors.Errorf(`cannot specify both --partitions and --client-partitions;
 					--partitions actually partitions underlying data.
@@ -301,29 +262,22 @@ func (w *tpcc) Hooks() workload.Hooks {
 				}
 
 			} else {
+
 				for _, p := range w.affinityPartitions {
 					if p < 0 || p >= w.partitions {
 						return errors.Errorf(`--partition-affinity out of bounds of --partitions`)
 					}
 				}
 
-				if len(w.multiRegionCfg.regions) > 0 && (len(w.multiRegionCfg.regions) != w.partitions) {
-					return errors.Errorf(`--regions should have the same length as --partitions.`)
-				}
-
-				if len(w.multiRegionCfg.regions) < 3 && w.multiRegionCfg.survivalGoal == survivalGoalRegion {
-					return errors.Errorf(`REGION survivability needs at least 3 regions.`)
-				}
-
 				if len(w.zoneCfg.zones) > 0 && (len(w.zoneCfg.zones) != w.partitions) {
-					return errors.Errorf(`--zones should have the same length as --partitions.`)
+					return errors.Errorf(`--zones should have the sames length as --partitions.`)
 				}
 			}
 
 			w.initNonUniformRandomConstants()
 
 			if w.workers == 0 {
-				w.workers = w.activeWarehouses * NumWorkersPerWarehouse
+				w.workers = w.activeWarehouses * numWorkersPerWarehouse
 			}
 
 			if w.numConns == 0 {
@@ -338,90 +292,32 @@ func (w *tpcc) Hooks() workload.Hooks {
 				}
 			}
 
-			if w.waitFraction > 0 && w.workers != w.activeWarehouses*NumWorkersPerWarehouse {
+			if w.waitFraction > 0 && w.workers != w.activeWarehouses*numWorkersPerWarehouse {
 				return errors.Errorf(`--wait > 0 and --warehouses=%d requires --workers=%d`,
-					w.activeWarehouses, w.warehouses*NumWorkersPerWarehouse)
+					w.activeWarehouses, w.warehouses*numWorkersPerWarehouse)
 			}
 
 			if w.serializable {
-				w.txOpts = pgx.TxOptions{IsoLevel: pgx.Serializable}
+				w.txOpts = &pgx.TxOptions{IsoLevel: pgx.Serializable}
 			}
 
 			w.auditor = newAuditor(w.activeWarehouses)
 
 			// Create a partitioner to help us partition the warehouses. The base-case is
 			// where w.warehouses == w.activeWarehouses and w.partitions == 1.
-			partitions := w.partitions
-			if w.clientPartitions > 0 {
-				partitions = w.clientPartitions
-			}
 			var err error
-			// This partitioner will not actually be used to partition the
-			// data, but instead is only used to limit the warehouses the
-			// client attempts to manipulate.
-			w.wPart, err = makePartitioner(w.warehouses, w.activeWarehouses, partitions)
+			if w.clientPartitions > 0 {
+				// This partitioner will not actually be used to partiton the data, but instead
+				// is only used to limit the warehouses the client attempts to manipulate.
+				w.wPart, err = makePartitioner(w.warehouses, w.activeWarehouses, w.clientPartitions)
+			} else {
+				w.wPart, err = makePartitioner(w.warehouses, w.activeWarehouses, w.partitions)
+			}
 			if err != nil {
 				return errors.Wrap(err, "error creating partitioner")
 			}
-			if len(w.multiRegionCfg.regions) != 0 {
-				// For multi-region workloads, make a multi-region partitioner.
-				w.wMRPart, err = makeMRPartitioner(w.warehouses, w.activeWarehouses, partitions)
-				if err != nil {
-					return errors.Wrap(err, "error creating multi-region partitioner")
-				}
-			}
+
 			return initializeMix(w)
-		},
-		PreCreate: func(db *gosql.DB) error {
-			if len(w.multiRegionCfg.regions) == 0 {
-				// Not a multi-region deployment.
-				return nil
-			}
-
-			regions, err := queryDatabaseRegions(db)
-			if err != nil {
-				return err
-			}
-
-			var dbName string
-			if err := db.QueryRow(`SHOW DATABASE`).Scan(&dbName); err != nil {
-				return err
-			}
-
-			var stmts []string
-			for i, region := range w.multiRegionCfg.regions {
-				var stmt string
-				// The first region is the PRIMARY region.
-				if i == 0 {
-					stmt = fmt.Sprintf(`alter database %s set primary region %q`, dbName, region)
-				} else {
-					// Region additions should be idempotent.
-					if _, ok := regions[region]; ok {
-						continue
-					}
-					stmt = fmt.Sprintf(`alter database %s add region %q`, dbName, region)
-				}
-				stmts = append(stmts, stmt)
-			}
-
-			var survivalGoal string
-			switch w.multiRegionCfg.survivalGoal {
-			case survivalGoalZone:
-				survivalGoal = `zone failure`
-			case survivalGoalRegion:
-				survivalGoal = `region failure`
-			default:
-				panic("unexpected")
-			}
-			stmts = append(stmts, fmt.Sprintf(`alter database %s survive %s`, dbName, survivalGoal))
-
-			for _, stmt := range stmts {
-				if _, err := db.Exec(stmt); err != nil {
-					return err
-				}
-			}
-
-			return nil
 		},
 		PostLoad: func(db *gosql.DB) error {
 			if w.fks {
@@ -463,27 +359,12 @@ func (w *tpcc) Hooks() workload.Hooks {
 						}
 					}
 				}
-				// Set GLOBAL only after data is loaded to speed up initialization
-				// time. Otherwise, the mass INSERT at workload init time takes
-				// extraordinarily longer. If data is imported with IMPORT, this
-				// statement is idempotent.
-				if len(w.multiRegionCfg.regions) > 0 {
-					if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE item SET %s`, localityGlobalSuffix)); err != nil {
-						return err
-					}
-				}
 			}
 
-			// With multi-region enabled, we do not need to partition and scatter
-			// our data anymore as it has already been partitioned by the
-			// computed column on REGIONAL BY ROW tables.
-			if len(w.multiRegionCfg.regions) != 0 {
-				return nil
-			}
 			return w.partitionAndScatterWithDB(db)
 		},
 		PostRun: func(startElapsed time.Duration) error {
-			w.auditor.runChecks(w.localWarehouses)
+			w.auditor.runChecks()
 			const totalHeader = "\n_elapsed_______tpmC____efc__avg(ms)__p50(ms)__p90(ms)__p95(ms)__p99(ms)_pMax(ms)"
 			fmt.Println(totalHeader)
 
@@ -566,13 +447,10 @@ func (w *tpcc) Tables() []workload.Table {
 	}
 	warehouse := workload.Table{
 		Name: `warehouse`,
-		Schema: makeSchema(
+		Schema: maybeAddColumnFamiliesSuffix(
+			w.separateColumnFamilies,
 			tpccWarehouseSchema,
-			maybeAddLocalityRegionalByRow(w.multiRegionCfg, `w_id`),
-			maybeAddColumnFamiliesSuffix(
-				w.separateColumnFamilies,
-				tpccWarehouseColumnFamiliesSuffix,
-			),
+			tpccWarehouseColumnFamiliesSuffix,
 		),
 		InitialRows: workload.BatchedTuples{
 			NumBatches: w.warehouses,
@@ -588,13 +466,12 @@ func (w *tpcc) Tables() []workload.Table {
 	}
 	district := workload.Table{
 		Name: `district`,
-		Schema: makeSchema(
-			tpccDistrictSchemaBase,
+		Schema: maybeAddInterleaveSuffix(
+			w.interleaved,
 			maybeAddColumnFamiliesSuffix(
-				w.separateColumnFamilies,
-				tpccDistrictColumnFamiliesSuffix,
+				w.separateColumnFamilies, tpccDistrictSchemaBase, tpccDistrictColumnFamiliesSuffix,
 			),
-			maybeAddLocalityRegionalByRow(w.multiRegionCfg, `d_w_id`),
+			tpccDistrictSchemaInterleaveSuffix,
 		),
 		InitialRows: workload.BatchedTuples{
 			NumBatches: numDistrictsPerWarehouse * w.warehouses,
@@ -610,13 +487,14 @@ func (w *tpcc) Tables() []workload.Table {
 	}
 	customer := workload.Table{
 		Name: `customer`,
-		Schema: makeSchema(
-			tpccCustomerSchemaBase,
+		Schema: maybeAddInterleaveSuffix(
+			w.interleaved,
 			maybeAddColumnFamiliesSuffix(
 				w.separateColumnFamilies,
+				tpccCustomerSchemaBase,
 				tpccCustomerColumnFamiliesSuffix,
 			),
-			maybeAddLocalityRegionalByRow(w.multiRegionCfg, `c_w_id`),
+			tpccCustomerSchemaInterleaveSuffix,
 		),
 		InitialRows: workload.BatchedTuples{
 			NumBatches: numCustomersPerWarehouse * w.warehouses,
@@ -626,13 +504,10 @@ func (w *tpcc) Tables() []workload.Table {
 	}
 	history := workload.Table{
 		Name: `history`,
-		Schema: makeSchema(
+		Schema: maybeAddFkSuffix(
+			w.deprecatedFkIndexes,
 			tpccHistorySchemaBase,
-			maybeAddFkSuffix(
-				w.deprecatedFkIndexes,
-				deprecatedTpccHistorySchemaFkSuffix,
-			),
-			maybeAddLocalityRegionalByRow(w.multiRegionCfg, `h_w_id`),
+			deprecatedTpccHistorySchemaFkSuffix,
 		),
 		InitialRows: workload.BatchedTuples{
 			NumBatches: numHistoryPerWarehouse * w.warehouses,
@@ -648,9 +523,10 @@ func (w *tpcc) Tables() []workload.Table {
 	}
 	order := workload.Table{
 		Name: `order`,
-		Schema: makeSchema(
+		Schema: maybeAddInterleaveSuffix(
+			w.interleaved,
 			tpccOrderSchemaBase,
-			maybeAddLocalityRegionalByRow(w.multiRegionCfg, `o_w_id`),
+			tpccOrderSchemaInterleaveSuffix,
 		),
 		InitialRows: workload.BatchedTuples{
 			NumBatches: numOrdersPerWarehouse * w.warehouses,
@@ -659,11 +535,8 @@ func (w *tpcc) Tables() []workload.Table {
 		Stats: w.tpccOrderStats(),
 	}
 	newOrder := workload.Table{
-		Name: `new_order`,
-		Schema: makeSchema(
-			tpccNewOrderSchema,
-			maybeAddLocalityRegionalByRow(w.multiRegionCfg, `no_w_id`),
-		),
+		Name:   `new_order`,
+		Schema: tpccNewOrderSchema,
 		InitialRows: workload.BatchedTuples{
 			NumBatches: numNewOrdersPerWarehouse * w.warehouses,
 			FillBatch:  w.tpccNewOrderInitialRowBatch,
@@ -671,10 +544,8 @@ func (w *tpcc) Tables() []workload.Table {
 		Stats: w.tpccNewOrderStats(),
 	}
 	item := workload.Table{
-		Name: `item`,
-		Schema: makeSchema(
-			tpccItemSchema,
-		),
+		Name:   `item`,
+		Schema: tpccItemSchema,
 		InitialRows: workload.BatchedTuples{
 			NumBatches: numItems,
 			FillBatch:  w.tpccItemInitialRowBatch,
@@ -689,13 +560,14 @@ func (w *tpcc) Tables() []workload.Table {
 	}
 	stock := workload.Table{
 		Name: `stock`,
-		Schema: makeSchema(
-			tpccStockSchemaBase,
+		Schema: maybeAddInterleaveSuffix(
+			w.interleaved,
 			maybeAddFkSuffix(
 				w.deprecatedFkIndexes,
+				tpccStockSchemaBase,
 				deprecatedTpccStockSchemaFkSuffix,
 			),
-			maybeAddLocalityRegionalByRow(w.multiRegionCfg, `s_w_id`),
+			tpccStockSchemaInterleaveSuffix,
 		),
 		InitialRows: workload.BatchedTuples{
 			NumBatches: numStockPerWarehouse * w.warehouses,
@@ -705,13 +577,14 @@ func (w *tpcc) Tables() []workload.Table {
 	}
 	orderLine := workload.Table{
 		Name: `order_line`,
-		Schema: makeSchema(
-			tpccOrderLineSchemaBase,
+		Schema: maybeAddInterleaveSuffix(
+			w.interleaved,
 			maybeAddFkSuffix(
 				w.deprecatedFkIndexes,
+				tpccOrderLineSchemaBase,
 				deprecatedTpccOrderLineSchemaFkSuffix,
 			),
-			maybeAddLocalityRegionalByRow(w.multiRegionCfg, `ol_w_id`),
+			tpccOrderLineSchemaInterleaveSuffix,
 		),
 		InitialRows: workload.BatchedTuples{
 			NumBatches: numOrdersPerWarehouse * w.warehouses,
@@ -728,17 +601,13 @@ func (w *tpcc) Tables() []workload.Table {
 func (w *tpcc) Ops(
 	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
-	if len(w.multiRegionCfg.regions) == 0 {
-		// It would be nice to remove the need for this and to require that
-		// partitioning and scattering occurs only when the PostLoad hook is
-		// run, but to maintain backward compatibility, it's easiest to allow
-		// partitioning and scattering during `workload run`.
-		if err := w.partitionAndScatter(urls); err != nil {
-			return workload.QueryLoad{}, err
-		}
+	// It would be nice to remove the need for this and to require that
+	// partitioning and scattering occurs only when the PostLoad hook is
+	// run, but to maintain backward compatibility, it's easiest to allow
+	// partitioning and scattering during `workload run`.
+	if err := w.partitionAndScatter(urls); err != nil {
+		return workload.QueryLoad{}, err
 	}
-
-	counters := setupTPCCMetrics(reg.Registerer())
 
 	sqlDatabase, err := workload.SanitizeUrls(w, w.dbOverride, urls)
 	if err != nil {
@@ -752,6 +621,14 @@ func (w *tpcc) Ops(
 	w.reg = reg
 	w.usePostgres = parsedURL.Port() == "5432"
 
+	method, err := workload.StringToMethod(w.connFlags.Method)
+	if err != nil {
+		return workload.QueryLoad{}, err
+	}
+
+	// We only Prepare statements if Prepare is explicitly specified.
+	noPrepare := method != workload.Prepare
+
 	// We can't use a single MultiConnPool because we want to implement partition
 	// affinity. Instead we have one MultiConnPool per server.
 	cfg := workload.MultiConnPoolCfg{
@@ -759,6 +636,7 @@ func (w *tpcc) Ops(
 		// Limit the number of connections per pool (otherwise preparing statements
 		// at startup can be slow).
 		MaxConnsPerPool: 50,
+		NoPrepare:       noPrepare,
 	}
 	fmt.Printf("Initializing %d connections...\n", w.numConns)
 
@@ -768,7 +646,7 @@ func (w *tpcc) Ops(
 		i := i
 		g.Go(func() error {
 			var err error
-			dbs[i], err = workload.NewMultiConnPool(ctx, cfg, urls[i])
+			dbs[i], err = workload.NewMultiConnPool(cfg, urls[i])
 			return err
 		})
 	}
@@ -777,7 +655,7 @@ func (w *tpcc) Ops(
 	}
 	var partitionDBs [][]*workload.MultiConnPool
 	if w.clientPartitions > 0 {
-		// Client partitions simply emulates the behavior of data partitions
+		// Client partitons simply emulates the behavior of data partitions
 		// w/r/t database connections, though all of the connections will
 		// be for the same partition.
 		partitionDBs = make([][]*workload.MultiConnPool, w.clientPartitions)
@@ -796,8 +674,8 @@ func (w *tpcc) Ops(
 
 	} else {
 		// This is making some assumptions about how racks are handed out.
-		// If we have more than one affinityPartition then we assume that the
-		// URLs are mapped to partitions in a round-robin fashion.
+		// If we have more than one affinityPartion then we assume that the URLs
+		// are mapped to partitions in a round-robin fashion.
 		// Imagine there are 5 partitions and 15 urls, this code assumes that urls
 		// 0, 5, and 10 correspond to the 0th partition.
 		for i, db := range dbs {
@@ -816,11 +694,11 @@ func (w *tpcc) Ops(
 	var conns []*pgx.Conn
 	for i := 0; i < w.idleConns; i++ {
 		for _, url := range urls {
-			connConfig, err := pgx.ParseConfig(url)
+			connConfig, err := pgx.ParseURI(url)
 			if err != nil {
 				return workload.QueryLoad{}, err
 			}
-			conn, err := pgx.ConnectConfig(ctx, connConfig)
+			conn, err := pgx.Connect(connConfig)
 			if err != nil {
 				return workload.QueryLoad{}, err
 			}
@@ -848,16 +726,8 @@ func (w *tpcc) Ops(
 	sem := make(chan struct{}, 100)
 	for workerIdx := 0; workerIdx < w.workers; workerIdx++ {
 		workerIdx := workerIdx
-		var warehouse int
-		var p int
-		if len(w.multiRegionCfg.regions) == 0 {
-			warehouse = w.wPart.totalElems[workerIdx%len(w.wPart.totalElems)]
-			p = w.wPart.partElemsMap[warehouse]
-		} else {
-			// For multi-region workloads, use the multi-region partitioning.
-			warehouse = w.wMRPart.totalElems[workerIdx%len(w.wMRPart.totalElems)]
-			p = w.wMRPart.partElemsMap[warehouse]
-		}
+		warehouse := w.wPart.totalElems[workerIdx%len(w.wPart.totalElems)]
+		p := w.wPart.partElemsMap[warehouse]
 
 		// This isn't part of our local partition.
 		if !isMyPart(p) {
@@ -871,7 +741,7 @@ func (w *tpcc) Ops(
 		idx := len(ql.WorkerFns) - 1
 		sem <- struct{}{}
 		group.Go(func() error {
-			worker, err := newWorker(ctx, w, db, reg.GetHandle(), counters, warehouse)
+			worker, err := newWorker(ctx, w, db, reg.GetHandle(), warehouse)
 			if err == nil {
 				ql.WorkerFns[idx] = worker.run
 			}
@@ -890,7 +760,7 @@ func (w *tpcc) Ops(
 	// Close idle connections.
 	ql.Close = func(context context.Context) {
 		for _, conn := range conns {
-			if err := conn.Close(ctx); err != nil {
+			if err := conn.Close(); err != nil {
 				log.Warningf(ctx, "%v", err)
 			}
 		}

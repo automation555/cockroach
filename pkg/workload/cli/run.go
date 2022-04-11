@@ -13,7 +13,6 @@ package cli
 import (
 	"context"
 	gosql "database/sql"
-	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -36,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/cockroachdb/errors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"golang.org/x/time/rate"
@@ -47,7 +45,6 @@ var tolerateErrors = runFlags.Bool("tolerate-errors", false, "Keep running on er
 var maxRate = runFlags.Float64(
 	"max-rate", 0, "Maximum frequency of operations (reads/writes). If 0, no limit.")
 var maxOps = runFlags.Uint64("max-ops", 0, "Maximum number of operations to run")
-var countErrors = runFlags.Bool("count-errors", false, "If true, unsuccessful operations count towards --max-ops limit.")
 var duration = runFlags.Duration("duration", 0,
 	"The duration to run (in addition to --ramp). If 0, run forever.")
 var doInit = runFlags.Bool("init", false, "Automatically run init. DEPRECATED: Use workload init instead.")
@@ -55,6 +52,8 @@ var ramp = runFlags.Duration("ramp", 0*time.Second, "The duration over which to 
 
 var initFlags = pflag.NewFlagSet(`init`, pflag.ContinueOnError)
 var drop = initFlags.Bool("drop", false, "Drop the existing database, if it exists")
+var runInsertInTx = initFlags.Bool("run-insert-in-tx", false,
+	"If set to true, each insert statement  by the dataloader will be run in a transaction")
 
 var sharedFlags = pflag.NewFlagSet(`shared`, pflag.ContinueOnError)
 var pprofport = sharedFlags.Int("pprofport", 33333, "Port for pprof endpoint.")
@@ -66,12 +65,6 @@ var initConns = sharedFlags.Int("init-conns", 16,
 var displayEvery = runFlags.Duration("display-every", time.Second, "How much time between every one-line activity reports.")
 
 var displayFormat = runFlags.String("display-format", "simple", "Output display format (simple, incremental-json)")
-
-var prometheusPort = sharedFlags.Int(
-	"prometheus-port",
-	2112,
-	"Port to expose prometheus metrics if the workload has a prometheus gatherer set.",
-)
 
 var histograms = runFlags.String(
 	"histograms", "",
@@ -86,7 +79,6 @@ var secure = securityFlags.Bool("secure", false,
 		"Running in secure mode expects the relevant certs to have been created for the user in the certs/ directory."+
 		"For example when using root, certs/client.root.crt certs/client.root.key should exist.")
 var user = securityFlags.String("user", "root", "Specify a user to run the workload as")
-var password = securityFlags.String("password", "", "Optionally specify a password for the user")
 
 func init() {
 
@@ -198,23 +190,16 @@ func CmdHelper(
 		if dbFlag := cmd.Flag(`db`); dbFlag != nil {
 			dbOverride = dbFlag.Value.String()
 		}
-
 		urls := args
+
 		if len(urls) == 0 {
 			crdbDefaultURL := fmt.Sprintf(`postgres://%s@localhost:26257?sslmode=disable`, *user)
 			if *secure {
-				if *password != "" {
-					crdbDefaultURL = fmt.Sprintf(
-						`postgres://%s:%s@localhost:26257?sslmode=require&sslrootcert=certs/ca.crt`,
-						*user, *password)
-				} else {
-					crdbDefaultURL = fmt.Sprintf(
-						// This URL expects the certs to have been created by the user.
-						`postgres://%s@localhost:26257?sslcert=certs/client.%s.crt&sslkey=certs/client.%s.key&sslrootcert=certs/ca.crt&sslmode=require`,
-						*user, *user, *user)
-				}
+				crdbDefaultURL = fmt.Sprintf(
+					// This URL expects the certs to have been created by the user.
+					`postgres://%s@localhost:26257?sslcert=certs/client.%s.crt&sslkey=certs/client.%s.key&sslrootcert=certs/ca.crt&sslmode=require`,
+					*user, *user, *user)
 			}
-
 			urls = []string{crdbDefaultURL}
 		}
 		dbName, err := workload.SanitizeUrls(gen, dbOverride, urls)
@@ -242,8 +227,7 @@ func SetCmdDefaults(cmd *cobra.Command) *cobra.Command {
 	return cmd
 }
 
-// numOps keeps a global count of successful operations (if countErrors is
-// false) or of all operations (if countErrors is true).
+// numOps keeps a global count of successful operations.
 var numOps uint64
 
 // workerRun is an infinite loop in which the worker continuously attempts to
@@ -273,18 +257,11 @@ func workerRun(
 		}
 
 		if err := workFn(ctx); err != nil {
-			if ctx.Err() != nil && (errors.Is(err, ctx.Err()) || errors.Is(err, driver.ErrBadConn)) {
-				// lib/pq may return either the `context canceled` error or a
-				// `bad connection` error when performing an operation with a context
-				// that has been canceled. See https://github.com/lib/pq/pull/1000
+			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 				return
 			}
 			errCh <- err
-			if !*countErrors {
-				// Continue to the next iteration of the infinite loop only if
-				// we are not counting the errors.
-				continue
-			}
+			continue
 		}
 
 		v := atomic.AddUint64(&numOps, 1)
@@ -322,7 +299,8 @@ func runInitImpl(
 	switch strings.ToLower(*dataLoader) {
 	case `insert`, `inserts`:
 		l = workloadsql.InsertsDataLoader{
-			Concurrency: *initConns,
+			Concurrency:            *initConns,
+			RunInsertInTransaction: *runInsertInTx,
 		}
 	case `import`, `imports`:
 		l = workload.ImportDataLoader
@@ -395,20 +373,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	if !ok {
 		return errors.Errorf(`no operations defined for %s`, gen.Meta().Name)
 	}
-	reg := histogram.NewRegistry(
-		*histogramsMaxLatency,
-		gen.Meta().Name,
-	)
-	// Expose the prometheus gatherer.
-	go func() {
-		if err := http.ListenAndServe(
-			fmt.Sprintf(":%d", *prometheusPort),
-			promhttp.HandlerFor(reg.Gatherer(), promhttp.HandlerOpts{}),
-		); err != nil {
-			log.Errorf(context.Background(), "error serving prometheus: %v", err)
-		}
-	}()
-
+	reg := histogram.NewRegistry(*histogramsMaxLatency)
 	var ops workload.QueryLoad
 	prepareStart := timeutil.Now()
 	log.Infof(ctx, "creating load generator...")
@@ -442,7 +407,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	}(prepareCtx); prepareErr != nil {
 		return prepareErr
 	}
-	log.Infof(ctx, "creating load generator... done (took %s)", timeutil.Since(prepareStart))
+	log.Infof(ctx, "creating load generator... done (took %s)", timeutil.Now().Sub(prepareStart))
 
 	start := timeutil.Now()
 	errCh := make(chan error)
@@ -470,11 +435,14 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		for i, workFn := range ops.WorkerFns {
 			go func(i int, workFn func(context.Context) error) {
 				// If a ramp period was specified, start all of the workers
-				// gradually.
+				// gradually with a new context.
 				if rampCtx != nil {
 					rampPerWorker := *ramp / time.Duration(len(ops.WorkerFns))
 					time.Sleep(time.Duration(i) * rampPerWorker)
+					workerRun(rampCtx, errCh, nil /* wg */, limiter, workFn)
 				}
+
+				// Start worker again, this time with the main context.
 				workerRun(workersCtx, errCh, &wg, limiter, workFn)
 			}(i, workFn)
 		}
@@ -512,15 +480,6 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			return err
 		}
 		jsonEnc = json.NewEncoder(jsonF)
-		defer func() {
-			if err := jsonF.Sync(); err != nil {
-				log.Warningf(ctx, "histogram: %v", err)
-			}
-
-			if err := jsonF.Close(); err != nil {
-				log.Warningf(ctx, "histogram: %v", err)
-			}
-		}()
 	}
 
 	everySecond := log.Every(*displayEvery)
@@ -541,9 +500,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			reg.Tick(func(t histogram.Tick) {
 				formatter.outputTick(startElapsed, t)
 				if jsonEnc != nil && rampDone == nil {
-					if err := jsonEnc.Encode(t.Snapshot()); err != nil {
-						log.Warningf(ctx, "histogram: %v", err)
-					}
+					_ = jsonEnc.Encode(t.Snapshot())
 				}
 			})
 
@@ -572,9 +529,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 					// Note that we're outputting the delta from the last tick. The
 					// cumulative histogram can be computed by merging all of the
 					// per-tick histograms.
-					if err := jsonEnc.Encode(t.Snapshot()); err != nil {
-						log.Warningf(ctx, "histogram: %v", err)
-					}
+					_ = jsonEnc.Encode(t.Snapshot())
 				}
 				if ops.ResultHist == `` || ops.ResultHist == t.Name {
 					if resultTick.Cumulative == nil {
