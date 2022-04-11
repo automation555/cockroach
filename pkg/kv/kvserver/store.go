@@ -2990,7 +2990,7 @@ func (s *Store) Descriptor(ctx context.Context, useCached bool) (*roachpb.StoreD
 // the provided stream and returns with an optional error when the rangefeed is
 // complete.
 func (s *Store) RangeFeed(
-	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
+	args *roachpb.RangeFeedRequest, stream roachpb.RangeFeedEventSink,
 ) *roachpb.Error {
 
 	if filter := s.TestingKnobs().TestingRangefeedFilter; filter != nil {
@@ -3265,8 +3265,7 @@ func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracing.Rec
 	defer collectAndFinish()
 	canTransferLease := func(ctx context.Context, repl *Replica) bool { return true }
 	_, err := s.replicateQueue.processOneChange(
-		ctx, repl, canTransferLease, false /* scatter */, true, /* dryRun */
-	)
+		ctx, repl, canTransferLease, true /* dryRun */)
 	if err != nil {
 		log.Eventf(ctx, "error simulating allocator on replica %s: %s", repl, err)
 	}
