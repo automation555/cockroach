@@ -18,9 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
 )
 
@@ -133,33 +131,27 @@ type Memo struct {
 
 	// The following are selected fields from SessionData which can affect
 	// planning. We need to cross-check these before reusing a cached memo.
-	// NOTE: If you add new fields here, be sure to add them to the relevant
-	//       fields in explain_bundle.go.
-	reorderJoinsLimit           int
-	zigzagJoinEnabled           bool
-	useHistograms               bool
-	useMultiColStats            bool
-	localityOptimizedSearch     bool
-	safeUpdates                 bool
-	preferLookupJoinsForFKs     bool
-	saveTablesPrefix            string
-	dateStyleEnabled            bool
-	intervalStyleEnabled        bool
-	dateStyle                   pgdate.DateStyle
-	intervalStyle               duration.IntervalStyle
-	propagateInputOrdering      bool
-	disallowFullTableScans      bool
-	largeFullScanRows           float64
-	nullOrderedLast             bool
-	costScansWithDefaultColSize bool
+	reorderJoinsLimit       int
+	zigzagJoinEnabled       bool
+	useHistograms           bool
+	useMultiColStats        bool
+	localityOptimizedSearch bool
+	safeUpdates             bool
+	preferLookupJoinsForFKs bool
+	saveTablesPrefix        string
 
-	// curRank is the highest currently in-use scalar expression rank.
-	curRank opt.ScalarRank
+	// curID is the highest currently in-use scalar expression ID.
+	curID opt.ScalarID
 
 	// curWithID is the highest currently in-use WITH ID.
 	curWithID opt.WithID
 
 	newGroupFn func(opt.Expr)
+
+	// allowHypotheticalIndexes is true if the optimzer is allowed to generate
+	// plans involving hypothetical indexes. It is set to true in EXPLAIN
+	// (HYPOTHETICAL) statements.
+	allowHypotheticalIndexes bool
 
 	// disableCheckExpr disables expression validation performed by CheckExpr,
 	// if the crdb_test build tag is set. If the crdb_test build tag is not set,
@@ -181,34 +173,17 @@ func (m *Memo) Init(evalCtx *tree.EvalContext) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*m = Memo{
-		metadata:                    m.metadata,
-		reorderJoinsLimit:           int(evalCtx.SessionData().ReorderJoinsLimit),
-		zigzagJoinEnabled:           evalCtx.SessionData().ZigzagJoinEnabled,
-		useHistograms:               evalCtx.SessionData().OptimizerUseHistograms,
-		useMultiColStats:            evalCtx.SessionData().OptimizerUseMultiColStats,
-		localityOptimizedSearch:     evalCtx.SessionData().LocalityOptimizedSearch,
-		safeUpdates:                 evalCtx.SessionData().SafeUpdates,
-		preferLookupJoinsForFKs:     evalCtx.SessionData().PreferLookupJoinsForFKs,
-		saveTablesPrefix:            evalCtx.SessionData().SaveTablesPrefix,
-		intervalStyleEnabled:        evalCtx.SessionData().IntervalStyleEnabled,
-		dateStyleEnabled:            evalCtx.SessionData().DateStyleEnabled,
-		dateStyle:                   evalCtx.SessionData().GetDateStyle(),
-		intervalStyle:               evalCtx.SessionData().GetIntervalStyle(),
-		propagateInputOrdering:      evalCtx.SessionData().PropagateInputOrdering,
-		disallowFullTableScans:      evalCtx.SessionData().DisallowFullTableScans,
-		largeFullScanRows:           evalCtx.SessionData().LargeFullScanRows,
-		nullOrderedLast:             evalCtx.SessionData().NullOrderedLast,
-		costScansWithDefaultColSize: evalCtx.SessionData().CostScansWithDefaultColSize,
+		metadata:                m.metadata,
+		reorderJoinsLimit:       evalCtx.SessionData.ReorderJoinsLimit,
+		zigzagJoinEnabled:       evalCtx.SessionData.ZigzagJoinEnabled,
+		useHistograms:           evalCtx.SessionData.OptimizerUseHistograms,
+		useMultiColStats:        evalCtx.SessionData.OptimizerUseMultiColStats,
+		localityOptimizedSearch: evalCtx.SessionData.LocalityOptimizedSearch,
+		safeUpdates:             evalCtx.SessionData.SafeUpdates,
+		preferLookupJoinsForFKs: evalCtx.SessionData.PreferLookupJoinsForFKs,
+		saveTablesPrefix:        evalCtx.SessionData.SaveTablesPrefix,
 	}
 	m.metadata.Init()
-	m.logPropsBuilder.init(evalCtx, m)
-}
-
-// ResetLogProps resets the logPropsBuilder. It should be used in combination
-// with the perturb-cost OptTester flag in order to update the query plan tree
-// after optimization is complete with the real computed cost, not the perturbed
-// cost.
-func (m *Memo) ResetLogProps(evalCtx *tree.EvalContext) {
 	m.logPropsBuilder.init(evalCtx, m)
 }
 
@@ -307,23 +282,14 @@ func (m *Memo) IsStale(
 ) (bool, error) {
 	// Memo is stale if fields from SessionData that can affect planning have
 	// changed.
-	if m.reorderJoinsLimit != int(evalCtx.SessionData().ReorderJoinsLimit) ||
-		m.zigzagJoinEnabled != evalCtx.SessionData().ZigzagJoinEnabled ||
-		m.useHistograms != evalCtx.SessionData().OptimizerUseHistograms ||
-		m.useMultiColStats != evalCtx.SessionData().OptimizerUseMultiColStats ||
-		m.localityOptimizedSearch != evalCtx.SessionData().LocalityOptimizedSearch ||
-		m.safeUpdates != evalCtx.SessionData().SafeUpdates ||
-		m.preferLookupJoinsForFKs != evalCtx.SessionData().PreferLookupJoinsForFKs ||
-		m.saveTablesPrefix != evalCtx.SessionData().SaveTablesPrefix ||
-		m.intervalStyleEnabled != evalCtx.SessionData().IntervalStyleEnabled ||
-		m.dateStyleEnabled != evalCtx.SessionData().DateStyleEnabled ||
-		m.dateStyle != evalCtx.SessionData().GetDateStyle() ||
-		m.intervalStyle != evalCtx.SessionData().GetIntervalStyle() ||
-		m.propagateInputOrdering != evalCtx.SessionData().PropagateInputOrdering ||
-		m.disallowFullTableScans != evalCtx.SessionData().DisallowFullTableScans ||
-		m.largeFullScanRows != evalCtx.SessionData().LargeFullScanRows ||
-		m.nullOrderedLast != evalCtx.SessionData().NullOrderedLast ||
-		m.costScansWithDefaultColSize != evalCtx.SessionData().CostScansWithDefaultColSize {
+	if m.reorderJoinsLimit != evalCtx.SessionData.ReorderJoinsLimit ||
+		m.zigzagJoinEnabled != evalCtx.SessionData.ZigzagJoinEnabled ||
+		m.useHistograms != evalCtx.SessionData.OptimizerUseHistograms ||
+		m.useMultiColStats != evalCtx.SessionData.OptimizerUseMultiColStats ||
+		m.localityOptimizedSearch != evalCtx.SessionData.LocalityOptimizedSearch ||
+		m.safeUpdates != evalCtx.SessionData.SafeUpdates ||
+		m.preferLookupJoinsForFKs != evalCtx.SessionData.PreferLookupJoinsForFKs ||
+		m.saveTablesPrefix != evalCtx.SessionData.SaveTablesPrefix {
 		return true, nil
 	}
 
@@ -375,7 +341,7 @@ func (m *Memo) SetBestProps(
 	}
 	bp := e.bestProps()
 	bp.required = required
-	bp.provided = provided
+	bp.provided = *provided
 	bp.cost = cost
 }
 
@@ -393,15 +359,10 @@ func (m *Memo) IsOptimized() bool {
 	return ok && rel.RequiredPhysical() != nil
 }
 
-// NextRank returns a new rank that can be assigned to a scalar expression.
-func (m *Memo) NextRank() opt.ScalarRank {
-	m.curRank++
-	return m.curRank
-}
-
-// CopyNextRankFrom copies the next ScalarRank from the other memo.
-func (m *Memo) CopyNextRankFrom(other *Memo) {
-	m.curRank = other.curRank
+// NextID returns a new unique ScalarID to number expressions with.
+func (m *Memo) NextID() opt.ScalarID {
+	m.curID++
+	return m.curID
 }
 
 // RequestColStat calculates and returns the column statistic calculated on the
@@ -413,19 +374,6 @@ func (m *Memo) RequestColStat(
 	// If this happens, we can't serve the request anymore.
 	if m.logPropsBuilder.sb.md != nil {
 		return m.logPropsBuilder.sb.colStat(cols, expr), true
-	}
-	return nil, false
-}
-
-// RequestColStatTable calculates and returns the column statistic in table
-// tabId.
-func (m *Memo) RequestColStatTable(
-	tabID opt.TableID, colSet opt.ColSet,
-) (colStat *props.ColumnStatistic, ok bool) {
-	// When SetRoot is called, the statistics builder may have been cleared.
-	// If this happens, we can't serve the request anymore.
-	if m.logPropsBuilder.sb.md != nil {
-		return m.logPropsBuilder.sb.colStatTable(tabID, colSet), true
 	}
 	return nil, false
 }
@@ -479,4 +427,12 @@ func (m *Memo) Detach() {
 // CheckExpr is always a no-op, so DisableCheckExpr has no effect.
 func (m *Memo) DisableCheckExpr() {
 	m.disableCheckExpr = true
+}
+
+func (m *Memo) AllowHypotheticalIndexes() {
+	m.allowHypotheticalIndexes = true
+}
+
+func (m *Memo) IsHypotheticalIndexAllowed() bool {
+	return m.allowHypotheticalIndexes
 }

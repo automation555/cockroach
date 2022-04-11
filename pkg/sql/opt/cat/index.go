@@ -63,10 +63,6 @@ type Index interface {
 	// the table.
 	ColumnCount() int
 
-	// ExplicitColumnCount returns the number of key columns that are explicitly
-	// specified in the index definition. This does not include stored columns.
-	ExplicitColumnCount() int
-
 	// KeyColumnCount returns the number of columns in the index that are part
 	// of its unique key. No two rows in the index will have the same values for
 	// those columns (where NULL values are treated as equal). Every index has a
@@ -137,9 +133,9 @@ type Index interface {
 	// i < ColumnCount.
 	Column(i int) IndexColumn
 
-	// InvertedColumn returns the inverted IndexColumn of the index. Panics if
-	// the index is not an inverted index.
-	InvertedColumn() IndexColumn
+	// VirtualInvertedColumn returns the VirtualInverted IndexColumn of the
+	// index. Panics if the index is not an inverted index.
+	VirtualInvertedColumn() IndexColumn
 
 	// Predicate returns the partial index predicate expression and true if the
 	// index is a partial index. If it is not a partial index, the empty string
@@ -178,6 +174,49 @@ type Index interface {
 	// list, and ImplicitPartitioningColumnCount < LaxKeyColumnCount.
 	ImplicitPartitioningColumnCount() int
 
+	// InterleaveAncestorCount returns the number of interleave ancestors for this
+	// index (or zero if this is not an interleaved index). Each ancestor is an
+	// index (usually from another table) with a key that shares a prefix with
+	// the key of this index.
+	//
+	// Each ancestor contributes one or more key columns; together these pieces
+	// form a prefix of an index key.
+	//
+	// The ancestors appear in the order they appear in an encoded key. This means
+	// they are always in the far-to-near ancestor order (e.g.
+	// grand-grand-parent, grand-parent, parent).
+	//
+	//
+	// Example:
+	//   Index 1 -> /a/b
+	//   Index 2 -> /a/b/c
+	//   Index 3 -> /a/b/c/d
+	//
+	// Index 3 has two ancestors; the first is index 1 (contributing 2 key
+	// columns) and the second is index 2 (contributing 1 key column).
+	InterleaveAncestorCount() int
+
+	// InterleaveAncestor returns information about an ancestor index.
+	//
+	// numKeyCols is the number of key columns that this ancestor contributes to
+	// an encoded key. In other words: each ancestor has a shared key prefix
+	// with this index; numKeyCols is the difference the shared prefix length for
+	// this ancestor and the shared prefix length for the previous ancestor.
+	// See InterleaveAncestorCount for an example.
+	InterleaveAncestor(i int) (table, index StableID, numKeyCols int)
+
+	// InterleavedByCount returns the number of indexes (usually from other
+	// tables) that are interleaved into this index.
+	//
+	// Note that these indexes can themselves be interleaved by other indexes, but
+	// this list contains only those for which this index is a direct interleave
+	// parent.
+	InterleavedByCount() int
+
+	// InterleavedBy returns information about an index that is interleaved into
+	// this index; see InterleavedByCount.
+	InterleavedBy(i int) (table, index StableID)
+
 	// GeoConfig returns a geospatial index configuration. If non-nil, it
 	// describes the configuration for this geospatial inverted index.
 	GeoConfig() *geoindex.Config
@@ -192,6 +231,12 @@ type Index interface {
 	// Partition returns the ith PARTITION BY LIST partition within the index
 	// definition, where i < PartitionCount.
 	Partition(i int) Partition
+
+	// Hypothetical returns true if the index is a hypothetical index that
+	// cannot be written to or read from. A hypothetical index can be used to
+	// test if an index improves a query plan without having to actually create
+	// the index.
+	Hypothetical() bool
 }
 
 // IndexColumn describes a single column that is part of an index definition.

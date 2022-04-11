@@ -11,18 +11,11 @@
 package tabledesc
 
 import (
-	"fmt"
-	"strings"
-	"time"
-
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 var _ catalog.Index = (*index)(nil)
@@ -71,14 +64,14 @@ func (w index) GetID() descpb.IndexID {
 	return w.desc.ID
 }
 
-// GetConstraintID returns the constraint ID.
-func (w index) GetConstraintID() descpb.ConstraintID {
-	return w.desc.ConstraintID
-}
-
 // GetName returns the index name.
 func (w index) GetName() string {
 	return w.desc.Name
+}
+
+// IsInterleaved returns true iff the index is interleaved.
+func (w index) IsInterleaved() bool {
+	return w.desc.IsInterleaved()
 }
 
 // IsPartial returns true iff the index is a partial index.
@@ -99,6 +92,11 @@ func (w index) IsDisabled() bool {
 // IsSharded returns true iff the index is hash sharded.
 func (w index) IsSharded() bool {
 	return w.desc.IsSharded()
+}
+
+// IsHypothetical returns true iff the index is a hypothetical index.
+func (w index) IsHypothetical() bool {
+	return w.desc.Hypothetical
 }
 
 // IsCreatedExplicitly returns true iff this index was created explicitly, i.e.
@@ -144,10 +142,7 @@ func (w index) IsValidReferencedUniqueConstraint(referencedColIDs descpb.ColumnI
 }
 
 // HasOldStoredColumns returns whether the index has stored columns in the old
-// format, in which the IDs of the stored columns were kept in the "extra"
-// column IDs slice, which is now called KeySuffixColumnIDs. Thus their data
-// was encoded the same way as if they were in an implicit column.
-// TODO(postamar): this concept should be migrated away.
+// format (data encoded the same way as if they were in an implicit column).
 func (w index) HasOldStoredColumns() bool {
 	return w.NumKeySuffixColumns() > 0 &&
 		!w.Primary() &&
@@ -168,27 +163,10 @@ func (w index) InvertedColumnName() string {
 	return w.desc.InvertedColumnName()
 }
 
-// InvertedColumnKeyType returns the type of the data element that is encoded
-// as the inverted index key. This is currently always Bytes.
-//
-// Panics if the index is not inverted.
-func (w index) InvertedColumnKeyType() *types.T {
-	return w.desc.InvertedColumnKeyType()
-}
-
 // CollectKeyColumnIDs creates a new set containing the column IDs in the key
 // of this index.
 func (w index) CollectKeyColumnIDs() catalog.TableColSet {
 	return catalog.MakeTableColSet(w.desc.KeyColumnIDs...)
-}
-
-// CollectPrimaryStoredColumnIDs creates a new set containing the column IDs
-// stored in this index if it is a primary index.
-func (w index) CollectPrimaryStoredColumnIDs() catalog.TableColSet {
-	if !w.Primary() {
-		return catalog.TableColSet{}
-	}
-	return catalog.MakeTableColSet(w.desc.StoreColumnIDs...)
 }
 
 // CollectSecondaryStoredColumnIDs creates a new set containing the column IDs
@@ -219,7 +197,7 @@ func (w index) GetGeoConfig() geoindex.Config {
 }
 
 // GetSharded returns the ShardedDescriptor in the index descriptor
-func (w index) GetSharded() catpb.ShardedDescriptor {
+func (w index) GetSharded() descpb.ShardedDescriptor {
 	return w.desc.Sharded
 }
 
@@ -246,6 +224,29 @@ func (w index) GetEncodingType() descpb.IndexDescriptorEncodingType {
 	return w.desc.EncodingType
 }
 
+// NumInterleaveAncestors returns the number of interleave ancestors as per the
+// index descriptor.
+func (w index) NumInterleaveAncestors() int {
+	return len(w.desc.Interleave.Ancestors)
+}
+
+// GetInterleaveAncestor returns the ancestorOrdinal-th interleave ancestor.
+func (w index) GetInterleaveAncestor(ancestorOrdinal int) descpb.InterleaveDescriptor_Ancestor {
+	return w.desc.Interleave.Ancestors[ancestorOrdinal]
+}
+
+// NumInterleavedBy returns the number of tables/indexes that are interleaved
+// into this index.
+func (w index) NumInterleavedBy() int {
+	return len(w.desc.InterleavedBy)
+}
+
+// GetInterleavedBy returns the interleavedByOrdinal-th table/index that is
+// interleaved into this index.
+func (w index) GetInterleavedBy(interleavedByOrdinal int) descpb.ForeignKeyReference {
+	return w.desc.InterleavedBy[interleavedByOrdinal]
+}
+
 // NumKeyColumns returns the number of columns in the index key.
 func (w index) NumKeyColumns() int {
 	return len(w.desc.KeyColumnIDs)
@@ -266,16 +267,6 @@ func (w index) GetKeyColumnName(columnOrdinal int) string {
 // the index key.
 func (w index) GetKeyColumnDirection(columnOrdinal int) descpb.IndexDescriptor_Direction {
 	return w.desc.KeyColumnDirections[columnOrdinal]
-}
-
-// NumPrimaryStoredColumns returns the number of columns which the index
-// stores in addition to the columns which are part of the primary key.
-// Returns 0 if the index isn't primary.
-func (w index) NumPrimaryStoredColumns() int {
-	if !w.Primary() {
-		return 0
-	}
-	return len(w.desc.StoreColumnIDs)
 }
 
 // NumSecondaryStoredColumns returns the number of columns which the index
@@ -323,56 +314,19 @@ func (w index) GetCompositeColumnID(compositeColumnOrdinal int) descpb.ColumnID 
 	return w.desc.CompositeColumnIDs[compositeColumnOrdinal]
 }
 
-// UseDeletePreservingEncoding returns true if the index is to be encoded with
-// an additional bit that indicates whether or not the value has been deleted.
-//
-// Index key-values that are deleted in this way are not actually deleted,
-// but remain in the index with a value which has the delete bit set to true.
-// This is necessary to preserve the delete history for the MVCC-compatible
-// index backfiller
-// docs/RFCS/20211004_incremental_index_backfiller.md#new-index-encoding-for-deletions-vs-mvcc
-//
-// We only use the delete preserving encoding if the index is
-// writable. Otherwise, we may preserve a delete when in DELETE_ONLY but never
-// see a subsequent write that replaces it. This a problem for the
-// MVCC-compatible index backfiller which merges entries from a
-// delete-preserving index into a newly-added index. A delete preserved in
-// DELETE_ONLY could result in a value being erroneously deleted during the
-// merge process. While we could filter such deletes, the filtering would
-// require more data being stored in each deleted entry and further complicate
-// the merge process. See #75720 for further details.
-func (w index) UseDeletePreservingEncoding() bool {
-	return w.desc.UseDeletePreservingEncoding && !w.maybeMutation.DeleteOnly()
-}
-
-// ForcePut returns true if writes to the index should only use Put (rather than
-// CPut or InitPut). This is used by indexes currently being built by the
-// MVCC-compliant index backfiller and the temporary indexes that support that
-// process.
-func (w index) ForcePut() bool {
-	return w.Merging() || w.desc.UseDeletePreservingEncoding
-}
-
-func (w index) CreatedAt() time.Time {
-	if w.desc.CreatedAtNanos == 0 {
-		return time.Time{}
-	}
-	return timeutil.Unix(0, w.desc.CreatedAtNanos)
-}
-
 // partitioning is the backing struct for a catalog.Partitioning interface.
 type partitioning struct {
-	desc *catpb.PartitioningDescriptor
+	desc *descpb.PartitioningDescriptor
 }
 
 // PartitioningDesc returns the underlying protobuf descriptor.
-func (p partitioning) PartitioningDesc() *catpb.PartitioningDescriptor {
+func (p partitioning) PartitioningDesc() *descpb.PartitioningDescriptor {
 	return p.desc
 }
 
 // DeepCopy returns a deep copy of the receiver.
 func (p partitioning) DeepCopy() catalog.Partitioning {
-	return &partitioning{desc: protoutil.Clone(p.desc).(*catpb.PartitioningDescriptor)}
+	return &partitioning{desc: protoutil.Clone(p.desc).(*descpb.PartitioningDescriptor)}
 }
 
 // FindPartitionByName recursively searches the partitioning for a partition
@@ -491,7 +445,6 @@ type indexCache struct {
 	all                  []catalog.Index
 	active               []catalog.Index
 	nonDrop              []catalog.Index
-	nonPrimary           []catalog.Index
 	publicNonPrimary     []catalog.Index
 	writableNonPrimary   []catalog.Index
 	deletableNonPrimary  []catalog.Index
@@ -524,13 +477,7 @@ func newIndexCache(desc *descpb.TableDescriptor, mutations *mutationCache) *inde
 	c.primary = c.all[0]
 	c.active = c.all[:numPublic]
 	c.publicNonPrimary = c.active[1:]
-	for _, idx := range c.all[1:] {
-		if !idx.Backfilling() {
-			lazyAllocAppendIndex(&c.deletableNonPrimary, idx, len(c.all[1:]))
-		}
-		lazyAllocAppendIndex(&c.nonPrimary, idx, len(c.all[1:]))
-	}
-
+	c.deletableNonPrimary = c.all[1:]
 	if numMutations == 0 {
 		c.writableNonPrimary = c.publicNonPrimary
 	} else {
@@ -546,11 +493,7 @@ func newIndexCache(desc *descpb.TableDescriptor, mutations *mutationCache) *inde
 		if !idx.Dropped() && (!idx.Primary() || desc.IsPhysicalTable()) {
 			lazyAllocAppendIndex(&c.nonDrop, idx, len(c.all))
 		}
-		// TODO(ssd): We exclude backfilling indexes from
-		// IsPartial() for the unprincipled reason of not
-		// wanting to modify all of the code that assumes
-		// these are always at least delete-only.
-		if idx.IsPartial() && !idx.Backfilling() {
+		if idx.IsPartial() {
 			lazyAllocAppendIndex(&c.partial, idx, len(c.all))
 		}
 	}
@@ -562,9 +505,4 @@ func lazyAllocAppendIndex(slice *[]catalog.Index, idx catalog.Index, cap int) {
 		*slice = make([]catalog.Index, 0, cap)
 	}
 	*slice = append(*slice, idx)
-}
-
-// ForeignKeyConstraintName forms a default foreign key constraint name.
-func ForeignKeyConstraintName(fromTable string, columnNames []string) string {
-	return fmt.Sprintf("%s_%s_fkey", fromTable, strings.Join(columnNames, "_"))
 }
