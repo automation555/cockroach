@@ -102,8 +102,6 @@ func makeTestBaseConfig(st *cluster.Settings, tr *tracing.Tracer) BaseConfig {
 	baseCfg.HTTPAddr = util.TestAddr.String()
 	// Set standard user for intra-cluster traffic.
 	baseCfg.User = security.NodeUserName()
-	// Enable web session authentication.
-	baseCfg.EnableWebSessionAuthentication = true
 	return baseCfg
 }
 
@@ -222,9 +220,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.HTTPAddr != "" {
 		cfg.HTTPAddr = params.HTTPAddr
 	}
-	cfg.DisableTLSForHTTP = params.DisableTLSForHTTP
+	cfg.SecurityOverrides.SetFlag(base.DisableHTTPTLS, params.DisableTLSForHTTP)
 	if params.DisableWebSessionAuthentication {
-		cfg.EnableWebSessionAuthentication = false
+		cfg.SecurityOverrides.SetFlag(base.DisableHTTPAuthn, true)
 	}
 	if params.EnableDemoLoginEndpoint {
 		cfg.EnableDemoLoginEndpoint = true
@@ -276,6 +274,12 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 
 	if params.Knobs.SQLExecutor == nil {
 		cfg.TestingKnobs.SQLExecutor = &sql.ExecutorTestingKnobs{}
+	}
+
+	if cfg.Insecure {
+		// We do this override at the end, after the other override
+		// flags above have been applied.
+		_ = cfg.SecurityOverrides.Set("disable-all")
 	}
 
 	return cfg
@@ -513,7 +517,6 @@ type TestTenant struct {
 	sqlAddr  string
 	httpAddr string
 	*httpTestServer
-	drain *drainServer
 }
 
 var _ serverutils.TestTenantInterface = &TestTenant{}
@@ -626,11 +629,6 @@ func (t *TestTenant) SpanConfigSQLWatcher() interface{} {
 	return t.SQLServer.spanconfigSQLWatcher
 }
 
-// DrainClients exports the drainClients() method for use by tests.
-func (t *TestTenant) DrainClients(ctx context.Context) error {
-	return t.drain.drainClients(ctx, nil /* reporter */)
-}
-
 // StartTenant starts a SQL tenant communicating with this TestServer.
 func (ts *TestServer) StartTenant(
 	ctx context.Context, params base.TestTenantArgs,
@@ -689,6 +687,9 @@ func (ts *TestServer) StartTenant(
 	baseCfg := makeTestBaseConfig(st, stopper.Tracer())
 	baseCfg.TestingKnobs = params.TestingKnobs
 	baseCfg.Insecure = params.ForceInsecure
+	if baseCfg.Insecure {
+		_ = baseCfg.SecurityOverrides.Set("disable-all")
+	}
 	baseCfg.Locality = params.Locality
 	if params.SSLCertsDir != "" {
 		baseCfg.SSLCertsDir = params.SSLCertsDir
@@ -724,7 +725,7 @@ func (ts *TestServer) StartTenant(
 	if params.RPCHeartbeatInterval != 0 {
 		baseCfg.RPCHeartbeatInterval = params.RPCHeartbeatInterval
 	}
-	sqlServer, authServer, drainServer, addr, httpAddr, err := startTenantInternal(
+	sqlServer, authServer, addr, httpAddr, err := startTenantInternal(
 		ctx,
 		stopper,
 		ts.Cfg.ClusterName,
@@ -745,7 +746,6 @@ func (ts *TestServer) StartTenant(
 		sqlAddr:        addr,
 		httpAddr:       httpAddr,
 		httpTestServer: hts,
-		drain:          drainServer,
 	}, err
 }
 
@@ -822,7 +822,7 @@ func (ts *TestServer) SQLAddr() string {
 
 // DrainClients exports the drainClients() method for use by tests.
 func (ts *TestServer) DrainClients(ctx context.Context) error {
-	return ts.drain.drainClients(ctx, nil /* reporter */)
+	return ts.drainClients(ctx, nil /* reporter */)
 }
 
 // Readiness returns nil when the server's health probe reports
