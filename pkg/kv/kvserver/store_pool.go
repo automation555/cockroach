@@ -45,10 +45,19 @@ const (
 // replicate queue will not consider stores which have failed a reservation a
 // viable target.
 var FailedReservationsTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
 	"server.failed_reservation_timeout",
 	"the amount of time to consider the store throttled for up-replication after a failed reservation call",
 	5*time.Second,
+	settings.NonNegativeDuration,
+)
+
+// DeclinedSnapshotTimeout specifies a duration during which the local replicate
+// queue will not consider stores which have declined a snapshot a viable
+// target.
+var DeclinedSnapshotTimeout = settings.RegisterDurationSetting(
+	"server.declined_snapshot.timeout",
+	"the amount of time to consider the store throttled for rebalancing after a declined snapshot",
+	60*time.Second,
 	settings.NonNegativeDuration,
 )
 
@@ -57,7 +66,6 @@ const timeAfterStoreSuspectSettingName = "server.time_after_store_suspect"
 // TimeAfterStoreSuspect measures how long we consider a store suspect since
 // it's last failure.
 var TimeAfterStoreSuspect = settings.RegisterDurationSetting(
-	settings.TenantWritable,
 	timeAfterStoreSuspectSettingName,
 	"the amount of time we consider a store suspect for after it fails a node liveness heartbeat."+
 		" A suspect node would not receive any new replicas or lease transfers, but will keep the replicas it has.",
@@ -81,7 +89,6 @@ const timeUntilStoreDeadSettingName = "server.time_until_store_dead"
 // TimeUntilStoreDead wraps "server.time_until_store_dead".
 var TimeUntilStoreDead = func() *settings.DurationSetting {
 	s := settings.RegisterDurationSetting(
-		settings.TenantWritable,
 		timeUntilStoreDeadSettingName,
 		"the time after which if there is no new gossiped information about a store, it is considered dead",
 		5*time.Minute,
@@ -917,6 +924,7 @@ type throttleReason int
 const (
 	_ throttleReason = iota
 	throttleFailed
+	throttleDeclined
 )
 
 // throttle informs the store pool that the given remote store declined a
@@ -940,6 +948,14 @@ func (sp *StorePool) throttle(reason throttleReason, why string, storeID roachpb
 		if log.V(2) {
 			ctx := sp.AnnotateCtx(context.TODO())
 			log.Infof(ctx, "snapshot failed (%s), s%d will be throttled for %s until %s",
+				why, storeID, timeout, detail.throttledUntil)
+		}
+	case throttleDeclined:
+		timeout := DeclinedSnapshotTimeout.Get(&sp.st.SV)
+		detail.throttledUntil = sp.clock.PhysicalTime().Add(timeout)
+		if log.V(2) {
+			ctx := sp.AnnotateCtx(context.TODO())
+			log.Infof(ctx, "snapshot declined (%s), s%d will be throttled for %s until %s",
 				why, storeID, timeout, detail.throttledUntil)
 		}
 	default:
