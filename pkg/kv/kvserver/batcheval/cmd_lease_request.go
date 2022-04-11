@@ -12,10 +12,10 @@ package batcheval
 
 import (
 	"context"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -27,11 +27,7 @@ func init() {
 }
 
 func declareKeysRequestLease(
-	rs ImmutableRangeState,
-	_ *roachpb.Header,
-	_ roachpb.Request,
-	latchSpans, _ *spanset.SpanSet,
-	_ time.Duration,
+	rs ImmutableRangeState, _ roachpb.Header, _ roachpb.Request, latchSpans, _ *spanset.SpanSet,
 ) {
 	// NOTE: RequestLease is run on replicas that do not hold the lease, so
 	// acquiring latches would not help synchronize with other requests. As
@@ -148,12 +144,30 @@ func RequestLease(
 		// lease is changing hands or the leaseholder restarted), construct a
 		// read summary to instruct the new leaseholder on how to update its
 		// timestamp cache. Since we are not the leaseholder ourselves, we must
-		// pessimistically assume that prior leaseholders served reads all the
-		// way up to the start of the new lease.
+		// pessimistically assume that prior leaseholders either served reads all
+		// the way up to the start of the new lease or what the prior leaseholder's
+		// read summary says, whichever is higher.
+		//
+		// The read summary may contain a read at a higher timestamp than the new
+		// lease's start time. This is slightly surprising because the new lease can
+		// only be acquired after the previous lease has expired and we only serve
+		// reads within a lease's interval. But lease expiration times can regress
+		// during cooperative lease transfers because the lease expiration time has
+		// a layer of indirection through the transferee's node liveness record.
+		// Thus, if one of the prior leaseholders served a future time read at a
+		// timestamp above what was later regressed by a subsequent leaseholder, we
+		// could be acquiring a lease here below a recorded read in the read
+		// summary. See #66562.
 		//
 		// NB: this is equivalent to the leaseChangingHands condition in
 		// leasePostApplyLocked.
 		worstCaseSum := rspb.FromTimestamp(newLease.Start.ToTimestamp())
+		if priorSum, err := readsummary.Load(ctx, readWriter, cArgs.EvalCtx.GetRangeID()); err != nil {
+			return result.Result{}, err
+		} else if priorSum != nil {
+			worstCaseSum.Merge(*priorSum)
+		}
+
 		priorReadSum = &worstCaseSum
 	}
 
