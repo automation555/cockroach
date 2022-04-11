@@ -210,6 +210,7 @@ func CheckTwoVersionInvariant(
 	descsCol.ReleaseLeases(ctx)
 
 	// Wait until all older version leases have been released or expired.
+	retryCount := 0
 	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
 		// Use the current clock time.
 		now := clock.Now()
@@ -223,6 +224,10 @@ func CheckTwoVersionInvariant(
 		if onRetryBackoff != nil {
 			onRetryBackoff()
 		}
+		if retryCount == 5 {
+			lease.DumpLeases(ctx, ie, descs, now)
+		}
+		retryCount += 1
 	}
 	return true, retryErr
 }

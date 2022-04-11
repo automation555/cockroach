@@ -20,8 +20,46 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
+
+func DumpLeases(
+	ctx context.Context, executor sqlutil.InternalExecutor, versions []IDVersion, at hlc.Timestamp,
+) error {
+	var whereClauses []string
+	for _, t := range versions {
+		whereClauses = append(whereClauses,
+			fmt.Sprintf(`("descID" = %d AND version = %d AND expiration > $1)`,
+				t.ID, t.Version),
+		)
+	}
+
+	stmt := fmt.Sprintf(`SELECT descID FROM system.public.lease AS OF SYSTEM TIME '%s' WHERE `,
+		at.AsOfSystemTime()) +
+		strings.Join(whereClauses, " OR ")
+	rows, err := executor.QueryIteratorEx(
+		ctx, "count-leases", nil, /* txn */
+		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		stmt, at.GoTime(),
+	)
+	if err != nil {
+		return err
+	}
+	for {
+		hasNext, err := rows.Next(ctx)
+		if !hasNext {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		descID := tree.MustBeDInt(rows.Cur()[0])
+		log.Errorf(ctx, "Still holding leases on  %d", descID)
+	}
+	rows.Close()
+	return nil
+}
 
 // CountLeases returns the number of unexpired leases for a number of descriptors
 // each at a particular version at a particular time.
