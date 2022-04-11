@@ -47,7 +47,6 @@ func (l *localTestClusterTransport) SendNext(
 // InitFactoryForLocalTestCluster initializes a TxnCoordSenderFactory
 // that can be used with LocalTestCluster.
 func InitFactoryForLocalTestCluster(
-	ctx context.Context,
 	st *cluster.Settings,
 	nodeDesc *roachpb.NodeDescriptor,
 	tracer *tracing.Tracer,
@@ -59,18 +58,17 @@ func InitFactoryForLocalTestCluster(
 ) kv.TxnSenderFactory {
 	return NewTxnCoordSenderFactory(
 		TxnCoordSenderFactoryConfig{
-			AmbientCtx: log.MakeTestingAmbientContext(tracer),
+			AmbientCtx: log.AmbientContext{Tracer: tracer},
 			Settings:   st,
 			Clock:      clock,
 			Stopper:    stopper,
 		},
-		NewDistSenderForLocalTestCluster(ctx, st, nodeDesc, tracer, clock, latency, stores, stopper, gossip),
+		NewDistSenderForLocalTestCluster(st, nodeDesc, tracer, clock, latency, stores, stopper, gossip),
 	)
 }
 
 // NewDistSenderForLocalTestCluster creates a DistSender for a LocalTestCluster.
 func NewDistSenderForLocalTestCluster(
-	ctx context.Context,
 	st *cluster.Settings,
 	nodeDesc *roachpb.NodeDescriptor,
 	tracer *tracing.Tracer,
@@ -82,10 +80,10 @@ func NewDistSenderForLocalTestCluster(
 ) *DistSender {
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.Closer = stopper.ShouldQuiesce()
-	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
+	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
 	senderTransportFactory := SenderTransportFactory(tracer, stores)
 	return NewDistSender(DistSenderConfig{
-		AmbientCtx:         log.MakeTestingAmbientContext(tracer),
+		AmbientCtx:         log.AmbientContext{Tracer: tracer},
 		Settings:           st,
 		Clock:              clock,
 		NodeDescs:          g,
@@ -97,7 +95,7 @@ func NewDistSenderForLocalTestCluster(
 		TestingKnobs: ClientTestingKnobs{
 			TransportFactory: func(
 				opts SendOptions,
-				nodeDialer *nodedialer.Dialer,
+				nodeDialer NodeDialer,
 				replicas ReplicaSlice,
 			) (Transport, error) {
 				transport, err := senderTransportFactory(opts, nodeDialer, replicas)

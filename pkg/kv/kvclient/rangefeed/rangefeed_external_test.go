@@ -15,15 +15,11 @@ import (
 	"runtime/pprof"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sstutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -83,7 +79,7 @@ func TestRangeFeedIntegration(t *testing.T) {
 			case <-ctx.Done():
 			}
 		},
-		rangefeed.WithDiff(true),
+		rangefeed.WithDiff(),
 		rangefeed.WithInitialScan(func(ctx context.Context) {
 			close(initialScanDone)
 		}),
@@ -387,7 +383,7 @@ func TestRangefeedValueTimestamps(t *testing.T) {
 			case <-ctx.Done():
 			}
 		},
-		rangefeed.WithDiff(true),
+		rangefeed.WithDiff(),
 	)
 	require.NoError(t, err)
 	defer r.Close()
@@ -456,178 +452,13 @@ func TestRangefeedValueTimestamps(t *testing.T) {
 	}
 }
 
-// TestWithOnSSTable tests that the rangefeed emits SST ingestions correctly.
-func TestWithOnSSTable(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
-	srv := tc.Server(0)
-	db := srv.DB()
-
-	_, _, err := tc.SplitRange(roachpb.Key("a"))
-	require.NoError(t, err)
-	require.NoError(t, tc.WaitForFullReplication())
-
-	_, err = tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true")
-	require.NoError(t, err)
-	f, err := rangefeed.NewFactory(srv.Stopper(), db, srv.ClusterSettings(), nil)
-	require.NoError(t, err)
-
-	// We start the rangefeed over a narrower span than the AddSSTable (c-e vs
-	// a-f), to ensure the entire SST is emitted even if the registration is
-	// narrower.
-	var once sync.Once
-	checkpointC := make(chan struct{})
-	sstC := make(chan *roachpb.RangeFeedSSTable)
-	spans := []roachpb.Span{{Key: roachpb.Key("c"), EndKey: roachpb.Key("e")}}
-	r, err := f.RangeFeed(ctx, "test", spans, db.Clock().Now(),
-		func(ctx context.Context, value *roachpb.RangeFeedValue) {},
-		rangefeed.WithOnCheckpoint(func(ctx context.Context, checkpoint *roachpb.RangeFeedCheckpoint) {
-			once.Do(func() {
-				close(checkpointC)
-			})
-		}),
-		rangefeed.WithOnSSTable(func(ctx context.Context, sst *roachpb.RangeFeedSSTable) {
-			select {
-			case sstC <- sst:
-			case <-ctx.Done():
-			}
-		}),
-	)
-	require.NoError(t, err)
-	defer r.Close()
-
-	// Wait for initial checkpoint.
-	select {
-	case <-checkpointC:
-	case <-time.After(3 * time.Second):
-		require.Fail(t, "timed out waiting for checkpoint")
-	}
-
-	// Ingest an SST.
-	now := db.Clock().Now()
-	now.Logical = 0
-	ts := now.WallTime
-	sstKVs := []sstutil.KV{{"a", ts, "1"}, {"b", ts, "2"}, {"c", ts, "3"}, {"d", ts, "4"}, {"e", ts, "5"}}
-	sst, sstStart, sstEnd := sstutil.MakeSST(t, sstKVs)
-	_, pErr := db.AddSSTableAtBatchTimestamp(ctx, sstStart, sstEnd, sst,
-		false /* disallowConflicts */, false /* disallowShadowing */, hlc.Timestamp{}, nil, /* stats */
-		false /* ingestAsWrites */, now)
-	require.Nil(t, pErr)
-
-	// Wait for the SST event and check its contents.
-	var sstEvent *roachpb.RangeFeedSSTable
-	select {
-	case sstEvent = <-sstC:
-	case <-time.After(3 * time.Second):
-		require.Fail(t, "timed out waiting for SST event")
-	}
-
-	require.Equal(t, roachpb.Span{Key: sstStart, EndKey: sstEnd}, sstEvent.Span)
-	require.Equal(t, now, sstEvent.WriteTS)
-	require.Equal(t, sstKVs, sstutil.ScanSST(t, sstEvent.Data))
-}
-
-// TestWithOnSSTableCatchesUpIfNotSet tests that the rangefeed runs a catchup
-// scan if an OnSSTable event is emitted and no OnSSTable event handler is set.
-func TestWithOnSSTableCatchesUpIfNotSet(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
-	srv := tc.Server(0)
-	db := srv.DB()
-
-	_, _, err := tc.SplitRange(roachpb.Key("a"))
-	require.NoError(t, err)
-	require.NoError(t, tc.WaitForFullReplication())
-
-	_, err = tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true")
-	require.NoError(t, err)
-	f, err := rangefeed.NewFactory(srv.Stopper(), db, srv.ClusterSettings(), nil)
-	require.NoError(t, err)
-
-	// We start the rangefeed over a narrower span than the AddSSTable (c-e vs
-	// a-f), to ensure only the restricted span is emitted by the catchup scan.
-	var once sync.Once
-	checkpointC := make(chan struct{})
-	rowC := make(chan *roachpb.RangeFeedValue)
-	spans := []roachpb.Span{{Key: roachpb.Key("c"), EndKey: roachpb.Key("e")}}
-	r, err := f.RangeFeed(ctx, "test", spans, db.Clock().Now(),
-		func(ctx context.Context, value *roachpb.RangeFeedValue) {
-			select {
-			case rowC <- value:
-			case <-ctx.Done():
-			}
-		},
-		rangefeed.WithOnCheckpoint(func(ctx context.Context, checkpoint *roachpb.RangeFeedCheckpoint) {
-			once.Do(func() {
-				close(checkpointC)
-			})
-		}),
-	)
-	require.NoError(t, err)
-	defer r.Close()
-
-	// Wait for initial checkpoint.
-	select {
-	case <-checkpointC:
-	case <-time.After(3 * time.Second):
-		require.Fail(t, "timed out waiting for checkpoint")
-	}
-
-	// Ingest an SST.
-	now := db.Clock().Now()
-	now.Logical = 0
-	ts := now.WallTime
-	sstKVs := []sstutil.KV{{"a", ts, "1"}, {"b", ts, "2"}, {"c", ts, "3"}, {"d", ts, "4"}, {"e", ts, "5"}}
-	expectKVs := []sstutil.KV{{"c", ts, "3"}, {"d", ts, "4"}}
-	sst, sstStart, sstEnd := sstutil.MakeSST(t, sstKVs)
-	_, pErr := db.AddSSTableAtBatchTimestamp(ctx, sstStart, sstEnd, sst,
-		false /* disallowConflicts */, false /* disallowShadowing */, hlc.Timestamp{}, nil, /* stats */
-		false /* ingestAsWrites */, now)
-	require.Nil(t, pErr)
-
-	// Assert that we receive the KV pairs within the rangefeed span.
-	timer := time.NewTimer(3 * time.Second)
-	var seenKVs []sstutil.KV
-	for len(seenKVs) < len(expectKVs) {
-		select {
-		case row := <-rowC:
-			value, err := row.Value.GetBytes()
-			require.NoError(t, err)
-			seenKVs = append(seenKVs, sstutil.KV{
-				KeyString:     string(row.Key),
-				WallTimestamp: row.Value.Timestamp.WallTime,
-				ValueString:   string(value),
-			})
-		case <-timer.C:
-			require.Fail(t, "timed out waiting for catchup scan", "saw entries: %v", seenKVs)
-		}
-	}
-	require.Equal(t, expectKVs, seenKVs)
-}
-
 // TestUnrecoverableErrors verifies that unrecoverable internal errors are surfaced
 // to callers.
 func TestUnrecoverableErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				SpanConfig: &spanconfig.TestingKnobs{
-					ConfigureScratchRange: true,
-				},
-			},
-		},
-	})
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
 	srv0 := tc.Server(0)
@@ -658,18 +489,9 @@ func TestUnrecoverableErrors(t *testing.T) {
 		syncutil.Mutex
 		internalErr error
 	}{}
-
-	testutils.SucceedsSoon(t, func() error {
-		repl := tc.GetFirstStoreFromServer(t, 0).LookupReplica(roachpb.RKey(scratchKey))
-		if repl.SpanConfig().GCPolicy.IgnoreStrictEnforcement {
-			return errors.New("waiting for span config to apply")
-		}
-		return nil
-	})
-
 	r, err := f.RangeFeed(ctx, "test", []roachpb.Span{sp}, preGCThresholdTS,
 		func(context.Context, *roachpb.RangeFeedValue) {},
-		rangefeed.WithDiff(true),
+		rangefeed.WithDiff(),
 		rangefeed.WithOnInternalError(func(ctx context.Context, err error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -689,83 +511,6 @@ func TestUnrecoverableErrors(t *testing.T) {
 		}
 		return nil
 	})
-}
-
-// TestMVCCHistoryMutationError verifies that applying a MVCC history mutation
-// emits an unrecoverable error.
-func TestMVCCHistoryMutationError(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
-
-	srv0 := tc.Server(0)
-	db0 := srv0.DB()
-	scratchKey := tc.ScratchRange(t)
-	scratchKey = scratchKey[:len(scratchKey):len(scratchKey)]
-	sp := roachpb.Span{
-		Key:    scratchKey,
-		EndKey: scratchKey.PrefixEnd(),
-	}
-
-	_, err := tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true")
-	require.NoError(t, err)
-	_, err = tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'")
-	require.NoError(t, err)
-
-	// Set up a rangefeed.
-	f, err := rangefeed.NewFactory(srv0.Stopper(), db0, srv0.ClusterSettings(), nil)
-	require.NoError(t, err)
-
-	var once sync.Once
-	checkpointC := make(chan struct{})
-	errC := make(chan error)
-	r, err := f.RangeFeed(ctx, "test", []roachpb.Span{sp}, srv0.Clock().Now(),
-		func(context.Context, *roachpb.RangeFeedValue) {},
-		rangefeed.WithOnCheckpoint(func(ctx context.Context, checkpoint *roachpb.RangeFeedCheckpoint) {
-			once.Do(func() {
-				close(checkpointC)
-			})
-		}),
-		rangefeed.WithOnInternalError(func(ctx context.Context, err error) {
-			select {
-			case errC <- err:
-			case <-ctx.Done():
-			}
-		}),
-	)
-	require.NoError(t, err)
-	defer r.Close()
-
-	// Wait for initial checkpoint.
-	select {
-	case <-checkpointC:
-	case err := <-errC:
-		require.NoError(t, err)
-	case <-time.After(3 * time.Second):
-		require.Fail(t, "timed out waiting for checkpoint")
-	}
-
-	// Send a ClearRange request that mutates MVCC history.
-	_, pErr := kv.SendWrapped(ctx, db0.NonTransactionalSender(), &roachpb.ClearRangeRequest{
-		RequestHeader: roachpb.RequestHeader{
-			Key:    sp.Key,
-			EndKey: sp.EndKey,
-		},
-	})
-	require.Nil(t, pErr)
-
-	// Wait for the MVCCHistoryMutationError.
-	select {
-	case err := <-errC:
-		var mvccErr *roachpb.MVCCHistoryMutationError
-		require.ErrorAs(t, err, &mvccErr)
-		require.Equal(t, &roachpb.MVCCHistoryMutationError{Span: sp}, err)
-	case <-time.After(3 * time.Second):
-		require.Fail(t, "timed out waiting for error")
-	}
 }
 
 // TestRangefeedWithLabelsOption verifies go routines started by rangefeed are
