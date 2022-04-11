@@ -20,6 +20,7 @@ import "roachpb/io-formats.proto";
 import "sql/catalog/descpb/structured.proto";
 import "sql/catalog/descpb/tenant.proto";
 import "util/hlc/timestamp.proto";
+import "sql/schemachanger/scpb/scpb.proto";
 import "clusterversion/cluster_version.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -109,6 +110,27 @@ message StreamIngestionProgress {
   // PartitionProgress maps partition addresses to their progress.
   // TODO(pbardea): This could scale O(partitions) = O(nodes).
   map<string, PartitionProgress> partition_progress = 2 [(gogoproto.nullable) = false];
+}
+
+
+message StreamReplicationStatus {
+  enum StreamStatus {
+    // Stream is running. Consumers should continue to heartbeat.
+    STREAM_ACTIVE = 0;
+    // Stream stopped running. Consumers should stop heartbeating and
+    // optionally start a new replication stream.
+    STREAM_INACTIVE = 1;
+    // Stream replication is paused. Consumers can resume the job and start heartbeating.
+    STREAM_PAUSED = 2;
+    // Stream status is unknown. Consumers should retry heartbeating.
+    UNKNOWN_STREAM_STATUS_RETRY = 4;
+  }
+
+  StreamStatus stream_status = 1;
+
+  // Current protected timestamp for spans being replicated. It is absent
+  // when the replication stream is 'STOPPED'.
+  util.hlc.Timestamp protected_timestamp = 2;
 }
 
 message StreamReplicationDetails {
@@ -272,6 +294,9 @@ message RestoreDetails {
 
   // The restore job has several atomic stages. For now, we keep track of which
   // stages have completed via these flags.
+
+  // PrepareCompleted: indicates that the updated descriptors have been written to disk in
+  // offline state
   bool prepare_completed = 8;
   bool stats_inserted = 9;
   // SystemTablesMigrated keeps track of which system tables data have been
@@ -317,8 +342,11 @@ message RestoreDetails {
 
   // DebugPauseOn describes the events that the job should pause itself on for debugging purposes.
   string debug_pause_on = 20;
+  
+  // DryRun indicates the restore job will not actually write data to disk
+  bool dry_run = 22;
 
-  // NEXT ID: 22.
+  // NEXT ID: 23
 }
 
 message RestoreProgress {
@@ -396,7 +424,7 @@ message ImportDetails {
   // If the database being imported into is a multi-region database, then this
   // field stores the databases' primary region.
   string database_primary_region = 27 [
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb.RegionName"
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.RegionName"
   ];
 
   // next val: 28
@@ -469,14 +497,13 @@ message TypeSchemaChangeProgress {
 
 }
 
-// NewSchemaChangeDetails is the job detail information for the new schema change job.
+// TypeSchemaChangeDetails is the job detail information for the new schema change job.
 message NewSchemaChangeDetails {
+  repeated cockroach.sql.schemachanger.scpb.Target targets = 1;
 
   // BackfillProgress stores the progress for index backfills which may
   // be ongoing.
   repeated BackfillProgress backfill_progress = 4 [(gogoproto.nullable) = false];
-
-  reserved 1, 2, 3, 5;
 }
 
 // BackfillProgress is used to track backfill progress in the declarative
@@ -518,7 +545,15 @@ message BackfillProgress {
 
 // NewSchemaChangeProgress is the persisted progress for the new schema change job.
 message NewSchemaChangeProgress {
-  reserved 1;
+  // Tracks the current status of nodes in an ordered manner for
+  // keeping track of progress.
+  repeated cockroach.sql.schemachanger.scpb.Status states = 1;
+  // Statements for the schema changes which this job is currently
+  // running work for. A transaction can have multiple statements
+  // for example associated.
+  repeated cockroach.sql.schemachanger.scpb.Statement statements = 2;
+  // Authorization information for the schema change.
+  cockroach.sql.schemachanger.scpb.Authorization authorization = 3;
 }
 
 // AutoSpanConfigReconciliationDetails is the job detail information for the
@@ -529,7 +564,6 @@ message AutoSpanConfigReconciliationDetails {
 // AutoSpanConfigReconciliationProgress is the persisted progress for the span
 // config reconciliation job.
 message AutoSpanConfigReconciliationProgress {
-  util.hlc.Timestamp checkpoint = 1 [(gogoproto.nullable) = false];
 }
 
 message ResumeSpanList {
@@ -842,17 +876,6 @@ message AutoSQLStatsCompactionDetails {
 message AutoSQLStatsCompactionProgress {
 }
 
-message RowLevelTTLDetails {
-  uint32 table_id = 1 [
-    (gogoproto.customname) = "TableID",
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
-  ];
-  google.protobuf.Timestamp cutoff = 2 [(gogoproto.nullable)=false, (gogoproto.stdtime) = true];
-}
-
-message RowLevelTTLProgress {
-}
-
 message Payload {
   string description = 1;
   // If empty, the description is assumed to be the statement.
@@ -899,7 +922,6 @@ message Payload {
     AutoSpanConfigReconciliationDetails autoSpanConfigReconciliation = 27;
     AutoSQLStatsCompactionDetails autoSQLStatsCompaction = 30;
     StreamReplicationDetails streamReplication = 33;
-    RowLevelTTLDetails row_level_ttl = 34 [(gogoproto.customname)="RowLevelTTL"];
   }
   reserved 26;
   // PauseReason is used to describe the reason that the job is currently paused
@@ -937,7 +959,6 @@ message Progress {
     AutoSpanConfigReconciliationProgress AutoSpanConfigReconciliation = 22;
     AutoSQLStatsCompactionProgress autoSQLStatsCompaction = 23;
     StreamReplicationProgress streamReplication = 24;
-    RowLevelTTLProgress row_level_ttl = 25 [(gogoproto.customname)="RowLevelTTL"];
   }
 
   uint64 trace_id = 21 [(gogoproto.nullable) = false, (gogoproto.customname) = "TraceID", (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb.TraceID"];
@@ -965,7 +986,6 @@ enum Type {
   AUTO_SPAN_CONFIG_RECONCILIATION = 13 [(gogoproto.enumvalue_customname) = "TypeAutoSpanConfigReconciliation"];
   AUTO_SQL_STATS_COMPACTION = 14 [(gogoproto.enumvalue_customname) = "TypeAutoSQLStatsCompaction"];
   STREAM_REPLICATION = 15 [(gogoproto.enumvalue_customname) = "TypeStreamReplication"];
-  ROW_LEVEL_TTL = 16 [(gogoproto.enumvalue_customname) = "TypeRowLevelTTL"];
 }
 
 message Job {

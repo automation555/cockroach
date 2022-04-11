@@ -21,7 +21,6 @@ option go_package = "execinfrapb";
 
 import "jobs/jobspb/jobs.proto";
 import "roachpb/io-formats.proto";
-import "sql/catalog/catpb/catalog.proto";
 import "sql/catalog/descpb/structured.proto";
 import "sql/execinfrapb/processors_base.proto";
 import "util/hlc/timestamp.proto";
@@ -72,8 +71,6 @@ message BackfillerSpec {
   repeated uint32 indexes_to_backfill = 8 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.IndexID"];
 
   reserved 6;
-
-  optional int32 initial_splits = 11 [(gogoproto.nullable) = false];
 }
 
 // JobProgress identifies the job to report progress on. This reporting
@@ -151,12 +148,10 @@ message ReadImportDataSpec {
   // field stores the databases' primary region.
   optional string database_primary_region = 17 [
     (gogoproto.nullable) = false,
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb.RegionName"
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.RegionName"
   ];
 
-  optional int32 initial_splits = 18 [(gogoproto.nullable) = false];
-
-  // NEXTID: 19
+  // NEXTID: 18
 }
 
 message StreamIngestionDataSpec {
@@ -231,13 +226,6 @@ message TableRekey {
   optional bytes new_desc = 2;
 }
 
-message TenantRekey {
-  // OldID is a previous tenant ID.
-  optional roachpb.TenantID old_id = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "OldID"];
-  // NewID is the ID with which to replace OldID.
-  optional roachpb.TenantID new_id = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "NewID"];
-}
-
 // RestoreDataEntry will be specified at planning time to the SplitAndScatter
 // processors, then those processors will stream these, encoded as bytes in rows
 // to the RestoreDataProcessors.
@@ -251,12 +239,12 @@ message RestoreSpanEntry {
 message RestoreDataSpec {
   optional util.hlc.Timestamp restore_time = 1 [(gogoproto.nullable) = false];
   optional roachpb.FileEncryptionOptions encryption = 2;
-  repeated TableRekey table_rekeys = 3 [(gogoproto.nullable) = false];
-  repeated TenantRekey tenant_rekeys = 5[(gogoproto.nullable) = false];
+  repeated TableRekey rekeys = 3 [(gogoproto.nullable) = false];
+
   // PKIDs is used to convert result from an ExportRequest into row count
   // information passed back to track progress in the backup job.
   map<uint64, bool> pk_ids = 4 [(gogoproto.customname) = "PKIDs"];
-  // NEXT ID: 6.
+  optional bool dry_run = 5 [(gogoproto.nullable) = false];
 }
 
 message SplitAndScatterSpec {
@@ -265,31 +253,66 @@ message SplitAndScatterSpec {
   }
 
   repeated RestoreEntryChunk chunks = 1 [(gogoproto.nullable) = false];
-  repeated TableRekey table_rekeys = 2 [(gogoproto.nullable) = false];
-  repeated TenantRekey tenant_rekeys = 3 [(gogoproto.nullable) = false];
+  repeated TableRekey rekeys = 2 [(gogoproto.nullable) = false];
+  optional bool dry_run = 3 [(gogoproto.nullable) = false];
 }
 
-// ExporterSpec is the specification for a processor that consumes rows and
-// writes them to Parquet or CSV files at uri. It outputs a row per file written with
+// FileCompression list of the compression codecs which are currently
+// supported for CSVWriter spec
+enum FileCompression {
+  None = 0;
+  Gzip = 1;
+}
+
+// CSVWriterSpec is the specification for a processor that consumes rows and
+// writes them to CSV files at uri. It outputs a row per file written with
 // the file name, row count and byte size.
-message ExportSpec {
+message CSVWriterSpec {
   // destination as a cloud.ExternalStorage URI pointing to an export store
   // location (directory).
   optional string destination = 1 [(gogoproto.nullable) = false];
   optional string name_pattern = 2 [(gogoproto.nullable) = false];
-  optional roachpb.IOFileFormat format = 3 [(gogoproto.nullable) = false];
+  optional roachpb.CSVOptions options = 3 [(gogoproto.nullable) = false];
+  // chunk_rows is num rows to write per file. 0 = no limit.
+  optional int64 chunk_rows = 4 [(gogoproto.nullable) = false];
+  // chunk_size is the target byte size per file.
+  optional int64 chunk_size = 7 [(gogoproto.nullable) = false];
+
+  // compression_codec specifies compression used for exported file.
+  optional FileCompression compression_codec = 5 [(gogoproto.nullable) = false];
+
+  // User who initiated the export. This is used to check access privileges
+  // when using FileTable ExternalStorage.
+  optional string user_proto = 6 [(gogoproto.nullable) = false, (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security.SQLUsernameProto"];
+}
+
+// ParquetWriterSpec is the specification for a processor that consumes rows and
+// writes them to Parquet files at uri. It outputs a row per file written with
+// the file name, row count and byte size.
+message ParquetWriterSpec {
+  // destination as a cloud.ExternalStorage URI pointing to an export store
+  // location (directory).
+  optional string destination = 1 [(gogoproto.nullable) = false];
+  optional string name_pattern = 2 [(gogoproto.nullable) = false];
+  optional roachpb.ParquetOptions options = 3 [(gogoproto.nullable) = false];
 
   // chunk_rows is num rows to write per file. 0 = no limit.
   optional int64 chunk_rows = 4 [(gogoproto.nullable) = false];
   // chunk_size is the target byte size per file.
-  optional int64 chunk_size = 5 [(gogoproto.nullable) = false];
+  optional int64 chunk_size = 7 [(gogoproto.nullable) = false];
+
+  // compression_codec specifies compression used for exported file. THIS IS ISN'T USED RIGHT NOW
+  optional FileCompression compression_codec = 5 [(gogoproto.nullable) = false];
 
   // User who initiated the export. This is used to check access privileges
   // when using FileTable ExternalStorage.
   optional string user_proto = 6 [(gogoproto.nullable) = false, (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security.SQLUsernameProto"];
 
   // col_names specifies the logical column names for the exported parquet file.
-  repeated string col_names = 7 ;
+  repeated string col_names = 8 ;
+
+  // col_nullability specifies which columns allow null values in the exported parquet file.
+  repeated bool col_nullability = 9 ;
 }
 
 // BulkRowWriterSpec is the specification for a processor that consumes rows and

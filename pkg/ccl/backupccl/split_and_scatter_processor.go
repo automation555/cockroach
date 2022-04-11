@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -40,12 +39,33 @@ type splitAndScatterer interface {
 	scatter(ctx context.Context, codec keys.SQLCodec, scatterKey roachpb.Key) (roachpb.NodeID, error)
 }
 
-type noopSplitAndScatterer struct{}
+type noopSplitAndScatterer struct {
+	scatterNode roachpb.NodeID
+	kr          *KeyRewriter
+}
 
 var _ splitAndScatterer = noopSplitAndScatterer{}
 
 // split implements splitAndScatterer.
-func (n noopSplitAndScatterer) split(_ context.Context, _ keys.SQLCodec, _ roachpb.Key) error {
+func (s noopSplitAndScatterer) split(
+	ctx context.Context, codec keys.SQLCodec, splitKey roachpb.Key,
+) error {
+	if s.kr == nil {
+		return errors.AssertionFailedf("KeyRewriter was not set when expected to be")
+	}
+	/*if s.db == nil {
+		return errors.AssertionFailedf("split and scatterer's database was not set when expected")
+	}*/
+
+	newSplitKey, err := rewriteBackupSpanKey(codec, s.kr, splitKey)
+	if err != nil {
+		return err
+	}
+	if splitAt, err := keys.EnsureSafeSplitKey(newSplitKey); err != nil {
+		// Ignore the error, not all keys are table keys.
+	} else if len(splitAt) != 0 {
+		newSplitKey = splitAt
+	}
 	return nil
 }
 
@@ -53,7 +73,7 @@ func (n noopSplitAndScatterer) split(_ context.Context, _ keys.SQLCodec, _ roach
 func (n noopSplitAndScatterer) scatter(
 	_ context.Context, _ keys.SQLCodec, _ roachpb.Key,
 ) (roachpb.NodeID, error) {
-	return 0, nil
+	return n.scatterNode, nil
 }
 
 // dbSplitAndScatter is the production implementation of this processor's
@@ -212,14 +232,20 @@ func newSplitAndScatterProcessor(
 	for _, chunk := range spec.Chunks {
 		numEntries += len(chunk.Entries)
 	}
-
 	db := flowCtx.Cfg.DB
-	kr, err := makeKeyRewriterFromRekeys(flowCtx.Codec(), spec.TableRekeys, spec.TenantRekeys)
+	kr, err := makeKeyRewriterFromRekeys(flowCtx.Codec(), spec.Rekeys)
 	if err != nil {
 		return nil, err
 	}
 
-	scatterer := makeSplitAndScatterer(db, kr)
+	var scatterer = makeSplitAndScatterer(db, kr)
+	if spec.DryRun {
+		nodeID, _ := flowCtx.NodeID.OptionalNodeID()
+		scatterer = noopSplitAndScatterer{nodeID, kr}
+	}
+	if !flowCtx.Cfg.Codec.ForSystemTenant() {
+		scatterer = noopSplitAndScatterer{0, kr}
+	}
 	ssp := &splitAndScatterProcessor{
 		flowCtx:   flowCtx,
 		spec:      spec,
@@ -292,7 +318,7 @@ func (ssp *splitAndScatterProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pr
 		// The routing datums informs the router which output stream should be used.
 		routingDatum, ok := ssp.routingDatumCache[scatteredEntry.node]
 		if !ok {
-			routingDatum, _ = routingDatumsForSQLInstance(base.SQLInstanceID(scatteredEntry.node))
+			routingDatum, _ = routingDatumsForNode(scatteredEntry.node)
 			ssp.routingDatumCache[scatteredEntry.node] = routingDatum
 		}
 
@@ -415,20 +441,18 @@ func runSplitAndScatter(
 	return g.Wait()
 }
 
-func routingDatumsForSQLInstance(
-	sqlInstanceID base.SQLInstanceID,
-) (rowenc.EncDatum, rowenc.EncDatum) {
-	routingBytes := roachpb.Key(fmt.Sprintf("node%d", sqlInstanceID))
+func routingDatumsForNode(nodeID roachpb.NodeID) (rowenc.EncDatum, rowenc.EncDatum) {
+	routingBytes := roachpb.Key(fmt.Sprintf("node%d", nodeID))
 	startDatum := rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(routingBytes)))
 	endDatum := rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(routingBytes.Next())))
 	return startDatum, endDatum
 }
 
-// routingSpanForSQLInstance provides the mapping to be used during distsql planning
+// routingSpanForNode provides the mapping to be used during distsql planning
 // when setting up the output router.
-func routingSpanForSQLInstance(sqlInstanceID base.SQLInstanceID) ([]byte, []byte, error) {
-	var alloc tree.DatumAlloc
-	startDatum, endDatum := routingDatumsForSQLInstance(sqlInstanceID)
+func routingSpanForNode(nodeID roachpb.NodeID) ([]byte, []byte, error) {
+	var alloc rowenc.DatumAlloc
+	startDatum, endDatum := routingDatumsForNode(nodeID)
 
 	startBytes, endBytes := make([]byte, 0), make([]byte, 0)
 	startBytes, err := startDatum.Encode(splitAndScatterOutputTypes[0], &alloc, descpb.DatumEncoding_ASCENDING_KEY, startBytes)
