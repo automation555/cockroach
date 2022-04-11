@@ -26,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
@@ -89,6 +89,16 @@ func nilLogger() *logger.Logger {
 	return l
 }
 
+func alwaysFailingClusterAllocator(
+	ctx context.Context,
+	t registry.TestSpec,
+	alloc *quotapool.IntAlloc,
+	artifactsDir string,
+	wStatus *workerStatus,
+) (*clusterImpl, error) {
+	return nil, errors.New("cluster creation failed")
+}
+
 func TestRunnerRun(t *testing.T) {
 	ctx := context.Background()
 	r := mkReg(t)
@@ -106,45 +116,29 @@ func TestRunnerRun(t *testing.T) {
 		},
 		Cluster: r.MakeClusterSpec(0),
 	})
-	r.Add(registry.TestSpec{
-		Name:  "errors",
-		Owner: OwnerUnitTest,
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			t.Errorf("first %s", "error")
-			t.Errorf("second error")
-		},
-		Cluster: r.MakeClusterSpec(0),
-	})
 
 	testCases := []struct {
 		filters []string
 		expErr  string
-		expOut  string
 	}{
-		{filters: nil, expErr: "some tests failed"},
-		{filters: []string{"pass"}},
-		{filters: []string{"fail"}, expErr: "some tests failed"},
-		{filters: []string{"pass|fail"}, expErr: "some tests failed"},
-		{filters: []string{"pass", "fail"}, expErr: "some tests failed"},
-		{filters: []string{"notests"}, expErr: "no test"},
-		{filters: []string{"errors"}, expErr: "some tests failed", expOut: "second error"},
+		{nil, "some tests failed"},
+		{[]string{"pass"}, ""},
+		{[]string{"fail"}, "some tests failed"},
+		{[]string{"pass|fail"}, "some tests failed"},
+		{[]string{"pass", "fail"}, "some tests failed"},
+		{[]string{"notests"}, "no test"},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
 			tests := testsToRun(ctx, r, registry.NewTestFilter(c.filters))
 			cr := newClusterRegistry()
+			runner := newTestRunner(cr, r.buildVersion)
 
-			stopper := stop.NewStopper()
-			defer stopper.Stop(ctx)
-			runner := newTestRunner(cr, stopper, r.buildVersion)
-
-			var stdout syncedBuffer
-			var stderr syncedBuffer
 			lopt := loggingOpt{
 				l:            nilLogger(),
 				tee:          logger.NoTee,
-				stdout:       &stdout,
-				stderr:       &stderr,
+				stdout:       ioutil.Discard,
+				stderr:       ioutil.Discard,
 				artifactsDir: "",
 			}
 			copt := clustersOpt{
@@ -153,17 +147,46 @@ func TestRunnerRun(t *testing.T) {
 				cpuQuota:                  1000,
 				keepClustersOnTestFailure: false,
 			}
+			var clusterAllocator clusterAllocatorFn
+			// run without cluster allocator error injection
 			err := runner.Run(ctx, tests, 1, /* count */
-				defaultParallelism, copt, testOpts{}, lopt)
+				defaultParallelism, copt, testOpts{}, lopt, clusterAllocator)
 
-			if !testutils.IsError(err, c.expErr) {
-				t.Fatalf("expected err: %q, but found %v. Filters: %s", c.expErr, err, c.filters)
-			}
-			out := stdout.String() + "\n" + stderr.String()
-			if exp := c.expOut; exp != "" && !strings.Contains(out, exp) {
-				t.Fatalf("'%s' not found in output:\n%s", exp, out)
+			assertTestCompletion(t, tests, c.filters, runner.getCompletedTests(), err, c.expErr)
+
+			// N.B. skip the case of no matching tests
+			if len(tests) > 0 {
+				// run _with_ cluster allocator error injection
+				clusterAllocator = alwaysFailingClusterAllocator
+				err = runner.Run(ctx, tests, 1, /* count */
+					defaultParallelism, copt, testOpts{}, lopt, clusterAllocator)
+
+				assertTestCompletion(t, tests, c.filters, runner.getCompletedTests(), err, "some clusters could not be created")
 			}
 		})
+	}
+}
+
+// verifies that actual test completion conditions match the expected
+func assertTestCompletion(
+	t *testing.T,
+	tests []registry.TestSpec,
+	filters []string,
+	completed []completedTestInfo,
+	actualErr error,
+	expectedErr string,
+) {
+	require.True(t, len(completed) == len(tests))
+
+	for _, info := range completed {
+		if info.test == "pass" {
+			require.True(t, info.pass)
+		} else if info.test == "fail" {
+			require.True(t, !info.pass)
+		}
+	}
+	if !testutils.IsError(actualErr, expectedErr) {
+		t.Fatalf("expected err: %q, but found %v. Filters: %s", expectedErr, actualErr, filters)
 	}
 }
 
@@ -186,10 +209,9 @@ func (b *syncedBuffer) String() string {
 
 func TestRunnerTestTimeout(t *testing.T) {
 	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
+
 	cr := newClusterRegistry()
-	runner := newTestRunner(cr, stopper, version.Version{})
+	runner := newTestRunner(cr, version.Version{})
 
 	var buf syncedBuffer
 	lopt := loggingOpt{
@@ -215,7 +237,7 @@ func TestRunnerTestTimeout(t *testing.T) {
 		},
 	}
 	err := runner.Run(ctx, []registry.TestSpec{test}, 1, /* count */
-		defaultParallelism, copt, testOpts{}, lopt)
+		defaultParallelism, copt, testOpts{}, lopt, nil /* clusterAllocator */)
 	if !testutils.IsError(err, "some tests failed") {
 		t.Fatalf("expected error \"some tests failed\", got: %v", err)
 	}
@@ -285,9 +307,7 @@ func runExitCodeTest(t *testing.T, injectedError error) error {
 	ctx := context.Background()
 	t.Helper()
 	cr := newClusterRegistry()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	runner := newTestRunner(cr, stopper, version.Version{})
+	runner := newTestRunner(cr, version.Version{})
 	r := mkReg(t)
 	r.Add(registry.TestSpec{
 		Name:    "boom",
@@ -307,7 +327,7 @@ func runExitCodeTest(t *testing.T, injectedError error) error {
 		stderr:       ioutil.Discard,
 		artifactsDir: "",
 	}
-	return runner.Run(ctx, tests, 1, 1, clustersOpt{}, testOpts{}, lopt)
+	return runner.Run(ctx, tests, 1, 1, clustersOpt{}, testOpts{}, lopt, nil /* clusterAllocator */)
 }
 
 func TestExitCode(t *testing.T) {
