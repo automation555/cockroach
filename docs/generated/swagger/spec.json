@@ -929,11 +929,6 @@
           },
           "x-go-name": "Errors"
         },
-        "internal_app_name_prefix": {
-          "description": "If set and non-empty, indicates the prefix to application_name\nused for statements/queries issued internally by CockroachDB.",
-          "type": "string",
-          "x-go-name": "InternalAppNamePrefix"
-        },
         "sessions": {
           "description": "A list of sessions on this node or cluster.",
           "type": "array",
@@ -1022,6 +1017,12 @@
         }
       },
       "x-go-package": "github.com/cockroachdb/cockroach/pkg/util/metric"
+    },
+    "RangeID": {
+      "type": "integer",
+      "format": "int64",
+      "title": "A RangeID is a unique ID associated to a Raft consensus group.",
+      "x-go-package": "github.com/cockroachdb/cockroach/pkg/roachpb"
     },
     "RangeProblems": {
       "type": "object",
@@ -1278,12 +1279,6 @@
           "type": "integer",
           "format": "int64",
           "x-go-name": "RangeCount"
-        },
-        "stats_last_created_at": {
-          "description": "stats_last_created_at is the time at which statistics were last created.",
-          "type": "string",
-          "format": "date-time",
-          "x-go-name": "StatsLastCreatedAt"
         },
         "zone_config": {
           "$ref": "#/definitions/ZoneConfig"
@@ -1780,6 +1775,51 @@
       },
       "x-go-package": "github.com/cockroachdb/cockroach/pkg/server"
     },
+    "hotRangeInfo": {
+      "description": "(ie its range ID, QPS, table name, etc.).",
+      "type": "object",
+      "title": "Hot range details struct describes common information about hot range,",
+      "properties": {
+        "database_name": {
+          "type": "string",
+          "x-go-name": "DatabaseName"
+        },
+        "index_name": {
+          "type": "string",
+          "x-go-name": "IndexName"
+        },
+        "leaseholder_node_id": {
+          "$ref": "#/definitions/NodeID"
+        },
+        "node_id": {
+          "$ref": "#/definitions/NodeID"
+        },
+        "qps": {
+          "type": "number",
+          "format": "double",
+          "x-go-name": "QPS"
+        },
+        "range_id": {
+          "$ref": "#/definitions/RangeID"
+        },
+        "replica_node_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/NodeID"
+          },
+          "x-go-name": "ReplicaNodeIDs"
+        },
+        "schema_name": {
+          "type": "string",
+          "x-go-name": "SchemaName"
+        },
+        "table_name": {
+          "type": "string",
+          "x-go-name": "TableName"
+        }
+      },
+      "x-go-package": "github.com/cockroachdb/cockroach/pkg/server"
+    },
     "hotRangesResponse": {
       "type": "object",
       "title": "Response struct for listHotRanges.",
@@ -1789,15 +1829,12 @@
           "type": "string",
           "x-go-name": "Next"
         },
-        "ranges_by_node_id": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "array",
-            "items": {
-              "$ref": "#/definitions/rangeDescriptorInfo"
-            }
+        "ranges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/hotRangeInfo"
           },
-          "x-go-name": "RangesByNodeID"
+          "x-go-name": "Ranges"
         },
         "response_error": {
           "type": "array",
@@ -1820,11 +1857,6 @@
             "$ref": "#/definitions/ListSessionsError"
           },
           "x-go-name": "Errors"
-        },
-        "internal_app_name_prefix": {
-          "description": "If set and non-empty, indicates the prefix to application_name\nused for statements/queries issued internally by CockroachDB.",
-          "type": "string",
-          "x-go-name": "InternalAppNamePrefix"
         },
         "next": {
           "description": "The continuation token, for use in the next paginated call in the `start`\nparameter.",

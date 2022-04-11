@@ -308,40 +308,6 @@ message RegionsResponse {
   map<string, Region> regions = 1;
 }
 
-// NodesListRequest requests list of all nodes.
-// The nodes are KV nodes when the cluster is a single
-// tenant cluster or the host cluster in case of multi-tenant
-// clusters.
-// The nodes are SQL instances in case of multi-tenant
-// clusters.
-message NodesListRequest {}
-
-message NodeDetails {
-  // node_id is a unique identifier for the node. This corresponds
-  // to SQL instance ID for a tenant server and KV node id for
-  // for a KV server.
-  int32 node_id = 1 [(gogoproto.customname) = "NodeID"];
-  // address is the RPC address for a KV node. This will be set to
-  // null for a tenant server node.
-  util.UnresolvedAddr address = 2 [(gogoproto.nullable) = false];
-  // sql_address is the SQL address for a node.
-  util.UnresolvedAddr sql_address = 3 [(gogoproto.nullable) = false,
-    (gogoproto.customname) = "SQLAddress"];
-}
-
-// NodesListResponse contains a list of all nodes with their addresses.
-// The nodes are KV nodes when the cluster is a single
-// tenant cluster or the host cluster in case of multi-tenant
-// clusters.
-// The nodes are SQL instances in case of multi-tenant
-// clusters.
-message NodesListResponse {
-  // nodes contains a list of NodeDetails. Each individual node within
-  // the list is a SQL node in case of a tenant server and KV nodes in
-  // case of a KV server.
-  repeated NodeDetails nodes = 1 [(gogoproto.nullable) = false];
-}
-
 message NodeRequest {
   // node_id is a string so that "local" can be used to specify that no
   // forwarding is necessary.
@@ -852,9 +818,6 @@ message ListSessionsResponse {
   repeated Session sessions = 1 [ (gogoproto.nullable) = false ];
   // Any errors that occurred during fan-out calls to other nodes.
   repeated ListSessionsError errors = 2 [ (gogoproto.nullable) = false ];
-  // If set and non-empty, indicates the prefix to application_name
-  // used for statements/queries issued internally by CockroachDB.
-  string internal_app_name_prefix = 3;
 }
 
 // Request object for issuing a query cancel request.
@@ -877,30 +840,6 @@ message CancelQueryRequest {
 
 // Response returned by target query's gateway node.
 message CancelQueryResponse {
-  // Whether the cancellation request succeeded and the query was canceled.
-  bool canceled = 1;
-  // Error message (accompanied with canceled = false).
-  string error = 2;
-}
-
-// Request object for issuing a pgwire query cancel request.
-message CancelQueryByKeyRequest {
-  // The SQLInstanceID of the gateway node for the query to be canceled.
-  int32 sql_instance_id = 1 [
-    (gogoproto.customname) = "SQLInstanceID",
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/base.SQLInstanceID"
-  ];
-
-  // The key that was generated during session initialization as
-  // part of the pgwire protocol.
-  uint64 cancel_query_key = 2 [
-    (gogoproto.customname) = "CancelQueryKey",
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel.BackendKeyData"
-  ];
-}
-
-// Response returned by target query's gateway node for a pgwire cancel request.
-message CancelQueryByKeyResponse {
   // Whether the cancellation request succeeded and the query was canceled.
   bool canceled = 1;
   // Error message (accompanied with canceled = false).
@@ -1129,6 +1068,12 @@ message HotRangesResponse {
     // on this range.
     // API: PUBLIC ALPHA
     double queries_per_second = 2;
+    // LeaseholderNodeID indicates the Node ID that is the current leaseholder for the given range.
+    int32 leaseholder_node_id = 3 [
+      (gogoproto.customname) = "LeaseholderNodeID",
+      (gogoproto.casttype) =
+        "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"
+    ];
   }
 
   // StoreResponse contains the part of a hot ranges report that
@@ -1175,6 +1120,49 @@ message HotRangesResponse {
     (gogoproto.customname) = "HotRangesByNodeID",
     (gogoproto.nullable) = false
   ];
+}
+
+// HotRangesResponseV2 is a response payload returned by `HotRangesV2` service.
+message HotRangesResponseV2 {
+  // HotRange message describes a single hot range, ie its QPS, node ID it belongs to, etc.
+  message HotRange {
+    // range_id indicates Range ID that's identified as hot range.
+    int32 range_id = 1 [
+      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.RangeID",
+      (gogoproto.customname) = "RangeID"
+    ];
+    // node_id indicates the node that contains the current hot range.
+    int32 node_id = 2 [
+      (gogoproto.customname) = "NodeID",
+      (gogoproto.casttype) =
+        "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"
+    ];
+    // qps (queries per second) shows the amount of queries that interact with current range.
+    double qps = 3 [
+      (gogoproto.customname) = "QPS"
+    ];
+    // table_name indicates the SQL table that the range belongs to.
+    string table_name = 4;
+    // database_name indicates on database that has current hot range.
+    string database_name = 5;
+    // index_name indicates the index name for current range.
+    string index_name = 6;
+    // replica_node_ids specifies the list of node ids that contain replicas with current hot range.
+    repeated int32 replica_node_ids = 7 [
+      (gogoproto.casttype) =
+        "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"
+    ];
+    // leaseholder_node_id indicates the Node ID that is the current leaseholder for the given range.
+    int32 leaseholder_node_id = 8 [
+      (gogoproto.customname) = "LeaseholderNodeID",
+      (gogoproto.casttype) =
+        "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"
+    ];
+    // schema_name provides the name of schema (if exists) for table in current range.
+    string schema_name = 9;
+  }
+  // ranges contain list of hot ranges info that has highest number of QPS.
+  repeated HotRange ranges = 1;
 }
 
 message RangeRequest {
@@ -1255,19 +1243,12 @@ message StoresResponse {
 // `node_id` field refers to the instanceIDs that identify individual
 // tenant pods.
 message StatementsRequest {
-  enum FetchMode {
-    StmtAndTxnStats = 0; // Default.
-    StmtStatsOnly = 1;
-    TxnStatsOnly = 2;
-  }
-
   string node_id = 1 [(gogoproto.customname) = "NodeID"];
   // If this field is set we will use the combined statements API instead.
   bool combined = 2;
   // These fields are used for the combined statements API.
   int64 start = 3 [(gogoproto.nullable) = true];
   int64 end = 4 [(gogoproto.nullable) = true];
-  FetchMode fetch_mode = 5;
 }
 
 message StatementsResponse {
@@ -1347,7 +1328,7 @@ message CreateStatementDiagnosticsReportResponse {
 }
 
 message CancelStatementDiagnosticsReportRequest {
-  int64 request_id = 1 [(gogoproto.customname) = "RequestID"];
+  string statement_fingerprint = 1;
 }
 
 message CancelStatementDiagnosticsReportResponse {
@@ -1453,10 +1434,6 @@ message TableIndexStatsResponse {
     // create_statement is the SQL statement that would re-create the
     // current index if executed.
     string create_statement = 4;
-    // CreatedAt is an approximate timestamp at which the index was created.
-    // Note that it may not always be populated.
-    google.protobuf.Timestamp created_at = 5 [(gogoproto.stdtime) = true];
-
   }
 
   repeated ExtendedCollectedIndexUsageStatistics statistics = 1;
@@ -1500,9 +1477,6 @@ service Status {
 
   // RegionsRequest retrieves all available regions.
   rpc Regions(RegionsRequest) returns (RegionsResponse) {}
-
-  // NodesList returns all available nodes with their addresses.
-  rpc NodesList(NodesListRequest) returns (NodesListResponse) {}
 
   // Nodes returns status info for all commissioned nodes. Decommissioned nodes
   // are not included, except in rare cases where the node doing the
@@ -1611,11 +1585,6 @@ service Status {
       body: "*"
     };
   }
-
-  // CancelQueryByKey cancels a SQL query given its pgwire BackendKeyData.
-  // It is invoked through the pgwire protocol, so it's not exposed as an
-  // HTTP endpoint.
-  rpc CancelQueryByKey(CancelQueryByKeyRequest) returns (CancelQueryByKeyResponse) {}
 
   // ListContentionEvents retrieves the contention events across the entire
   // cluster.
@@ -1782,6 +1751,14 @@ service Status {
       get : "/_status/hotranges"
     };
   }
+
+  rpc HotRangesV2(HotRangesRequest) returns (HotRangesResponseV2) {
+    option (google.api.http) = {
+      post : "/_status/v2/hotranges"
+      body : "*"
+    };
+  }
+
   rpc Range(RangeRequest) returns (RangeResponse) {
     option (google.api.http) = {
       get : "/_status/range/{range_id}"
