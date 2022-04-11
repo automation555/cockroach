@@ -10,6 +10,8 @@ package streamproducer
 
 import (
 	"context"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
@@ -122,7 +124,32 @@ func startReplicationStreamJob(
 	registry := execConfig.JobRegistry
 	timeout := streamingccl.StreamReplicationJobLivenessTimeout.Get(&evalCtx.Settings.SV)
 	ptsID := uuid.MakeV4()
+
+	tableSpans := make([]*roachpb.Span, 0)
+	allDescs, err := catalogkv.GetAllDescriptors(
+		evalCtx.Ctx(), txn, execConfig.Codec, true, /* shouldRunPostDeserializationChanges */
+	)
+
+	if err != nil {
+		return streaming.InvalidStreamID, err
+	}
+
+	for _, desc := range allDescs {
+		if desc.GetName() == "bank" {
+			tableDesc, _ := desc.(catalog.TableDescriptor)
+			tableSpan := tableDesc.PrimaryIndexSpan(evalCtx.Codec)
+			tableSpans = append(tableSpans, &tableSpan)
+		}
+	}
+
 	jr := makeProducerJobRecord(registry, tenantID, timeout, evalCtx.SessionData().User(), ptsID)
+
+	if tenantID == roachpb.SystemTenantID.ToUint64() {
+		jr.Details = jobspb.StreamReplicationDetails{
+			ProtectedTimestampRecord: &ptsID,
+			Spans:                    tableSpans,
+		}
+	}
 	if _, err := registry.CreateAdoptableJobWithTxn(evalCtx.Ctx(), jr, jr.JobID, txn); err != nil {
 		return streaming.InvalidStreamID, err
 	}

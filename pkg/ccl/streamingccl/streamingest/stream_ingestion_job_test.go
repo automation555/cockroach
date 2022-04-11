@@ -10,6 +10,10 @@ package streamingest
 
 import (
 	"context"
+	gosql "database/sql"
+	"fmt"
+	"github.com/cockroachdb/cockroach/pkg/workload/bank"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"net/url"
 	"testing"
 	"time"
@@ -39,8 +43,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestTenantStreaming tests that tenants can stream changes end-to-end.
-func TestTenantStreaming(t *testing.T) {
+// TestSinklessTenantStreaming tests that tenants can stream changes end-to-end using sinkless client.
+func TestSinklessTenantStreaming(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -66,7 +70,7 @@ func TestTenantStreaming(t *testing.T) {
 	// Make changefeeds run faster.
 	resetFreq := changefeedbase.TestingSetDefaultMinCheckpointFrequency(50 * time.Millisecond)
 	defer resetFreq()
-	// Set required cluster settings.
+	// Set required cluster settings to run changefeeds.
 	_, err := sourceDB.Exec(`
 SET CLUSTER SETTING kv.rangefeed.enabled = true;
 SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s';
@@ -121,6 +125,7 @@ INSERT INTO d.t2 VALUES (2);
 		}
 		return nil
 	})
+	fmt.Println("The job reached the picked cutover time")
 
 	destSQL.Exec(
 		t,
@@ -128,10 +133,240 @@ INSERT INTO d.t2 VALUES (2);
 		ingestionJobID, cutoverTime)
 
 	jobutils.WaitForJob(t, destSQL, jobspb.JobID(ingestionJobID))
+	fmt.Println("The ingestion job finished")
 
 	query := "SELECT * FROM d.t1"
 	sourceData := sourceSQL.QueryStr(t, query)
 	destData := hDest.Tenant.SQL.QueryStr(t, query)
+	require.Equal(t, sourceData, destData)
+}
+
+func startTestClusterWithTenant(t *testing.T, ctx context.Context,
+	serverArgs base.TestServerArgs, tenantID roachpb.TenantID, numNodes int) (serverutils.TestClusterInterface, *gosql.DB, *gosql.DB, func()) {
+
+	params := base.TestClusterArgs{ServerArgs: serverArgs}
+	c := testcluster.StartTestCluster(t, numNodes, params)
+	c.ToggleReplicateQueues(false)
+
+	//c := serverutils.StartNewTestCluster(t, numNodes,
+	//	base.TestClusterArgs{
+	//		ServerArgs: serverArgs,
+	//		ReplicationMode: base.ReplicationManual,
+	//	})
+	if tenantID == roachpb.SystemTenantID {
+		return c, c.ServerConn(0), c.ServerConn(0), func() {
+			c.Stopper().Stop(ctx)
+		}
+	}
+
+	_, tenantConn := serverutils.StartTenant(t, c.Server(0), base.TestTenantArgs{TenantID: tenantID})
+	// sourceSQL refers to the tenant generating the data.
+	return c, c.ServerConn(0), tenantConn, func() {
+		tenantConn.Close()
+		c.Stopper().Stop(ctx)
+	}
+}
+
+func setupCluster(t testing.TB,
+	ctx context.Context,
+	clusterSize int,
+	) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, startTime string, cleanup func()){
+	const numAccounts = 1000
+	params := base.TestClusterArgs{
+		ServerArgsPerNode: map[int]base.TestServerArgs{
+			0: {
+				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
+					{Key: "region", Value: "west"},
+					// NB: This has the same value as an az in the east region
+					// on purpose.
+					{Key: "az", Value: "az1"},
+					{Key: "dc", Value: "dc1"},
+				}},
+			},
+			1: {
+				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
+					{Key: "region", Value: "east"},
+					// NB: This has the same value as an az in the west region
+					// on purpose.
+					{Key: "az", Value: "az1"},
+					{Key: "dc", Value: "dc2"},
+				}},
+			},
+			2: {
+				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
+					{Key: "region", Value: "east"},
+					{Key: "az", Value: "az2"},
+					{Key: "dc", Value: "dc3"},
+				}},
+			},
+		},
+	}
+
+
+	dir, dirCleanupFn := testutils.TempDir(t)
+	params.ServerArgs.ExternalIODir = dir
+	params.ServerArgs.UseDatabase = "data"
+	if len(params.ServerArgsPerNode) > 0 {
+		for i := range params.ServerArgsPerNode {
+			param := params.ServerArgsPerNode[i]
+			param.ExternalIODir = dir
+			param.UseDatabase = "data"
+			params.ServerArgsPerNode[i] = param
+		}
+	}
+
+	tc = testcluster.StartTestCluster(t, clusterSize, params)
+
+	tc.ToggleReplicateQueues(false)
+
+	const payloadSize = 100
+	splits := 10
+	bankData := bank.FromConfig(numAccounts, numAccounts, payloadSize, splits)
+
+	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
+
+	sqlDB.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&startTime)
+	sqlDB.Exec(t, `CREATE DATABASE data`)
+	l := workloadsql.InsertsDataLoader{BatchSize: 1000, Concurrency: 4}
+	if _, err := workloadsql.Setup(ctx, sqlDB.DB.(*gosql.DB), bankData, l); err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	if err := tc.WaitForFullReplication(); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupFn := func() {
+		tc.Stopper().Stop(ctx) // cleans up in memory storage's auxiliary dirs
+		dirCleanupFn()         // cleans up dir, which is the nodelocal:// storage
+	}
+
+	return tc, sqlDB, startTime, cleanupFn
+}
+
+func TestPartitionedTenantStreaming(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t, "slow under race")
+
+	ctx := context.Background()
+
+	args := base.TestServerArgs{
+		UseDatabase:   "test",
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
+	}
+
+	// Start the source cluster.
+	//tenantID := serverutils.TestTenantID()
+	tenantID := roachpb.SystemTenantID
+	//sc, sourceSysDB, sourceTenantDB, cleanup := startTestClusterWithTenant(t, ctx, args, tenantID, 3)
+	//defer cleanup()
+	//sourceSysSQL, sourceTenantSQL := sqlutils.MakeSQLRunner(sourceSysDB), sqlutils.MakeSQLRunner(sourceTenantDB)
+
+	sc, sourceSysSQL, startTime, cleanup := setupCluster(t, ctx, 3)
+	fmt.Println("finish setup cluster")
+	defer cleanup()
+	sourceTenantSQL := sourceSysSQL
+
+	sourceSysSQL.Exec(t, `
+	SET CLUSTER SETTING kv.rangefeed.enabled = true;
+	SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s';
+	SET CLUSTER SETTING changefeed.experimental_poll_interval = '10ms'
+  `)
+
+
+	// Start the destination cluster.
+	// TODO: multiple nodes
+	//hDest, cleanupDest := streamingtest.NewReplicationHelper(t, base.TestServerArgs{})
+	//defer cleanupDest()
+	//// destSQL refers to the system tenant as that's the one that's running the
+	//// job.
+	//destSQL := hDest.SysDB
+	_, destDB, destTenantDB, destCleanup := startTestClusterWithTenant(t, ctx, args, tenantID, 3)
+	defer destCleanup()
+
+	destSysSQL, destTenantSQL := sqlutils.MakeSQLRunner(destDB), sqlutils.MakeSQLRunner(destTenantDB)
+	// Set the cluster settings required on the ingestion side.
+	destSysSQL.Exec(t, `
+SET CLUSTER SETTING bulkio.stream_ingestion.minimum_flush_interval = '5us';
+SET CLUSTER SETTING bulkio.stream_ingestion.cutover_signal_poll_interval = '100ms';
+SET enable_experimental_stream_replication = true;
+`)
+
+
+
+	//sqlutils.CreateTable(
+	//	t, sourceTenantDB, "foo",
+	//	"k INT PRIMARY KEY, v INT",
+	//	10,
+	//	sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(2)),
+	//)
+
+	res := sourceTenantSQL.QueryStr(t, "SHOW RANGES FROM TABLE data.bank")
+	fmt.Println(res)
+	fmt.Println(startTime)
+	////require.Equal(t, len(res), 50)
+	//
+	//// Introduce 4 splits to get 5 ranges.
+	//sourceTenantSQL.Exec(t, "ALTER TABLE test.foo SPLIT AT (SELECT i*2 FROM generate_series(1, 4) AS g(i))")
+	////sourceTenantSQL.Exec(t, "ALTER TABLE test.foo SCATTER")
+	////require.Equal(t, len(res), 50)
+	//res = sourceTenantSQL.QueryStr(t, "SHOW RANGES FROM TABLE test.foo")
+	//fmt.Println(res)
+
+	//if err := sc.WaitForFullReplication(); err != nil {
+	//	t.Fatal(err)
+	//}
+
+	// Sink to read data from.
+	pgURL, cleanupSink := sqlutils.PGUrl(t, sc.Server(0).ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanupSink()
+
+	var ingestionJobID int
+	destSysSQL.QueryRow(t,
+		`RESTORE TENANT 1 FROM REPLICATION STREAM FROM $1 AS OF SYSTEM TIME `+startTime,
+		pgURL.String(),
+	).Scan(&ingestionJobID)
+
+//	sourceSQL.Exec(t, `
+//CREATE DATABASE d;
+//CREATE TABLE d.t1(i int primary key, a string, b string);
+//CREATE TABLE d.t2(i int primary key);
+//INSERT INTO d.t1 (i) VALUES (42);
+//INSERT INTO d.t2 VALUES (2);
+//`)
+
+	// Pick a cutover time, then wait for the job to reach that time.
+	cutoverTime := timeutil.Now().Round(time.Microsecond)
+	testutils.SucceedsSoon(t, func() error {
+		progress := jobutils.GetJobProgress(t, destSysSQL, jobspb.JobID(ingestionJobID))
+		if progress.GetHighWater() == nil {
+			return errors.Newf("stream ingestion has not recorded any progress yet, waiting to advance pos %s",
+				cutoverTime.String())
+		}
+		highwater := timeutil.Unix(0, progress.GetHighWater().WallTime)
+		if highwater.Before(cutoverTime) {
+			return errors.Newf("waiting for stream ingestion job progress %s to advance beyond %s",
+				highwater.String(), cutoverTime.String())
+		}
+		return nil
+	})
+	fmt.Println("The job reached the picked cutover time")
+
+	destSysSQL.Exec(
+		t,
+		`SELECT crdb_internal.complete_stream_ingestion_job($1, $2)`,
+		ingestionJobID, cutoverTime)
+
+	jobutils.WaitForJob(t, destSysSQL, jobspb.JobID(ingestionJobID))
+	fmt.Println("The ingestion job finished")
+
+
+	query := "SELECT * FROM test.foo"
+	sourceData := sourceTenantSQL.QueryStr(t, query)
+	destData := destTenantSQL.QueryStr(t, query)
 	require.Equal(t, sourceData, destData)
 }
 

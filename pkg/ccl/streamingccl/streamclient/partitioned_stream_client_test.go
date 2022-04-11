@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -71,8 +71,9 @@ INSERT INTO d.t2 VALUES (2);
 `)
 
 	client, err := newPartitionedStreamClient(&h.PGUrl)
+	fmt.Println("url", h.PGUrl)
 	defer func() {
-		_ = client.Close()
+		require.NoError(t, client.Close())
 	}()
 	require.NoError(t, err)
 	expectStreamState := func(streamID streaming.StreamID, status jobs.Status) {
@@ -116,7 +117,7 @@ INSERT INTO d.t2 VALUES (2);
 	makePartitionSpec := func(tables ...string) *streampb.StreamPartitionSpec {
 		var spans []roachpb.Span
 		for _, table := range tables {
-			desc := desctestutils.TestingGetPublicTableDescriptor(
+			desc := catalogkv.TestingGetTableDescriptor(
 				h.SysServer.DB(), h.Tenant.Codec, "d", table)
 			spans = append(spans, desc.PrimaryIndexSpan(h.Tenant.Codec))
 		}
@@ -136,11 +137,17 @@ INSERT INTO d.t2 VALUES (2);
 	}
 
 	// Ignore table t2 and only subscribe to the changes to table t1.
-	sub, err := client.Subscribe(ctx, id, encodeSpec("t1"), hlc.Timestamp{})
+	require.Equal(t, len(top), 1)
+	url, err := streamingccl.StreamAddress(top[0].SrcAddr).URL()
 	require.NoError(t, err)
+	subClient, err := newPartitionedStreamClient(url)
+	defer subClient.Close()
+	require.NoError(t, err)
+	require.NoError(t, err)
+	sub, err := subClient.Subscribe(ctx, id, encodeSpec("t1"), hlc.Timestamp{})
 
 	rf := streamingtest.MakeReplicationFeed(t, &subscriptionFeedSource{sub: sub})
-	t1Descr := desctestutils.TestingGetPublicTableDescriptor(h.SysServer.DB(), h.Tenant.Codec, "d", "t1")
+	t1Descr := catalogkv.TestingGetTableDescriptor(h.SysServer.DB(), h.Tenant.Codec, "d", "t1")
 
 	ctxWithCancel, cancelFn := context.WithCancel(ctx)
 	cg := ctxgroup.WithContext(ctxWithCancel)

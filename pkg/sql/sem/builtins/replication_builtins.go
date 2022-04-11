@@ -11,6 +11,7 @@
 package builtins
 
 import (
+	"fmt"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/streaming"
@@ -124,6 +125,7 @@ var replicationBuiltins = map[string]builtinDefinition{
 					return nil, err
 				}
 				streamID := streaming.StreamID(int(tree.MustBeDInt(args[0])))
+				fmt.Println("Update progress")
 				sps, err := mgr.UpdateReplicationStreamProgress(evalCtx, streamID, frontier, evalCtx.Txn)
 				if err != nil {
 					return nil, err

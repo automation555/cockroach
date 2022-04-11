@@ -115,7 +115,8 @@ type Subscription interface {
 
 // NewStreamClient creates a new stream client based on the stream
 // address.
-func NewStreamClient(streamAddress streamingccl.StreamAddress) (Client, error) {
+func NewStreamClient(streamAddress streamingccl.StreamAddress, partitionedStream bool) (Client, error) {
+	partitionedStream = true
 	var streamClient Client
 	streamURL, err := streamAddress.URL()
 	if err != nil {
@@ -126,6 +127,9 @@ func NewStreamClient(streamAddress streamingccl.StreamAddress) (Client, error) {
 	case "postgres", "postgresql":
 		// The canonical PostgreSQL URL scheme is "postgresql", however our
 		// own client commands also accept "postgres".
+		if partitionedStream {
+			return newPartitionedStreamClient(streamURL)
+		}
 		return newPGWireReplicationClient(streamURL)
 	case RandomGenScheme:
 		streamClient, err = newRandomStreamClient(streamURL)

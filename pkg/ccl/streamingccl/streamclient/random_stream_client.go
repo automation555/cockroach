@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -187,6 +186,7 @@ func (c randomStreamConfig) URL(table int) string {
 //
 // The client can be configured to return more than one partition via the stream
 // URL. Each partition covers a single table span.
+// Does the random stream client need to wrap a partitioned stream client?
 type randomStreamClient struct {
 	config randomStreamConfig
 
@@ -274,7 +274,7 @@ func (m *randomStreamClient) getDescriptorAndNamespaceKVForTableID(
 		IngestionDatabaseID,
 		tableID,
 		fmt.Sprintf(RandomStreamSchemaPlaceholder, tableName),
-		catpb.NewBasePrivilegeDescriptor(security.RootUserName()),
+		descpb.NewBasePrivilegeDescriptor(security.RootUserName()),
 	)
 	if err != nil {
 		return nil, nil, err
