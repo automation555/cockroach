@@ -133,9 +133,9 @@ func incrementSequenceHelper(
 func (p *planner) incrementSequenceUsingCache(
 	ctx context.Context, descriptor catalog.TableDescriptor,
 ) (int64, error) {
-	seqOpts := descriptor.GetSequenceOpts()
+	opts := descriptor.GetSequenceOpts()
 
-	cacheSize := seqOpts.EffectiveCacheSize()
+	cacheSize := opts.EffectiveCacheSize()
 
 	fetchNextValues := func() (currentValue, incrementAmount, sizeOfCache int64, err error) {
 		seqValueKey := p.ExecCfg().Codec.SequenceKey(uint32(descriptor.GetID()))
@@ -143,8 +143,8 @@ func (p *planner) incrementSequenceUsingCache(
 		// We *do not* use the planner txn here, since nextval does not respect
 		// transaction boundaries. This matches the specification at
 		// https://www.postgresql.org/docs/14/functions-sequence.html
-		endValue, err := kv.IncrementValRetryable(
-			ctx, p.ExecCfg().DB, seqValueKey, seqOpts.Increment*cacheSize)
+		postIncrement, err := kv.IncrementValRetryable(
+			ctx, p.ExecCfg().DB, seqValueKey, opts.Increment*cacheSize)
 
 		if err != nil {
 			if errors.HasType(err, (*roachpb.IntegerOverflowError)(nil)) {
@@ -152,32 +152,38 @@ func (p *planner) incrementSequenceUsingCache(
 			}
 			return 0, 0, 0, err
 		}
+		preIncrement := postIncrement - opts.Increment*cacheSize
+		nextVal := preIncrement + opts.Increment
 
-		// This sequence has exceeded its bounds after performing this increment.
-		if endValue > seqOpts.MaxValue || endValue < seqOpts.MinValue {
-			// If the sequence exceeded its bounds prior to the increment, then return an error.
-			if (seqOpts.Increment > 0 && endValue-seqOpts.Increment*cacheSize >= seqOpts.MaxValue) ||
-				(seqOpts.Increment < 0 && endValue-seqOpts.Increment*cacheSize <= seqOpts.MinValue) {
-				return 0, 0, 0, boundsExceededError(descriptor)
-			}
-			// Otherwise, values between the limit and the value prior to incrementing can be cached.
-			limit := seqOpts.MaxValue
-			if seqOpts.Increment < 0 {
-				limit = seqOpts.MinValue
-			}
-			abs := func(i int64) int64 {
-				if i < 0 {
-					return -i
-				}
-				return i
-			}
-			currentValue = endValue - seqOpts.Increment*(cacheSize-1)
-			incrementAmount = seqOpts.Increment
-			sizeOfCache = abs(limit-(endValue-seqOpts.Increment*cacheSize)) / abs(seqOpts.Increment)
-			return currentValue, incrementAmount, sizeOfCache, nil
+		// The postIncrement value is in-bounds, this implies that nextVal and
+		// all interceding values are too.
+		if postIncrement <= opts.MaxValue && postIncrement >= opts.MinValue {
+			return nextVal, opts.Increment, cacheSize, nil
 		}
-
-		return endValue - seqOpts.Increment*(cacheSize-1), seqOpts.Increment, cacheSize, nil
+		// The postIncrement value is out-of-bounds, find the portion of
+		// the cached sequence which is valid, if any.
+		positiveIncrement := opts.Increment > 0
+		if (positiveIncrement && nextVal > opts.MaxValue) ||
+			(!positiveIncrement && nextVal < opts.MinValue) {
+			return 0, 0, 0, boundsExceededError(descriptor)
+		}
+		// Otherwise, some values between the limit and the value prior to
+		// incrementing can be cached. Figure out how many.
+		var limit int64
+		switch positiveIncrement {
+		case true:
+			limit = opts.MaxValue
+		case false:
+			limit = opts.MinValue
+		}
+		abs := func(i int64) int64 {
+			if i < 0 {
+				return -i
+			}
+			return i
+		}
+		sizeOfCache = abs(limit-preIncrement) / abs(opts.Increment)
+		return nextVal, opts.Increment, sizeOfCache, nil
 	}
 
 	var val int64
@@ -192,6 +198,10 @@ func (p *planner) incrementSequenceUsingCache(
 		if err != nil {
 			return 0, err
 		}
+	}
+	currentSeqKey := p.ExecCfg().Codec.CurrentSequenceKey(uint32(descriptor.GetID()))
+	if err := p.txn.Put(ctx, currentSeqKey, val); err != nil {
+		return 0, err
 	}
 	return val, nil
 }
@@ -438,11 +448,10 @@ func setSequenceIntegerBounds(
 // assignSequenceOptions moves options from the AST node to the sequence options descriptor,
 // starting with defaults and overriding them with user-provided options.
 func assignSequenceOptions(
-	ctx context.Context,
-	p *planner,
 	opts *descpb.TableDescriptor_SequenceOpts,
 	optsNode tree.SequenceOptions,
 	setDefaults bool,
+	params *runParams,
 	sequenceID descpb.ID,
 	sequenceParentID descpb.ID,
 	existingType *types.T,
@@ -558,25 +567,25 @@ func assignSequenceOptions(
 		case tree.SeqOptVirtual:
 			opts.Virtual = true
 		case tree.SeqOptOwnedBy:
-			if p == nil {
+			if params == nil {
 				return pgerror.Newf(pgcode.Internal,
-					"Trying to add/remove Sequence Owner outside of context of a planner")
+					"Trying to add/remove Sequence Owner without access to context")
 			}
 			// The owner is being removed
 			if option.ColumnItemVal == nil {
-				if err := removeSequenceOwnerIfExists(ctx, p, sequenceID, opts); err != nil {
+				if err := removeSequenceOwnerIfExists(params.ctx, params.p, sequenceID, opts); err != nil {
 					return err
 				}
 			} else {
 				// The owner is being added/modified
 				tableDesc, col, err := resolveColumnItemToDescriptors(
-					ctx, p, option.ColumnItemVal,
+					params.ctx, params.p, option.ColumnItemVal,
 				)
 				if err != nil {
 					return err
 				}
 				if tableDesc.ParentID != sequenceParentID &&
-					!allowCrossDatabaseSeqOwner.Get(&p.execCfg.Settings.SV) {
+					!allowCrossDatabaseSeqOwner.Get(&params.p.execCfg.Settings.SV) {
 					return errors.WithHintf(
 						pgerror.Newf(pgcode.FeatureNotSupported,
 							"OWNED BY cannot refer to other databases; (see the '%s' cluster setting)",
@@ -588,10 +597,10 @@ func assignSequenceOptions(
 				// want it to be.
 				if opts.SequenceOwner.OwnerTableID != tableDesc.ID ||
 					opts.SequenceOwner.OwnerColumnID != col.GetID() {
-					if err := removeSequenceOwnerIfExists(ctx, p, sequenceID, opts); err != nil {
+					if err := removeSequenceOwnerIfExists(params.ctx, params.p, sequenceID, opts); err != nil {
 						return err
 					}
-					err := addSequenceOwner(ctx, p, option.ColumnItemVal, sequenceID, opts)
+					err := addSequenceOwner(params.ctx, params.p, option.ColumnItemVal, sequenceID, opts)
 					if err != nil {
 						return err
 					}
@@ -771,7 +780,7 @@ func maybeAddSequenceDependencies(
 	ctx context.Context,
 	st *cluster.Settings,
 	sc resolver.SchemaResolver,
-	tableDesc catalog.TableDescriptor,
+	tableDesc *tabledesc.Mutable,
 	col *descpb.ColumnDescriptor,
 	expr tree.TypedExpr,
 	backrefs map[descpb.ID]*tabledesc.Mutable,
@@ -807,43 +816,22 @@ func maybeAddSequenceDependencies(
 		if prev, ok := backrefs[seqDesc.ID]; ok {
 			seqDesc = prev
 		}
+		col.UsesSequenceIds = append(col.UsesSequenceIds, seqDesc.ID)
 		// Add reference from sequence descriptor to column.
-		{
-			var found bool
-			for _, seqID := range col.UsesSequenceIds {
-				if seqID == seqDesc.ID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				col.UsesSequenceIds = append(col.UsesSequenceIds, seqDesc.ID)
-			}
-		}
 		refIdx := -1
 		for i, reference := range seqDesc.DependedOnBy {
-			if reference.ID == tableDesc.GetID() {
+			if reference.ID == tableDesc.ID {
 				refIdx = i
 			}
 		}
 		if refIdx == -1 {
 			seqDesc.DependedOnBy = append(seqDesc.DependedOnBy, descpb.TableDescriptor_Reference{
-				ID:        tableDesc.GetID(),
+				ID:        tableDesc.ID,
 				ColumnIDs: []descpb.ColumnID{col.ID},
 				ByID:      true,
 			})
 		} else {
-			ref := &seqDesc.DependedOnBy[refIdx]
-			var found bool
-			for _, colID := range ref.ColumnIDs {
-				if colID == col.ID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				ref.ColumnIDs = append(ref.ColumnIDs, col.ID)
-			}
+			seqDesc.DependedOnBy[refIdx].ColumnIDs = append(seqDesc.DependedOnBy[refIdx].ColumnIDs, col.ID)
 		}
 		seqDescs = append(seqDescs, seqDesc)
 	}
