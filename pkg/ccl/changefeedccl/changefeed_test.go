@@ -39,11 +39,11 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // registers cloud storage providers
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -134,66 +134,65 @@ func TestChangefeedBasics(t *testing.T) {
 	// cloudStorageTest is a regression test for #36994.
 }
 
-// TestChangefeedSendError validates that SendErrors do not fail the changefeed
-// as they can occur in normal situations such as a cluster update
-func TestChangefeedSendError(t *testing.T) {
+func TestChangefeedIdleness(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(db)
-		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (0)`)
+		changefeedbase.IdleTimeout.Override(
+			context.Background(), &f.Server().ClusterSettings().SV, 3*time.Second)
 
-		knobs := f.Server().TestingKnobs().
-			DistSQL.(*execinfra.TestingKnobs).
-			Changefeed.(*TestingKnobs)
+		// Idleness functionality is version gated
+		knobs := f.Server().TestingKnobs().Server.(*server.TestingKnobs)
+		knobs.BinaryVersionOverride = clusterversion.ByKey(clusterversion.ChangefeedIdleness)
 
-		// Allow triggering a single sendError
-		var sendError int32 = 0
-		knobs.FeedKnobs.OnRangeFeedValue = func(_ roachpb.KeyValue) error {
-			if sendError != 0 {
-				atomic.StoreInt32(&sendError, 0)
-				return kvcoord.TestNewSendError("test sendError")
-			}
-			return nil
+		registry := f.Server().JobRegistry().(*jobs.Registry)
+		currentlyIdle := registry.MetricsStruct().JobMetrics[jobspb.TypeChangefeed].CurrentlyIdle
+		waitForIdleCount := func(numIdle int64) {
+			testutils.SucceedsSoon(t, func() error {
+				if currentlyIdle.Value() != numIdle {
+					return fmt.Errorf("expected (%+v) idle changefeeds, found (%+v)", numIdle, currentlyIdle.Value())
+				}
+				return nil
+			})
 		}
 
-		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
-		defer closeFeed(t, foo)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
+		sqlDB.Exec(t, `CREATE TABLE bar (b INT PRIMARY KEY)`)
+		cf1 := feed(t, f, "CREATE CHANGEFEED FOR TABLE foo WITH resolved='10ms'") // higher resolved frequency for faster test
+		cf2 := feed(t, f, "CREATE CHANGEFEED FOR TABLE bar WITH resolved='10ms'")
+		defer closeFeed(t, cf1)
+
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (0)`)
+		sqlDB.Exec(t, `INSERT INTO bar VALUES (0)`)
+		waitForIdleCount(0)
+		waitForIdleCount(2) // Both should eventually be considered idle
+
+		jobFeed := cf2.(cdctest.EnterpriseTestFeed)
+		require.NoError(t, jobFeed.Pause())
+		waitForIdleCount(1) // Paused jobs aren't considered idle
+
+		require.NoError(t, jobFeed.Resume())
+		waitForIdleCount(2) // Resumed job should eventually become idle
+
+		closeFeed(t, cf2)
+		waitForIdleCount(1) // The cancelled changefeed isn't considered idle
 
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (2)`)
-		atomic.StoreInt32(&sendError, 1)
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (3)`)
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (4)`)
+		waitForIdleCount(0)
+		waitForIdleCount(1)
 
-		// Changefeed should've been retried due to the SendError
-		registry := f.Server().JobRegistry().(*jobs.Registry)
-		sli, err := registry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics(defaultSLIScope)
-		require.NoError(t, err)
-		retryCounter := sli.ErrorRetries
-		testutils.SucceedsSoon(t, func() error {
-			if retryCounter.Value() < 1 {
-				return fmt.Errorf("no retry has occured")
-			}
-			return nil
-		})
-
-		assertPayloads(t, foo, []string{
+		assertPayloads(t, cf1, []string{
 			`foo: [0]->{"after": {"a": 0}}`,
 			`foo: [1]->{"after": {"a": 1}}`,
-			`foo: [2]->{"after": {"a": 2}}`,
-			`foo: [3]->{"after": {"a": 3}}`,
-			`foo: [4]->{"after": {"a": 4}}`,
 		})
 	}
 
-	t.Run(`enterprise`, enterpriseTest(testFn))
-	t.Run(`cloudstorage`, cloudStorageTest(testFn))
-	t.Run(`kafka`, kafkaTest(testFn))
-	t.Run(`webhook`, webhookTest(testFn))
-	t.Run(`pubsub`, pubsubTest(testFn))
+	// Tenant testing disabled due to TestServerInterface being required
+	t.Run(`enterprise`, enterpriseTest(testFn, feedTestNoTenants))
+	t.Run(`kafka`, kafkaTest(testFn, feedTestNoTenants))
+	t.Run(`webhook`, webhookTest(testFn, feedTestNoTenants))
 }
 
 func TestChangefeedBasicConfluentKafka(t *testing.T) {
@@ -1724,7 +1723,7 @@ func TestChangefeedAuthorization(t *testing.T) {
 			rootDB.Exec(t, `create type type_a as enum ('a');`)
 			rootDB.Exec(t, `create table table_a (id int, type type_a);`)
 
-			guestDB.ExpectErr(t, `current user must have a role WITH CONTROLCHANGEFEED`, tc.statement)
+			guestDB.ExpectErr(t, `permission denied to create changefeed`, tc.statement)
 			feedCreatorDB.ExpectErr(t, `user feedcreator does not have SELECT privilege on relation table_a`, tc.statement)
 
 			// Actual success would hang in sinkless and require cleanup in enterprise, so checking for successful authorization

@@ -1141,10 +1141,7 @@ func (r *Registry) stepThroughStateMachine(
 		}
 
 		if errors.Is(err, errPauseSelfSentinel) {
-			if err := r.PauseRequested(ctx, nil, job.ID(), err.Error()); err != nil {
-				return err
-			}
-			return errPauseSelfSentinel
+			return r.PauseRequested(ctx, nil, job.ID(), err.Error())
 		}
 		// TODO(spaskob): enforce a limit on retries.
 
@@ -1289,9 +1286,8 @@ func (r *Registry) adoptionDisabled(ctx context.Context) bool {
 	return false
 }
 
-// MarkIdle marks a currently adopted job as Idle.
 // A single job should not toggle its idleness more than twice per-minute as it
-// is logged and may write to persisted job state in the future.
+// is logged and may write to persisted job state in the future
 func (r *Registry) MarkIdle(job *Job, isIdle bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1309,6 +1305,12 @@ func (r *Registry) MarkIdle(job *Job, isIdle bool) {
 			aj.isIdle = isIdle
 		}
 	}
+}
+
+func (r *Registry) IsJobIdle(jobID jobspb.JobID) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.adoptedJobs[jobID].isIdle
 }
 
 func (r *Registry) cancelAllAdoptedJobs() {
@@ -1424,12 +1426,4 @@ func (r *Registry) CheckPausepoint(name string) error {
 		}
 	}
 	return nil
-}
-
-// TestingIsJobIdle returns true if the job is adopted and currently idle.
-func (r *Registry) TestingIsJobIdle(jobID jobspb.JobID) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	adoptedJob := r.mu.adoptedJobs[jobID]
-	return adoptedJob != nil && adoptedJob.isIdle
 }
