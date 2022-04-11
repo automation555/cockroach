@@ -98,7 +98,7 @@ func (g *optgen) run(args ...string) bool {
 	case "ops":
 	case "rulenames":
 
-	case "execfactory", "execexplain", "execplangist":
+	case "execfactory", "execexplain", "execfingerprint":
 		runValidate = false
 
 	default:
@@ -190,8 +190,8 @@ func (g *optgen) run(args ...string) bool {
 		var gen execExplainGen
 		err = g.generate(compiled, gen.generate)
 
-	case "execplangist":
-		var gen execPlanGistGen
+	case "execfingerprint":
+		var gen execFingerprintGen
 		err = g.generate(compiled, gen.generate)
 	}
 
@@ -218,7 +218,7 @@ func (g *optgen) generate(compiled *lang.CompiledExpr, genFunc genFunc) error {
 			// Write out incorrect source for easier debugging.
 			b = buf.Bytes()
 			out := g.cmdLine.Lookup("out").Value.String()
-			err = errors.Wrapf(err, "code formatting failed with Go parse error\n%s", out)
+			err = fmt.Errorf("code formatting failed with Go parse error\n%s:%s", out, err)
 		}
 	} else {
 		b = buf.Bytes()
@@ -264,15 +264,15 @@ func (g *optgen) usage() {
 	fmt.Fprintf(g.stdErr, "\toptgen [flags] command sources...\n\n")
 
 	fmt.Fprintf(g.stdErr, "The commands are:\n\n")
-	fmt.Fprintf(g.stdErr, "\tcompile      generate the optgen compiled format\n")
-	fmt.Fprintf(g.stdErr, "\texplorer     generate expression tree exploration rules\n")
-	fmt.Fprintf(g.stdErr, "\texprs        generate expression definitions and functions\n")
-	fmt.Fprintf(g.stdErr, "\tfactory      generate expression tree creation and normalization functions\n")
-	fmt.Fprintf(g.stdErr, "\tops          generate operator definitions and functions\n")
-	fmt.Fprintf(g.stdErr, "\trulenames    generate enumeration of rule names\n")
-	fmt.Fprintf(g.stdErr, "\texecfactory  generate exec.Factory interface\n")
-	fmt.Fprintf(g.stdErr, "\texecexplain  generate explain factory\n")
-	fmt.Fprintf(g.stdErr, "\texecplangist generate plan gist factory\n")
+	fmt.Fprintf(g.stdErr, "\tcompile    generate the optgen compiled format\n")
+	fmt.Fprintf(g.stdErr, "\texplorer   generate expression tree exploration rules\n")
+	fmt.Fprintf(g.stdErr, "\texprs      generate expression definitions and functions\n")
+	fmt.Fprintf(g.stdErr, "\tfactory    generate expression tree creation and normalization functions\n")
+	fmt.Fprintf(g.stdErr, "\tops        generate operator definitions and functions\n")
+	fmt.Fprintf(g.stdErr, "\trulenames  generate enumeration of rule names\n")
+	fmt.Fprintf(g.stdErr, "\texecplan  generate enumeration of rule names\n")
+	fmt.Fprintf(g.stdErr, "\texecfactory  generate enumeration of rule names\n")
+	fmt.Fprintf(g.stdErr, "\texecfingerprint  generate enumeration of rule names\n")
 
 	fmt.Fprintf(g.stdErr, "\n")
 
