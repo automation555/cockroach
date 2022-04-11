@@ -25,13 +25,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 	"go.etcd.io/etcd/raft/v3"
 )
 
@@ -67,13 +65,11 @@ func newUnloadedReplica(
 	ctx context.Context, desc *roachpb.RangeDescriptor, store *Store, replicaID roachpb.ReplicaID,
 ) *Replica {
 	if replicaID == 0 {
-		log.Fatalf(ctx, "cannot construct a replica for range %d with a 0 replica ID", desc.RangeID)
+		log.Fatalf(context.TODO(), "cannot construct a replica for range %d with a 0 replica ID", desc.RangeID)
 	}
 	r := &Replica{
 		AmbientContext: store.cfg.AmbientCtx,
 		RangeID:        desc.RangeID,
-		replicaID:      replicaID,
-		creationTime:   timeutil.Now(),
 		store:          store,
 		abortSpan:      abortspan.New(desc.RangeID),
 		concMgr: concurrency.NewManager(concurrency.Config{
@@ -94,6 +90,7 @@ func newUnloadedReplica(
 	r.mu.stateLoader = stateloader.Make(desc.RangeID)
 	r.mu.quiescent = true
 	r.mu.conf = store.cfg.DefaultSpanConfig
+	r.mu.replicaID = replicaID
 	split.Init(&r.loadBasedSplitter, rand.Intn, func() float64 {
 		return float64(SplitByLoadQPSThreshold.Get(&store.cfg.Settings.SV))
 	}, func() time.Duration {
@@ -120,7 +117,6 @@ func newUnloadedReplica(
 	r.rangeStr.store(replicaID, &roachpb.RangeDescriptor{RangeID: desc.RangeID})
 	// Add replica log tag - the value is rangeStr.String().
 	r.AmbientContext.AddLogTag("r", &r.rangeStr)
-	r.raftCtx = logtags.AddTag(r.AnnotateCtx(context.Background()), "raft", nil /* value */)
 	// Add replica pointer value. NB: this was historically useful for debugging
 	// replica GC issues, but is a distraction at the moment.
 	// r.AmbientContext.AddLogTag("@", fmt.Sprintf("%x", unsafe.Pointer(r)))
@@ -128,24 +124,6 @@ func newUnloadedReplica(
 
 	r.splitQueueThrottle = util.Every(splitQueueThrottleDuration)
 	r.mergeQueueThrottle = util.Every(mergeQueueThrottleDuration)
-
-	onTrip := func() {
-		telemetry.Inc(telemetryTripAsync)
-		r.store.Metrics().ReplicaCircuitBreakerCumTripped.Inc(1)
-		store.Metrics().ReplicaCircuitBreakerCurTripped.Inc(1)
-	}
-	onReset := func() {
-		store.Metrics().ReplicaCircuitBreakerCurTripped.Dec(1)
-	}
-	var cancelStorage CancelStorage
-	if f := r.store.cfg.TestingKnobs.CancelStorageFactory; f != nil {
-		cancelStorage = f()
-	} else {
-		cancelStorage = &MapCancelStorage{}
-	}
-	r.breaker = newReplicaCircuitBreaker(
-		store.cfg.Settings, store.stopper, r.AmbientContext, r, cancelStorage, onTrip, onReset,
-	)
 	return r
 }
 
@@ -179,22 +157,29 @@ func (r *Replica) loadRaftMuLockedReplicaMuLocked(desc *roachpb.RangeDescriptor)
 	ctx := r.AnnotateCtx(context.TODO())
 	if r.mu.state.Desc != nil && r.isInitializedRLocked() {
 		log.Fatalf(ctx, "r%d: cannot reinitialize an initialized replica", desc.RangeID)
-	} else if r.replicaID == 0 {
+	} else if r.mu.replicaID == 0 {
 		// NB: This is just a defensive check as r.mu.replicaID should never be 0.
 		log.Fatalf(ctx, "r%d: cannot initialize replica without a replicaID", desc.RangeID)
 	}
-	if desc.IsInitialized() {
+	isInitialized := desc.IsInitialized()
+	if isInitialized {
 		r.setStartKeyLocked(desc.StartKey)
 	}
 
 	// Clear the internal raft group in case we're being reset. Since we're
 	// reloading the raft state below, it isn't safe to use the existing raft
 	// group.
+	//
+	// TODO(tbg): this dates back to when replicas could be used across multiple
+	// replicaIDs. I believe this is no longer happening (except perhaps under
+	// the DisableEagerReplicaRemoval testing knob).
 	r.mu.internalRaftGroup = nil
 
 	var err error
-	if r.mu.state, err = r.mu.stateLoader.Load(ctx, r.Engine(), desc); err != nil {
-		return err
+	if isInitialized {
+		if r.mu.state, err = r.mu.stateLoader.Load(ctx, r.Engine(), desc); err != nil {
+			return err
+		}
 	}
 	r.mu.lastIndex, err = r.mu.stateLoader.LoadLastIndex(ctx, r.Engine())
 	if err != nil {
@@ -204,15 +189,15 @@ func (r *Replica) loadRaftMuLockedReplicaMuLocked(desc *roachpb.RangeDescriptor)
 
 	// Ensure that we're not trying to load a replica with a different ID than
 	// was used to construct this Replica.
-	replicaID := r.replicaID
+	replicaID := r.mu.replicaID
 	if replicaDesc, found := r.mu.state.Desc.GetReplicaDescriptor(r.StoreID()); found {
 		replicaID = replicaDesc.ReplicaID
 	} else if desc.IsInitialized() {
 		log.Fatalf(ctx, "r%d: cannot initialize replica which is not in descriptor %v", desc.RangeID, desc)
 	}
-	if r.replicaID != replicaID {
+	if r.mu.replicaID != replicaID {
 		log.Fatalf(ctx, "attempting to initialize a replica which has ID %d with ID %d",
-			r.replicaID, replicaID)
+			r.mu.replicaID, replicaID)
 	}
 
 	r.setDescLockedRaftMuLocked(ctx, desc)
@@ -225,7 +210,7 @@ func (r *Replica) loadRaftMuLockedReplicaMuLocked(desc *roachpb.RangeDescriptor)
 	// this problem would multiply to a number of replicas at cluster bootstrap.
 	// Instead, we make the first lease special (which is OK) and the problem
 	// disappears.
-	if r.mu.state.Lease.Sequence > 0 {
+	if isInitialized && r.mu.state.Lease.Sequence > 0 {
 		r.mu.minLeaseProposedTS = r.Clock().NowAsClockTimestamp()
 	}
 
@@ -240,7 +225,9 @@ func (r *Replica) loadRaftMuLockedReplicaMuLocked(desc *roachpb.RangeDescriptor)
 	); err != nil {
 		return errors.Wrap(err, "while initializing sideloaded storage")
 	}
-	r.assertStateRaftMuLockedReplicaMuRLocked(ctx, r.store.Engine())
+	if isInitialized {
+		r.assertStateRaftMuLockedReplicaMuRLocked(ctx, r.store.Engine())
+	}
 
 	r.sideTransportClosedTimestamp.init(r.store.cfg.ClosedTimestampReceiver, desc.RangeID)
 
@@ -346,9 +333,9 @@ func (r *Replica) setDescLockedRaftMuLocked(ctx context.Context, desc *roachpb.R
 	//      store to exist on disk.
 	//   3) Various unit tests do not provide a valid descriptor.
 	replDesc, found := desc.GetReplicaDescriptor(r.StoreID())
-	if found && replDesc.ReplicaID != r.replicaID {
+	if found && replDesc.ReplicaID != r.mu.replicaID {
 		log.Fatalf(ctx, "attempted to change replica's ID from %d to %d",
-			r.replicaID, replDesc.ReplicaID)
+			r.mu.replicaID, replDesc.ReplicaID)
 	}
 
 	// Initialize the tenant. The must be the first time that the descriptor has
@@ -361,7 +348,7 @@ func (r *Replica) setDescLockedRaftMuLocked(ctx context.Context, desc *roachpb.R
 				"replica %v: %v", r, err)
 		}
 		r.mu.tenantID = tenantID
-		r.tenantMetricsRef = r.store.metrics.acquireTenant(tenantID)
+		r.store.metrics.acquireTenant(tenantID)
 		if tenantID != roachpb.SystemTenantID {
 			r.tenantLimiter = r.store.tenantRateLimiters.GetTenant(ctx, tenantID, r.store.stopper.ShouldQuiesce())
 		}
@@ -380,7 +367,7 @@ func (r *Replica) setDescLockedRaftMuLocked(ctx context.Context, desc *roachpb.R
 		r.mu.lastReplicaAddedTime = time.Time{}
 	}
 
-	r.rangeStr.store(r.replicaID, desc)
+	r.rangeStr.store(r.mu.replicaID, desc)
 	r.connectionClass.set(rpc.ConnectionClassForKey(desc.StartKey))
 	r.concMgr.OnRangeDescUpdated(desc)
 	r.mu.state.Desc = desc

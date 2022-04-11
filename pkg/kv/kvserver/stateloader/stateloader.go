@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
@@ -61,7 +60,25 @@ func (rsl StateLoader) Load(
 	var s kvserverpb.ReplicaState
 	// TODO(tschottdorf): figure out whether this is always synchronous with
 	// on-disk state (likely iffy during Split/ChangeReplica triggers).
-	s.Desc = protoutil.Clone(desc).(*roachpb.RangeDescriptor)
+	if desc.IsInitialized() {
+		loadDesc, err := rsl.LoadRangeDescriptor(ctx, reader, desc.StartKey)
+		if err != nil {
+			return kvserverpb.ReplicaState{}, err
+		}
+		if loadDesc == nil {
+			panic("no descriptor")
+		}
+		s.Desc = loadDesc
+	} else {
+		panic("should not load state for uninitialized replica")
+		// This is awkward - for an uninitialized replica, the start key is not
+		// known and so we cannot load a descriptor (and even if we could it would
+		// not be there). The incoming descriptor in this case is a complete stub
+		// anyway; see tryGetOrCreateReplica. Uninitialized replicas require a
+		// delicate dance that nobody quite understands yet. There is room for
+		// improvement.
+		s.Desc = desc
+	}
 	// Read the range lease.
 	lease, err := rsl.LoadLease(ctx, reader)
 	if err != nil {
@@ -78,7 +95,6 @@ func (rsl StateLoader) Load(
 		return kvserverpb.ReplicaState{}, err
 	}
 	s.RaftAppliedIndex = as.RaftAppliedIndex
-	s.RaftAppliedIndexTerm = as.RaftAppliedIndexTerm
 	s.LeaseAppliedIndex = as.LeaseAppliedIndex
 	ms := as.RangeStats.ToStats()
 	s.Stats = &ms
@@ -134,9 +150,8 @@ func (rsl StateLoader) Save(
 			return enginepb.MVCCStats{}, err
 		}
 	}
-	rai, lai, rait, ct := state.RaftAppliedIndex, state.LeaseAppliedIndex, state.RaftAppliedIndexTerm,
-		&state.RaftClosedTimestamp
-	if err := rsl.SetRangeAppliedState(ctx, readWriter, rai, lai, rait, ms, ct); err != nil {
+	rai, lai, ct := state.RaftAppliedIndex, state.LeaseAppliedIndex, &state.RaftClosedTimestamp
+	if err := rsl.SetRangeAppliedState(ctx, readWriter, rai, lai, ms, ct); err != nil {
 		return enginepb.MVCCStats{}, err
 	}
 	return *ms, nil
@@ -150,6 +165,22 @@ func (rsl StateLoader) LoadLease(
 	_, err := storage.MVCCGetProto(ctx, reader, rsl.RangeLeaseKey(),
 		hlc.Timestamp{}, &lease, storage.MVCCGetOptions{})
 	return lease, err
+}
+
+// LoadRangeDescriptor loads the RangeDescriptor. The result may be nil if
+// the replica is uninitialized (i.e. its applied index is zero).
+func (rsl StateLoader) LoadRangeDescriptor(
+	ctx context.Context, reader storage.Reader, startKey roachpb.RKey,
+) (*roachpb.RangeDescriptor, error) {
+	var desc roachpb.RangeDescriptor
+	ok, err := storage.MVCCGetProto(ctx, reader, keys.RangeDescriptorKey(startKey),
+		hlc.Timestamp{WallTime: math.MaxInt64}, &desc, storage.MVCCGetOptions{
+			Inconsistent: true, // ignore intent
+		})
+	if err != nil || !ok {
+		return nil, err
+	}
+	return &desc, nil
 }
 
 // SetLease persists a lease.
@@ -196,15 +227,14 @@ func (rsl StateLoader) LoadMVCCStats(
 func (rsl StateLoader) SetRangeAppliedState(
 	ctx context.Context,
 	readWriter storage.ReadWriter,
-	appliedIndex, leaseAppliedIndex, appliedIndexTerm uint64,
+	appliedIndex, leaseAppliedIndex uint64,
 	newMS *enginepb.MVCCStats,
 	raftClosedTimestamp *hlc.Timestamp,
 ) error {
 	as := enginepb.RangeAppliedState{
-		RaftAppliedIndex:     appliedIndex,
-		LeaseAppliedIndex:    leaseAppliedIndex,
-		RangeStats:           newMS.ToPersistentStats(),
-		RaftAppliedIndexTerm: appliedIndexTerm,
+		RaftAppliedIndex:  appliedIndex,
+		LeaseAppliedIndex: leaseAppliedIndex,
+		RangeStats:        newMS.ToPersistentStats(),
 	}
 	if raftClosedTimestamp != nil && !raftClosedTimestamp.IsEmpty() {
 		as.RaftClosedTimestamp = raftClosedTimestamp
@@ -226,8 +256,7 @@ func (rsl StateLoader) SetMVCCStats(
 		return err
 	}
 	return rsl.SetRangeAppliedState(
-		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex, as.RaftAppliedIndexTerm, newMS,
-		as.RaftClosedTimestamp)
+		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex, newMS, as.RaftClosedTimestamp)
 }
 
 // SetClosedTimestamp overwrites the closed timestamp.
@@ -239,7 +268,7 @@ func (rsl StateLoader) SetClosedTimestamp(
 		return err
 	}
 	return rsl.SetRangeAppliedState(
-		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex, as.RaftAppliedIndexTerm,
+		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex,
 		as.RangeStats.ToStatsPtr(), closedTS)
 }
 
@@ -437,30 +466,4 @@ func (rsl StateLoader) SynthesizeHardState(
 	}
 	err := rsl.SetHardState(ctx, readWriter, newHS)
 	return errors.Wrapf(err, "writing HardState %+v", &newHS)
-}
-
-// SetRaftReplicaID overwrites the RaftReplicaID.
-func (rsl StateLoader) SetRaftReplicaID(
-	ctx context.Context, writer storage.Writer, replicaID roachpb.ReplicaID,
-) error {
-	rid := roachpb.RaftReplicaID{ReplicaID: replicaID}
-	// "Blind" because ms == nil and timestamp.IsEmpty().
-	return storage.MVCCBlindPutProto(
-		ctx,
-		writer,
-		nil, /* ms */
-		rsl.RaftReplicaIDKey(),
-		hlc.Timestamp{}, /* timestamp */
-		&rid,
-		nil, /* txn */
-	)
-}
-
-// LoadRaftReplicaID loads the RaftReplicaID.
-func (rsl StateLoader) LoadRaftReplicaID(
-	ctx context.Context, reader storage.Reader,
-) (replicaID roachpb.RaftReplicaID, found bool, err error) {
-	found, err = storage.MVCCGetProto(ctx, reader, rsl.RaftReplicaIDKey(),
-		hlc.Timestamp{}, &replicaID, storage.MVCCGetOptions{})
-	return
 }
