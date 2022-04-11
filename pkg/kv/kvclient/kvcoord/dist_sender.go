@@ -279,10 +279,9 @@ type DistSender struct {
 	firstRangeProvider FirstRangeProvider
 	transportFactory   TransportFactory
 	rpcContext         *rpc.Context
-	// nodeDialer allows RPC calls from the SQL layer to the KV layer.
-	nodeDialer      *nodedialer.Dialer
-	rpcRetryOptions retry.Options
-	asyncSenderSem  *quotapool.IntPool
+	nodeDialer         *nodedialer.Dialer
+	rpcRetryOptions    retry.Options
+	asyncSenderSem     *quotapool.IntPool
 	// clusterID is used to verify access to enterprise features.
 	// It is copied out of the rpcContext at construction time and used in
 	// testing.
@@ -335,8 +334,7 @@ type DistSenderConfig struct {
 	nodeDescriptor  *roachpb.NodeDescriptor
 	RPCRetryOptions *retry.Options
 	RPCContext      *rpc.Context
-	// NodeDialer is the dialer from the SQL layer to the KV layer.
-	NodeDialer *nodedialer.Dialer
+	NodeDialer      *nodedialer.Dialer
 
 	// One of the following two must be provided, but not both.
 	//
@@ -1189,13 +1187,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	// turning single-range queries into multi-range queries for no good
 	// reason.
 	if ba.IsUnsplittable() {
-		mismatch := roachpb.NewRangeKeyMismatchErrorWithCTPolicy(ctx,
-			rs.Key.AsRawKey(),
-			rs.EndKey.AsRawKey(),
-			ri.Desc(),
-			nil, /* lease */
-			ri.ClosedTimestampPolicy(),
-		)
+		mismatch := roachpb.NewRangeKeyMismatchError(ctx, rs.Key.AsRawKey(), rs.EndKey.AsRawKey(), ri.Desc(), nil /* lease */)
 		return nil, roachpb.NewError(mismatch)
 	}
 	// If there's no transaction and ba spans ranges, possibly re-run as part of
@@ -1598,9 +1590,6 @@ func (ds *DistSender) sendPartialBatch(
 		}
 
 		if err != nil {
-			// Set pErr so that, if we don't perform any more retries, the
-			// deduceRetryEarlyExitError() call below the loop is inhibited.
-			pErr = roachpb.NewError(err)
 			switch {
 			case errors.HasType(err, sendError{}):
 				// We've tried all the replicas without success. Either they're all
@@ -1622,6 +1611,9 @@ func (ds *DistSender) sendPartialBatch(
 				routingTok.Evict(ctx)
 				continue
 			}
+			// Set pErr so that the deduceRetryEarlyExitError() call below the loop is
+			// inhibited.
+			pErr = roachpb.NewError(err)
 			break
 		}
 
@@ -1685,7 +1677,7 @@ func (ds *DistSender) sendPartialBatch(
 	// channels were closed.
 	if pErr == nil {
 		if err := ds.deduceRetryEarlyExitError(ctx); err == nil {
-			log.Fatal(ctx, "exited retry loop without an error")
+			pErr = roachpb.NewError(errors.AssertionFailedf("exited retry loop without an error"))
 		} else {
 			pErr = roachpb.NewError(err)
 		}
@@ -2293,11 +2285,6 @@ type sendError struct {
 // newSendError creates a sendError.
 func newSendError(msg string) error {
 	return sendError{message: msg}
-}
-
-// TestNewSendError creates a new sendError for the purpose of unit tests
-func TestNewSendError(msg string) error {
-	return newSendError(msg)
 }
 
 func (s sendError) Error() string {
