@@ -36,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -53,10 +52,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
@@ -67,7 +64,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -157,18 +153,15 @@ func (b *baseStatusServer) getLocalSessions(
 
 	sessionUser, isAdmin, err := b.privilegeChecker.getUserAndRole(ctx)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	reqUsername, err := security.MakeSQLUsernameFromPreNormalizedStringChecked(req.Username)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	errViewActivity := b.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx)
-	// TODO(knz): The following check on errViewActivity is incorrect, it
-	// does not properly handle non-privilege errors.
-	// See: https://github.com/cockroachdb/cockroach/issues/76288
 	if !isAdmin && errViewActivity != nil {
 		// For non-superusers, requests with an empty username is
 		// implicitly a request for the client's own sessions.
@@ -264,14 +257,14 @@ func (b *baseStatusServer) checkCancelPrivilege(
 
 	hasAdmin, err := b.privilegeChecker.hasAdminRole(ctx, reqUser)
 	if err != nil {
-		return serverError(ctx, err)
+		return err
 	}
 
 	if !hasAdmin {
 		// Check if the user has permission to see the session.
 		session, err := findSession(b.sessionRegistry.SerializeAll())
 		if err != nil {
-			return serverError(ctx, err)
+			return err
 		}
 
 		sessionUser := security.MakeSQLUsernameFromPreNormalizedString(session.Username)
@@ -280,7 +273,7 @@ func (b *baseStatusServer) checkCancelPrivilege(
 			// sessions/queries.
 			ok, err := b.privilegeChecker.hasRoleOption(ctx, reqUser, roleoption.CANCELQUERY)
 			if err != nil {
-				return serverError(ctx, err)
+				return err
 			}
 			if !ok {
 				return errRequiresRoleOption(roleoption.CANCELQUERY)
@@ -288,7 +281,7 @@ func (b *baseStatusServer) checkCancelPrivilege(
 			// Non-admins cannot cancel admins' sessions/queries.
 			isAdminSession, err := b.privilegeChecker.hasAdminRole(ctx, sessionUser)
 			if err != nil {
-				return serverError(ctx, err)
+				return err
 			}
 			if isAdminSession {
 				return status.Error(
@@ -308,8 +301,6 @@ func (b *baseStatusServer) ListLocalContentionEvents(
 	ctx = b.AnnotateCtx(ctx)
 
 	if err := b.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -325,8 +316,6 @@ func (b *baseStatusServer) ListLocalDistSQLFlows(
 	ctx = b.AnnotateCtx(ctx)
 
 	if err := b.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -475,23 +464,17 @@ func (s *statusServer) RegisterGateway(
 }
 
 func (s *statusServer) parseNodeID(nodeIDParam string) (roachpb.NodeID, bool, error) {
-	return parseNodeID(s.gossip, nodeIDParam)
-}
-
-func parseNodeID(
-	gossip *gossip.Gossip, nodeIDParam string,
-) (nodeID roachpb.NodeID, isLocal bool, err error) {
 	// No parameter provided or set to local.
 	if len(nodeIDParam) == 0 || localRE.MatchString(nodeIDParam) {
-		return gossip.NodeID.Get(), true, nil
+		return s.gossip.NodeID.Get(), true, nil
 	}
 
 	id, err := strconv.ParseInt(nodeIDParam, 0, 32)
 	if err != nil {
 		return 0, false, errors.Wrap(err, "node ID could not be parsed")
 	}
-	nodeID = roachpb.NodeID(id)
-	return nodeID, nodeID == gossip.NodeID.Get(), nil
+	nodeID := roachpb.NodeID(id)
+	return nodeID, nodeID == s.gossip.NodeID.Get(), nil
 }
 
 func (s *statusServer) dialNode(
@@ -517,8 +500,6 @@ func (s *statusServer) Gossip(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -533,7 +514,7 @@ func (s *statusServer) Gossip(
 	}
 	status, err := s.dialNode(ctx, nodeID)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	return status.Gossip(ctx, req)
 }
@@ -545,8 +526,6 @@ func (s *statusServer) EngineStats(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -558,7 +537,7 @@ func (s *statusServer) EngineStats(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.EngineStats(ctx, req)
 	}
@@ -575,7 +554,7 @@ func (s *statusServer) EngineStats(
 		return nil
 	})
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	return resp, nil
 }
@@ -588,8 +567,6 @@ func (s *statusServer) Allocator(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -601,7 +578,7 @@ func (s *statusServer) Allocator(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.Allocator(ctx, req)
 	}
@@ -616,7 +593,7 @@ func (s *statusServer) Allocator(
 					if !rep.OwnsValidLease(ctx, store.Clock().NowAsClockTimestamp()) {
 						return true // continue.
 					}
-					var allocatorSpans tracing.Recording
+					var allocatorSpans tracingpb.Recording
 					allocatorSpans, err = store.AllocatorDryRun(ctx, rep)
 					if err != nil {
 						return false // break and bubble up the error.
@@ -654,7 +631,7 @@ func (s *statusServer) Allocator(
 		return nil
 	})
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 	return output, nil
 }
@@ -681,8 +658,6 @@ func (s *statusServer) AllocatorRange(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -724,7 +699,7 @@ func (s *statusServer) AllocatorRange(
 					return nil
 				})
 			}); err != nil {
-			return nil, serverError(ctx, err)
+			return nil, status.Errorf(codes.Internal, err.Error())
 		}
 	}
 
@@ -758,7 +733,7 @@ func (s *statusServer) AllocatorRange(
 			}
 			fmt.Fprintf(&buf, "n%d: %s", nodeID, err)
 		}
-		return nil, serverErrorf(ctx, "%v", buf)
+		return nil, status.Errorf(codes.Internal, buf.String())
 	}
 	return &serverpb.AllocatorRangeResponse{}, nil
 }
@@ -771,8 +746,6 @@ func (s *statusServer) Certificates(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -782,27 +755,27 @@ func (s *statusServer) Certificates(
 	}
 
 	if s.cfg.Insecure {
-		return nil, status.Errorf(codes.Unavailable, "server is in insecure mode, cannot examine certificates")
+		return nil, errors.New("server is in insecure mode, cannot examine certificates")
 	}
 
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.Certificates(ctx, req)
 	}
 
 	cm, err := s.rpcCtx.GetCertificateManager()
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	// The certificate manager gives us a list of CertInfo objects to avoid
 	// making security depend on serverpb.
 	certs, err := cm.ListCertificates()
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	cr := &serverpb.CertificatesResponse{}
@@ -822,7 +795,7 @@ func (s *statusServer) Certificates(
 		case security.ClientPem:
 			details.Type = serverpb.CertificateDetails_CLIENT
 		default:
-			return nil, serverErrorf(ctx, "unknown certificate type %v for file %s", cert.FileUsage, cert.Filename)
+			return nil, errors.Errorf("unknown certificate type %v for file %s", cert.FileUsage, cert.Filename)
 		}
 
 		if cert.Error == nil {
@@ -893,8 +866,6 @@ func (s *statusServer) Details(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -905,7 +876,7 @@ func (s *statusServer) Details(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.Details(ctx, req)
 	}
@@ -934,8 +905,6 @@ func (s *statusServer) GetFiles(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -946,7 +915,7 @@ func (s *statusServer) GetFiles(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.GetFiles(ctx, req)
 	}
@@ -981,14 +950,14 @@ func (s *statusServer) GetFiles(
 			if !req.ListOnly {
 				contents, err = ioutil.ReadFile(path)
 				if err != nil {
-					return nil, serverError(ctx, err)
+					return nil, status.Errorf(codes.Internal, err.Error())
 				}
 			}
 			resp.Files = append(resp.Files,
 				&serverpb.File{Name: fileinfo.Name(), FileSize: fileinfo.Size(), Contents: contents})
 		}
 	}
-	return &resp, nil
+	return &resp, err
 }
 
 // checkFilePattern checks if a pattern is acceptable for the GetFiles call.
@@ -1026,8 +995,6 @@ func (s *statusServer) LogFilesList(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -1038,16 +1005,16 @@ func (s *statusServer) LogFilesList(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.LogFilesList(ctx, req)
 	}
 	log.Flush()
 	logFiles, err := log.ListLogFiles()
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
-	return &serverpb.LogFilesListResponse{Files: logFiles}, nil
+	return &serverpb.LogFilesListResponse{Files: logFiles}, err
 }
 
 // LogFile returns a single log file.
@@ -1061,8 +1028,6 @@ func (s *statusServer) LogFile(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -1073,7 +1038,7 @@ func (s *statusServer) LogFile(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.LogFile(ctx, req)
 	}
@@ -1087,14 +1052,14 @@ func (s *statusServer) LogFile(
 	// Read the logs.
 	reader, err := log.GetLogReader(req.File)
 	if err != nil {
-		return nil, serverError(ctx, errors.Wrapf(err, "log file %q could not be opened", req.File))
+		return nil, errors.Wrapf(err, "log file %q could not be opened", req.File)
 	}
 	defer reader.Close()
 
 	var resp serverpb.LogEntriesResponse
 	decoder, err := log.NewEntryDecoder(reader, inputEditMode)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	for {
 		var entry logpb.Entry
@@ -1102,7 +1067,7 @@ func (s *statusServer) LogFile(
 			if err == io.EOF {
 				break
 			}
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		resp.Entries = append(resp.Entries, entry)
 	}
@@ -1148,8 +1113,6 @@ func (s *statusServer) Logs(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -1160,7 +1123,7 @@ func (s *statusServer) Logs(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.Logs(ctx, req)
 	}
@@ -1207,7 +1170,7 @@ func (s *statusServer) Logs(
 	entries, err := log.FetchEntriesFromFiles(
 		startTimestamp, endTimestamp, int(maxEntries), regex, inputEditMode)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	return &serverpb.LogEntriesResponse{Entries: entries}, nil
@@ -1221,8 +1184,6 @@ func (s *statusServer) Stacks(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -1234,7 +1195,7 @@ func (s *statusServer) Stacks(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.Stacks(ctx, req)
 	}
@@ -1251,7 +1212,7 @@ func (s *statusServer) Stacks(
 
 	var buf bytes.Buffer
 	if err := pprof.Lookup("goroutine").WriteTo(&buf, debug); err != nil {
-		return nil, serverError(ctx, err)
+		return nil, status.Errorf(codes.Unknown, "failed to write goroutine stack: %s", err)
 	}
 	return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
 }
@@ -1268,8 +1229,6 @@ func (s *statusServer) Profile(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -1281,7 +1240,7 @@ func (s *statusServer) Profile(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.Profile(ctx, req)
 	}
@@ -1315,7 +1274,7 @@ func profileLocal(
 				return nil
 			}
 		}); err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
 	default:
@@ -1342,7 +1301,7 @@ func (s *statusServer) Regions(
 ) (*serverpb.RegionsResponse, error) {
 	resp, _, err := s.nodesHelper(ctx, 0 /* limit */, 0 /* offset */)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	return regionsResponseFromNodesResponse(resp), nil
 }
@@ -1386,35 +1345,6 @@ func regionsResponseFromNodesResponse(nr *serverpb.NodesResponse) *serverpb.Regi
 	return ret
 }
 
-// NodesList returns a list of nodes with their corresponding addresses.
-func (s *statusServer) NodesList(
-	ctx context.Context, _ *serverpb.NodesListRequest,
-) (*serverpb.NodesListResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
-	ctx = s.AnnotateCtx(ctx)
-
-	// The node status contains details about the command line, network
-	// addresses, env vars etc which are admin-only.
-	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
-		return nil, err
-	}
-	statuses, _, err := s.getNodeStatuses(ctx, 0 /* limit */, 0 /* offset */)
-	if err != nil {
-		return nil, serverError(ctx, err)
-	}
-	resp := &serverpb.NodesListResponse{
-		Nodes: make([]serverpb.NodeDetails, len(statuses)),
-	}
-	for i, status := range statuses {
-		resp.Nodes[i].NodeID = int32(status.Desc.NodeID)
-		resp.Nodes[i].Address = status.Desc.Address
-		resp.Nodes[i].SQLAddress = status.Desc.SQLAddress
-	}
-	return resp, nil
-}
-
 // Nodes returns all node statuses.
 //
 // Do not use this method inside the server code! Use
@@ -1429,38 +1359,30 @@ func (s *statusServer) NodesList(
 func (s *statusServer) Nodes(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
-	ctx = s.AnnotateCtx(ctx)
-
 	// The node status contains details about the command line, network
 	// addresses, env vars etc which are admin-only.
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
 	resp, _, err := s.nodesHelper(ctx, 0 /* limit */, 0 /* offset */)
-	if err != nil {
-		return nil, serverError(ctx, err)
-	}
-	return resp, nil
+	return resp, err
 }
 
 func (s *statusServer) NodesUI(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponseExternal, error) {
-	ctx = propagateGatewayMetadata(ctx)
-	ctx = s.AnnotateCtx(ctx)
+	// The node status contains details about the command line, network
+	// addresses, env vars etc which are admin-only.
 
 	_, isAdmin, err := s.privilegeChecker.getUserAndRole(ctx)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	internalResp, _, err := s.nodesHelper(ctx, 0 /* limit */, 0 /* offset */)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	resp := &serverpb.NodesResponseExternal{
 		Nodes:            make([]serverpb.NodeResponse, len(internalResp.Nodes)),
@@ -1470,7 +1392,7 @@ func (s *statusServer) NodesUI(
 		resp.Nodes[i] = nodeStatusToResp(&nodeStatus, isAdmin)
 	}
 
-	return resp, nil
+	return resp, err
 }
 
 func nodeStatusToResp(n *statuspb.NodeStatus, isAdmin bool) serverpb.NodeResponse {
@@ -1573,9 +1495,6 @@ func nodeStatusToResp(n *statuspb.NodeStatus, isAdmin bool) serverpb.NodeRespons
 
 // ListNodesInternal is a helper function for the benefit of SQL exclusively.
 // It skips the privilege check, assuming that SQL is doing privilege checking already.
-//
-// Note that the function returns plain errors, and it is the caller's
-// responsibility to convert them to serverErrors.
 func (s *statusServer) ListNodesInternal(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponse, error) {
@@ -1583,20 +1502,23 @@ func (s *statusServer) ListNodesInternal(
 	return resp, err
 }
 
-// Note that the function returns plain errors, and it is the caller's
-// responsibility to convert them to serverErrors.
-func (s *statusServer) getNodeStatuses(
+func (s *statusServer) nodesHelper(
 	ctx context.Context, limit, offset int,
-) (statuses []statuspb.NodeStatus, next int, _ error) {
+) (*serverpb.NodesResponse, int, error) {
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
 	startKey := keys.StatusNodePrefix
 	endKey := startKey.PrefixEnd()
 
 	b := &kv.Batch{}
 	b.Scan(startKey, endKey)
 	if err := s.db.Run(ctx, b); err != nil {
-		return nil, 0, err
+		log.Errorf(ctx, "%v", err)
+		return nil, 0, status.Errorf(codes.Internal, err.Error())
 	}
 
+	var next int
 	var rows []kv.KeyValue
 	if len(b.Results[0].Rows) > 0 {
 		var rowsInterface interface{}
@@ -1604,29 +1526,14 @@ func (s *statusServer) getNodeStatuses(
 		rows = rowsInterface.([]kv.KeyValue)
 	}
 
-	statuses = make([]statuspb.NodeStatus, len(rows))
-	for i, row := range rows {
-		if err := row.ValueProto(&statuses[i]); err != nil {
-			return nil, 0, err
-		}
-	}
-	return statuses, next, nil
-}
-
-// Note that the function returns plain errors, and it is the caller's
-// responsibility to convert them to serverErrors.
-func (s *statusServer) nodesHelper(
-	ctx context.Context, limit, offset int,
-) (*serverpb.NodesResponse, int, error) {
-	ctx = propagateGatewayMetadata(ctx)
-	ctx = s.AnnotateCtx(ctx)
-
-	statuses, next, err := s.getNodeStatuses(ctx, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
 	resp := serverpb.NodesResponse{
-		Nodes: statuses,
+		Nodes: make([]statuspb.NodeStatus, len(rows)),
+	}
+	for i, row := range rows {
+		if err := row.ValueProto(&resp.Nodes[i]); err != nil {
+			log.Errorf(ctx, "%v", err)
+			return nil, 0, status.Errorf(codes.Internal, err.Error())
+		}
 	}
 
 	clock := s.admin.server.clock
@@ -1636,9 +1543,6 @@ func (s *statusServer) nodesHelper(
 
 // nodesStatusWithLiveness is like Nodes but for internal
 // use within this package.
-//
-// Note that the function returns plain errors, and it is the caller's
-// responsibility to convert them to serverErrors.
 func (s *statusServer) nodesStatusWithLiveness(
 	ctx context.Context,
 ) (map[roachpb.NodeID]nodeStatusWithLiveness, error) {
@@ -1680,13 +1584,9 @@ func (s *statusServer) Node(
 	// The node status contains details about the command line, network
 	// addresses, env vars etc which are admin-only.
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
-	// NB: not using serverError() here since nodeStatus
-	// already returns a proper gRPC error status.
 	return s.nodeStatus(ctx, req)
 }
 
@@ -1702,13 +1602,15 @@ func (s *statusServer) nodeStatus(
 	b := &kv.Batch{}
 	b.Get(key)
 	if err := s.db.Run(ctx, b); err != nil {
-		return nil, serverError(ctx, err)
+		log.Errorf(ctx, "%v", err)
+		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 
 	var nodeStatus statuspb.NodeStatus
 	if err := b.Results[0].Rows[0].ValueProto(&nodeStatus); err != nil {
 		err = errors.Wrapf(err, "could not unmarshal NodeStatus from %s", key)
-		return nil, serverError(ctx, err)
+		log.Errorf(ctx, "%v", err)
+		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 	return &nodeStatus, nil
 }
@@ -1723,13 +1625,11 @@ func (s *statusServer) NodeUI(
 	// addresses, env vars etc which are admin-only.
 	_, isAdmin, err := s.privilegeChecker.getUserAndRole(ctx)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	nodeStatus, err := s.nodeStatus(ctx, req)
 	if err != nil {
-		// NB: not using serverError() here since nodeStatus
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 	resp := nodeStatusToResp(nodeStatus, isAdmin)
@@ -1742,7 +1642,6 @@ func (s *statusServer) Metrics(
 ) (*serverpb.JSONResponse, error) {
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
-
 	nodeID, local, err := s.parseNodeID(req.NodeId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, err.Error())
@@ -1751,15 +1650,11 @@ func (s *statusServer) Metrics(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.Metrics(ctx, req)
 	}
-	j, err := marshalJSONResponse(s.metricSource)
-	if err != nil {
-		return nil, serverError(ctx, err)
-	}
-	return j, nil
+	return marshalJSONResponse(s.metricSource)
 }
 
 // RaftDebug returns raft debug information for all known nodes.
@@ -1770,14 +1665,12 @@ func (s *statusServer) RaftDebug(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
 	nodes, err := s.ListNodesInternal(ctx, nil)
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	mu := struct {
@@ -1875,6 +1768,10 @@ func (h varsHandler) handleVars(w http.ResponseWriter, r *http.Request) {
 	}
 
 	telemetry.Inc(telemetryPrometheusVars)
+}
+
+func (s *statusServer) handleVars(w http.ResponseWriter, r *http.Request) {
+	varsHandler{s.metricSource, s.st}.handleVars(w, r)
 }
 
 // Ranges returns range info for the specified node.
@@ -2078,8 +1975,6 @@ func (s *statusServer) HotRanges(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -2103,7 +1998,7 @@ func (s *statusServer) HotRanges(
 		// Only hot ranges from one non-local node.
 		status, err := s.dialNode(ctx, requestedNodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.HotRanges(ctx, req)
 	}
@@ -2129,7 +2024,7 @@ func (s *statusServer) HotRanges(
 	}
 
 	if err := s.iterateNodes(ctx, "hot ranges", dialFn, nodeFn, responseFn, errorFn); err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	return response, nil
@@ -2165,8 +2060,6 @@ func (s *statusServer) Range(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -2210,7 +2103,7 @@ func (s *statusServer) Range(
 	if err := s.iterateNodes(
 		ctx, fmt.Sprintf("details about range %d", req.RangeId), dialFn, nodeFn, responseFn, errorFn,
 	); err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	return response, nil
 }
@@ -2221,8 +2114,6 @@ func (s *statusServer) ListLocalSessions(
 ) (*serverpb.ListSessionsResponse, error) {
 	sessions, err := s.getLocalSessions(ctx, req)
 	if err != nil {
-		// NB: not using serverError() here since getLocalSessions
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 	for i := range sessions {
@@ -2400,9 +2291,8 @@ func (s *statusServer) listSessionsHelper(
 	ctx context.Context, req *serverpb.ListSessionsRequest, limit int, start paginationState,
 ) (*serverpb.ListSessionsResponse, paginationState, error) {
 	response := &serverpb.ListSessionsResponse{
-		Sessions:              make([]serverpb.Session, 0),
-		Errors:                make([]serverpb.ListSessionsError, 0),
-		InternalAppNamePrefix: catconstants.InternalAppNamePrefix,
+		Sessions: make([]serverpb.Session, 0),
+		Errors:   make([]serverpb.ListSessionsError, 0),
 	}
 
 	dialFn := func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error) {
@@ -2453,16 +2343,11 @@ func (s *statusServer) ListSessions(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, _, err := s.privilegeChecker.getUserAndRole(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
 	resp, _, err := s.listSessionsHelper(ctx, req, 0 /* limit */, paginationState{})
-	if err != nil {
-		return nil, serverError(ctx, err)
-	}
-	return resp, nil
+	return resp, err
 }
 
 // CancelSession responds to a session cancellation request by canceling the
@@ -2481,27 +2366,21 @@ func (s *statusServer) CancelSession(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.CancelSession(ctx, req)
 	}
 
 	reqUsername, err := security.MakeSQLUsernameFromPreNormalizedStringChecked(req.Username)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, err.Error())
-	}
-
-	if err := s.checkCancelPrivilege(ctx, reqUsername, findSessionBySessionID(req.SessionID)); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
-	r, err := s.sessionRegistry.CancelSession(req.SessionID)
-	if err != nil {
-		return nil, serverError(ctx, err)
+	if err := s.checkCancelPrivilege(ctx, reqUsername, findSessionBySessionID(req.SessionID)); err != nil {
+		return nil, err
 	}
-	return r, nil
+
+	return s.sessionRegistry.CancelSession(req.SessionID)
 }
 
 // CancelQuery responds to a query cancellation request, and cancels
@@ -2519,19 +2398,17 @@ func (s *statusServer) CancelQuery(
 		ctx = s.AnnotateCtx(ctx)
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.CancelQuery(ctx, req)
 	}
 
 	reqUsername, err := security.MakeSQLUsernameFromPreNormalizedStringChecked(req.Username)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, err.Error())
+		return nil, err
 	}
 
 	if err := s.checkCancelPrivilege(ctx, reqUsername, findSessionByQueryID(req.QueryID)); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -2541,58 +2418,6 @@ func (s *statusServer) CancelQuery(
 		output.Error = err.Error()
 	}
 	return output, nil
-}
-
-// CancelQueryByKey responds to a pgwire query cancellation request, and cancels
-// the target query's associated context and sets a cancellation flag. This
-// endpoint is rate-limited by a semaphore.
-func (s *statusServer) CancelQueryByKey(
-	ctx context.Context, req *serverpb.CancelQueryByKeyRequest,
-) (resp *serverpb.CancelQueryByKeyResponse, retErr error) {
-	local := req.SQLInstanceID == s.sqlServer.SQLInstanceID()
-
-	// Acquiring the semaphore here helps protect both the source and destination
-	// nodes. The source node is protected against an attacker causing too much
-	// inter-node network traffic by spamming cancel requests. The destination
-	// node is protected so that if an attacker spams all the nodes in the cluster
-	// with requests that all go to the same node, this semaphore will prevent
-	// them from having too many guesses.
-	// More concretely, suppose we have a 100-node cluster. If we limit the
-	// ingress only, then each node is limited to processing X requests per
-	// second. But if an attacker crafts the CancelRequests to all target the
-	// same SQLInstance, then that one instance would have to process 100*X
-	// requests per second.
-	alloc, err := pgwirecancel.CancelSemaphore.TryAcquire(ctx, 1)
-	if err != nil {
-		return nil, status.Errorf(codes.ResourceExhausted, "exceeded rate limit of pgwire cancellation requests")
-	}
-	defer func() {
-		// If we acquired the semaphore but the cancellation request failed, then
-		// hold on to the semaphore for longer. This helps mitigate a DoS attack
-		// of random cancellation requests.
-		if err != nil || (resp != nil && !resp.Canceled) {
-			time.Sleep(1 * time.Second)
-		}
-		alloc.Release()
-	}()
-
-	if local {
-		resp = &serverpb.CancelQueryByKeyResponse{}
-		resp.Canceled, err = s.sessionRegistry.CancelQueryByKey(req.CancelQueryKey)
-		if err != nil {
-			resp.Error = err.Error()
-		}
-		return resp, nil
-	}
-
-	// This request needs to be forwarded to another node.
-	ctx = propagateGatewayMetadata(ctx)
-	ctx = s.AnnotateCtx(ctx)
-	client, err := s.dialNode(ctx, roachpb.NodeID(req.SQLInstanceID))
-	if err != nil {
-		return nil, err
-	}
-	return client.CancelQueryByKey(ctx, req)
 }
 
 // ListContentionEvents returns a list of contention events on all nodes in the
@@ -2605,8 +2430,6 @@ func (s *statusServer) ListContentionEvents(
 
 	// Check permissions early to avoid fan-out to all nodes.
 	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -2639,7 +2462,7 @@ func (s *statusServer) ListContentionEvents(
 	}
 
 	if err := s.iterateNodes(ctx, "contention events list", dialFn, nodeFn, responseFn, errorFn); err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	return &response, nil
 }
@@ -2652,8 +2475,6 @@ func (s *statusServer) ListDistSQLFlows(
 
 	// Check permissions early to avoid fan-out to all nodes.
 	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -2686,7 +2507,7 @@ func (s *statusServer) ListDistSQLFlows(
 	}
 
 	if err := s.iterateNodes(ctx, "distsql flows list", dialFn, nodeFn, responseFn, errorFn); err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	return &response, nil
 }
@@ -2745,8 +2566,6 @@ func (s *statusServer) SpanStats(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -2758,7 +2577,7 @@ func (s *statusServer) SpanStats(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.SpanStats(ctx, req)
 	}
@@ -2775,7 +2594,7 @@ func (s *statusServer) SpanStats(
 		return nil
 	})
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 
 	return output, nil
@@ -2795,7 +2614,7 @@ func (s *statusServer) Diagnostics(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.Diagnostics(ctx, req)
 	}
@@ -2811,8 +2630,6 @@ func (s *statusServer) Stores(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -2824,7 +2641,7 @@ func (s *statusServer) Stores(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.Stores(ctx, req)
 	}
@@ -2853,7 +2670,7 @@ func (s *statusServer) Stores(
 		return nil
 	})
 	if err != nil {
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	return resp, nil
 }
@@ -2963,8 +2780,6 @@ func (s *statusServer) JobRegistryStatus(
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
@@ -2975,7 +2790,7 @@ func (s *statusServer) JobRegistryStatus(
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
-			return nil, serverError(ctx, err)
+			return nil, err
 		}
 		return status.JobRegistryStatus(ctx, req)
 	}
@@ -3001,17 +2816,12 @@ func (s *statusServer) JobStatus(
 	ctx = s.AnnotateCtx(propagateGatewayMetadata(ctx))
 
 	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
 		return nil, err
 	}
 
 	j, err := s.admin.server.sqlServer.jobRegistry.LoadJob(ctx, jobspb.JobID(req.JobId))
 	if err != nil {
-		if je := (*jobs.JobNotFoundError)(nil); errors.As(err, &je) {
-			return nil, status.Errorf(codes.NotFound, "%v", err)
-		}
-		return nil, serverError(ctx, err)
+		return nil, err
 	}
 	res := &jobspb.Job{
 		Payload:  &jobspb.Payload{},

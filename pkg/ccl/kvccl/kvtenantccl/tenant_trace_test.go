@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,7 +49,7 @@ func testTenantTracesAreRedactedImpl(t *testing.T, redactable bool) {
 		visibleString   = "tenant-can-see-this"
 	)
 
-	recCh := make(chan tracing.Recording, 1)
+	recCh := make(chan tracingpb.Recording, 1)
 
 	args := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
@@ -63,7 +63,7 @@ func testTenantTracesAreRedactedImpl(t *testing.T, redactable bool) {
 				},
 			},
 			SQLExecutor: &sql.ExecutorTestingKnobs{
-				WithStatementTrace: func(trace tracing.Recording, stmt string) {
+				WithStatementTrace: func(trace tracingpb.Recording, stmt string) {
 					if stmt == testStmt {
 						recCh <- trace
 					}

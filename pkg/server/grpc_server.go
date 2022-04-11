@@ -26,15 +26,21 @@ import (
 // RPCs.
 type grpcServer struct {
 	*grpc.Server
-	mode serveMode
+	unaryInterceptors  []grpc.UnaryServerInterceptor
+	streamInterceptors []grpc.StreamServerInterceptor
+	mode               serveMode
 }
 
 func newGRPCServer(rpcCtx *rpc.Context) *grpcServer {
 	s := &grpcServer{}
 	s.mode.set(modeInitializing)
-	s.Server = rpc.NewServer(rpcCtx, rpc.WithInterceptor(func(path string) error {
-		return s.intercept(path)
-	}))
+	srv, unaryServerInterceptors, streamServerInterceptors := rpc.NewServerEx(
+		rpcCtx, rpc.WithInterceptor(func(path string) error {
+			return s.intercept(path)
+		}))
+	s.Server = srv
+	s.unaryInterceptors = unaryServerInterceptors
+	s.streamInterceptors = streamServerInterceptors
 	return s
 }
 

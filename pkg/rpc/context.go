@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/grpcinterceptor"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
@@ -155,6 +156,17 @@ func WithInterceptor(f func(fullMethod string) error) ServerOption {
 // either expects incoming connections from KV nodes, or from tenant SQL
 // servers.
 func NewServer(rpcCtx *Context, opts ...ServerOption) *grpc.Server {
+	srv, _ /* unaryInterceptors */, _ /* streamInterceptors */ := NewServerEx(rpcCtx, opts...)
+	return srv
+}
+
+// NewServerEx is like NewServer, but also returns the interceptors that have
+// been registered with gRPC for the server. These interceptors can be used
+// manually when bypassing gRPC to call into the server (like the
+// internalClientAdapter does).
+func NewServerEx(
+	rpcCtx *Context, opts ...ServerOption,
+) (*grpc.Server, []grpc.UnaryServerInterceptor, []grpc.StreamServerInterceptor) {
 	var o serverOpts
 	for _, f := range opts {
 		f(&o)
@@ -247,8 +259,8 @@ func NewServer(rpcCtx *Context, opts ...ServerOption) *grpc.Server {
 	}
 
 	if tracer := rpcCtx.Stopper.Tracer(); tracer != nil {
-		unaryInterceptor = append(unaryInterceptor, tracing.ServerInterceptor(tracer))
-		streamInterceptor = append(streamInterceptor, tracing.StreamServerInterceptor(tracer))
+		unaryInterceptor = append(unaryInterceptor, grpcinterceptor.ServerInterceptor(tracer))
+		streamInterceptor = append(streamInterceptor, grpcinterceptor.StreamServerInterceptor(tracer))
 	}
 
 	grpcOpts = append(grpcOpts, grpc.ChainUnaryInterceptor(unaryInterceptor...))
@@ -256,7 +268,7 @@ func NewServer(rpcCtx *Context, opts ...ServerOption) *grpc.Server {
 
 	s := grpc.NewServer(grpcOpts...)
 	RegisterHeartbeatServer(s, rpcCtx.NewHeartbeatService())
-	return s
+	return s, unaryInterceptor, streamInterceptor
 }
 
 type heartbeatResult struct {
@@ -346,7 +358,7 @@ type Context struct {
 
 	breakerClock breakerClock
 	RemoteClocks *RemoteClockMonitor
-	MasterCtx    context.Context
+	masterCtx    context.Context
 
 	heartbeatTimeout time.Duration
 	HeartbeatCB      func()
@@ -367,6 +379,9 @@ type Context struct {
 
 	// For testing. See the comment on the same field in HeartbeatService.
 	TestingAllowNamedRPCToAnonymousServer bool
+
+	clientUnaryInterceptors  []grpc.UnaryClientInterceptor
+	clientStreamInterceptors []grpc.StreamClientInterceptor
 }
 
 // connKey is used as key in the Context.conns map.
@@ -485,7 +500,7 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
 		RemoteClocks: newRemoteClockMonitor(
 			opts.Clock, 10*opts.Config.RPCHeartbeatInterval, opts.Config.HistogramWindowInterval()),
 		rpcCompression:   enableRPCCompression,
-		MasterCtx:        masterCtx,
+		masterCtx:        masterCtx,
 		metrics:          makeMetrics(),
 		heartbeatTimeout: 2 * opts.Config.RPCHeartbeatInterval,
 	}
@@ -511,9 +526,46 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
 			return true
 		})
 	}
-	if err := rpcCtx.Stopper.RunAsyncTask(rpcCtx.MasterCtx, "wait-rpcctx-quiesce", waitQuiesce); err != nil {
-		waitQuiesce(rpcCtx.MasterCtx)
+	if err := rpcCtx.Stopper.RunAsyncTask(rpcCtx.masterCtx, "wait-rpcctx-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(rpcCtx.masterCtx)
 	}
+
+	if tracer := rpcCtx.Stopper.Tracer(); tracer != nil {
+		// TODO(tbg): re-write all of this for our tracer.
+
+		// We use a decorator to set the "node" tag. All other spans get the
+		// node tag from context log tags.
+		//
+		// Unfortunately we cannot use the corresponding interceptor on the
+		// server-side of gRPC to set this tag on server spans because that
+		// interceptor runs too late - after a traced RPC's recording had
+		// already been collected. So, on the server-side, the equivalent code
+		// is in setupSpanForIncomingRPC().
+		//
+		tagger := func(span *tracing.Span) {
+			span.SetTag("node", attribute.IntValue(int(rpcCtx.NodeID.Get())))
+		}
+		compatMode := func(reqCtx context.Context) bool {
+			return !rpcCtx.ContextOptions.Settings.Version.IsActive(reqCtx, clusterversion.SelectRPCsTakeTracingInfoInband)
+		}
+
+		if rpcCtx.ClientOnly {
+			// client-only RPC contexts don't have a node ID to report nor a
+			// cluster version to check against.
+			tagger = func(span *tracing.Span) {}
+			compatMode = func(_ context.Context) bool { return false }
+		}
+
+		rpcCtx.clientUnaryInterceptors = append(rpcCtx.clientUnaryInterceptors,
+			grpcinterceptor.ClientInterceptor(tracer, tagger, compatMode))
+		rpcCtx.clientStreamInterceptors = append(rpcCtx.clientStreamInterceptors,
+			grpcinterceptor.StreamClientInterceptor(tracer, tagger))
+	}
+	// Note that we do not consult rpcCtx.Knobs.StreamClientInterceptor. That knob
+	// can add another interceptor, but it can only do it dynamically, based on
+	// a connection class. Only calls going over an actual gRPC connection will
+	// use that interceptor.
+
 	return rpcCtx
 }
 
@@ -551,8 +603,105 @@ func (rpcCtx *Context) GetLocalInternalClientForAddr(
 	return nil
 }
 
+// internalClientAdapter is an implementation of roachpb.InternalClient that
+// bypasses gRPC, calling the wrapped local server directly.
 type internalClientAdapter struct {
-	server roachpb.InternalServer
+	server                   roachpb.InternalServer
+	clientUnaryInterceptors  clientUnaryInterceptorsChain
+	serverUnaryInterceptors  serverUnaryInterceptorsChain
+	serverStreamInterceptors serverStreamInterceptorsChain
+}
+
+var _ roachpb.InternalClient = internalClientAdapter{}
+
+type serverUnaryInterceptorsChain []grpc.UnaryServerInterceptor
+type serverStreamInterceptorsChain []grpc.StreamServerInterceptor
+
+func (c serverUnaryInterceptorsChain) run(
+	ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler,
+) (interface{}, error) {
+	// The state struct groups escaping variables to save allocations.
+	var state struct {
+		i    int
+		next grpc.UnaryHandler
+	}
+	state.next = func(ctx context.Context, req interface{}) (interface{}, error) {
+		if state.i == len(c)-1 {
+			return c[state.i](ctx, req, info, handler)
+		}
+		state.i++
+		return c[state.i-1](ctx, req, info, state.next)
+	}
+	return state.next(ctx, req)
+}
+
+func (c serverStreamInterceptorsChain) run(
+	srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler,
+) error {
+	// the struct ensures the variables are allocated together, rather than separately, since we
+	// know they should be garbage collected together. This saves 1 allocation and decreases
+	// time/call by about 10% on the microbenchmark.
+	var state struct {
+		i    int
+		next grpc.StreamHandler
+	}
+	state.next = func(srv interface{}, ss grpc.ServerStream) error {
+		if state.i == len(c)-1 {
+			return c[state.i](srv, ss, info, handler)
+		}
+		state.i++
+		return c[state.i-1](srv, ss, info, state.next)
+	}
+	return state.next(srv, ss)
+}
+
+type clientUnaryInterceptorsChain []grpc.UnaryClientInterceptor
+
+func (c clientUnaryInterceptorsChain) run(
+	ctx context.Context,
+	method string,
+	req, reply interface{},
+	rpcHandler func(ctx context.Context, req interface{}) error,
+) error {
+	invoker := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+		return rpcHandler(ctx, req)
+	}
+	chainInvoker := getChainUnaryInvoker(c, 0, invoker)
+	return chainInvoker(ctx, method, req, reply, nil /* ClientConn */)
+}
+
+// !!!
+//// chainUnaryClientInterceptors chains all unary client interceptors into one.
+//func chainUnaryClientInterceptors(cc *ClientConn) {
+//	interceptors := cc.dopts.chainUnaryInts
+//	// Prepend dopts.unaryInt to the chaining interceptors if it exists, since unaryInt will
+//	// be executed before any other chained interceptors.
+//	if cc.dopts.unaryInt != nil {
+//		interceptors = append([]UnaryClientInterceptor{cc.dopts.unaryInt}, interceptors...)
+//	}
+//	var chainedInt UnaryClientInterceptor
+//	if len(interceptors) == 0 {
+//		chainedInt = nil
+//	} else if len(interceptors) == 1 {
+//		chainedInt = interceptors[0]
+//	} else {
+//		chainedInt = func(ctx context.Context, method string, req, reply interface{}, cc *ClientConn, invoker UnaryInvoker, opts ...CallOption) error {
+//			return interceptors[0](ctx, method, req, reply, cc, getChainUnaryInvoker(interceptors, 0, invoker), opts...)
+//		}
+//	}
+//	cc.dopts.unaryInt = chainedInt
+//}
+
+// getChainUnaryInvoker recursively generate the chained unary invoker.
+func getChainUnaryInvoker(
+	interceptors clientUnaryInterceptorsChain, curr int, finalInvoker grpc.UnaryInvoker,
+) grpc.UnaryInvoker {
+	if curr == len(interceptors)-1 {
+		return finalInvoker
+	}
+	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+		return interceptors[curr+1](ctx, method, req, reply, cc, getChainUnaryInvoker(interceptors, curr+1, finalInvoker), opts...)
+	}
 }
 
 // Batch implements the roachpb.InternalClient interface.
@@ -562,49 +711,182 @@ func (a internalClientAdapter) Batch(
 	// Mark this as originating locally, which is useful for the decision about
 	// memory allocation tracking.
 	ba.AdmissionHeader.SourceLocation = roachpb.AdmissionHeader_LOCAL
-	return a.server.Batch(ctx, ba)
+
+	methodName := grpcinterceptor.BatchMethodName
+	serverInfo := &grpc.UnaryServerInfo{
+		Server:     a.server,
+		FullMethod: methodName,
+	}
+	// rpcHandler adapts the server's RPC handler to the interface expected by the
+	// server interceptors.
+	rpcHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return a.server.Batch(ctx, req.(*roachpb.BatchRequest))
+	}
+	// reply serves to communicate the RPC response from the RPC handler (through
+	// the server interceptors) to the client interceptors. The client
+	// interceptors will have a chance to modify it, and ultimately it'll be
+	// returned to the caller.
+	var reply *roachpb.BatchResponse
+	// serverInvoker adapts the chain of server interceptors (which bottoms out at
+	// the RPC handler through rpcHandler above) to the interface expected by the
+	// client interceptors.
+	serverInvoker := func(ctx context.Context, req interface{}) error {
+		res, err := a.serverUnaryInterceptors.run(ctx, req, serverInfo, rpcHandler)
+		if err != nil {
+			return err
+		}
+		// reply can be further modified by client interceptors.
+		reply = res.(*roachpb.BatchResponse)
+		return nil
+	}
+	if err := a.clientUnaryInterceptors.run(ctx, methodName, ba, reply, serverInvoker); err != nil {
+		return nil, err
+	}
+	return reply, nil
 }
 
 // RangeLookup implements the roachpb.InternalClient interface.
 func (a internalClientAdapter) RangeLookup(
 	ctx context.Context, rl *roachpb.RangeLookupRequest, _ ...grpc.CallOption,
 ) (*roachpb.RangeLookupResponse, error) {
-	return a.server.RangeLookup(ctx, rl)
+	serverInfo := &grpc.UnaryServerInfo{
+		Server:     a.server,
+		FullMethod: "/cockroach.roachpb.Internal/RangeLookup",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return a.server.RangeLookup(ctx, req.(*roachpb.RangeLookupRequest))
+	}
+	res, err := a.serverUnaryInterceptors.run(ctx, rl, serverInfo, handler)
+	if err != nil {
+		return nil, err
+	}
+	return res.(*roachpb.RangeLookupResponse), nil
 }
 
 // Join implements the roachpb.InternalClient interface.
 func (a internalClientAdapter) Join(
 	ctx context.Context, req *roachpb.JoinNodeRequest, _ ...grpc.CallOption,
 ) (*roachpb.JoinNodeResponse, error) {
-	return a.server.Join(ctx, req)
+	serverInfo := &grpc.UnaryServerInfo{
+		Server:     a.server,
+		FullMethod: "/cockroach.roachpb.Internal/Join",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return a.server.Join(ctx, req.(*roachpb.JoinNodeRequest))
+	}
+	res, err := a.serverUnaryInterceptors.run(ctx, req, serverInfo, handler)
+	if err != nil {
+		return nil, err
+	}
+	return res.(*roachpb.JoinNodeResponse), nil
 }
 
 // ResetQuorum is part of the roachpb.InternalClient interface.
 func (a internalClientAdapter) ResetQuorum(
 	ctx context.Context, req *roachpb.ResetQuorumRequest, _ ...grpc.CallOption,
 ) (*roachpb.ResetQuorumResponse, error) {
-	return a.server.ResetQuorum(ctx, req)
+	serverInfo := &grpc.UnaryServerInfo{
+		Server:     a.server,
+		FullMethod: "/cockroach.roachpb.Internal/RangeLookup",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return a.server.ResetQuorum(ctx, req.(*roachpb.ResetQuorumRequest))
+	}
+	res, err := a.serverUnaryInterceptors.run(ctx, req, serverInfo, handler)
+	if err != nil {
+		return nil, err
+	}
+	return res.(*roachpb.ResetQuorumResponse), nil
 }
 
 // TokenBucket is part of the roachpb.InternalClient interface.
 func (a internalClientAdapter) TokenBucket(
 	ctx context.Context, in *roachpb.TokenBucketRequest, opts ...grpc.CallOption,
 ) (*roachpb.TokenBucketResponse, error) {
-	return a.server.TokenBucket(ctx, in)
+	serverInfo := &grpc.UnaryServerInfo{
+		Server:     a.server,
+		FullMethod: "/cockroach.roachpb.Internal/TokenBucket",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return a.server.TokenBucket(ctx, req.(*roachpb.TokenBucketRequest))
+	}
+	res, err := a.serverUnaryInterceptors.run(ctx, in, serverInfo, handler)
+	if err != nil {
+		return nil, err
+	}
+	return res.(*roachpb.TokenBucketResponse), nil
 }
 
 // GetSpanConfigs is part of the roachpb.InternalClient interface.
 func (a internalClientAdapter) GetSpanConfigs(
 	ctx context.Context, req *roachpb.GetSpanConfigsRequest, _ ...grpc.CallOption,
 ) (*roachpb.GetSpanConfigsResponse, error) {
-	return a.server.GetSpanConfigs(ctx, req)
+	serverInfo := &grpc.UnaryServerInfo{
+		Server:     a.server,
+		FullMethod: "/cockroach.roachpb.Internal/GetSpanConfigs",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return a.server.GetSpanConfigs(ctx, req.(*roachpb.GetSpanConfigsRequest))
+	}
+	res, err := a.serverUnaryInterceptors.run(ctx, req, serverInfo, handler)
+	if err != nil {
+		return nil, err
+	}
+	return res.(*roachpb.GetSpanConfigsResponse), nil
 }
 
 // UpdateSpanConfigs is part of the roachpb.InternalClient interface.
 func (a internalClientAdapter) UpdateSpanConfigs(
 	ctx context.Context, req *roachpb.UpdateSpanConfigsRequest, _ ...grpc.CallOption,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
-	return a.server.UpdateSpanConfigs(ctx, req)
+	serverInfo := &grpc.UnaryServerInfo{
+		Server:     a.server,
+		FullMethod: "/cockroach.roachpb.Internal/UpdateSpanConfigs",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return a.server.UpdateSpanConfigs(ctx, req.(*roachpb.UpdateSpanConfigsRequest))
+	}
+	res, err := a.serverUnaryInterceptors.run(ctx, req, serverInfo, handler)
+	if err != nil {
+		return nil, err
+	}
+	return res.(*roachpb.UpdateSpanConfigsResponse), nil
+}
+
+// GetSystemSpanConfigs is part of the roachpb.InternalClient interface.
+func (a internalClientAdapter) GetSystemSpanConfigs(
+	ctx context.Context, req *roachpb.GetSystemSpanConfigsRequest, _ ...grpc.CallOption,
+) (*roachpb.GetSystemSpanConfigsResponse, error) {
+	serverInfo := &grpc.UnaryServerInfo{
+		Server:     a.server,
+		FullMethod: "/cockroach.roachpb.Internal/GetSystemSpanConfigs",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return a.server.GetSystemSpanConfigs(ctx, req.(*roachpb.GetSystemSpanConfigsRequest))
+	}
+	res, err := a.serverUnaryInterceptors.run(ctx, req, serverInfo, handler)
+	if err != nil {
+		return nil, err
+	}
+	return res.(*roachpb.GetSystemSpanConfigsResponse), nil
+}
+
+// UpdateSystemSpanConfigs is part of the roachpb.InternalClient interface.
+func (a internalClientAdapter) UpdateSystemSpanConfigs(
+	ctx context.Context, req *roachpb.UpdateSystemSpanConfigsRequest, _ ...grpc.CallOption,
+) (*roachpb.UpdateSystemSpanConfigsResponse, error) {
+	serverInfo := &grpc.UnaryServerInfo{
+		Server:     a.server,
+		FullMethod: "/cockroach.roachpb.Internal/UpdateSystemSpanConfigs",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return a.server.UpdateSystemSpanConfigs(ctx, req.(*roachpb.UpdateSystemSpanConfigsRequest))
+	}
+	res, err := a.serverUnaryInterceptors.run(ctx, req, serverInfo, handler)
+	if err != nil {
+		return nil, err
+	}
+	return res.(*roachpb.UpdateSystemSpanConfigsResponse), nil
 }
 
 type respStreamClientAdapter struct {
@@ -699,7 +981,17 @@ func (a internalClientAdapter) RangeFeed(
 	go func() {
 		defer cancel()
 		defer sp.Finish()
-		err := a.server.RangeFeed(args, rfAdapter)
+
+		info := &grpc.StreamServerInfo{
+			FullMethod:     "/cockroach.roachpb.Internal/RangeFeed",
+			IsClientStream: false,
+			IsServerStream: true,
+		}
+		handler := func(srv interface{}, stream grpc.ServerStream) error {
+			return a.server.RangeFeed(args, rfAdapter)
+		}
+		err := a.serverStreamInterceptors.run(a.server, rfAdapter, info, handler)
+
 		if err == nil {
 			err = io.EOF
 		}
@@ -743,7 +1035,17 @@ func (a internalClientAdapter) GossipSubscription(
 	go func() {
 		defer cancel()
 		defer sp.Finish()
-		err := a.server.GossipSubscription(args, gsAdapter)
+
+		info := &grpc.StreamServerInfo{
+			FullMethod:     "/cockroach.roachpb.Internal/GossipSubscription",
+			IsClientStream: false,
+			IsServerStream: true,
+		}
+		handler := func(srv interface{}, stream grpc.ServerStream) error {
+			return a.server.GossipSubscription(args, gsAdapter)
+		}
+		err := a.serverStreamInterceptors.run(a.server, gsAdapter, info, handler)
+
 		if err == nil {
 			err = io.EOF
 		}
@@ -779,23 +1081,32 @@ func (a internalClientAdapter) TenantSettings(
 	ctx context.Context, args *roachpb.TenantSettingsRequest, _ ...grpc.CallOption,
 ) (roachpb.Internal_TenantSettingsClient, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	gsAdapter := tenantSettingsClientAdapter{
+	ctx, sp := tracing.ChildSpan(ctx, "/cockroach.roachpb.Internal/TenantSettings")
+	tsAdapter := tenantSettingsClientAdapter{
 		respStreamClientAdapter: makeRespStreamClientAdapter(ctx),
 	}
 
 	go func() {
 		defer cancel()
-		err := a.server.TenantSettings(args, gsAdapter)
+		defer sp.Finish()
+
+		info := &grpc.StreamServerInfo{
+			FullMethod:     "/cockroach.roachpb.Internal/TenantSettings",
+			IsClientStream: false,
+			IsServerStream: true,
+		}
+		handler := func(srv interface{}, stream grpc.ServerStream) error {
+			return a.server.TenantSettings(args, tsAdapter)
+		}
+		err := a.serverStreamInterceptors.run(a.server, tsAdapter, info, handler)
 		if err == nil {
 			err = io.EOF
 		}
-		gsAdapter.errC <- err
+		tsAdapter.errC <- err
 	}()
 
-	return gsAdapter, nil
+	return tsAdapter, nil
 }
-
-var _ roachpb.InternalClient = internalClientAdapter{}
 
 // IsLocal returns true if the given InternalClient is local.
 func IsLocal(iface roachpb.InternalClient) bool {
@@ -804,8 +1115,18 @@ func IsLocal(iface roachpb.InternalClient) bool {
 }
 
 // SetLocalInternalServer sets the context's local internal batch server.
-func (rpcCtx *Context) SetLocalInternalServer(internalServer roachpb.InternalServer) {
-	rpcCtx.localInternalClient = internalClientAdapter{internalServer}
+func (rpcCtx *Context) SetLocalInternalServer(
+	internalServer roachpb.InternalServer,
+	unaryServerInterceptors []grpc.UnaryServerInterceptor,
+	streamServerInterceptors []grpc.StreamServerInterceptor,
+	clientUnaryInterceptors []grpc.UnaryClientInterceptor,
+) {
+	rpcCtx.localInternalClient = internalClientAdapter{
+		server:                   internalServer,
+		serverUnaryInterceptors:  unaryServerInterceptors,
+		serverStreamInterceptors: streamServerInterceptors,
+		clientUnaryInterceptors:  clientUnaryInterceptors,
+	}
 }
 
 // removeConn removes the given connection from the pool. The supplied connKeys
@@ -814,11 +1135,11 @@ func (rpcCtx *Context) removeConn(conn *Connection, keys ...connKey) {
 	for _, key := range keys {
 		rpcCtx.conns.Delete(key)
 	}
-	log.Health.Infof(rpcCtx.MasterCtx, "closing %+v", keys)
+	log.Health.Infof(rpcCtx.masterCtx, "closing %+v", keys)
 	if grpcConn := conn.grpcConn; grpcConn != nil {
 		err := grpcConn.Close() // nolint:grpcconnclose
 		if err != nil && !grpcutil.IsClosedConnection(err) {
-			log.Health.Warningf(rpcCtx.MasterCtx, "failed to close client connection: %v", err)
+			log.Health.Warningf(rpcCtx.masterCtx, "failed to close client connection: %v", err)
 		}
 	}
 }
@@ -929,9 +1250,9 @@ func (rpcCtx *Context) grpcDialOptions(
 		}
 
 		unaryInterceptors = append(unaryInterceptors,
-			tracing.ClientInterceptor(tracer, tagger, compatMode))
+			grpcinterceptor.ClientInterceptor(tracer, tagger, compatMode))
 		streamInterceptors = append(streamInterceptors,
-			tracing.StreamClientInterceptor(tracer, tagger))
+			grpcinterceptor.StreamClientInterceptor(tracer, tagger))
 	}
 	if rpcCtx.Knobs.UnaryClientInterceptor != nil {
 		testingUnaryInterceptor := rpcCtx.Knobs.UnaryClientInterceptor(target, class)
@@ -953,7 +1274,7 @@ func (rpcCtx *Context) grpcDialOptions(
 			return dialer.DialContext(ctx, "tcp", target)
 		}
 		latency := rpcCtx.Knobs.ArtificialLatencyMap[target]
-		log.VEventf(rpcCtx.MasterCtx, 1, "connecting to node %s with simulated latency %dms", target, latency)
+		log.VEventf(rpcCtx.masterCtx, 1, "connecting to node %s with simulated latency %dms", target, latency)
 		dialer := artificialLatencyDialer{
 			dialerFunc: dialerFunc,
 			latencyMS:  latency,
@@ -969,6 +1290,14 @@ func (rpcCtx *Context) grpcDialOptions(
 		dialOpts = append(dialOpts, grpc.WithChainStreamInterceptor(streamInterceptors...))
 	}
 	return dialOpts, nil
+}
+
+// !!! comment
+func (rpcCtx *Context) ClientInterceptors() (
+	[]grpc.UnaryClientInterceptor,
+	[]grpc.StreamClientInterceptor,
+) {
+	return rpcCtx.clientUnaryInterceptors, rpcCtx.clientStreamInterceptors
 }
 
 // growStackCodec wraps the default grpc/encoding/proto codec to detect
@@ -1136,7 +1465,7 @@ type delayingHeader struct {
 func (rpcCtx *Context) makeDialCtx(
 	target string, remoteNodeID roachpb.NodeID, class ConnectionClass,
 ) context.Context {
-	dialCtx := rpcCtx.MasterCtx
+	dialCtx := rpcCtx.masterCtx
 	var rnodeID interface{} = remoteNodeID
 	if remoteNodeID == 0 {
 		rnodeID = '?'
@@ -1210,7 +1539,7 @@ func (rpcCtx *Context) grpcDialRaw(
 
 	log.Health.Infof(ctx, "dialing")
 	conn, err := grpc.DialContext(ctx, target, dialOpts...)
-	if err != nil && rpcCtx.MasterCtx.Err() != nil {
+	if err != nil && rpcCtx.masterCtx.Err() != nil {
 		// If the node is draining, discard the error (which is likely gRPC's version
 		// of context.Canceled) and return errDialRejected which instructs callers not
 		// to retry.
@@ -1330,7 +1659,7 @@ func (rpcCtx *Context) NewBreaker(name string) *circuit.Breaker {
 	if rpcCtx.BreakerFactory != nil {
 		return rpcCtx.BreakerFactory()
 	}
-	return newBreaker(rpcCtx.MasterCtx, name, &rpcCtx.breakerClock)
+	return newBreaker(rpcCtx.masterCtx, name, &rpcCtx.breakerClock)
 }
 
 // ErrNotHeartbeated is returned by ConnHealth when we have not yet performed

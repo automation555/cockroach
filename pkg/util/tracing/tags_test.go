@@ -14,6 +14,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
@@ -31,7 +32,7 @@ func TestLogTags(t *testing.T) {
 	l = l.Add("tag2", "val2")
 	sp1 := tr.StartSpan("foo", WithLogTags(l))
 	sp1.SetVerbose(true)
-	require.NoError(t, CheckRecordedSpans(sp1.FinishAndGetRecording(RecordingVerbose), `
+	require.NoError(t, CheckRecordedSpans(sp1.FinishAndGetRecording(tracingpb.RecordingVerbose), `
 		span: foo
 			tags: _verbose=1 tag1=val1 tag2=val2
 	`))
@@ -50,7 +51,7 @@ func TestLogTags(t *testing.T) {
 
 	sp2 := tr.StartSpan("bar", WithLogTags(l))
 	sp2.SetVerbose(true)
-	require.NoError(t, CheckRecordedSpans(sp2.FinishAndGetRecording(RecordingVerbose), `
+	require.NoError(t, CheckRecordedSpans(sp2.FinishAndGetRecording(tracingpb.RecordingVerbose), `
 		span: bar
 			tags: _verbose=1 one=val1 two=val2
 	`))
@@ -67,7 +68,7 @@ func TestLogTags(t *testing.T) {
 
 	sp3 := tr.StartSpan("baz", WithLogTags(l))
 	sp3.SetVerbose(true)
-	require.NoError(t, CheckRecordedSpans(sp3.FinishAndGetRecording(RecordingVerbose), `
+	require.NoError(t, CheckRecordedSpans(sp3.FinishAndGetRecording(tracingpb.RecordingVerbose), `
 		span: baz
 			tags: _verbose=1 one=val1 two=val2
 	`))

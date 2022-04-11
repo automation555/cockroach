@@ -96,7 +96,7 @@ type instrumentationHelper struct {
 	diagRequestID           stmtdiagnostics.RequestID
 	diagRequest             stmtdiagnostics.Request
 	stmtDiagnosticsRecorder *stmtdiagnostics.Registry
-	withStatementTrace      func(trace tracing.Recording, stmt string)
+	withStatementTrace      func(trace tracingpb.Recording, stmt string)
 
 	sp *tracing.Span
 	// shouldFinishSpan determines whether sp needs to be finished in
@@ -225,7 +225,7 @@ func (ih *instrumentationHelper) Setup(
 			// recording. Stats will be added as structured metadata and processed in
 			// Finish.
 			newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement",
-				tracing.WithRecording(tracing.RecordingStructured))
+				tracing.WithRecording(tracingpb.RecordingStructured))
 			ih.shouldFinishSpan = true
 			return newCtx, true
 		}
@@ -235,7 +235,7 @@ func (ih *instrumentationHelper) Setup(
 	ih.collectExecStats = true
 	ih.traceMetadata = make(execNodeTraceMetadata)
 	ih.evalCtx = p.EvalContext()
-	newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement", tracing.WithRecording(tracing.RecordingVerbose))
+	newCtx, ih.sp = tracing.EnsureChildSpan(ctx, cfg.AmbientCtx.Tracer, "traced statement", tracing.WithRecording(tracingpb.RecordingVerbose))
 	ih.shouldFinishSpan = true
 	return newCtx, true
 }
@@ -258,7 +258,7 @@ func (ih *instrumentationHelper) Finish(
 
 	// Record the statement information that we've collected.
 	// Note that in case of implicit transactions, the trace contains the auto-commit too.
-	var trace tracing.Recording
+	var trace tracingpb.Recording
 	if ih.shouldFinishSpan {
 		trace = ih.sp.FinishAndGetConfiguredRecording()
 	} else {
@@ -296,7 +296,6 @@ func (ih *instrumentationHelper) Finish(
 			ImplicitTxn: ih.implicitTxn,
 			Database:    p.SessionData().Database,
 			Failed:      retErr != nil,
-			PlanHash:    ih.planGist.Hash(),
 		}
 		// We populate transaction fingerprint ID if this is an implicit transaction.
 		// See executor_statement_metrics.go:recordStatementSummary() for further
@@ -497,7 +496,7 @@ func (ih *instrumentationHelper) setExplainAnalyzeResult(
 	phaseTimes *sessionphase.Times,
 	queryLevelStats *execstats.QueryLevelStats,
 	distSQLFlowInfos []flowInfo,
-	trace tracing.Recording,
+	trace tracingpb.Recording,
 ) (commErr error) {
 	res.ResetStmtType(&tree.ExplainAnalyze{})
 	res.SetColumns(ctx, colinfo.ExplainPlanColumns)

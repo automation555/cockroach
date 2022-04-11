@@ -53,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -317,9 +318,6 @@ func (ex *connExecutor) execStmtInOpenState(
 	}
 
 	ex.addActiveQuery(ast, formatWithPlaceholders(ast, ex.planner.EvalContext()), queryID, ex.state.cancel)
-	if ex.executorType != executorTypeInternal {
-		ex.metrics.EngineMetrics.SQLActiveStatements.Inc(1)
-	}
 
 	// Make sure that we always unregister the query. It also deals with
 	// overwriting res.Error to a more user-friendly message in case of query
@@ -333,9 +331,6 @@ func (ex *connExecutor) execStmtInOpenState(
 			}
 		}
 		ex.removeActiveQuery(queryID, ast)
-		if ex.executorType != executorTypeInternal {
-			ex.metrics.EngineMetrics.SQLActiveStatements.Dec(1)
-		}
 
 		// Detect context cancelation and overwrite whatever error might have been
 		// set on the result before. The idea is that once the query's context is
@@ -719,7 +714,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	var stmtCtx context.Context
 	// TODO(andrei): I think we should do this even if alreadyRecording == true.
 	if !alreadyRecording && stmtTraceThreshold > 0 {
-		stmtCtx, stmtThresholdSpan = tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "trace-stmt-threshold", tracing.WithRecording(tracing.RecordingVerbose))
+		stmtCtx, stmtThresholdSpan = tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "trace-stmt-threshold", tracing.WithRecording(tracingpb.RecordingVerbose))
 	} else {
 		stmtCtx = ctx
 	}
@@ -733,7 +728,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		stmtDur := timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived))
 		needRecording := stmtTraceThreshold < stmtDur
 		if needRecording {
-			rec := stmtThresholdSpan.FinishAndGetRecording(tracing.RecordingVerbose)
+			rec := stmtThresholdSpan.FinishAndGetRecording(tracingpb.RecordingVerbose)
 			// NB: This recording does not include the commit for implicit
 			// transactions if the statement didn't auto-commit.
 			logTraceAboveThreshold(
@@ -1787,7 +1782,7 @@ func (ex *connExecutor) runSetTracing(
 
 func (ex *connExecutor) enableTracing(modes []string) error {
 	traceKV := false
-	recordingType := tracing.RecordingVerbose
+	recordingType := tracingpb.RecordingVerbose
 	enableMode := true
 	showResults := false
 
@@ -1802,7 +1797,7 @@ func (ex *connExecutor) enableTracing(modes []string) error {
 		case "kv":
 			traceKV = true
 		case "cluster":
-			recordingType = tracing.RecordingVerbose
+			recordingType = tracingpb.RecordingVerbose
 		default:
 			return pgerror.Newf(pgcode.Syntax,
 				"set tracing: unknown mode %q", s)
@@ -1989,9 +1984,7 @@ func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
 		ex.extraTxnState.shouldCollectTxnExecutionStats = txnExecStatsSampleRate > ex.rng.Float64()
 	}
 
-	if ex.executorType != executorTypeInternal {
-		ex.metrics.EngineMetrics.SQLTxnsOpen.Inc(1)
-	}
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Inc(1)
 
 	ex.extraTxnState.shouldExecuteOnTxnFinish = true
 	ex.extraTxnState.txnFinishClosure.txnStartTime = txnStart
@@ -2028,9 +2021,7 @@ func (ex *connExecutor) recordTransactionFinish(
 
 	txnEnd := timeutil.Now()
 	txnTime := txnEnd.Sub(txnStart)
-	if ex.executorType != executorTypeInternal {
-		ex.metrics.EngineMetrics.SQLTxnsOpen.Dec(1)
-	}
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Dec(1)
 	ex.metrics.EngineMetrics.SQLTxnLatency.RecordValue(txnTime.Nanoseconds())
 
 	ex.txnIDCacheWriter.Record(txnidcache.ResolvedTxnID{
@@ -2070,7 +2061,7 @@ func (ex *connExecutor) recordTransactionFinish(
 // given threshold. It is used when txn or stmt threshold tracing is enabled.
 // This function assumes that sp is non-nil and threshold tracing was enabled.
 func logTraceAboveThreshold(
-	ctx context.Context, r tracing.Recording, opName string, threshold, elapsed time.Duration,
+	ctx context.Context, r tracingpb.Recording, opName string, threshold, elapsed time.Duration,
 ) {
 	if elapsed < threshold {
 		return

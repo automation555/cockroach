@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"google.golang.org/grpc"
 )
 
@@ -151,7 +152,7 @@ func (*mockInternalClient) ResetQuorum(
 func (m *mockInternalClient) Batch(
 	ctx context.Context, in *roachpb.BatchRequest, opts ...grpc.CallOption,
 ) (*roachpb.BatchResponse, error) {
-	sp := m.tr.StartSpan("mock", tracing.WithRecording(tracing.RecordingVerbose))
+	sp := m.tr.StartSpan("mock", tracing.WithRecording(tracingpb.RecordingVerbose))
 	defer sp.Finish()
 	ctx = tracing.ContextWithSpan(ctx, sp)
 
@@ -206,6 +207,18 @@ func (m *mockInternalClient) GetSpanConfigs(
 func (m *mockInternalClient) UpdateSpanConfigs(
 	_ context.Context, _ *roachpb.UpdateSpanConfigsRequest, _ ...grpc.CallOption,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
+	return nil, fmt.Errorf("unsupported UpdateSpanConfigs call")
+}
+
+func (m *mockInternalClient) GetSystemSpanConfigs(
+	_ context.Context, _ *roachpb.GetSystemSpanConfigsRequest, _ ...grpc.CallOption,
+) (*roachpb.GetSystemSpanConfigsResponse, error) {
+	return nil, fmt.Errorf("unsupported GetSpanConfigs call")
+}
+
+func (m *mockInternalClient) UpdateSystemSpanConfigs(
+	_ context.Context, _ *roachpb.UpdateSystemSpanConfigsRequest, _ ...grpc.CallOption,
+) (*roachpb.UpdateSystemSpanConfigsResponse, error) {
 	return nil, fmt.Errorf("unsupported UpdateSpanConfigs call")
 }
 
