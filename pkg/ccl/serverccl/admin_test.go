@@ -10,26 +10,43 @@ package serverccl
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/stretchr/testify/require"
 )
 
 var adminPrefix = "/_admin/v1/"
 
+func getAdminJSONProto(
+	ts serverutils.TestServerInterface, path string, response protoutil.Message,
+) error {
+	return getAdminJSONProtoWithAdminOption(ts, path, response, true)
+}
+
+func getAdminJSONProtoWithAdminOption(
+	ts serverutils.TestServerInterface, path string, response protoutil.Message, isAdmin bool,
+) error {
+	return serverutils.GetJSONProtoWithAdminOption(ts, adminPrefix+path, response, isAdmin)
+}
+
 // TestAdminAPIDataDistributionPartitioning partitions a table and verifies
 // that we see all zone configs (#27718).
 func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
 
 	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
@@ -59,8 +76,8 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 
 	// Assert that we get all roachblog zone configs back.
 	expectedZoneConfigNames := map[string]struct{}{
-		"PARTITION eu OF INDEX roachblog.public.comments@comments_pkey": {},
-		"PARTITION us OF INDEX roachblog.public.comments@comments_pkey": {},
+		"PARTITION eu OF INDEX roachblog.public.comments@primary": {},
+		"PARTITION us OF INDEX roachblog.public.comments@primary": {},
 	}
 
 	var resp serverpb.DataDistributionResponse
@@ -82,7 +99,6 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 // TestAdminAPIChartCatalog verifies that an error doesn't happen.
 func TestAdminAPIChartCatalog(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
 
 	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
@@ -92,4 +108,148 @@ func TestAdminAPIChartCatalog(t *testing.T) {
 	var resp serverpb.ChartCatalogResponse
 	err := serverutils.GetJSONProto(firstServer, adminPrefix+"chartcatalog", &resp)
 	require.NoError(t, err)
+}
+
+// getScheduleIDs queries the scheduled jobs table for all schedule IDs that
+// have the given status.
+func getScheduleIDs(t testing.TB, db *sqlutils.SQLRunner) []int64 {
+	rows := db.Query(t, `SELECT schedule_id FROM system.scheduled_jobs`)
+	defer rows.Close()
+
+	res := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		res = append(res, id)
+	}
+	return res
+}
+
+func TestAdminAPISchedules(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	dir, dirCleanupFn := testutils.TempDir(t)
+	defer dirCleanupFn()
+	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
+	defer s.Stopper().Stop(context.Background())
+	sqlDB := sqlutils.MakeSQLRunner(conn)
+
+	scheduleIDsBeforeBackup := getScheduleIDs(t, sqlDB)
+	unpausedBackupScheduleIDs := make([]int64, 0)
+	pausedBackupScheduleIDs := make([]int64, 0)
+	testSchedules := []struct {
+		query string
+	}{
+		{
+			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup/1?AWS_SECRET_ACCESS_KEY=neverappears' RECURRING '@hourly'",
+		},
+		{
+			query: "CREATE SCHEDULE 'my-backup' FOR BACKUP INTO 'nodelocal://0/backup/2' RECURRING '@hourly'",
+		},
+		{
+			query: "CREATE SCHEDULE FOR BACKUP INTO 'nodelocal://0/backup/3' RECURRING '@hourly' FULL BACKUP ALWAYS",
+		},
+	}
+	for _, test := range testSchedules {
+		rows, err := sqlDB.DB.QueryContext(ctx, test.query)
+		require.NoError(t, err)
+
+		var unusedStr string
+		var unusedTS *time.Time
+		var status string
+		for rows.Next() {
+			var id int64
+			require.NoError(t, rows.Scan(&id, &unusedStr, &status, &unusedTS, &unusedStr, &unusedStr))
+			fmt.Println(status)
+			if strings.Contains(status, "PAUSED") {
+				pausedBackupScheduleIDs = append(pausedBackupScheduleIDs, id)
+			} else {
+				unpausedBackupScheduleIDs = append(unpausedBackupScheduleIDs, id)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	allBackupScheduleIDs := append(pausedBackupScheduleIDs, unpausedBackupScheduleIDs...)
+	allScheduleIDs := append(scheduleIDsBeforeBackup, allBackupScheduleIDs...)
+
+	const invalidScheduleType = "boom"
+
+	testCases := []struct {
+		uri                 string
+		expectedScheduleIDs []int64
+		err                 string
+	}{
+		{
+			"schedules",
+			allScheduleIDs,
+			"",
+		},
+		{
+			"schedules?limit=1",
+			[]int64{scheduleIDsBeforeBackup[0]},
+			"",
+		},
+		{
+			"schedules?status=paused",
+			pausedBackupScheduleIDs,
+			"",
+		},
+		{
+			"schedules?status=garbage",
+			[]int64{},
+			"invalid schedule status",
+		},
+		{
+			fmt.Sprintf("schedules?type=%s", invalidScheduleType),
+			[]int64{},
+			"invalid schedule type",
+		},
+		{
+			fmt.Sprintf("schedules?type=%s", tree.ScheduledBackupExecutor.InternalName()),
+			allBackupScheduleIDs,
+			"",
+		},
+		{
+			fmt.Sprintf("schedules?status=running&type=%s", tree.ScheduledBackupExecutor.InternalName()),
+			unpausedBackupScheduleIDs,
+			"",
+		},
+	}
+
+	for i, testCase := range testCases {
+		t.Run(testCase.uri, func(t *testing.T) {
+			var res serverpb.SchedulesResponse
+			if err := getAdminJSONProto(s, testCase.uri, &res); err != nil {
+				if testCase.err == "" {
+					t.Fatal(err)
+				}
+				testutils.IsError(err, testCase.err)
+			}
+			resIDs := []int64{}
+			for _, schedule := range res.Schedules {
+				fmt.Println(schedule.String())
+				resIDs = append(resIDs, schedule.ID)
+			}
+
+			expected := testCase.expectedScheduleIDs
+
+			sort.Slice(expected, func(i, j int) bool {
+				return expected[i] < expected[j]
+			})
+
+			sort.Slice(resIDs, func(i, j int) bool {
+				return resIDs[i] < resIDs[j]
+			})
+
+			if e, a := expected, resIDs; !reflect.DeepEqual(e, a) {
+				t.Errorf("%d: expected schedule IDs %v, but got %v", i, e, a)
+			}
+		})
+	}
 }
