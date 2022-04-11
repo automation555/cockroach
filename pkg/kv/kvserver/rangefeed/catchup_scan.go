@@ -25,7 +25,9 @@ import (
 // A CatchUpIterator is an iterator for catchUp-scans.
 type CatchUpIterator struct {
 	storage.SimpleMVCCIterator
-	close func()
+
+	useTBI bool
+	close  func()
 }
 
 // NewCatchUpIterator returns a CatchUpIterator for the given Reader.
@@ -35,14 +37,10 @@ func NewCatchUpIterator(
 	reader storage.Reader, args *roachpb.RangeFeedRequest, useTBI bool, closer func(),
 ) *CatchUpIterator {
 	ret := &CatchUpIterator{
-		close: closer,
+		close:  closer,
+		useTBI: useTBI,
 	}
-	// TODO(ssd): The withDiff option requires us to iterate over
-	// values arbitrarily in the past so that we can populate the
-	// previous value of a key. This is possible since the
-	// IncrementalIterator has a non-timebound iterator
-	// internally, but it is not yet implemented.
-	if useTBI && !args.WithDiff {
+	if useTBI {
 		ret.SimpleMVCCIterator = storage.NewMVCCIncrementalIterator(reader, storage.MVCCIncrementalIterOptions{
 			EnableTimeBoundIteratorOptimization: true,
 			EndKey:                              args.Span.EndKey,
@@ -86,7 +84,7 @@ func (i *CatchUpIterator) Close() {
 type outputEventFn func(e *roachpb.RangeFeedEvent) error
 
 // CatchUpScan iterates over all changes for the given span of keys,
-// starting at catchUpTimestamp. Keys and Values are emitted as
+// starting at catchUpTimestamp.  Keys and Values are emitted as
 // RangeFeedEvents passed to the given outputFn.
 func (i *CatchUpIterator) CatchUpScan(
 	startKey, endKey storage.MVCCKey,
@@ -101,6 +99,8 @@ func (i *CatchUpIterator) CatchUpScan(
 	// the encountered values in reverse. This also allows us to buffer events
 	// as we fill in previous values.
 	var lastKey roachpb.Key
+	var valueBuf []byte
+
 	reorderBuf := make([]roachpb.RangeFeedEvent, 0, 5)
 	addPrevToLastEvent := func(val []byte) {
 		if l := len(reorderBuf); l > 0 {
@@ -112,13 +112,21 @@ func (i *CatchUpIterator) CatchUpScan(
 	}
 
 	outputEvents := func() error {
+		if i.useTBI && withDiff {
+			// Our last entry will be erroneously missing a
+			// previous value if it was outside the time window of
+			// the incremental iterator.
+			if len(valueBuf) > 0 && len(reorderBuf) > 0 {
+				reorderBuf[len(reorderBuf)-1].Val.PrevValue.RawBytes = valueBuf
+			}
+		}
 		for i := len(reorderBuf) - 1; i >= 0; i-- {
 			e := reorderBuf[i]
 			if err := outputFn(&e); err != nil {
 				return err
 			}
-			reorderBuf[i] = roachpb.RangeFeedEvent{} // Drop references to values to allow GC
 		}
+		valueBuf = valueBuf[:0]
 		reorderBuf = reorderBuf[:0]
 		return nil
 	}
@@ -143,21 +151,18 @@ func (i *CatchUpIterator) CatchUpScan(
 			}
 			if !meta.IsInline() {
 				// This is an MVCCMetadata key for an intent. The catchUp scan
-				// only cares about committed values, so ignore this and skip past
-				// the corresponding provisional key-value. To do this, iterate to
-				// the provisional key-value, validate its timestamp, then iterate
-				// again.
-				i.Next()
-				if ok, err := i.Valid(); err != nil {
-					return errors.Wrap(err, "iterating to provisional value for intent")
-				} else if !ok {
-					return errors.Errorf("expected provisional value for intent")
-				}
-				if !meta.Timestamp.ToTimestamp().EqOrdering(i.UnsafeKey().Timestamp) {
-					return errors.Errorf("expected provisional value for intent with ts %s, found %s",
-						meta.Timestamp, i.UnsafeKey().Timestamp)
-				}
-				i.Next()
+				// only cares about committed values, so ignore this and skip
+				// past the corresponding provisional key-value. To do this,
+				// scan to the timestamp immediately before (i.e. the key
+				// immediately after) the provisional key.
+				//
+				// Make a copy since should not pass an unsafe key from the iterator
+				// that provided it, when asking it to seek.
+				a, unsafeKey.Key = a.Copy(unsafeKey.Key, 0)
+				i.SeekGE(storage.MVCCKey{
+					Key:       unsafeKey.Key,
+					Timestamp: meta.Timestamp.ToTimestamp().Prev(),
+				})
 				continue
 			}
 
@@ -235,7 +240,17 @@ func (i *CatchUpIterator) CatchUpScan(
 			i.NextKey()
 		} else {
 			// Move to the next version of this key.
-			i.Next()
+			if i.useTBI && withDiff {
+				// If we are using TBI and withDiff, we potentially need to capture the "PrevValue" for the key we just added.
+				iter := i.SimpleMVCCIterator.(*storage.MVCCIncrementalIterator)
+				if iter.NextSavingSkipped(key) {
+					skippedValue := iter.UnsafeSkippedValue()
+					valueBuf = append(valueBuf, skippedValue...)
+				}
+
+			} else {
+				i.Next()
+			}
 		}
 	}
 

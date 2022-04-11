@@ -52,6 +52,9 @@ import (
 //        if !ok { ... }
 //        [code using iter.Key() and iter.Value()]
 //    }
+//    if err := iter.Error(); err != nil {
+//      ...
+//    }
 //
 // Note regarding the correctness of the time-bound iterator optimization:
 //
@@ -85,6 +88,11 @@ type MVCCIncrementalIterator struct {
 	// regardless if they are metakeys.
 	meta enginepb.MVCCMetadata
 
+	// For allocation amortization, skippedValBuf is used for
+	// saving Values that we might need to return to the user
+	// calling NextSavingSkipped.
+	skippedValBuf []byte
+
 	// Configuration passed in MVCCIncrementalIterOptions.
 	intentPolicy MVCCIncrementalIterIntentPolicy
 	inlinePolicy MVCCIncrementalIterInlinePolicy
@@ -96,7 +104,7 @@ type MVCCIncrementalIterator struct {
 var _ SimpleMVCCIterator = &MVCCIncrementalIterator{}
 
 // MVCCIncrementalIterIntentPolicy controls how the
-// MVCCIncrementalIterator will handle intents that it encounters
+// MVCCIncrementalInterator will handle intents that it encounters
 // when iterating.
 type MVCCIncrementalIterIntentPolicy int
 
@@ -142,7 +150,9 @@ type MVCCIncrementalIterOptions struct {
 	EnableTimeBoundIteratorOptimization bool
 	EndKey                              roachpb.Key
 	// Keys visible by the MVCCIncrementalIterator must be within (StartTime,
-	// EndTime].
+	// EndTime]. Note that if {Min,Max}TimestampHints are specified in
+	// IterOptions, the timestamp hints interval should include the start and end
+	// time.
 	StartTime hlc.Timestamp
 	EndTime   hlc.Timestamp
 
@@ -153,6 +163,9 @@ type MVCCIncrementalIterOptions struct {
 // NewMVCCIncrementalIterator creates an MVCCIncrementalIterator with the
 // specified reader and options. The timestamp hint range should not be more
 // restrictive than the start and end time range.
+// TODO(pbardea): Add validation here and in C++ implementation that the
+//  timestamp hints are not more restrictive than incremental iterator's
+//  (startTime, endTime] interval.
 func NewMVCCIncrementalIterator(
 	reader Reader, opts MVCCIncrementalIterOptions,
 ) *MVCCIncrementalIterator {
@@ -209,7 +222,9 @@ func (i *MVCCIncrementalIterator) SeekGE(startKey MVCCKey) {
 		}
 	}
 	i.iter.SeekGE(startKey)
-	if !i.checkValidAndSaveErr() {
+	if ok, err := i.iter.Valid(); !ok {
+		i.err = err
+		i.valid = false
 		return
 	}
 	i.err = nil
@@ -234,6 +249,42 @@ func (i *MVCCIncrementalIterator) Next() {
 		return
 	}
 	i.advance()
+}
+
+// UnsafeSkippedValue returns the last value saved by
+// NextSavingSkipped. The returned value is invalid after the next
+// call to NextSavingSkipped.
+func (i *MVCCIncrementalIterator) UnsafeSkippedValue() []byte {
+	return i.skippedValBuf
+}
+
+// NextSavingSkipped advances the iterator to the next key/value in
+// the iteration. Valid() will be true if the iterator was not
+// positioned at the last key.  If an un-timebound Next() would have
+// left the iterator at the next version of the same key passed by the
+// user, but the time-bound advances us past it, the value of that
+// skipped version is saved and true is returned.
+//
+// This is used by rangefeed catchup scans.
+func (i *MVCCIncrementalIterator) NextSavingSkipped(key roachpb.Key) bool {
+	i.iter.Next()
+	if !i.checkValidAndSaveErr() {
+		return false
+	}
+
+	nextWasSameKey := key.Equal(i.UnsafeKey().Key)
+	if nextWasSameKey {
+		// The un-timebound next is a version of the passed key.
+		i.skippedValBuf = i.skippedValBuf[:0]
+		i.skippedValBuf = append(i.skippedValBuf, i.UnsafeValue()...)
+	}
+	i.advance()
+	if nextWasSameKey && (!key.Equal(i.UnsafeKey().Key) || !i.valid) {
+		// We've advanced to a new key even though Next
+		// wouldn't have, return a copy of the value we saved.
+		return true
+	}
+	return false
 }
 
 // checkValidAndSaveErr checks if the underlying iter is valid after the operation
@@ -453,7 +504,10 @@ func (i *MVCCIncrementalIterator) advance() {
 			// done.
 			break
 		}
-		if !i.checkValidAndSaveErr() {
+
+		if ok, err := i.iter.Valid(); !ok {
+			i.err = err
+			i.valid = false
 			return
 		}
 	}
@@ -498,7 +552,9 @@ func (i *MVCCIncrementalIterator) UnsafeValue() []byte {
 func (i *MVCCIncrementalIterator) NextIgnoringTime() {
 	for {
 		i.iter.Next()
-		if !i.checkValidAndSaveErr() {
+		if ok, err := i.iter.Valid(); !ok {
+			i.err = err
+			i.valid = false
 			return
 		}
 

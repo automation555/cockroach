@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -29,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors/oserror"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
@@ -45,33 +43,28 @@ func runCatchUpBenchmark(b *testing.B, emk engineMaker, opts benchOptions) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		func() {
-			iter := rangefeed.NewCatchUpIterator(eng, &roachpb.RangeFeedRequest{
-				Header: roachpb.Header{
-					Timestamp: opts.ts,
-				},
-				WithDiff: opts.withDiff,
-				Span:     span,
-			}, opts.useTBI, func() {})
-			defer iter.Close()
-			counter := 0
-			err := iter.CatchUpScan(storage.MakeMVCCMetadataKey(startKey), storage.MakeMVCCMetadataKey(endKey), opts.ts, opts.withDiff, func(*roachpb.RangeFeedEvent) error {
-				counter++
-				return nil
-			})
-			if err != nil {
-				b.Fatalf("failed catchUp scan: %+v", err)
-			}
-			if counter < 1 {
-				b.Fatalf("didn't emit any events!")
-			}
-		}()
+		iter := rangefeed.NewCatchUpIterator(eng, &roachpb.RangeFeedRequest{
+			Header: roachpb.Header{
+				Timestamp: opts.ts,
+			},
+			WithDiff: opts.withDiff,
+			Span:     span,
+		}, opts.useTBI, func() {})
+		counter := 0
+		err := iter.CatchUpScan(storage.MakeMVCCMetadataKey(startKey), storage.MakeMVCCMetadataKey(endKey), opts.ts, opts.withDiff, func(*roachpb.RangeFeedEvent) error {
+			counter++
+			return nil
+		})
+		if err != nil {
+			b.Fatalf("failed catchUp scan: %+v", err)
+		}
+		if counter < 1 {
+			b.Fatalf("didn't emit any events!")
+		}
 	}
 }
 
 func BenchmarkCatchUpScan(b *testing.B) {
-	defer log.Scope(b).Close(b)
-
 	numKeys := 1_000_000
 	valueBytes := 64
 
@@ -138,8 +131,7 @@ func BenchmarkCatchUpScan(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			for _, useTBI := range []bool{true, false} {
 				b.Run(fmt.Sprintf("useTBI=%v", useTBI), func(b *testing.B) {
-					// TODO(ssd): withDiff isn't currently supported by the TBI optimization.
-					for _, withDiff := range []bool{false} {
+					for _, withDiff := range []bool{false, true} {
 						b.Run(fmt.Sprintf("withDiff=%v", withDiff), func(b *testing.B) {
 							for _, tsExcludePercent := range []float64{0.0, 0.50, 0.75, 0.95, 0.99} {
 								wallTime := int64((5 * (float64(numKeys)*tsExcludePercent + 1)))
@@ -188,11 +180,10 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 	opts.FS = vfs.Default
 	opts.LBaseMaxBytes = lBaseMaxBytes
 	opts.ReadOnly = readOnly
-	opts.FormatMajorVersion = pebble.FormatBlockPropertyCollector
 	peb, err := storage.NewPebble(
 		context.Background(),
 		storage.PebbleConfig{
-			StorageConfig: base.StorageConfig{Dir: dir, Settings: cluster.MakeTestingClusterSettings()},
+			StorageConfig: base.StorageConfig{Dir: dir},
 			Opts:          opts,
 		})
 	if err != nil {
