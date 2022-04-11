@@ -61,6 +61,7 @@ type AlterTableCmd interface {
 
 func (*AlterTableAddColumn) alterTableCmd()          {}
 func (*AlterTableAddConstraint) alterTableCmd()      {}
+func (*AlterTableAlterColumnAfter) alterTableCmd()   {}
 func (*AlterTableAlterColumnType) alterTableCmd()    {}
 func (*AlterTableAlterPrimaryKey) alterTableCmd()    {}
 func (*AlterTableDropColumn) alterTableCmd()         {}
@@ -77,12 +78,11 @@ func (*AlterTableSetVisible) alterTableCmd()         {}
 func (*AlterTableValidateConstraint) alterTableCmd() {}
 func (*AlterTablePartitionByTable) alterTableCmd()   {}
 func (*AlterTableInjectStats) alterTableCmd()        {}
-func (*AlterTableSetStorageParams) alterTableCmd()   {}
-func (*AlterTableResetStorageParams) alterTableCmd() {}
 
 var _ AlterTableCmd = &AlterTableAddColumn{}
 var _ AlterTableCmd = &AlterTableAddConstraint{}
 var _ AlterTableCmd = &AlterTableAlterColumnType{}
+var _ AlterTableCmd = &AlterTableAlterColumnAfter{}
 var _ AlterTableCmd = &AlterTableDropColumn{}
 var _ AlterTableCmd = &AlterTableDropConstraint{}
 var _ AlterTableCmd = &AlterTableDropNotNull{}
@@ -97,8 +97,6 @@ var _ AlterTableCmd = &AlterTableSetVisible{}
 var _ AlterTableCmd = &AlterTableValidateConstraint{}
 var _ AlterTableCmd = &AlterTablePartitionByTable{}
 var _ AlterTableCmd = &AlterTableInjectStats{}
-var _ AlterTableCmd = &AlterTableSetStorageParams{}
-var _ AlterTableCmd = &AlterTableResetStorageParams{}
 
 // ColumnMutationCmd is the subset of AlterTableCmds that modify an
 // existing column.
@@ -257,12 +255,35 @@ func (node *AlterTableAlterColumnType) GetColumn() Name {
 	return node.Column
 }
 
+// AlterTableAlterColumnAfter represents an ALTER TABLE ALTER COLUMN [COLUMN] AFTER [COLUMN]
+type AlterTableAlterColumnAfter struct {
+	Column      Name
+	ColumnAfter Name
+}
+
+// GetColumn implements the ColumnMutationCmd interface.
+func (node *AlterTableAlterColumnAfter) GetColumn() Name {
+	return node.Column
+}
+
+// TelemetryCounter implements the AlterTableCmd interface.
+func (node *AlterTableAlterColumnAfter) TelemetryCounter() telemetry.Counter {
+	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "alter_column_after")
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterTableAlterColumnAfter) Format(ctx *FmtCtx) {
+	ctx.WriteString(" MOVE COLUMN ")
+	ctx.FormatNode(&node.Column)
+	ctx.WriteString(" AFTER ")
+	ctx.FormatNode(&node.ColumnAfter)
+}
+
 // AlterTableAlterPrimaryKey represents an ALTER TABLE ALTER PRIMARY KEY command.
 type AlterTableAlterPrimaryKey struct {
-	Columns       IndexElemList
-	Sharded       *ShardedIndexDef
-	Name          Name
-	StorageParams StorageParams
+	Columns IndexElemList
+	Sharded *ShardedIndexDef
+	Name    Name
 }
 
 // TelemetryCounter implements the AlterTableCmd interface.
@@ -607,42 +628,6 @@ func (node *AlterTableInjectStats) TelemetryCounter() telemetry.Counter {
 func (node *AlterTableInjectStats) Format(ctx *FmtCtx) {
 	ctx.WriteString(" INJECT STATISTICS ")
 	ctx.FormatNode(node.Stats)
-}
-
-// AlterTableSetStorageParams represents a ALTER TABLE SET command.
-type AlterTableSetStorageParams struct {
-	StorageParams StorageParams
-}
-
-// TelemetryCounter returns the telemetry counter to increment
-// when this command is used.
-func (node *AlterTableSetStorageParams) TelemetryCounter() telemetry.Counter {
-	return sqltelemetry.SchemaChangeAlterCounter("set_storage_param")
-}
-
-// Format implements the NodeFormatter interface.
-func (node *AlterTableSetStorageParams) Format(ctx *FmtCtx) {
-	ctx.WriteString(" SET (")
-	ctx.FormatNode(&node.StorageParams)
-	ctx.WriteString(")")
-}
-
-// AlterTableResetStorageParams represents a ALTER TABLE RESET command.
-type AlterTableResetStorageParams struct {
-	Params NameList
-}
-
-// TelemetryCounter returns the telemetry counter to increment
-// when this command is used.
-func (node *AlterTableResetStorageParams) TelemetryCounter() telemetry.Counter {
-	return sqltelemetry.SchemaChangeAlterCounter("set_storage_param")
-}
-
-// Format implements the NodeFormatter interface.
-func (node *AlterTableResetStorageParams) Format(ctx *FmtCtx) {
-	ctx.WriteString(" RESET (")
-	ctx.FormatNode(&node.Params)
-	ctx.WriteString(")")
 }
 
 // AlterTableLocality represents an ALTER TABLE LOCALITY command.
