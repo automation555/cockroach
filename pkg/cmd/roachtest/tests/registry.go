@@ -80,6 +80,7 @@ func RegisterTests(r registry.Registry) {
 	registerQuitAllNodes(r)
 	registerQuitTransfersLeases(r)
 	registerRebalanceLoad(r)
+	registerReplicaCircuitBreaker(r)
 	registerReplicaGC(r)
 	registerRestart(r)
 	registerRestoreNodeShutdown(r)
