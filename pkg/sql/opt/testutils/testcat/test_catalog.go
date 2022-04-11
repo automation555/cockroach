@@ -350,7 +350,7 @@ func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
 // ExecuteDDL parses the given DDL SQL statement and creates objects in the test
 // catalog. This is used to test without spinning up a cluster.
 func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
-	return tc.ExecuteDDLWithIndexVersion(sql, descpb.PrimaryIndexWithStoredColumnsVersion)
+	return tc.ExecuteDDLWithIndexVersion(sql, descpb.StrictIndexColumnIDGuaranteesVersion)
 }
 
 // ExecuteDDLWithIndexVersion parses the given DDL SQL statement and creates
@@ -749,12 +749,6 @@ func (tt *Table) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 	return &tt.uniqueConstraints[i]
 }
 
-// Zone is part of the cat.Table interface.
-func (tt *Table) Zone() cat.Zone {
-	zone := zonepb.DefaultZoneConfig()
-	return &zone
-}
-
 // FindOrdinal returns the ordinal of the column with the given name.
 func (tt *Table) FindOrdinal(name string) int {
 	for i, col := range tt.Columns {
@@ -819,10 +813,6 @@ func (tt *Table) CollectTypes(ord int) (descpb.IDs, error) {
 // Index implements the cat.Index interface for testing purposes.
 type Index struct {
 	IdxName string
-
-	// ExplicitColCount is the number of columns that are explicitly specified in
-	// the index definition.
-	ExplicitColCount int
 
 	// KeyCount is the number of columns that make up the unique key for the
 	// index. See the cat.Index.KeyColumnCount for more details.
@@ -905,11 +895,6 @@ func (ti *Index) ColumnCount() int {
 	return len(ti.Columns)
 }
 
-// ExplicitColumnCount is part of the cat.Index interface.
-func (ti *Index) ExplicitColumnCount() int {
-	return ti.ExplicitColCount
-}
-
 // KeyColumnCount is part of the cat.Index interface.
 func (ti *Index) KeyColumnCount() int {
 	return ti.KeyCount
@@ -983,6 +968,12 @@ func (ti *Index) Partition(i int) cat.Partition {
 	return &ti.partitions[i]
 }
 
+// Partition is part of the cat.Index interface.
+// TODO: fix this
+func (oi *Index) Invisible() bool {
+	return false
+}
+
 // Partition implements the cat.Partition interface for testing purposes.
 type Partition struct {
 	name   string
@@ -1047,11 +1038,6 @@ func (ts *TableStat) DistinctCount() uint64 {
 // NullCount is part of the cat.TableStatistic interface.
 func (ts *TableStat) NullCount() uint64 {
 	return ts.js.NullCount
-}
-
-// AvgSize is part of the cat.TableStatistic interface.
-func (ts *TableStat) AvgSize() uint64 {
-	return ts.js.AvgSize
 }
 
 // Histogram is part of the cat.TableStatistic interface.
@@ -1252,12 +1238,6 @@ func (u *UniqueConstraint) WithoutIndex() bool {
 // Validated is part of the cat.UniqueConstraint interface.
 func (u *UniqueConstraint) Validated() bool {
 	return u.validated
-}
-
-// UniquenessGuaranteedByAnotherIndex is part of the cat.UniqueConstraint
-// interface.
-func (u *UniqueConstraint) UniquenessGuaranteedByAnotherIndex() bool {
-	return false
 }
 
 // Sequence implements the cat.Sequence interface for testing purposes.

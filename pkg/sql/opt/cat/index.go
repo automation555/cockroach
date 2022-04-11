@@ -63,10 +63,6 @@ type Index interface {
 	// the table.
 	ColumnCount() int
 
-	// ExplicitColumnCount returns the number of key columns that are explicitly
-	// specified in the index definition. This does not include stored columns.
-	ExplicitColumnCount() int
-
 	// KeyColumnCount returns the number of columns in the index that are part
 	// of its unique key. No two rows in the index will have the same values for
 	// those columns (where NULL values are treated as equal). Every index has a
@@ -192,6 +188,8 @@ type Index interface {
 	// Partition returns the ith PARTITION BY LIST partition within the index
 	// definition, where i < PartitionCount.
 	Partition(i int) Partition
+
+	Invisible() bool
 }
 
 // IndexColumn describes a single column that is part of an index definition.
