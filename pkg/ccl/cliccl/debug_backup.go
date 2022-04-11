@@ -38,12 +38,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -371,7 +371,21 @@ func runListIncrementalCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	basepath := uri.Path
+	incBasepath := uri.Path
+	if len(incPaths) == 0 {
+		incURI := *uri
+		incURI.Path = filepath.Join(incURI.Path, backupccl.DefaultIncrementalsSubdir)
+		incBasepath = incURI.Path
+		incStore, err := externalStorageFromURIFactory(ctx, incURI.String(), security.RootUserName())
+		if err != nil {
+			return errors.Wrapf(err, "connect to external storage")
+		}
+		incPaths, err = backupccl.FindPriorBackups(ctx, incStore, backupccl.OmitManifest)
+		if err != nil {
+			return err
+		}
+	}
+
 	manifestPaths := append([]string{""}, incPaths...)
 	stores := make([]cloud.ExternalStorage, len(manifestPaths))
 	stores[0] = store
@@ -380,14 +394,13 @@ func runListIncrementalCmd(cmd *cobra.Command, args []string) error {
 	for i := range manifestPaths {
 
 		if i > 0 {
-			uri.Path = filepath.Join(basepath, manifestPaths[i])
+			uri.Path = filepath.Join(incBasepath, manifestPaths[i])
 			stores[i], err = externalStorageFromURIFactory(ctx, uri.String(), security.RootUserName())
 			if err != nil {
 				return errors.Wrapf(err, "connect to external storage")
 			}
 			defer stores[i].Close()
 		}
-
 		manifest, _, err := backupccl.ReadBackupManifestFromStore(ctx, nil /* mem */, stores[i], nil)
 		if err != nil {
 			return err
@@ -411,7 +424,6 @@ func runExportDataCmd(cmd *cobra.Command, args []string) error {
 	}
 	fullyQualifiedTableName := strings.ToLower(debugBackupArgs.exportTableName)
 	manifestPaths := args
-
 	ctx := context.Background()
 	manifests := make([]backupccl.BackupManifest, 0, len(manifestPaths))
 	for _, path := range manifestPaths {
@@ -563,26 +575,36 @@ func makeIters(
 func makeRowFetcher(
 	ctx context.Context, entry backupccl.BackupTableEntry, codec keys.SQLCodec,
 ) (row.Fetcher, error) {
-	colIDs := entry.Desc.PublicColumnIDs()
-	if debugBackupArgs.withRevisions {
-		colIDs = append(colIDs, colinfo.MVCCTimestampColumnID)
+	colDescs := make([]catalog.Column, len(entry.Desc.PublicColumns()))
+	for i, col := range entry.Desc.PublicColumns() {
+		colDescs[i] = col
 	}
 
-	var spec descpb.IndexFetchSpec
-	if err := rowenc.InitIndexFetchSpec(&spec, codec, entry.Desc, entry.Desc.GetPrimaryIndex(), colIDs); err != nil {
-		return row.Fetcher{}, err
+	if debugBackupArgs.withRevisions {
+		newCol, err := entry.Desc.FindColumnWithName(colinfo.MVCCTimestampColumnName)
+		if err != nil {
+			return row.Fetcher{}, errors.Wrapf(err, "get mvcc timestamp column")
+		}
+		colDescs = append(colDescs, newCol)
+	}
+
+	table := row.FetcherTableArgs{
+		Desc:    entry.Desc,
+		Index:   entry.Desc.GetPrimaryIndex(),
+		Columns: colDescs,
 	}
 
 	var rf row.Fetcher
 	if err := rf.Init(
 		ctx,
+		codec,
 		false, /*reverse*/
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
 		0, /* lockTimeout */
 		&tree.DatumAlloc{},
 		nil, /*mon.BytesMonitor*/
-		&spec,
+		table,
 	); err != nil {
 		return rf, err
 	}

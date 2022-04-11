@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -63,7 +64,7 @@ const (
 	backupOptWithPrivileges  = "privileges"
 	backupOptAsJSON          = "as_json"
 	backupOptWithDebugIDs    = "debug_ids"
-	backupOptIncStorage      = "incremental_location"
+	backupOptIncStorage      = "incremental_storage"
 	localityURLParam         = "COCKROACH_LOCALITY"
 	defaultLocalityValue     = "default"
 )
@@ -678,7 +679,7 @@ func backupPlanHook(
 			return err
 		}
 		if !backupStmt.Nested && len(incrementalStorage) > 0 {
-			return errors.New("incremental_location option not supported with `BACKUP TO` syntax")
+			return errors.New("incremental_storage option not supported with `BACKUP TO` syntax")
 		}
 
 		endTime := p.ExecCfg().Clock.Now()
@@ -1452,7 +1453,7 @@ func getBackupDetailAndManifest(
 	// TODO(pbardea): Refactor (defaultURI and urisByLocalityKV) pairs into a
 	// backupDestination struct.
 	collectionURI, defaultURI, resolvedSubdir, urisByLocalityKV, prevs, err :=
-		resolveDest(ctx, user, initialDetails.Destination, makeCloudStorage, endTime, initialDetails.IncrementalFrom)
+		resolveDest(ctx, user, initialDetails.Destination, makeCloudStorage, endTime, initialDetails.IncrementalFrom, execCfg.Settings.Version.IsActive(ctx, clusterversion.IncrementalBackupSubdir))
 	if err != nil {
 		return jobspb.BackupDetails{}, BackupManifest{}, err
 	}
