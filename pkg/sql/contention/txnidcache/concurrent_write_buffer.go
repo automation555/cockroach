@@ -14,11 +14,22 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/contention/contentionutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 )
 
 const messageBlockSize = 1024
 
-type messageBlock [messageBlockSize]ResolvedTxnID
+type messageBlock [messageBlockSize]contentionpb.ResolvedTxnID
+
+var blockPool = &sync.Pool{
+	New: func() interface{} {
+		return &messageBlock{}
+	},
+}
+
+func (m *messageBlock) isFull() bool {
+	return m[messageBlockSize-1].Valid()
+}
 
 // concurrentWriteBuffer is a data structure that optimizes for concurrent
 // writes and also implements the Writer interface.
@@ -31,8 +42,6 @@ type concurrentWriteBuffer struct {
 		msgBlock *messageBlock
 	}
 
-	msgBlockPool *sync.Pool
-
 	// sink is the flush target that ConcurrentWriteBuffer flushes to once
 	// msgBlock is full.
 	sink messageSink
@@ -41,13 +50,12 @@ type concurrentWriteBuffer struct {
 var _ Writer = &concurrentWriteBuffer{}
 
 // newConcurrentWriteBuffer returns a new instance of concurrentWriteBuffer.
-func newConcurrentWriteBuffer(sink messageSink, msgBlockPool *sync.Pool) *concurrentWriteBuffer {
+func newConcurrentWriteBuffer(sink messageSink) *concurrentWriteBuffer {
 	writeBuffer := &concurrentWriteBuffer{
-		sink:         sink,
-		msgBlockPool: msgBlockPool,
+		sink: sink,
 	}
 
-	writeBuffer.guard.msgBlock = msgBlockPool.Get().(*messageBlock)
+	writeBuffer.guard.msgBlock = blockPool.Get().(*messageBlock)
 	writeBuffer.guard.ConcurrentBufferGuard = contentionutils.NewConcurrentBufferGuard(
 		func() int64 {
 			return messageBlockSize
@@ -56,7 +64,7 @@ func newConcurrentWriteBuffer(sink messageSink, msgBlockPool *sync.Pool) *concur
 			writeBuffer.sink.push(writeBuffer.guard.msgBlock)
 
 			// Resets the msgBlock.
-			writeBuffer.guard.msgBlock = writeBuffer.msgBlockPool.Get().(*messageBlock)
+			writeBuffer.guard.msgBlock = blockPool.Get().(*messageBlock)
 		} /* onBufferFull */)
 
 	return writeBuffer
@@ -64,7 +72,7 @@ func newConcurrentWriteBuffer(sink messageSink, msgBlockPool *sync.Pool) *concur
 
 // Record records a mapping from txnID to its corresponding transaction
 // fingerprint ID. Record is safe to be used concurrently.
-func (c *concurrentWriteBuffer) Record(resolvedTxnID ResolvedTxnID) {
+func (c *concurrentWriteBuffer) Record(resolvedTxnID contentionpb.ResolvedTxnID) {
 	c.guard.AtomicWrite(func(writerIdx int64) {
 		c.guard.msgBlock[writerIdx] = resolvedTxnID
 	})

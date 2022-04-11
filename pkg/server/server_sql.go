@@ -679,7 +679,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		SQLStatusServer:         cfg.sqlStatusServer,
 		RegionsServer:           cfg.regionsServer,
 		SessionRegistry:         cfg.sessionRegistry,
-		ContentionRegistry:      contention.NewRegistry(),
+		ContentionRegistry:      contention.NewRegistry(cfg.Settings, cfg.sqlStatusServer.TxnIDResolution),
 		SQLLiveness:             cfg.sqlLivenessProvider,
 		JobRegistry:             jobRegistry,
 		VirtualSchemas:          virtualSchemas,
