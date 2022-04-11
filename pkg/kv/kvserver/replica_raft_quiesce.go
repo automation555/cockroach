@@ -14,7 +14,6 @@ import (
 	"context"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -25,13 +24,16 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
-func (r *Replica) quiesceLocked(ctx context.Context, lagging laggingReplicaSet) {
+func (r *Replica) quiesceLocked(
+	ctx context.Context, lagging laggingReplicaSet, laggingAccurate bool,
+) {
 	if !r.mu.quiescent {
 		if log.V(3) {
 			log.Infof(ctx, "quiescing %d", r.RangeID)
 		}
 		r.mu.quiescent = true
 		r.mu.laggingFollowersOnQuiesce = lagging
+		r.mu.laggingFollowersOnQuiesceAccurate = laggingAccurate
 		r.store.unquiescedReplicas.Lock()
 		delete(r.store.unquiescedReplicas.m, r.RangeID)
 		r.store.unquiescedReplicas.Unlock()
@@ -40,57 +42,55 @@ func (r *Replica) quiesceLocked(ctx context.Context, lagging laggingReplicaSet) 
 	}
 }
 
-func (r *Replica) maybeUnquiesce() bool {
+func (r *Replica) unquiesce() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.maybeUnquiesceLocked()
+	r.unquiesceLocked()
 }
 
-func (r *Replica) maybeUnquiesceLocked() bool {
-	return r.maybeUnquiesceWithOptionsLocked(true /* campaignOnWake */)
+func (r *Replica) unquiesceLocked() {
+	r.unquiesceWithOptionsLocked(true /* campaignOnWake */)
 }
 
-func (r *Replica) maybeUnquiesceWithOptionsLocked(campaignOnWake bool) bool {
-	if !r.canUnquiesceRLocked() {
-		return false
+func (r *Replica) unquiesceWithOptionsLocked(campaignOnWake bool) {
+	if r.canUnquiesceRLocked() {
+		ctx := r.AnnotateCtx(context.TODO())
+		if log.V(3) {
+			log.Infof(ctx, "unquiescing %d", r.RangeID)
+		}
+		r.mu.quiescent = false
+		r.mu.laggingFollowersOnQuiesce = nil
+		r.mu.laggingFollowersOnQuiesceAccurate = false
+		r.store.unquiescedReplicas.Lock()
+		r.store.unquiescedReplicas.m[r.RangeID] = struct{}{}
+		r.store.unquiescedReplicas.Unlock()
+		if campaignOnWake {
+			r.maybeCampaignOnWakeLocked(ctx)
+		}
+		// NB: we know there's a non-nil RaftStatus because internalRaftGroup isn't nil.
+		r.mu.lastUpdateTimes.updateOnUnquiesce(
+			r.mu.state.Desc.Replicas().Descriptors(), r.raftStatusRLocked().Progress, timeutil.Now(),
+		)
 	}
-	ctx := r.AnnotateCtx(context.TODO())
-	if log.V(3) {
-		log.Infof(ctx, "unquiescing %d", r.RangeID)
-	}
-	r.mu.quiescent = false
-	r.mu.laggingFollowersOnQuiesce = nil
-	r.store.unquiescedReplicas.Lock()
-	r.store.unquiescedReplicas.m[r.RangeID] = struct{}{}
-	r.store.unquiescedReplicas.Unlock()
-	if campaignOnWake {
+}
+
+func (r *Replica) unquiesceAndWakeLeaderLocked() {
+	if r.canUnquiesceRLocked() {
+		ctx := r.AnnotateCtx(context.TODO())
+		if log.V(3) {
+			log.Infof(ctx, "unquiescing %d: waking leader", r.RangeID)
+		}
+		r.mu.quiescent = false
+		r.mu.laggingFollowersOnQuiesce = nil
+		r.mu.laggingFollowersOnQuiesceAccurate = false
+		r.store.unquiescedReplicas.Lock()
+		r.store.unquiescedReplicas.m[r.RangeID] = struct{}{}
+		r.store.unquiescedReplicas.Unlock()
 		r.maybeCampaignOnWakeLocked(ctx)
+		// Propose an empty command which will wake the leader.
+		data := encodeRaftCommand(raftVersionStandard, makeIDKey(), nil)
+		_ = r.mu.internalRaftGroup.Propose(data)
 	}
-	// NB: we know there's a non-nil RaftStatus because internalRaftGroup isn't nil.
-	r.mu.lastUpdateTimes.updateOnUnquiesce(
-		r.mu.state.Desc.Replicas().Descriptors(), r.raftStatusRLocked().Progress, timeutil.Now(),
-	)
-	return true
-}
-
-func (r *Replica) maybeUnquiesceAndWakeLeaderLocked() bool {
-	if !r.canUnquiesceRLocked() {
-		return false
-	}
-	ctx := r.AnnotateCtx(context.TODO())
-	if log.V(3) {
-		log.Infof(ctx, "unquiescing %d: waking leader", r.RangeID)
-	}
-	r.mu.quiescent = false
-	r.mu.laggingFollowersOnQuiesce = nil
-	r.store.unquiescedReplicas.Lock()
-	r.store.unquiescedReplicas.m[r.RangeID] = struct{}{}
-	r.store.unquiescedReplicas.Unlock()
-	r.maybeCampaignOnWakeLocked(ctx)
-	// Propose an empty command which will wake the leader.
-	data := kvserverbase.EncodeRaftCommand(kvserverbase.RaftVersionStandard, makeIDKey(), nil)
-	_ = r.mu.internalRaftGroup.Propose(data)
-	return true
 }
 
 func (r *Replica) canUnquiesceRLocked() bool {
@@ -122,9 +122,9 @@ func (r *Replica) canUnquiesceRLocked() bool {
 		r.mu.internalRaftGroup != nil
 }
 
-// maybeQuiesceRaftMuLockedReplicaMuLocked checks to see if the replica is
-// quiescable and initiates quiescence if it is. Returns true if the replica has
-// been quiesced and false otherwise.
+// maybeQuiesceLocked checks to see if the replica is quiescable and initiates
+// quiescence if it is. Returns true if the replica has been quiesced and false
+// otherwise.
 //
 // A quiesced range is not ticked and thus doesn't create MsgHeartbeat requests
 // or cause elections. The Raft leader for a range checks various
@@ -179,14 +179,14 @@ func (r *Replica) canUnquiesceRLocked() bool {
 // would quiesce. The fallout from this situation are undesirable raft
 // elections which will cause throughput hiccups to the range, but not
 // correctness issues.
-func (r *Replica) maybeQuiesceRaftMuLockedReplicaMuLocked(
+func (r *Replica) maybeQuiesceLocked(
 	ctx context.Context, now hlc.ClockTimestamp, livenessMap liveness.IsLiveMap,
 ) bool {
 	status, lagging, ok := shouldReplicaQuiesce(ctx, r, now, livenessMap)
 	if !ok {
 		return false
 	}
-	return r.quiesceAndNotifyRaftMuLockedReplicaMuLocked(ctx, status, lagging)
+	return r.quiesceAndNotifyLocked(ctx, status, lagging)
 }
 
 type quiescer interface {
@@ -399,30 +399,30 @@ func shouldReplicaQuiesce(
 	return status, lagging, true
 }
 
-func (r *Replica) quiesceAndNotifyRaftMuLockedReplicaMuLocked(
+func (r *Replica) quiesceAndNotifyLocked(
 	ctx context.Context, status *raft.Status, lagging laggingReplicaSet,
 ) bool {
-	fromReplica, fromErr := r.getReplicaDescriptorByIDRLocked(r.replicaID, r.raftMu.lastToReplica)
+	fromReplica, fromErr := r.getReplicaDescriptorByIDRLocked(r.mu.replicaID, r.mu.lastToReplica)
 	if fromErr != nil {
 		if log.V(4) {
-			log.Infof(ctx, "not quiescing: cannot find from replica (%d)", r.replicaID)
+			log.Infof(ctx, "not quiescing: cannot find from replica (%d)", r.mu.replicaID)
 		}
 		return false
 	}
 
-	r.quiesceLocked(ctx, lagging)
+	r.quiesceLocked(ctx, lagging, true /* laggingAccurate */)
 
 	for id, prog := range status.Progress {
-		if roachpb.ReplicaID(id) == r.replicaID {
+		if roachpb.ReplicaID(id) == r.mu.replicaID {
 			continue
 		}
 		toReplica, toErr := r.getReplicaDescriptorByIDRLocked(
-			roachpb.ReplicaID(id), r.raftMu.lastFromReplica)
+			roachpb.ReplicaID(id), r.mu.lastFromReplica)
 		if toErr != nil {
 			if log.V(4) {
 				log.Infof(ctx, "failed to quiesce: cannot find to replica (%d)", id)
 			}
-			r.maybeUnquiesceLocked()
+			r.unquiesceLocked()
 			return false
 		}
 
@@ -444,7 +444,7 @@ func (r *Replica) quiesceAndNotifyRaftMuLockedReplicaMuLocked(
 			curLagging = nil
 		}
 		msg := raftpb.Message{
-			From:   uint64(r.replicaID),
+			From:   uint64(r.mu.replicaID),
 			To:     id,
 			Type:   raftpb.MsgHeartbeat,
 			Term:   status.Term,
@@ -538,7 +538,7 @@ func shouldFollowerQuiesceOnNotify(
 }
 
 func (r *Replica) maybeQuiesceOnNotify(
-	ctx context.Context, msg raftpb.Message, lagging laggingReplicaSet,
+	ctx context.Context, msg raftpb.Message, lagging laggingReplicaSet, laggingAccurate bool,
 ) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -551,6 +551,6 @@ func (r *Replica) maybeQuiesceOnNotify(
 		return false
 	}
 
-	r.quiesceLocked(ctx, lagging)
+	r.quiesceLocked(ctx, lagging, laggingAccurate)
 	return true
 }
