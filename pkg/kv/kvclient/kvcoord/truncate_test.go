@@ -145,8 +145,14 @@ func TestTruncate(t *testing.T) {
 		}
 
 		original := roachpb.BatchRequest{Requests: make([]roachpb.RequestUnion, len(goldenOriginal.Requests))}
+
+		baPlus := batchReqPlus{
+			BatchRequest:  original,
+			startKeyAddrs: make([]roachpb.Key, len(goldenOriginal.Requests)),
+		}
 		for i, request := range goldenOriginal.Requests {
-			original.Requests[i].MustSetInner(request.GetInner().ShallowCopy())
+			baPlus.Requests[i].MustSetInner(request.GetInner().ShallowCopy())
+			baPlus.startKeyAddrs[i] = request.GetInner().Header().Key
 		}
 
 		desc := &roachpb.RangeDescriptor{
@@ -164,24 +170,24 @@ func TestTruncate(t *testing.T) {
 			t.Errorf("%d: intersection failure: %v", i, err)
 			continue
 		}
-		reqs, pos, err := Truncate(original.Requests, rs)
+		ba, pos, err := truncate(baPlus, rs)
 		if err != nil || test.err != "" {
 			if !testutils.IsError(err, test.err) {
 				t.Errorf("%d: %v (expected: %q)", i, err, test.err)
 			}
 			continue
 		}
-		var numReqs int
-		for j, arg := range reqs {
+		var reqs int
+		for j, arg := range ba.Requests {
 			req := arg.GetInner()
 			if h := req.Header(); !bytes.Equal(h.Key, roachpb.Key(test.expKeys[j][0])) || !bytes.Equal(h.EndKey, roachpb.Key(test.expKeys[j][1])) {
 				t.Errorf("%d.%d: range mismatch: actual [%q,%q), wanted [%q,%q)", i, j,
 					h.Key, h.EndKey, test.expKeys[j][0], test.expKeys[j][1])
 			} else if len(h.Key) != 0 {
-				numReqs++
+				reqs++
 			}
 		}
-		if num := len(pos); numReqs != num {
+		if num := len(pos); reqs != num {
 			t.Errorf("%d: counted %d requests, but truncation indicated %d", i, reqs, num)
 		}
 		if !reflect.DeepEqual(original, goldenOriginal) {
