@@ -12,6 +12,8 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
+	"hash/fnv"
 	"math"
 	"net"
 	"os"
@@ -22,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -47,7 +50,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
-	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher"
 	"github.com/cockroachdb/cockroach/pkg/server/tracedumper"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -56,6 +58,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqltranslator"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqlwatcher"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
@@ -63,7 +66,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
-	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -72,8 +74,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scsqldeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -89,7 +91,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/startupmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
@@ -104,6 +105,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/collector"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/service"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingservicepb"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 	"google.golang.org/grpc"
@@ -147,9 +149,10 @@ type SQLServer struct {
 	spanconfigMgr           *spanconfigmanager.Manager
 	spanconfigSQLTranslator *spanconfigsqltranslator.SQLTranslator
 	spanconfigSQLWatcher    *spanconfigsqlwatcher.SQLWatcher
-	settingsWatcher         *settingswatcher.SettingsWatcher
 
-	systemConfigWatcher *systemconfigwatcher.Cache
+	// settingsWatcher is utilized by secondary tenants to watch for settings
+	// changes. It is nil on the system tenant.
+	settingsWatcher *settingswatcher.SettingsWatcher
 
 	// pgL is the shared RPC/SQL listener, opened when RPC was initialized.
 	pgL net.Listener
@@ -231,16 +234,13 @@ type sqlServerArgs struct {
 	nodeDescs kvcoord.NodeDescStore
 
 	// Used by the executor config.
-	systemConfigWatcher *systemconfigwatcher.Cache
+	systemConfigProvider config.SystemConfigProvider
 
 	// Used by the span config reconciliation job.
 	spanConfigAccessor spanconfig.KVAccessor
 
-	// Used by DistSQLPlanner to dial KV nodes.
+	// Used by DistSQLPlanner.
 	nodeDialer *nodedialer.Dialer
-
-	// Used by DistSQLPlanner to dial other pods in a multi-tenant environment.
-	podNodeDialer *nodedialer.Dialer
 
 	// SQL mostly uses the DistSender "wrapped" under a *kv.DB, but SQL also
 	// uses range descriptors and leaseholders, which DistSender maintains,
@@ -258,6 +258,9 @@ type sqlServerArgs struct {
 
 	// Used for SHOW/CANCEL QUERIE(S)/SESSION(S).
 	sessionRegistry *sql.SessionRegistry
+
+	// Used to track the contention events on this node.
+	contentionRegistry *contention.Registry
 
 	// Used to track the DistSQL flows scheduled on this node but initiated on
 	// behalf of other nodes.
@@ -302,17 +305,6 @@ type sqlServerArgs struct {
 
 	// monitorAndMetrics contains the return value of newRootSQLMemoryMonitor.
 	monitorAndMetrics monitorAndMetrics
-
-	// allowSessionRevival is true if the cluster is allowed to create session
-	// revival tokens and use them to authenticate a session.
-	allowSessionRevival bool
-
-	// settingsStorage is an optional interface to drive storing of settings
-	// data on disk to provide a fresh source of settings upon next startup.
-	settingsStorage settingswatcher.Storage
-
-	// grpc is the RPC service.
-	grpc *grpcServer
 }
 
 type monitorAndMetrics struct {
@@ -384,24 +376,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	cfg.sqlInstanceProvider = instanceprovider.New(
 		cfg.stopper, cfg.db, codec, cfg.sqlLivenessProvider, cfg.advertiseAddr, cfg.rangeFeedFactory, cfg.clock,
 	)
-
-	if !codec.ForSystemTenant() {
-		// In a multi-tenant environment, use the sqlInstanceProvider to resolve
-		// SQL pod addresses.
-		addressResolver := func(nodeID roachpb.NodeID) (net.Addr, error) {
-			if cfg.sqlInstanceProvider == nil {
-				return nil, errors.Errorf("no sqlInstanceProvider")
-			}
-			info, err := cfg.sqlInstanceProvider.GetInstance(cfg.rpcContext.MasterCtx, base.SQLInstanceID(nodeID))
-			if err != nil {
-				return nil, errors.Errorf("unable to look up descriptor for n%d", nodeID)
-			}
-			return &util.UnresolvedAddr{AddressField: info.InstanceAddr}, nil
-		}
-		cfg.podNodeDialer = nodedialer.New(cfg.rpcContext, addressResolver)
-	} else {
-		cfg.podNodeDialer = cfg.nodeDialer
-	}
 
 	jobRegistry := cfg.circularJobRegistry
 	{
@@ -475,7 +449,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	bulkMemoryMonitor.Start(context.Background(), rootSQLMemoryMonitor, mon.BoundAccount{})
 
 	backfillMemoryMonitor := execinfra.NewMonitor(ctx, bulkMemoryMonitor, "backfill-mon")
-	backupMemoryMonitor := execinfra.NewMonitor(ctx, bulkMemoryMonitor, "backup-mon")
 
 	serverCacheMemoryMonitor := mon.NewMonitorInheritWithLimit(
 		"server-cache-mon", 0 /* limit */, rootSQLMemoryMonitor,
@@ -526,7 +499,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	hydratedTablesCache := hydratedtables.NewCache(cfg.Settings)
 	cfg.registry.AddMetricStruct(hydratedTablesCache.Metrics())
 
-	gcJobNotifier := gcjobnotifier.New(cfg.Settings, cfg.systemConfigWatcher, codec, cfg.stopper)
+	gcJobNotifier := gcjobnotifier.New(cfg.Settings, cfg.systemConfigProvider, codec, cfg.stopper)
 
 	var compactEngineSpanFunc tree.CompactEngineSpanFunc
 	if !codec.ForSystemTenant() {
@@ -547,12 +520,58 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		hydratedTablesCache,
 	)
 
+	// clusterIDForSQL is the cluster ID that SQL processes use.
+	//
+	// Note that this is separate from, but sometimes pointed at, the ClusterID in
+	// the cfg and rpcContext, which contains the host cluster ID and is used when
+	// communicating with the host KV layer.
+	//
+	// For the system tenant, this is just pointed to that host cluster ID, as the
+	// SQL processes of the system tenant are considered part of the host cluster.
+	//
+	// For non-system tenants however it must assigned a value that is unique to
+	// each tenant, such that two differnet tenants on the same host cluster, or
+	// the same tenant restored on to two different host clusters, all have unique
+	// IDs. This property is vital, as this ID is what is used by processes to
+	// determine if they are talking to, reading state written by, or otherwise
+	// interacting with processes on the same cluster or not. For example, when a
+	// BACKUP job resumes writing to some external files, it is vital that be able
+	// to verify that the data in those files what written by the same cluster,
+	// so e.g. data for "table 53" in those files is for the same table 53 this
+	// cluster would be reading when it resumes.
+	//
+	// Thus for the non-system tenant, this ClusterID is derived from the unique
+	// host cluster's ID, but with the TenantID hased into its lower bits to make
+	// an ID that is unique to this tenant on this host cluster.
+	//
+	// Note: we are careful to not override the ClusterID in cfg.rpcContext, which
+	// is also referenced in other fields of `cfg` and elsewhere, as it still
+	// holds the *host's* ClusterID and it important that that be maintained for
+	// use in RPCs to the host cluster as well as logging and telemetry, where it
+	// is important that events originating from different tenants can be tied to
+	// the their host cluster(s).
+	clusterIDForSQL := cfg.rpcContext.ClusterID
+	if !codec.ForSystemTenant() {
+		clusterIDForSQL = &base.ClusterIDContainer{}
+		hasher := fnv.New64a()
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], cfg.TenantID.ToUint64())
+		hasher.Write(b[:])
+		hashedTenantID := hasher.Sum64()
+
+		cfg.rpcContext.ClusterID.OnSet = func(id uuid.UUID) {
+			hiLo := id.ToUint128()
+			hiLo.Lo += hashedTenantID
+			clusterIDForSQL.Set(ctx, uuid.FromUint128(hiLo))
+		}
+	}
+
 	// Set up the DistSQL server.
 	distSQLCfg := execinfra.ServerConfig{
 		AmbientContext: cfg.AmbientCtx,
 		Settings:       cfg.Settings,
 		RuntimeStats:   cfg.runtime,
-		ClusterID:      cfg.rpcContext.ClusterID,
+		ClusterID:      clusterIDForSQL,
 		ClusterName:    cfg.ClusterName,
 		NodeID:         cfg.nodeIDContainer,
 		Locality:       cfg.Locality,
@@ -572,7 +591,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		VecFDSemaphore:    semaphore.New(envutil.EnvOrDefaultInt("COCKROACH_VEC_MAX_OPEN_FDS", colexec.VecMaxOpenFDsLimit)),
 		ParentDiskMonitor: cfg.TempStorageConfig.Mon,
 		BackfillerMonitor: backfillMemoryMonitor,
-		BackupMonitor:     backupMemoryMonitor,
 
 		ParentMemoryMonitor: rootSQLMemoryMonitor,
 		BulkAdder: func(
@@ -581,6 +599,10 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 			// Attach a child memory monitor to enable control over the BulkAdder's
 			// memory usage.
 			bulkMon := execinfra.NewMonitor(ctx, bulkMemoryMonitor, "bulk-adder-monitor")
+			if !codec.ForSystemTenant() {
+				// Tenants aren't allowed to split, so force off the split-after opt.
+				opts.SplitAndScatterAfter = func() int64 { return kvserverbase.DisableExplicitSplits }
+			}
 			return bulk.MakeBulkAdder(ctx, db, cfg.distSender.RangeDescriptorCache(), cfg.Settings, ts, opts, bulkMon)
 		},
 
@@ -592,13 +614,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		JobRegistry:       jobRegistry,
 		Gossip:            cfg.gossip,
 		NodeDialer:        cfg.nodeDialer,
-		PodNodeDialer:     cfg.podNodeDialer,
 		LeaseManager:      leaseMgr,
 
 		ExternalStorage:        cfg.externalStorage,
 		ExternalStorageFromURI: cfg.externalStorageFromURI,
 
-		DistSender:               cfg.distSender,
 		RangeCache:               cfg.distSender.RangeDescriptorCache(),
 		SQLSQLResponseAdmissionQ: cfg.sqlSQLResponseAdmissionQ,
 		CollectionFactory:        collectionFactory,
@@ -626,11 +646,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	nodeInfo := sql.NodeInfo{
 		AdminURL:  cfg.AdminURL,
 		PGURL:     cfg.rpcContext.PGURL,
-		ClusterID: cfg.rpcContext.ClusterID.Get,
+		ClusterID: clusterIDForSQL.Get,
 		NodeID:    cfg.nodeIDContainer,
 	}
 
-	var isAvailable func(sqlInstanceID base.SQLInstanceID) bool
+	var isAvailable func(roachpb.NodeID) bool
 	nodeLiveness, hasNodeLiveness := cfg.nodeLiveness.Optional(47900)
 	if hasNodeLiveness {
 		// TODO(erikgrinaker): We may want to use IsAvailableNotDraining instead, to
@@ -638,13 +658,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		// that are being drained/decommissioned. However, these nodes can still be
 		// leaseholders, and preventing processor scheduling on them can cause a
 		// performance cliff for e.g. table reads that then hit the network.
-		isAvailable = func(sqlInstanceID base.SQLInstanceID) bool {
-			return nodeLiveness.IsAvailable(roachpb.NodeID(sqlInstanceID))
-		}
+		isAvailable = nodeLiveness.IsAvailable
 	} else {
 		// We're on a SQL tenant, so this is the only node DistSQL will ever
 		// schedule on - always returning true is fine.
-		isAvailable = func(sqlInstanceID base.SQLInstanceID) bool {
+		isAvailable = func(roachpb.NodeID) bool {
 			return true
 		}
 	}
@@ -668,7 +686,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		DB:                      cfg.db,
 		Gossip:                  cfg.gossip,
 		NodeLiveness:            cfg.nodeLiveness,
-		SystemConfig:            cfg.systemConfigWatcher,
+		SystemConfig:            cfg.systemConfigProvider,
 		MetricsRecorder:         cfg.recorder,
 		DistSender:              cfg.distSender,
 		RPCContext:              cfg.rpcContext,
@@ -679,7 +697,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		SQLStatusServer:         cfg.sqlStatusServer,
 		RegionsServer:           cfg.regionsServer,
 		SessionRegistry:         cfg.sessionRegistry,
-		ContentionRegistry:      contention.NewRegistry(),
+		ContentionRegistry:      cfg.contentionRegistry,
 		SQLLiveness:             cfg.sqlLivenessProvider,
 		JobRegistry:             jobRegistry,
 		VirtualSchemas:          virtualSchemas,
@@ -692,13 +710,12 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		CompactEngineSpanFunc:   compactEngineSpanFunc,
 		TraceCollector:          traceCollector,
 		TenantUsageServer:       cfg.tenantUsageServer,
-		AllowSessionRevival:     cfg.allowSessionRevival,
 
 		DistSQLPlanner: sql.NewDistSQLPlanner(
 			ctx,
 			execinfra.Version,
 			cfg.Settings,
-			cfg.nodeIDContainer.SQLInstanceID(),
+			roachpb.NodeID(cfg.nodeIDContainer.SQLInstanceID()),
 			cfg.rpcContext,
 			distSQLServer,
 			cfg.distSender,
@@ -707,7 +724,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 			cfg.stopper,
 			isAvailable,
 			cfg.nodeDialer,
-			cfg.podNodeDialer,
 		),
 
 		TableStatsCache: stats.NewTableStatisticsCache(
@@ -729,6 +745,10 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		GCJobNotifier:              gcJobNotifier,
 		RangeFeedFactory:           cfg.rangeFeedFactory,
 		CollectionFactory:          collectionFactory,
+
+		SystemIDChecker: &catalog.SystemIDChecker{
+			SystemIDChecker: keys.DeprecatedSystemIDChecker(),
+		},
 	}
 
 	if sqlSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLSchemaChanger; sqlSchemaChangerTestingKnobs != nil {
@@ -774,21 +794,14 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	if backupRestoreKnobs := cfg.TestingKnobs.BackupRestore; backupRestoreKnobs != nil {
 		execCfg.BackupRestoreTestingKnobs = backupRestoreKnobs.(*sql.BackupRestoreTestingKnobs)
 	}
-	if ttlKnobs := cfg.TestingKnobs.TTL; ttlKnobs != nil {
-		execCfg.TTLTestingKnobs = ttlKnobs.(*sql.TTLTestingKnobs)
-	}
 	if sqlStatsKnobs := cfg.TestingKnobs.SQLStatsKnobs; sqlStatsKnobs != nil {
 		execCfg.SQLStatsTestingKnobs = sqlStatsKnobs.(*sqlstats.TestingKnobs)
 	}
 	if telemetryLoggingKnobs := cfg.TestingKnobs.TelemetryLoggingKnobs; telemetryLoggingKnobs != nil {
 		execCfg.TelemetryLoggingTestingKnobs = telemetryLoggingKnobs.(*sql.TelemetryLoggingTestingKnobs)
 	}
-	if spanConfigKnobs := cfg.TestingKnobs.SpanConfig; spanConfigKnobs != nil {
-		execCfg.SpanConfigTestingKnobs = spanConfigKnobs.(*spanconfig.TestingKnobs)
-	}
 
 	statsRefresher := stats.MakeRefresher(
-		cfg.AmbientCtx,
 		cfg.Settings,
 		cfg.circularInternalExecutor,
 		execCfg.TableStatsCache,
@@ -832,7 +845,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory = ieFactory
 	jobRegistry.SetSessionBoundInternalExecutorFactory(ieFactory)
 	execCfg.IndexBackfiller = sql.NewIndexBackfiller(execCfg, ieFactory)
-	execCfg.IndexValidator = scdeps.NewIndexValidator(
+	execCfg.IndexValidator = scsqldeps.NewIndexValidator(
 		execCfg.DB,
 		execCfg.Codec,
 		execCfg.Settings,
@@ -840,12 +853,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		sql.ValidateForwardIndexes,
 		sql.ValidateInvertedIndexes,
 		sql.NewFakeSessionData,
-	)
-
-	execCfg.DescMetadaUpdaterFactory = descmetadata.NewMetadataUpdaterFactory(
-		ieFactory,
-		collectionFactory,
-		&execCfg.Settings.SV,
 	)
 	execCfg.InternalExecutorFactory = ieFactory
 
@@ -907,9 +914,9 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		sqlTranslator *spanconfigsqltranslator.SQLTranslator
 		sqlWatcher    *spanconfigsqlwatcher.SQLWatcher
 	}{}
-	if !codec.ForSystemTenant() || !cfg.SpanConfigsDisabled {
+	if !codec.ForSystemTenant() || cfg.SpanConfigsEnabled {
 		// Instantiate a span config manager. If we're the host tenant we'll
-		// only do it unless COCKROACH_DISABLE_SPAN_CONFIGS is set.
+		// only do it if COCKROACH_EXPERIMENTAL_SPAN_CONFIGS is set.
 		spanConfigKnobs, _ := cfg.TestingKnobs.SpanConfig.(*spanconfig.TestingKnobs)
 		spanConfig.sqlTranslator = spanconfigsqltranslator.New(execCfg, codec, spanConfigKnobs)
 		spanConfig.sqlWatcher = spanconfigsqlwatcher.New(
@@ -941,7 +948,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 			spanConfigKnobs,
 		)
 
-		execCfg.SpanConfigReconciler = spanConfigReconciler
+		execCfg.SpanConfigReconciliationJobDeps = spanConfig.manager
 	}
 	execCfg.SpanConfigKVAccessor = cfg.sqlServerOptionalKVArgs.spanConfigKVAccessor
 
@@ -962,7 +969,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		AmbientCtx:    &cfg.AmbientCtx,
 		Config:        cfg.BaseConfig.Config,
 		Settings:      cfg.Settings,
-		ClusterID:     cfg.rpcContext.ClusterID.Get,
+		ClusterID:     clusterIDForSQL.Get,
 		TenantID:      cfg.rpcContext.TenantID,
 		SQLInstanceID: cfg.nodeIDContainer.SQLInstanceID,
 		SQLServer:     pgServer.SQLServer,
@@ -977,15 +984,9 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	}
 
 	var settingsWatcher *settingswatcher.SettingsWatcher
-	if codec.ForSystemTenant() {
+	if !codec.ForSystemTenant() {
 		settingsWatcher = settingswatcher.New(
-			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.settingsStorage,
-		)
-	} else {
-		// Create the tenant settings watcher, using the tenant connector as the
-		// overrides monitor.
-		settingsWatcher = settingswatcher.NewWithOverrides(
-			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.tenantConnect, cfg.settingsStorage,
+			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper,
 		)
 	}
 
@@ -1016,7 +1017,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		spanconfigSQLTranslator: spanConfig.sqlTranslator,
 		spanconfigSQLWatcher:    spanConfig.sqlWatcher,
 		settingsWatcher:         settingsWatcher,
-		systemConfigWatcher:     cfg.systemConfigWatcher,
 	}, nil
 }
 
@@ -1078,7 +1078,7 @@ func (s *SQLServer) initInstanceID(ctx context.Context) error {
 		return err
 	}
 	s.sqlLivenessSessionID = sessionID
-	s.execCfg.DistSQLPlanner.SetSQLInstanceInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(instanceID)})
+	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(instanceID)})
 	return nil
 }
 
@@ -1193,11 +1193,10 @@ func (s *SQLServer) preStart(
 		bootstrapVersion = roachpb.Version{Major: 20, Minor: 1, Internal: 1}
 	}
 
-	if err := s.settingsWatcher.Start(ctx); err != nil {
-		return errors.Wrap(err, "initializing settings")
-	}
-	if err := s.systemConfigWatcher.Start(ctx, s.stopper); err != nil {
-		return errors.Wrap(err, "initializing settings")
+	if s.settingsWatcher != nil {
+		if err := s.settingsWatcher.Start(ctx); err != nil {
+			return errors.Wrap(err, "initializing settings")
+		}
 	}
 
 	// Run startup migrations (note: these depend on jobs subsystem running).
@@ -1259,80 +1258,6 @@ func (s *SQLServer) AnnotateCtx(ctx context.Context) context.Context {
 	return s.ambientCtx.AnnotateCtx(ctx)
 }
 
-// startServeSQL starts accepting incoming SQL connections over TCP.
-// It also starts listening on the Unix socket, if that was configured.
-func (s *SQLServer) startServeSQL(
-	ctx context.Context,
-	stopper *stop.Stopper,
-	connManager netutil.Server,
-	pgL net.Listener,
-	socketFile string,
-) error {
-	log.Ops.Info(ctx, "serving sql connections")
-	// Start servicing SQL connections.
-
-	pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
-	tcpKeepAlive := makeTCPKeepAliveManager()
-
-	_ = stopper.RunAsyncTaskEx(pgCtx,
-		stop.TaskOpts{TaskName: "pgwire-listener", SpanOpt: stop.SterileRootSpan},
-		func(ctx context.Context) {
-			err := connManager.ServeWith(ctx, stopper, pgL, func(ctx context.Context, conn net.Conn) {
-				connCtx := s.pgServer.AnnotateCtxForIncomingConn(ctx, conn)
-				tcpKeepAlive.configure(connCtx, conn)
-
-				if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketTCP); err != nil {
-					log.Ops.Errorf(connCtx, "serving SQL client conn: %v", err)
-				}
-			})
-			netutil.FatalIfUnexpected(err)
-		})
-
-	// If a unix socket was requested, start serving there too.
-	if len(socketFile) != 0 {
-		log.Ops.Infof(ctx, "starting postgres server at unix:%s", socketFile)
-
-		// Unix socket enabled: postgres protocol only.
-		unixLn, err := net.Listen("unix", socketFile)
-		if err != nil {
-			return err
-		}
-
-		waitQuiesce := func(ctx context.Context) {
-			<-stopper.ShouldQuiesce()
-			// NB: we can't do this as a Closer because (*Server).ServeWith is
-			// running in a worker and usually sits on accept() which unblocks
-			// only when the listener closes. In other words, the listener needs
-			// to close when quiescing starts to allow that worker to shut down.
-			if err := unixLn.Close(); err != nil {
-				log.Ops.Fatalf(ctx, "%v", err)
-			}
-		}
-		if err := stopper.RunAsyncTaskEx(ctx,
-			stop.TaskOpts{TaskName: "unix-ln-close", SpanOpt: stop.SterileRootSpan},
-			func(ctx context.Context) {
-				waitQuiesce(ctx)
-			}); err != nil {
-			waitQuiesce(ctx)
-			return err
-		}
-
-		if err := stopper.RunAsyncTaskEx(pgCtx,
-			stop.TaskOpts{TaskName: "unix-listener", SpanOpt: stop.SterileRootSpan},
-			func(ctx context.Context) {
-				err := connManager.ServeWith(ctx, stopper, unixLn, func(ctx context.Context, conn net.Conn) {
-					connCtx := s.pgServer.AnnotateCtxForIncomingConn(ctx, conn)
-					if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
-						log.Ops.Errorf(connCtx, "%v", err)
-					}
-				})
-				netutil.FatalIfUnexpected(err)
-			}); err != nil {
-			return err
-		}
-	}
-
-	s.acceptingClients.Set(true)
-
-	return nil
+func (s *SQLServer) SQLClusterID() uuid.UUID {
+	return s.execCfg.ClusterID()
 }
