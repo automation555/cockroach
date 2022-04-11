@@ -48,7 +48,7 @@ const (
 // rather than reporting to some external sink, the caller's "owner"
 // must propagate the trace data back across process boundaries towards
 // the root of the trace span tree; see WithParent
-// and WithRemoteParentFromSpanMeta, respectively.
+// and WithRemoteParent, respectively.
 //
 // Additionally, the internal span type also supports turning on, stopping,
 // and restarting its data collection (see Span.StartRecording), and this is
@@ -267,32 +267,9 @@ func (sp *Span) finishInternal() {
 // would be forced to collect the recording before finishing and so the span
 // would appear to be unfinished in the recording (it's illegal to collect the
 // recording after the span finishes, except by using this method).
-//
-// Returns nil if the span is not currently recording (even if it had been
-// recording in the past).
 func (sp *Span) FinishAndGetRecording(recType RecordingType) Recording {
-	rec := Recording(nil)
-	if sp.RecordingType() != RecordingOff {
-		rec = sp.i.GetRecording(recType, true /* finishing */)
-	}
 	// Reach directly into sp.i to pass the finishing argument.
-	sp.finishInternal()
-	return rec
-}
-
-// FinishAndGetConfiguredRecording is like FinishAndGetRecording, except that
-// the type of recording returned is the type that the span was configured to
-// record.
-//
-// Returns nil if the span is not currently recording (even if it had been
-// recording in the past).
-func (sp *Span) FinishAndGetConfiguredRecording() Recording {
-	rec := Recording(nil)
-	recType := sp.RecordingType()
-	if recType != RecordingOff {
-		rec = sp.i.GetRecording(recType, true /* finishing */)
-	}
-	// Reach directly into sp.i to pass the finishing argument.
+	rec := sp.i.GetRecording(recType, true /* finishing */)
 	sp.finishInternal()
 	return rec
 }
@@ -300,9 +277,6 @@ func (sp *Span) FinishAndGetConfiguredRecording() Recording {
 // GetRecording retrieves the current recording, if the Span has recording
 // enabled. This can be called while spans that are part of the recording are
 // still open; it can run concurrently with operations on those spans.
-//
-// Returns nil if the span is not currently recording (even if it had been
-// recording in the past).
 //
 // recType indicates the type of information to be returned: structured info or
 // structured + verbose info. The caller can ask for either regardless of the
@@ -326,25 +300,6 @@ func (sp *Span) GetRecording(recType RecordingType) Recording {
 	if sp.detectUseAfterFinish() {
 		return nil
 	}
-	if sp.RecordingType() == RecordingOff {
-		return nil
-	}
-	return sp.i.GetRecording(recType, false /* finishing */)
-}
-
-// GetConfiguredRecording is like GetRecording, except the type of recording it
-// returns is the one that the span has been previously configured with.
-//
-// Returns nil if the span is not currently recording (even if it had been
-// recording in the past).
-func (sp *Span) GetConfiguredRecording() Recording {
-	if sp.detectUseAfterFinish() {
-		return nil
-	}
-	recType := sp.RecordingType()
-	if recType == RecordingOff {
-		return nil
-	}
 	return sp.i.GetRecording(recType, false /* finishing */)
 }
 
@@ -359,7 +314,7 @@ func (sp *Span) ImportRemoteSpans(remoteSpans []tracingpb.RecordedSpan) {
 
 // Meta returns the information which needs to be propagated across process
 // boundaries in order to derive child spans from this Span. This may return
-// nil, which is a valid input to WithRemoteParentFromSpanMeta, if the Span has been
+// nil, which is a valid input to WithRemoteParent, if the Span has been
 // optimized out.
 func (sp *Span) Meta() SpanMeta {
 	// It shouldn't be done in practice, but it is allowed to call Meta on
@@ -437,17 +392,79 @@ func (sp *Span) SetTag(key string, value attribute.Value) {
 	if sp.detectUseAfterFinish() {
 		return
 	}
-	sp.i.SetTag(key, value)
+	sp.i.SetTag(key, value, false /* statusTag */)
+}
+
+// ExpandingTag is a tag value that expands into a series of key-value tags when
+// included in a recording. ExpandingTags are can be used when it's useful to
+// maintain a single, structured tag in a Span (for example because the tag is
+// accessed through Span.GetTag(key)), but that tag should render as multiple
+// key-value pairs when the Span's recording is collected. Recordings can only
+// contain string tags, for simplicity.
+type ExpandingTag interface {
+	// ExpandToRecordingTags produces the list of key-value tags for the span's
+	// recording.
+	ExpandToRecordingTags() []attribute.KeyValue
+}
+
+// SetLazyTag adds a tag to the span. The tag's value is expected to implement
+// either fmt.Stringer or ExpandingTag, and is only stringified using one of
+// the two on demand:
+// - if the Span has an otel span or a net.Trace, the tag
+//   is stringified immediately and passed to the external trace (see
+//   SetLazyStatusTag if you want to avoid that).
+//- if/when the span's recording is collected, the tag is stringified on demand.
+//  If the recording is collected multiple times, the tag is stringified
+//  multiple times (so, the tag can evolve over time). Since generally the
+//  collection of a recording can happen asynchronously, the implementation of
+//  Stringer or ExpandingTag should be thread-safe.
+func (sp *Span) SetLazyTag(key string, value interface{}) {
+	if sp.detectUseAfterFinish() {
+		return
+	}
+	sp.i.SetLazyTag(key, value, false /* statusTag */)
+}
+
+// SetStatusTag is like SetTag, except the new tag can be removed from the Span
+// in the future via ClearStatusTag. Only the crdbSpan offers this
+// functionality, so the tag is not passed to the otel span or to net.Trace.
+func (sp *Span) SetStatusTag(key string, value attribute.Value) {
+	if sp.detectUseAfterFinish() {
+		return
+	}
+	sp.i.SetTag(key, value, true /* statusTag */)
+}
+
+// SetLazyStatusTag is like SetLazyTag, but the tag behaves like a "status tag"
+// - i.e. it is not passed to the otel span / net.Trace (if any) and it can be
+// clearer using ClearStatusTag.
+func (sp *Span) SetLazyStatusTag(key string, value interface{}) {
+	if sp.detectUseAfterFinish() {
+		return
+	}
+	sp.i.SetLazyTag(key, value, true /* statusTag */)
+}
+
+// ClearStatusTag removes a tag if it was previously added through SetStatusTag.
+func (sp *Span) ClearStatusTag(key string) {
+	if sp.detectUseAfterFinish() {
+		return
+	}
+	sp.i.ClearStatusTag(key)
+}
+
+// GetLazyTag returns the value of the tag with the given key. If that tag doesn't
+// exist, the bool retval is false.
+func (sp *Span) GetLazyTag(key string) (interface{}, bool) {
+	if sp.detectUseAfterFinish() {
+		return attribute.Value{}, false
+	}
+	return sp.i.GetLazyTag(key)
 }
 
 // TraceID retrieves a span's trace ID.
 func (sp *Span) TraceID() tracingpb.TraceID {
 	return sp.i.TraceID()
-}
-
-// SpanID retrieves a span's ID.
-func (sp *Span) SpanID() tracingpb.SpanID {
-	return sp.i.SpanID()
 }
 
 // OperationName returns the name of this span assigned when the span was
@@ -547,6 +564,7 @@ func (sp *Span) reset(
 		})
 	}
 
+	atomic.StoreInt32(&sp.finished, 0)
 	c := sp.i.crdb
 	sp.i = spanInner{
 		tracer:   sp.i.tracer,
@@ -558,7 +576,6 @@ func (sp *Span) reset(
 
 	c.traceID = traceID
 	c.spanID = spanID
-	c.parentSpanID = 0
 	c.operation = operation
 	c.startTime = startTime
 	c.logTags = logTags
