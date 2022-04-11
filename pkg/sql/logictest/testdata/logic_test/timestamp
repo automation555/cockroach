@@ -15,7 +15,7 @@ SELECT '2000-05-05 10:00:00+03':::TIMESTAMP FROM a
 2000-05-05 10:00:00 +0000 +0000
 
 query T
-select '2001-1-18 1:00:00.001-8':::TIMESTAMPTZ
+select '1-1-18 1:00:00.001-8':::TIMESTAMPTZ
 ----
 2001-01-18 09:00:00.001 +0000 UTC
 
@@ -44,33 +44,33 @@ SELECT TIMESTAMP '2001-02-16 20:38:40' AT TIME ZONE 'MST', timezone('MST', TIMES
 subtest timestamp_precision
 
 query error precision 7 out of range
-select '2001-1-18 1:00:00.001':::TIMESTAMP(7)
+select '1-1-18 1:00:00.001':::TIMESTAMP(7)
 
 query error precision 7 out of range
-select '2001-1-18 1:00:00.001':::TIMESTAMPTZ(7)
+select '1-1-18 1:00:00.001':::TIMESTAMPTZ(7)
 
 query T
-select '2001-1-18 1:00:00.001':::TIMESTAMP(0)
+select '1-1-18 1:00:00.001':::TIMESTAMP(0)
 ----
 2001-01-18 01:00:00 +0000 +0000
 
 query T
-select '2001-1-18 1:00:00.001':::TIMESTAMP(6)
+select '1-1-18 1:00:00.001':::TIMESTAMP(6)
 ----
 2001-01-18 01:00:00.001 +0000 +0000
 
 query T
-select '2001-1-18 1:00:00.001':::TIMESTAMP
+select '1-1-18 1:00:00.001':::TIMESTAMP
 ----
 2001-01-18 01:00:00.001 +0000 +0000
 
 query T
-select '2001-1-18 1:00:00.001-8':::TIMESTAMPTZ(0)
+select '1-1-18 1:00:00.001-8':::TIMESTAMPTZ(0)
 ----
 2001-01-18 01:00:00 -0800 PST
 
 query T
-select '2001-1-18 1:00:00.001-8':::TIMESTAMPTZ(6)
+select '1-1-18 1:00:00.001-8':::TIMESTAMPTZ(6)
 ----
 2001-01-18 01:00:00.001 -0800 PST
 
@@ -487,11 +487,6 @@ FROM (VALUES
 -1 mons -1 days -17:16:56               1 mon 1 day 17:16:56                         -29 days -17:16:56        29 days 17:16:56            -29 days -18:16:56        29 days 18:16:56
 -18:16:56                               18:16:56                                     -18:16:56                 18:16:56                    -18:16:56                 18:16:56
 22:58:58.888889                         -22:58:58.888889                             22:58:58.888889           -22:58:58.888889            22:58:58.888889           -22:58:58.888889
-
-query T
-SET TIME ZONE 'AuStralIA/SyDNEY'; SELECT '2000-05-15 00:00:00'::timestamptz
-----
-2000-05-15 00:00:00 +1000 AEST
 
 query T
 SET TIME ZONE 'Europe/Bucharest';

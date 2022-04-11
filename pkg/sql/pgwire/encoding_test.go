@@ -17,18 +17,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
-	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
-	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
+	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -47,7 +46,7 @@ type encodingTest struct {
 
 func readEncodingTests(t testing.TB) []*encodingTest {
 	var tests []*encodingTest
-	f, err := os.Open(testutils.TestDataPath(t, "encodings.json"))
+	f, err := os.Open(filepath.Join("testdata", "encodings.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,13 +91,6 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 		tc.T = types.OidToType[tc.Oid]
 		if tc.T == nil {
 			t.Fatalf("unknown Oid %d not found in the OidToType map", tc.Oid)
-		}
-		// If we type checked the expression and got a collated string, we need
-		// to override the type accordingly. If we don't do it, then the datum
-		// and the type would diverge (we would have tree.DCollatedString and
-		// the type of types.StringFamily).
-		if actualType := d.ResolvedType(); actualType.Family() == types.CollatedStringFamily {
-			tc.T = types.MakeCollatedString(tc.T, actualType.Locale())
 		}
 
 		// Populate specific type information based on OID and the specific test
@@ -149,88 +141,40 @@ func TestEncodings(t *testing.T) {
 		return data
 	}
 
-	conv, loc := makeTestingConvCfg()
+	var conv sessiondata.DataConversionConfig
 	ctx := context.Background()
 	evalCtx := tree.MakeTestingEvalContext(nil)
-
-	type writeFunc func(tree.Datum, *types.T)
-	type testCase struct {
-		name    string
-		writeFn writeFunc
-	}
-
-	writeTextDatum := func(d tree.Datum, t *types.T) {
-		buf.writeTextDatum(ctx, d, conv, loc, t)
-	}
-	writeBinaryDatum := func(d tree.Datum, t *types.T) {
-		buf.writeBinaryDatum(ctx, d, time.UTC, t)
-	}
-	convertToVec := func(d tree.Datum, t *types.T) *coldata.TypedVecs {
-		batch := coldata.NewMemBatchWithCapacity([]*types.T{t}, 1 /* capacity */, coldataext.NewExtendedColumnFactory(&evalCtx))
-		converter := colconv.GetDatumToPhysicalFn(t)
-		coldata.SetValueAt(batch.ColVec(0), converter(d), 0 /* rowIdx */)
-		var vecs coldata.TypedVecs
-		vecs.SetBatch(batch)
-		return &vecs
-	}
-	writeTextColumnarElement := func(d tree.Datum, t *types.T) {
-		buf.writeTextColumnarElement(ctx, convertToVec(d, t), 0 /* vecIdx */, 0 /* rowIdx */, conv, loc)
-	}
-	writeBinaryColumnarElement := func(d tree.Datum, t *types.T) {
-		buf.writeBinaryColumnarElement(ctx, convertToVec(d, t), 0 /* vecIdx */, 0 /* rowIdx */, loc)
-	}
 	t.Run("encode", func(t *testing.T) {
-		for _, test := range tests {
-			for _, tc := range []testCase{
-				{
-					name:    "datum",
-					writeFn: writeTextDatum,
-				},
-				{
-					name:    "columnar",
-					writeFn: writeTextColumnarElement,
-				},
-			} {
-				t.Run(fmt.Sprintf("%s/%s", pgwirebase.FormatText, tc.name), func(t *testing.T) {
-					d := test.Datum
-					buf.reset()
-					buf.textFormatter.Buffer.Reset()
-					tc.writeFn(d, test.T)
-					if buf.err != nil {
-						t.Fatal(buf.err)
-					}
-					got := verifyLen(t)
-					if !bytes.Equal(got, test.TextAsBinary) {
-						t.Errorf("unexpected text encoding:\n\t%q found,\n\t%q expected", got, test.TextAsBinary)
-					}
-				})
+		t.Run(pgwirebase.FormatText.String(), func(t *testing.T) {
+			for _, tc := range tests {
+				d := tc.Datum
+
+				buf.reset()
+				buf.textFormatter.Buffer.Reset()
+				buf.writeTextDatum(ctx, d, conv, tc.T)
+				if buf.err != nil {
+					t.Fatal(buf.err)
+				}
+				got := verifyLen(t)
+				if !bytes.Equal(got, tc.TextAsBinary) {
+					t.Errorf("unexpected text encoding:\n\t%q found,\n\t%q expected", got, tc.TextAsBinary)
+				}
 			}
-		}
-		for _, test := range tests {
-			for _, tc := range []testCase{
-				{
-					name:    "datum",
-					writeFn: writeBinaryDatum,
-				},
-				{
-					name:    "columnar",
-					writeFn: writeBinaryColumnarElement,
-				},
-			} {
-				t.Run(fmt.Sprintf("%s/%s", pgwirebase.FormatBinary, tc.name), func(t *testing.T) {
-					d := test.Datum
-					buf.reset()
-					tc.writeFn(d, test.T)
-					if buf.err != nil {
-						t.Fatal(buf.err)
-					}
-					got := verifyLen(t)
-					if !bytes.Equal(got, test.Binary) {
-						t.Errorf("unexpected binary encoding:\n\t%v found,\n\t%v expected", got, test.Binary)
-					}
-				})
+		})
+		t.Run(pgwirebase.FormatBinary.String(), func(t *testing.T) {
+			for _, tc := range tests {
+				d := tc.Datum
+				buf.reset()
+				buf.writeBinaryDatum(ctx, d, time.UTC, tc.T)
+				if buf.err != nil {
+					t.Fatal(buf.err)
+				}
+				got := verifyLen(t)
+				if !bytes.Equal(got, tc.Binary) {
+					t.Errorf("unexpected binary encoding:\n\t%v found,\n\t%v expected", got, tc.Binary)
+				}
 			}
-		}
+		})
 	})
 	t.Run("decode", func(t *testing.T) {
 		for _, tc := range tests {
@@ -239,19 +183,8 @@ func TestEncodings(t *testing.T) {
 				// Skip floats because postgres rounds them different than Go.
 				continue
 			case *tree.DTuple:
-
-				hasCollatedString := false
-				for _, elem := range tc.Datum.ResolvedType().TupleContents() {
-					if elem.Family() == types.CollatedStringFamily {
-						hasCollatedString = true
-					}
-				}
-
-				if hasCollatedString {
-					// Unsupported.
-					continue
-
-				}
+				// Unsupported.
+				continue
 			case *tree.DCollatedString:
 				// Decoding collated strings is unsupported by this test. The encoded
 				// value is the same as a normal string, so decoding it turns it into
@@ -262,19 +195,7 @@ func TestEncodings(t *testing.T) {
 				pgwirebase.FormatText:   tc.TextAsBinary,
 				pgwirebase.FormatBinary: tc.Binary,
 			} {
-
-				if _, ok := tc.Datum.(*tree.DTuple); ok && code == pgwirebase.FormatText {
-					// Decoding a Tuple from text as binary is not possible as the
-					// column types cannot be determined.
-					continue
-				}
-
-				d, err := pgwirebase.DecodeDatum(
-					&evalCtx,
-					types.OidToType[tc.Oid],
-					code,
-					value,
-				)
+				d, err := pgwirebase.DecodeOidDatum(context.Background(), nil, tc.Oid, code, value, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -332,12 +253,7 @@ func TestExoticNumericEncodings(t *testing.T) {
 	evalCtx := tree.MakeTestingEvalContext(nil)
 	for i, c := range testCases {
 		t.Run(fmt.Sprintf("%d_%s", i, c.Value), func(t *testing.T) {
-			d, err := pgwirebase.DecodeDatum(
-				&evalCtx,
-				types.Decimal,
-				pgwirebase.FormatBinary,
-				c.Encoding,
-			)
+			d, err := pgwirebase.DecodeOidDatum(context.Background(), nil, oid.T_numeric, pgwirebase.FormatBinary, c.Encoding, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -353,7 +269,7 @@ func TestExoticNumericEncodings(t *testing.T) {
 func BenchmarkEncodings(b *testing.B) {
 	tests := readEncodingTests(b)
 	buf := newWriteBuffer(metric.NewCounter(metric.Metadata{}))
-	conv, loc := makeTestingConvCfg()
+	var conv sessiondata.DataConversionConfig
 	ctx := context.Background()
 
 	for _, tc := range tests {
@@ -364,7 +280,7 @@ func BenchmarkEncodings(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					buf.reset()
 					buf.textFormatter.Buffer.Reset()
-					buf.writeTextDatum(ctx, d, conv, loc, tc.T)
+					buf.writeTextDatum(ctx, d, conv, tc.T)
 				}
 			})
 			b.Run("binary", func(b *testing.B) {
@@ -374,5 +290,17 @@ func BenchmarkEncodings(b *testing.B) {
 				}
 			})
 		})
+	}
+}
+
+func TestEncodingErrorCounts(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	buf := newWriteBuffer(metric.NewCounter(metric.Metadata{}))
+	d, _ := tree.ParseDDecimal("Inf")
+	buf.writeBinaryDatum(context.Background(), d, nil, d.ResolvedType())
+	if count := telemetry.GetRawFeatureCounts()["pgwire.#32489.binary_decimal_infinity"]; count != 1 {
+		t.Fatalf("expected 1 encoding error, got %d", count)
 	}
 }

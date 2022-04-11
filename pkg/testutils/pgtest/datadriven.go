@@ -48,10 +48,7 @@ func WalkWithNewServer(
 // "send": Sends messages to a server. Takes a newline-delimited list of
 // pgproto3.FrontendMessage types. Can fill in values by adding a space then
 // a JSON object. No output. Messages with a []byte type (like CopyData) should
-// not base64 encode the data, instead use Go-escaped strings. If the input
-// data actually has binary input or characters not allowed in JSON strings
-// (like '\n'), then a base64-encoded value should be used as the `BinaryData`
-// field.
+// not base64 encode the data, instead use Go-escaped strings.
 //
 // "until": Receives all messages from a server until messages of the given
 // types have been seen. Converts them to JSON one per line as output. Takes
@@ -65,7 +62,7 @@ func WalkWithNewServer(
 // messages.
 //
 // If the argument crdb_only is given and the server is non-crdb (e.g.
-// postgres), then the exchange is skipped. With noncrdb_only, the inverse
+// posrgres), then the exchange is skipped. With noncrdb_only, the inverse
 // happens.
 func RunTest(t *testing.T, path, addr, user string) {
 	p, err := NewPGTest(context.Background(), addr, user)
@@ -89,7 +86,25 @@ func RunTest(t *testing.T, path, addr, user string) {
 				return d.Expected
 			}
 			for _, line := range strings.Split(d.Input, "\n") {
-				if err := p.SendOneLine(line); err != nil {
+				sp := strings.SplitN(line, " ", 2)
+				msg := toMessage(sp[0])
+				if len(sp) == 2 {
+					msgBytes := []byte(sp[1])
+					switch msg := msg.(type) {
+					case *pgproto3.CopyData:
+						var data struct{ Data string }
+						if err := json.Unmarshal(msgBytes, &data); err != nil {
+							t.Fatal(err)
+						}
+						msg.Data = []byte(data.Data)
+					default:
+						if err := json.Unmarshal(msgBytes, msg); err != nil {
+							t.Log(sp[1])
+							t.Fatal(err)
+						}
+					}
+				}
+				if err := p.Send(msg.(pgproto3.FrontendMessage)); err != nil {
 					t.Fatalf("%s: send %s: %v", d.Pos, line, err)
 				}
 			}
@@ -179,12 +194,6 @@ func MsgsToJSONWithIgnore(msgs []pgproto3.BackendMessage, args *datadriven.TestD
 					for i := range m.Fields {
 						m.Fields[i].DataTypeSize = 0
 					}
-				}
-			}
-		case "ignore_constraint_name":
-			for _, msg := range msgs {
-				if m, ok := msg.(*pgproto3.ErrorResponse); ok {
-					m.ConstraintName = ""
 				}
 			}
 		case "ignore":
