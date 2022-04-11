@@ -770,8 +770,8 @@ func (crr *ClearRangeRequest) ShallowCopy() Request {
 }
 
 // ShallowCopy implements the Request interface.
-func (crr *RevertRangeRequest) ShallowCopy() Request {
-	shallowCopy := *crr
+func (rrr *RevertRangeRequest) ShallowCopy() Request {
+	shallowCopy := *rrr
 	return &shallowCopy
 }
 
@@ -1225,6 +1225,11 @@ func (*DeleteRequest) flags() flag {
 }
 
 func (drr *DeleteRangeRequest) flags() flag {
+	// DeleteRangeRequest using MVCC range tombstones cannot be transactional,
+	// and thus cannot span ranges.
+	if drr.UseExperimentalRangeTombstone {
+		return isWrite | isRange | isAlone | appliesTSCache
+	}
 	// DeleteRangeRequest has different properties if the "inline" flag is set.
 	// This flag indicates that the request is deleting inline MVCC values,
 	// which cannot be deleted transactionally - inline DeleteRange will thus
@@ -1258,7 +1263,13 @@ func (*ClearRangeRequest) flags() flag { return isWrite | isRange | isAlone }
 
 // Note that RevertRange commands cannot be part of a transaction as
 // they clear all MVCC versions above their target time.
-func (*RevertRangeRequest) flags() flag { return isWrite | isRange }
+func (rrr *RevertRangeRequest) flags() flag {
+	if rrr.ExperimentalPreserveHistory {
+		return isRead | isWrite | isRange | isAlone | updatesTSCache | appliesTSCache
+	}
+	// TODO(erikgrinaker): add isAlone?
+	return isWrite | isRange
+}
 
 func (sr *ScanRequest) flags() flag {
 	maybeLocking := flagForLockStrength(sr.KeyLocking)
