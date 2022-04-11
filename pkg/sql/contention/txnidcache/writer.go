@@ -11,8 +11,8 @@
 package txnidcache
 
 import (
-	"sync"
-
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
@@ -22,29 +22,33 @@ import (
 const shardCount = 16
 
 type writer struct {
+	st *cluster.Settings
+
 	shards [shardCount]*concurrentWriteBuffer
 
-	sink         messageSink
-	msgBlockPool *sync.Pool
+	sink messageSink
 }
 
 var _ Writer = &writer{}
 
-func newWriter(sink messageSink, msgBlockPool *sync.Pool) *writer {
+func newWriter(st *cluster.Settings, sink messageSink) *writer {
 	w := &writer{
-		sink:         sink,
-		msgBlockPool: msgBlockPool,
+		st:   st,
+		sink: sink,
 	}
 
 	for shardIdx := 0; shardIdx < shardCount; shardIdx++ {
-		w.shards[shardIdx] = newConcurrentWriteBuffer(sink, msgBlockPool)
+		w.shards[shardIdx] = newConcurrentWriteBuffer(sink)
 	}
 
 	return w
 }
 
 // Record implements the Writer interface.
-func (w *writer) Record(resolvedTxnID ResolvedTxnID) {
+func (w *writer) Record(resolvedTxnID contentionpb.ResolvedTxnID) {
+	if MaxSize.Get(&w.st.SV) == 0 {
+		return
+	}
 	shardIdx := hashTxnID(resolvedTxnID.TxnID)
 	buffer := w.shards[shardIdx]
 	buffer.Record(resolvedTxnID)

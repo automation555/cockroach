@@ -12,13 +12,11 @@ package txnidcache
 
 import (
 	"context"
-	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/cache"
+	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -36,7 +34,7 @@ type Writer interface {
 	// Record writes a pair of transactionID and transaction fingerprint ID
 	// into a temporary buffer. This buffer will eventually be flushed into
 	// the transaction ID cache asynchronously.
-	Record(resolvedTxnID ResolvedTxnID)
+	Record(resolvedTxnID contentionpb.ResolvedTxnID)
 
 	// Flush starts the flushing process of writer's temporary buffer.
 	Flush()
@@ -107,14 +105,7 @@ type Cache struct {
 	msgChan chan *messageBlock
 	closeCh chan struct{}
 
-	mu struct {
-		syncutil.RWMutex
-
-		store *cache.UnorderedCache
-	}
-
-	messageBlockPool *sync.Pool
-
+	store  *fifoCache
 	writer Writer
 
 	metrics *Metrics
@@ -124,17 +115,6 @@ var (
 	entrySize = int64(uuid.UUID{}.Size()) +
 		roachpb.TransactionFingerprintID(0).Size()
 )
-
-// ResolvedTxnID represents a TxnID that is resolved to its corresponding
-// TxnFingerprintID.
-type ResolvedTxnID struct {
-	TxnID            uuid.UUID
-	TxnFingerprintID roachpb.TransactionFingerprintID
-}
-
-func (r *ResolvedTxnID) valid() bool {
-	return r.TxnID != uuid.UUID{}
-}
 
 var (
 	_ Reader      = &Cache{}
@@ -151,47 +131,21 @@ func NewTxnIDCache(st *cluster.Settings, metrics *Metrics) *Cache {
 		closeCh: make(chan struct{}),
 	}
 
-	t.messageBlockPool = &sync.Pool{
-		New: func() interface{} {
-			return &messageBlock{}
-		},
-	}
+	t.store = newFIFOCache(func() int64 {
+		return MaxSize.Get(&st.SV) / entrySize
+	} /* capacity */)
 
-	t.mu.store = cache.NewUnorderedCache(cache.Config{
-		Policy: cache.CacheFIFO,
-		ShouldEvict: func(size int, _, _ interface{}) bool {
-			return int64(size)*entrySize > MaxSize.Get(&st.SV)
-		},
-	})
-
-	t.writer = newWriter(t, t.messageBlockPool)
+	t.writer = newWriter(st, t)
 	return t
 }
 
 // Start implements the Provider interface.
 func (t *Cache) Start(ctx context.Context, stopper *stop.Stopper) {
-	addBlockToStore := func(msgBlock *messageBlock) {
-		t.mu.Lock()
-		defer t.mu.Unlock()
-		for blockIdx := range msgBlock {
-			if !msgBlock[blockIdx].valid() {
-				break
-			}
-			t.mu.store.Add(msgBlock[blockIdx].TxnID, msgBlock[blockIdx].TxnFingerprintID)
-		}
-	}
-
-	consumeBlock := func(b *messageBlock) {
-		addBlockToStore(b)
-		*b = messageBlock{}
-		t.messageBlockPool.Put(b)
-	}
-
 	err := stopper.RunAsyncTask(ctx, "txn-id-cache-ingest", func(ctx context.Context) {
 		for {
 			select {
 			case msgBlock := <-t.msgChan:
-				consumeBlock(msgBlock)
+				t.store.Add(msgBlock)
 			case <-stopper.ShouldQuiesce():
 				close(t.closeCh)
 				return
@@ -207,20 +161,17 @@ func (t *Cache) Start(ctx context.Context, stopper *stop.Stopper) {
 func (t *Cache) Lookup(txnID uuid.UUID) (result roachpb.TransactionFingerprintID, found bool) {
 	t.metrics.CacheReadCounter.Inc(1)
 
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	txnFingerprintID, found := t.mu.store.Get(txnID)
+	txnFingerprintID, found := t.store.Get(txnID)
 	if !found {
 		t.metrics.CacheMissCounter.Inc(1)
 		return roachpb.InvalidTransactionFingerprintID, found
 	}
 
-	return txnFingerprintID.(roachpb.TransactionFingerprintID), found
+	return txnFingerprintID, found
 }
 
 // Record implements the Writer interface.
-func (t *Cache) Record(resolvedTxnID ResolvedTxnID) {
+func (t *Cache) Record(resolvedTxnID contentionpb.ResolvedTxnID) {
 	t.writer.Record(resolvedTxnID)
 }
 
@@ -239,7 +190,5 @@ func (t *Cache) Flush() {
 
 // Size return the current size of the Cache.
 func (t *Cache) Size() int64 {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return int64(t.mu.store.Len()) * entrySize
+	return int64(t.store.Size()) * entrySize
 }
