@@ -74,10 +74,6 @@ func (ru ErrorDetail) GetInner() error {
 		return t.OptimisticEvalConflicts
 	case *ErrorDetail_MinTimestampBoundUnsatisfiable:
 		return t.MinTimestampBoundUnsatisfiable
-	case *ErrorDetail_RefreshFailedError:
-		return t.RefreshFailedError
-	case *ErrorDetail_MVCCHistoryMutation:
-		return t.MVCCHistoryMutation
 	default:
 		return nil
 	}
@@ -352,10 +348,6 @@ func (ru *ErrorDetail) MustSetInner(r error) {
 		union = &ErrorDetail_OptimisticEvalConflicts{t}
 	case *MinTimestampBoundUnsatisfiableError:
 		union = &ErrorDetail_MinTimestampBoundUnsatisfiable{t}
-	case *RefreshFailedError:
-		union = &ErrorDetail_RefreshFailedError{t}
-	case *MVCCHistoryMutationError:
-		union = &ErrorDetail_MVCCHistoryMutation{t}
 	default:
 		panic(fmt.Sprintf("unsupported type %T for %T", r, ru))
 	}
