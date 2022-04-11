@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/errors"
 )
@@ -90,8 +90,9 @@ func (e *explainPlanNode) startExec(params runParams) error {
 			distSQLPlanner.finalizePlanWithRowCount(planCtx, physicalPlan, plan.mainRowCount)
 			ob.AddDistribution(physicalPlan.Distribution.String())
 			flows := physicalPlan.GenerateFlowSpecs()
+			flowCtx := newFlowCtxForExplainPurposes(planCtx, params.p)
 
-			ctxSessionData := planCtx.EvalContext().SessionData()
+			ctxSessionData := flowCtx.EvalCtx.SessionData()
 			var willVectorize bool
 			if ctxSessionData.VectorizeMode == sessiondatapb.VectorizeOff {
 				willVectorize = false
@@ -136,10 +137,8 @@ func (e *explainPlanNode) startExec(params runParams) error {
 		}
 	}
 	// Add index recommendations to output, if they exist.
-	if params.p.instrumentation.indexRecommendations != nil {
-		// First add empty row.
-		rows = append(rows, "")
-		rows = append(rows, params.p.instrumentation.indexRecommendations...)
+	if len(params.p.indexRecommendations) > 0 {
+		rows = append(rows, params.p.indexRecommendations)
 	}
 	v := params.p.newContainerValuesNode(colinfo.ExplainPlanColumns, 0)
 	datums := make([]tree.DString, len(rows))
@@ -169,7 +168,7 @@ func emitExplain(
 			// manipulate locks.
 			// Note that we don't catch anything in debug builds, so that failures are
 			// more visible.
-			if ok, e := errorutil.ShouldCatch(r); ok && !buildutil.CrdbTestBuild {
+			if ok, e := errorutil.ShouldCatch(r); ok && !util.CrdbTestBuild {
 				err = e
 			} else {
 				// Other panic objects can't be considered "safe" and thus are

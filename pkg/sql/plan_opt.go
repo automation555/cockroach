@@ -14,16 +14,19 @@ import (
 	"context"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/indexrec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -37,7 +40,6 @@ import (
 )
 
 var queryCacheEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
 	"sql.query_cache.enabled", "enable the query cache", true,
 )
 
@@ -524,16 +526,14 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 		return nil, err
 	}
 
-	// For index recommendations, after building we must interrupt the flow to
-	// find potential index candidates in the memo.
-	_, isExplain := opc.p.stmt.AST.(*tree.Explain)
-	if isExplain && p.SessionData().IndexRecommendationsEnabled {
-		if err := opc.makeQueryIndexRecommendation(); err != nil {
+	// For index recommendations, after building we must interrupt to find
+	// potential index candidates in the memo. Optimize is called from
+	// makeQueryIndexRecommendation.
+	if _, isExplain := opc.p.stmt.AST.(*tree.Explain); isExplain {
+		if err := opc.makeQueryIndexRecommendation(f); err != nil {
 			return nil, err
 		}
-	}
-
-	if _, isCanned := opc.p.stmt.AST.(*tree.CannedOptPlan); !isCanned {
+	} else if _, isCanned := opc.p.stmt.AST.(*tree.CannedOptPlan); !isCanned {
 		if _, err := opc.optimizer.Optimize(); err != nil {
 			return nil, err
 		}
@@ -618,7 +618,6 @@ func (opc *optPlanningCtx) runExecBuilder(
 	if gf != nil {
 		planTop.instrumentation.planGist = gf.PlanGist()
 	}
-	planTop.instrumentation.costEstimate = float64(mem.RootExpr().(memo.RelExpr).Cost())
 
 	if stmt.ExpectedTypes != nil {
 		cols := result.main.planColumns()
@@ -666,21 +665,16 @@ func (p *planner) DecodeGist(gist string) ([]string, error) {
 // indexes hypothetically added to the table. An index recommendation for the
 // query is outputted based on which hypothetical indexes are helpful in the
 // optimal plan.
-func (opc *optPlanningCtx) makeQueryIndexRecommendation() error {
+func (opc *optPlanningCtx) makeQueryIndexRecommendation(f *norm.Factory) error {
 	// Save the normalized memo created by the optbuilder.
 	savedMemo := opc.optimizer.DetachMemo()
 
-	// Use the optimizer to fully normalize the memo. We need to do this before
-	// finding index candidates because the *memo.SortExpr from the sort enforcer
-	// is only added to the memo in this step. The sort expression is required to
-	// determine certain index candidates.
-	f := opc.optimizer.Factory()
+	// Use the optimizer to apply normalization rules that are not yet added to
+	// the memo, like *memo.SortExpr.
 	f.FoldingControl().AllowStableFolds()
-	f.CopyAndReplace(
-		savedMemo.RootExpr().(memo.RelExpr),
-		savedMemo.RootProps(),
-		f.CopyWithoutAssigningPlaceholders,
-	)
+	if err := f.AssignPlaceholders(savedMemo); err != nil {
+		return err
+	}
 	opc.optimizer.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
 		return ruleName.IsNormalize()
 	})
@@ -688,37 +682,78 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation() error {
 		return err
 	}
 
-	// Walk through the fully normalized memo to determine index candidates and
-	// create hypothetical tables.
+	// Walk through fully normalized memo to determine index candidates and create
+	// hypothetical tables.
 	indexCandidates := indexrec.FindIndexCandidateSet(f.Memo().RootExpr(), f.Metadata())
-	optTables, hypTables := indexrec.BuildOptAndHypTableMaps(indexCandidates)
-
-	// Optimize with the saved memo and hypothetical tables. Walk through the
-	// optimal plan to determine index recommendations.
-	opc.optimizer.Init(f.EvalContext(), &opc.catalog)
-	f.CopyAndReplace(
-		savedMemo.RootExpr().(memo.RelExpr),
-		savedMemo.RootProps(),
-		f.CopyWithoutAssigningPlaceholders,
+	oldTables, hypTables := indexrec.BuildHypotheticalTables(
+		indexCandidates, getTableZones(indexCandidates), getExistingIndexes(indexCandidates),
 	)
+
+	// Optimize with saved memo and hypothetical tables. Walk through the optimal
+	// plan to determine index recommendations.
+	opc.optimizer.DetachMemo()
+	if err := f.AssignPlaceholders(savedMemo); err != nil {
+		return err
+	}
 	opc.optimizer.Memo().Metadata().UpdateTableMeta(hypTables)
 	if _, err := opc.optimizer.Optimize(); err != nil {
 		return err
 	}
 
 	indexRecommendations := indexrec.FindIndexRecommendationSet(f.Memo().RootExpr(), f.Metadata())
-	opc.p.instrumentation.indexRecommendations = indexRecommendations.Output()
 
-	// Re-initialize the optimizer (which also re-initializes the factory) and
-	// update the saved memo's metadata with the original table information.
-	// Prepare to re-optimize and create an executable plan.
-	opc.optimizer.Init(f.EvalContext(), &opc.catalog)
-	savedMemo.Metadata().UpdateTableMeta(optTables)
-	f.CopyAndReplace(
-		savedMemo.RootExpr().(memo.RelExpr),
-		savedMemo.RootProps(),
-		f.CopyWithoutAssigningPlaceholders,
-	)
+	// Re-optimize with saved memo and original table metadata to get an
+	// executable plan.
+	opc.optimizer.DetachMemo()
+	savedMemo.Metadata().UpdateTableMeta(oldTables)
+	if err := f.AssignPlaceholders(savedMemo); err != nil {
+		return err
+	}
+	if _, err := opc.optimizer.Optimize(); err != nil {
+		return err
+	}
 
+	opc.p.indexRecommendations = indexRecommendations
 	return nil
+}
+
+// getTableInfo casts the table keys of an indexCandidates map to *optTable in
+// order to map tables to their corresponding zones.
+func getTableZones(
+	indexCandidates map[cat.Table][][]cat.IndexColumn,
+) (tableZones map[cat.Table]*zonepb.ZoneConfig) {
+	tableZones = make(map[cat.Table]*zonepb.ZoneConfig)
+	for t := range indexCandidates {
+		tableZones[t] = t.(*optTable).zone
+	}
+	return tableZones
+}
+
+// getExistingIndexes returns a map from a table's cat.StableID to a slice of
+// indexes. This is used when building hypothetical tables to ensure a
+// hypothetical index is not added if an equivalent index already exists.
+func getExistingIndexes(
+	indexCandidates map[cat.Table][][]cat.IndexColumn,
+) (indexes map[cat.StableID][][]cat.IndexColumn) {
+	indexes = make(map[cat.StableID][][]cat.IndexColumn)
+	for tab := range indexCandidates {
+		tabIndexes := make([][]cat.IndexColumn, tab.IndexCount())
+		for i, n := 0, tab.IndexCount(); i < n; i++ {
+			currIndex := tab.Index(i).(*optIndex)
+			idx := currIndex.idx
+			existingIndex := make([]cat.IndexColumn, idx.NumKeyColumns())
+			for j, m := 0, idx.NumKeyColumns(); j < m; j++ {
+				id := idx.GetKeyColumnID(j)
+				dir := idx.GetKeyColumnDirection(i)
+				ord, _ := tab.(*optTable).lookupColumnOrdinal(id)
+				existingIndex[j] = cat.IndexColumn{
+					Column:     tab.Column(ord),
+					Descending: dir == descpb.IndexDescriptor_DESC,
+				}
+			}
+			tabIndexes[i] = existingIndex
+		}
+		indexes[tab.ID()] = tabIndexes
+	}
+	return indexes
 }
